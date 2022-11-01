@@ -231,9 +231,9 @@ def get_senders(transaction_pool: list) -> list:
     return sender_pool
 
 
-def validate_single_spending(transaction_pool: list, transaction):
+def validate_single_spending(transaction_pool: dict, transaction):
     """validate spending of a single spender against his transactions in a transaction pool"""
-    transaction_pool.append(transaction)  # future state
+    transaction_pool[transaction["txid"]] = transaction
 
     sender = transaction["sender"]
 
@@ -241,16 +241,16 @@ def validate_single_spending(transaction_pool: list, transaction):
     amount_sum = 0
     fee_sum = 0
 
-    for pool_tx in transaction_pool:
-        if pool_tx["sender"] == sender:
+    for tx in transaction_pool:
+        if tx["sender"] == sender:
             check_balance(
                 account=sender,
-                amount=pool_tx["amount"],
-                fee=pool_tx["fee"],
+                amount=tx["amount"],
+                fee=tx["fee"],
             )
 
-            amount_sum += pool_tx["amount"]
-            fee_sum += pool_tx["fee"]
+            amount_sum += tx["amount"]
+            fee_sum += tx["fee"]
 
             spending = amount_sum + fee_sum
             assert spending <= standing_balance, "Overspending attempt"
@@ -266,16 +266,16 @@ def validate_all_spending(transaction_pool: list):
         amount_sum = 0
         fee_sum = 0
 
-        for pool_tx in transaction_pool:
-            if pool_tx["sender"] == sender:
+        for tx in transaction_pool:
+            if tx["sender"] == sender:
                 check_balance(
                     account=sender,
-                    amount=pool_tx["amount"],
-                    fee=pool_tx["fee"],
+                    amount=tx["amount"],
+                    fee=tx["fee"],
                 )
 
-                amount_sum += pool_tx["amount"]
-                fee_sum += pool_tx["fee"]
+                amount_sum += tx["amount"]
+                fee_sum += tx["fee"]
 
                 spending = amount_sum + fee_sum
                 assert spending <= standing_balance, "Overspending attempt"
@@ -315,12 +315,13 @@ def create_transaction(sender, recipient, amount, public_key, private_key, times
         "public_key": public_key,
     }
     txid = create_txid(transaction_message)
-    transaction_message.update(txid=txid)
 
-    signature = sign(private_key=private_key, message=json.dumps(transaction_message))
-    transaction_message.update(signature=signature)
+    transaction = {txid: transaction_message}
 
-    return transaction_message
+    signature = sign(private_key=private_key, message=msgpack.packb(transaction))
+    transaction[txid].update(signature=signature)
+
+    return transaction
 
 
 if __name__ == "__main__":

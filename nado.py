@@ -44,7 +44,9 @@ class HomeHandler(tornado.web.RequestHandler):
 
 
 class StatusHandler(tornado.web.RequestHandler):
-    def get(self):
+    def get(self, parameter):
+        compress = GetBlocksAfterHandler.get_argument(self, "compress", default="none")
+
         try:
             status_dict = {
                 "reported_uptime": memserver.reported_uptime,
@@ -54,15 +56,28 @@ class StatusHandler(tornado.web.RequestHandler):
                 "latest_block_hash": get_latest_block_info(logger=logger)["block_hash"],
                 "protocol": memserver.protocol,
             }
-            self.write(status_dict)
+
+            if compress == "msgpack":
+                output = msgpack.packb(status_dict)
+            else:
+                output = status_dict
+
+            self.write(output)
+
         except Exception as e:
             self.set_status(403)
             self.write(f"Error: {e}")
 
 
 class TransactionPoolHandler(tornado.web.RequestHandler):
-    def get(self):
-        transaction_pool = {"transaction_pool": memserver.transaction_pool}
+
+    def get(self, parameter):
+        compress = GetBlocksAfterHandler.get_argument(self, "compress", default="none")
+
+        if compress == "msgpack":
+            transaction_pool = msgpack.packb(memserver.transaction_pool)
+        else:
+            transaction_pool = {"transaction_pool": memserver.transaction_pool}
         self.write(transaction_pool)
 
 
@@ -124,8 +139,13 @@ class FeeHandler(tornado.web.RequestHandler):
 
 
 class StatusPoolHandler(tornado.web.RequestHandler):
-    def get(self):
-        self.write(consensus.status_pool)
+    def get(self, parameter):
+        compress = GetBlocksAfterHandler.get_argument(self, "compress", default="none")
+
+        if compress == "msgpack":
+            self.write(msgpack.packb(consensus.status_pool))
+        else:
+            self.write(consensus.status_pool)
 
 
 class SubmitTransactionHandler(tornado.web.RequestHandler):
@@ -215,7 +235,7 @@ class GetBlocksBeforeHandler(tornado.web.RequestHandler):
         try:
             block_hash = GetBlocksBeforeHandler.get_argument(self, "hash")
             count = int(GetBlocksBeforeHandler.get_argument(self, "count"))
-            pack = GetBlocksAfterHandler.get_argument(self, "pack")
+            compress = GetBlocksAfterHandler.get_argument(self, "compress", default="none")
 
             parent_hash = get_block(block_hash)["parent_hash"]
 
@@ -232,7 +252,7 @@ class GetBlocksBeforeHandler(tornado.web.RequestHandler):
 
             collected_blocks.reverse()
 
-            if pack == "true":
+            if compress == "msgpack":
                 output = msgpack.packb(collected_blocks)
             else:
                 output = collected_blocks
@@ -241,7 +261,7 @@ class GetBlocksBeforeHandler(tornado.web.RequestHandler):
                 output = "Not found"
                 self.set_status(403)
 
-            if pack == "true":
+            if compress == "msgpack":
                 self.write(output)
             else:
                 self.write({"blocks_before": output})
@@ -256,7 +276,7 @@ class GetBlocksAfterHandler(tornado.web.RequestHandler):
         try:
             block_hash = GetBlocksAfterHandler.get_argument(self, "hash")
             count = int(GetBlocksAfterHandler.get_argument(self, "count"))
-            pack = GetBlocksAfterHandler.get_argument(self, "pack")
+            compress = GetBlocksAfterHandler.get_argument(self, "compress", default="none")
 
             child_hash = get_block(block_hash)["child_hash"]
 
@@ -271,7 +291,7 @@ class GetBlocksAfterHandler(tornado.web.RequestHandler):
                 except:
                     break
 
-            if pack == "true":
+            if compress == "msgpack":
                 output = msgpack.packb(collected_blocks)
             else:
                 output = collected_blocks
@@ -280,7 +300,7 @@ class GetBlocksAfterHandler(tornado.web.RequestHandler):
                 output = "Not found"
                 self.set_status(403)
 
-            if pack == "true":
+            if compress == "msgpack":
                 self.write(output)
             else:
                 self.write({"blocks_after": output})
@@ -389,7 +409,7 @@ def make_app():
     return tornado.web.Application(
         [
             (r"/", HomeHandler),
-            (r"/status", StatusHandler),
+            (r"/status(.*)", StatusHandler),
             (r"/get_transactions_of_account(.*)", AccountTransactionsHandler),
             (r"/get_transaction(.*)", TransactionHandler),
             (r"/get_blocks_after(.*)", GetBlocksAfterHandler),
@@ -397,7 +417,7 @@ def make_app():
             (r"/get_block(.*)", GetBlockHandler),
             (r"/get_account(.*)", AccountHandler),
             (r"/get_producer_set_from_hash(.*)", ProducerSetHandler),
-            (r"/transaction_pool", TransactionPoolHandler),
+            (r"/transaction_pool(.*)", TransactionPoolHandler),
             (r"/transaction_hash_pool", TransactionHashPoolHandler),
             (r"/transaction_buffer", TransactionBufferHandler),
             (r"/trust_pool", TrustPoolHandler),

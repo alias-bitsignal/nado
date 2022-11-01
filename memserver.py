@@ -39,10 +39,10 @@ class MemServer:
         self.public_key = self.keydict["public_key"]
         self.address = self.keydict["address"]
         self.server_key = self.config["server_key"]
-        self.transaction_pool = []
+        self.transaction_pool = {}
         self.since_last_block = 0
-        self.user_tx_buffer = []
-        self.tx_buffer = []
+        self.user_tx_buffer = {}
+        self.tx_buffer = {}
         self.peer_buffer = []
         self.ip = get_config()["ip"]
         self.port = get_config()["port"]
@@ -98,7 +98,7 @@ class MemServer:
 
     def merge_transaction(self, transaction, user=False) -> dict:
         """warning, can get stuck if not efficient"""
-        united_pools = self.transaction_pool.copy() + self.tx_buffer.copy() + self.user_tx_buffer.copy()
+        united_pools = self.transaction_pool.copy() | self.tx_buffer.copy() | self.user_tx_buffer.copy()
 
         self.waiting += 1
         while self.period == 3:
@@ -150,8 +150,8 @@ class MemServer:
         """of sender sending different txs to different nodes both exhausting balance"""
         for transaction in self.transaction_pool:
             if transaction["sender"] == sender:
-                self.transaction_pool.remove(transaction)
+                self.transaction_pool.pop(transaction)
 
         for transaction in self.tx_buffer:
             if transaction["sender"] == sender:
-                self.tx_buffer.remove(transaction)
+                self.tx_buffer.pop(transaction)

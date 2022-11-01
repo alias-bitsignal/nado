@@ -3,6 +3,7 @@ import json
 import time
 
 import aiohttp
+import msgpack
 
 from config import get_config
 from data_ops import sort_list_dict
@@ -15,14 +16,14 @@ async def get_list_of(key, peer, fail_storage, logger, retries=3):
     """method compounded by compound_get_list_of, fail storage external by reference (obj)"""
     """bandwith usage of this grows exponentially with number of peers"""
     """peers include themselves in their peer lists"""
+    url_construct = f"http://{peer}:{get_config()['port']}/{key}?compress=msgpack"
 
-    url_construct = f"http://{peer}:{get_config()['port']}/{key}"
     while retries > 0:
         try:
             timeout = aiohttp.ClientTimeout(total=3)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(url_construct) as response:
-                    fetched = json.loads(await response.text())[key]
+                    fetched = msgpack.unpackb(await response.text())[key]
                     return fetched
 
         except Exception:
@@ -62,13 +63,14 @@ async def compound_get_list_of(key, entries, logger, fail_storage):
 async def get_status(peer, logger, fail_storage, retries=3):
     """method compounded by compound_get_status_pool"""
 
-    url_construct = f"http://{peer}:{get_config()['port']}/status"
+    url_construct = f"http://{peer}:{get_config()['port']}/status?compress=msgpack"
+
     while retries > 0:
         try:
             timeout = aiohttp.ClientTimeout(total=3)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(url_construct) as response:
-                    fetched = json.loads(await response.text())
+                    fetched = msgpack.unpackb(await response.text())
                     return peer, fetched
 
         except Exception:
@@ -100,6 +102,7 @@ async def compound_get_status_pool(ips, logger, fail_storage):
 
 async def announce_self(peer, logger, fail_storage, retries=3):
     """method compounded by compound_announce_self"""
+
     url_construct = (
         f"http://{peer}:{get_config()['port']}/announce_peer?ip={get_config()['ip']}"
     )
