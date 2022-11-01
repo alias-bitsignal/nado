@@ -45,7 +45,7 @@ class HomeHandler(tornado.web.RequestHandler):
 
 class StatusHandler(tornado.web.RequestHandler):
     def get(self, parameter):
-        compress = GetBlocksAfterHandler.get_argument(self, "compress")
+        compress = GetBlocksAfterHandler.get_argument(self, "compress", default="none")
 
         try:
             status_dict = {
@@ -156,15 +156,15 @@ class StatusPoolHandler(tornado.web.RequestHandler):
 class SubmitTransactionHandler(tornado.web.RequestHandler):
     def get(self, parameter):
         try:
-            transaction = msgpack.unpackb(SubmitTransactionHandler.get_argument(self, "data"))
+            transaction = SubmitTransactionHandler.get_argument(self, "data")
             output = memserver.merge_transaction(transaction, user=True)
-            self.write(output)
+            self.write(msgpack.packb(output))
 
             if not output["result"]:
                 self.set_status(403)
 
         except Exception as e:
-            self.write(f"Invalid transaction structure on submission attempt: {e}")
+            self.write(msgpack.packb(f"Invalid tx structure: {e}"))
 
 
 class LogHandler(tornado.web.RequestHandler):
@@ -240,7 +240,7 @@ class GetBlocksBeforeHandler(tornado.web.RequestHandler):
         try:
             block_hash = GetBlocksBeforeHandler.get_argument(self, "hash")
             count = int(GetBlocksBeforeHandler.get_argument(self, "count"))
-            compress = GetBlocksAfterHandler.get_argument(self, "compress")
+            compress = GetBlocksAfterHandler.get_argument(self, "compress", default="none")
 
             parent_hash = get_block(block_hash)["parent_hash"]
 
@@ -281,7 +281,7 @@ class GetBlocksAfterHandler(tornado.web.RequestHandler):
         try:
             block_hash = GetBlocksAfterHandler.get_argument(self, "hash")
             count = int(GetBlocksAfterHandler.get_argument(self, "count"))
-            compress = GetBlocksAfterHandler.get_argument(self, "compress")
+            compress = GetBlocksAfterHandler.get_argument(self, "compress", default="none")
 
             child_hash = get_block(block_hash)["child_hash"]
 

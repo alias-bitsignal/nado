@@ -22,6 +22,10 @@ from account_ops import get_account, reflect_transaction
 def calculate_fee():
     return 1
 
+def get_recommneded_fee(target, port):
+    url = f"http://{target}:{port}/get_recommended_fee"
+    result = json.loads(requests.get(url, timeout=3).text)
+    return result['fee']
 
 def get_transaction(txid, logger):
     """return transaction based on txid"""
