@@ -2,6 +2,7 @@ import asyncio
 import time
 from threading import Lock
 
+from transaction_ops import create_txid
 from block_ops import load_block_producers
 from compounder import compound_get_list_of
 from config import get_timestamp_seconds, get_config
@@ -106,36 +107,37 @@ class MemServer:
         self.waiting -= 1
 
         with self.buffer_lock:
-            if not get_account(transaction["sender"], create_on_error=False):
+            transaction_message = list(dict.values(transaction))[0]
+            txid = list(transaction_message.keys())[0]
+            sender = transaction_message["sender"]
+
+            if not get_account(sender, create_on_error=False):
                 msg = {"result": False,
                        "message": f"Empty account"}
                 return msg
 
-            elif transaction not in united_pools:
+            elif txid not in united_pools:
                 try:
                     validate_transaction(transaction, logger=self.logger)
                 except Exception as e:
                     msg = {"result": False,
                            "message": f"Could not merge remote transaction: {e}"}
-
                     # self.logger.info(msg) spam
                     return msg
                 else:
                     try:
                         validate_single_spending(transaction_pool=united_pools, transaction=transaction)
 
-                        if transaction not in self.transaction_pool:
-                            if user and transaction not in self.tx_buffer:
-                                self.user_tx_buffer.append(transaction)
-                                self.user_tx_buffer = sort_list_dict(self.user_tx_buffer)
-                            elif transaction not in self.user_tx_buffer:
-                                self.tx_buffer.append(transaction)
-                                self.tx_buffer = sort_list_dict(self.tx_buffer)
+                        if txid not in self.transaction_pool:
+                            if user and txid not in self.tx_buffer:
+                                self.user_tx_buffer[txid] = transaction_message
+                            elif txid not in self.user_tx_buffer:
+                                self.tx_buffer[txid] = transaction_message
 
                     except Exception as e:
                         msg = f"Remote transaction failed to validate: {e}"
                         self.logger.info(msg)
-                        self.purge_txs_of_sender(transaction["sender"])
+                        self.purge_txs_of_sender(transaction_message["sender"])
                         return {"message": msg,
                                 "result": False}
 

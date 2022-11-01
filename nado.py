@@ -1,3 +1,4 @@
+import ast
 import ipaddress
 import json
 import os
@@ -156,15 +157,17 @@ class StatusPoolHandler(tornado.web.RequestHandler):
 class SubmitTransactionHandler(tornado.web.RequestHandler):
     def get(self, parameter):
         try:
-            transaction = SubmitTransactionHandler.get_argument(self, "data")
+            transaction_raw = SubmitTransactionHandler.get_argument(self, "data")
+            transaction = json.loads(transaction_raw)
             output = memserver.merge_transaction(transaction, user=True)
-            self.write(msgpack.packb(output))
+            self.write(json.dumps(output))
 
             if not output["result"]:
                 self.set_status(403)
 
         except Exception as e:
-            self.write(msgpack.packb(f"Invalid tx structure: {e}"))
+            self.write(json.dumps(f"Invalid tx structure: {e}"))
+            raise
 
 
 class LogHandler(tornado.web.RequestHandler):

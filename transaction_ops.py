@@ -59,13 +59,16 @@ def incorporate_transaction(transaction, block_hash):
 
 
 def validate_transaction(transaction, logger):
+    accessible = list(dict.values(transaction))[0]
+    txid = list(transaction.keys())[0]
+
     assert isinstance(transaction, dict), "Data structure incomplete"
     assert validate_origin(transaction), "Invalid origin"
-    assert validate_address(transaction["sender"]), f"Invalid sender {transaction['sender']}"
-    assert validate_address(transaction["recipient"]), f"Invalid recipient {transaction['recipient']}"
-    assert validate_uniqueness(transaction["txid"], logger=logger), f"Transaction {transaction['txid']} already exists"
-    assert isinstance(transaction["fee"], int), "Transaction fee is not an integer"
-    assert transaction["fee"] >= 0, "Transaction fee lower than zero"
+    assert validate_address(accessible['sender']), f"Invalid sender {accessible['sender']}"
+    assert validate_address(accessible["recipient"]), f"Invalid recipient {accessible['recipient']}"
+    assert validate_uniqueness(txid, logger=logger), f"Transaction {txid} already exists"
+    assert isinstance(accessible["fee"], int), "Transaction fee is not an integer"
+    assert accessible["fee"] >= 0, "Transaction fee lower than zero"
     return True
 
 
@@ -237,24 +240,27 @@ def get_senders(transaction_pool: list) -> list:
 
 def validate_single_spending(transaction_pool: dict, transaction):
     """validate spending of a single spender against his transactions in a transaction pool"""
-    transaction_pool[transaction["txid"]] = transaction
+    transaction_message = list(dict.values(transaction))[0]
+    txid = list(transaction.keys())[0]
 
-    sender = transaction["sender"]
+    transaction_pool[txid] = transaction_message
+
+    sender = transaction_message["sender"]
 
     standing_balance = get_account(sender)["account_balance"]
     amount_sum = 0
     fee_sum = 0
 
-    for tx in transaction_pool:
-        if tx["sender"] == sender:
+    for key, value in transaction_pool.items():
+        if value["sender"] == sender:
             check_balance(
                 account=sender,
-                amount=tx["amount"],
-                fee=tx["fee"],
+                amount=value["amount"],
+                fee=value["fee"],
             )
 
-            amount_sum += tx["amount"]
-            fee_sum += tx["fee"]
+            amount_sum += value["amount"]
+            fee_sum += value["fee"]
 
             spending = amount_sum + fee_sum
             assert spending <= standing_balance, "Overspending attempt"
@@ -288,19 +294,19 @@ def validate_all_spending(transaction_pool: list):
 
 def validate_origin(transaction: dict):
     """save signature and then remove it as it is not a part of the signed message"""
+    transaction_accessible = list(dict.values(transaction))[0]
 
-    transaction = transaction.copy()
-    signature = transaction["signature"]
-    del transaction["signature"]
+    signature = transaction_accessible["signature"]
+    del transaction_accessible["signature"]
 
     assert proof_sender(
-        sender=transaction["sender"], public_key=transaction["public_key"]
+        sender=transaction_accessible["sender"], public_key=transaction_accessible["public_key"]
     ), "Invalid sender"
 
     assert verify(
         signed=signature,
-        message=json.dumps(transaction),
-        public_key=transaction["public_key"],
+        message=msgpack.packb(transaction),
+        public_key=transaction_accessible["public_key"],
     ), "Invalid sender"
 
     return True
