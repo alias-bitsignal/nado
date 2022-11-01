@@ -45,7 +45,7 @@ class HomeHandler(tornado.web.RequestHandler):
 
 class StatusHandler(tornado.web.RequestHandler):
     def get(self, parameter):
-        compress = GetBlocksAfterHandler.get_argument(self, "compress", default="none")
+        compress = GetBlocksAfterHandler.get_argument(self, "compress")
 
         try:
             status_dict = {
@@ -75,7 +75,7 @@ class TransactionPoolHandler(tornado.web.RequestHandler):
         compress = GetBlocksAfterHandler.get_argument(self, "compress", default="none")
 
         if compress == "msgpack":
-            transaction_pool = msgpack.packb(memserver.transaction_pool)
+            transaction_pool = msgpack.packb({"transaction_pool": memserver.transaction_pool})
         else:
             transaction_pool = {"transaction_pool": memserver.transaction_pool}
         self.write(transaction_pool)
@@ -94,8 +94,13 @@ class TrustPoolHandler(tornado.web.RequestHandler):
 
 
 class PeerPoolHandler(tornado.web.RequestHandler):
-    def get(self):
-        self.write({"peers": list(memserver.peers)})
+    def get(self, parameter):
+        compress = GetBlocksAfterHandler.get_argument(self, "compress", default="none")
+
+        if compress == "msgpack":
+            self.write(msgpack.packb({"peers": list(memserver.peers)}))
+        else:
+            self.write({"peers": list(memserver.peers)})
 
 
 class BlockProducerPoolHandler(tornado.web.RequestHandler):
@@ -143,7 +148,7 @@ class StatusPoolHandler(tornado.web.RequestHandler):
         compress = GetBlocksAfterHandler.get_argument(self, "compress", default="none")
 
         if compress == "msgpack":
-            self.write(msgpack.packb(consensus.status_pool))
+            self.write(msgpack.packb(consensus.status_pool).encode())
         else:
             self.write(consensus.status_pool)
 
@@ -235,7 +240,7 @@ class GetBlocksBeforeHandler(tornado.web.RequestHandler):
         try:
             block_hash = GetBlocksBeforeHandler.get_argument(self, "hash")
             count = int(GetBlocksBeforeHandler.get_argument(self, "count"))
-            compress = GetBlocksAfterHandler.get_argument(self, "compress", default="none")
+            compress = GetBlocksAfterHandler.get_argument(self, "compress")
 
             parent_hash = get_block(block_hash)["parent_hash"]
 
@@ -276,7 +281,7 @@ class GetBlocksAfterHandler(tornado.web.RequestHandler):
         try:
             block_hash = GetBlocksAfterHandler.get_argument(self, "hash")
             count = int(GetBlocksAfterHandler.get_argument(self, "count"))
-            compress = GetBlocksAfterHandler.get_argument(self, "compress", default="none")
+            compress = GetBlocksAfterHandler.get_argument(self, "compress")
 
             child_hash = get_block(block_hash)["child_hash"]
 
@@ -424,7 +429,7 @@ def make_app():
             (r"/get_latest_block", GetLatestBlockHandler),
             (r"/announce_peer(.*)", AnnouncePeerHandler),
             (r"/status_pool", StatusPoolHandler),
-            (r"/peers", PeerPoolHandler),
+            (r"/peers(.*)", PeerPoolHandler),
             (r"/block_producers", BlockProducerPoolHandler),
             (r"/block_producers_hash_pool", BlockProducersHashPoolHandler),
             (r"/block_hash_pool", BlockHashPoolHandler),

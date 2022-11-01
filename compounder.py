@@ -23,10 +23,12 @@ async def get_list_of(key, peer, fail_storage, logger, retries=3):
             timeout = aiohttp.ClientTimeout(total=3)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(url_construct) as response:
-                    fetched = msgpack.unpackb(await response.text())[key]
-                    return fetched
+                    fetched = await response.read()
+                    fetched_decoded = msgpack.unpackb(fetched)[key]
+                    return fetched_decoded
 
-        except Exception:
+        except Exception as e:
+            print(e)
             retries -= 1
             time.sleep(0.3)
 
@@ -70,10 +72,12 @@ async def get_status(peer, logger, fail_storage, retries=3):
             timeout = aiohttp.ClientTimeout(total=3)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(url_construct) as response:
-                    fetched = msgpack.unpackb(await response.text())
-                    return peer, fetched
+                    fetched = await response.read()
+                    fetched_decoded = msgpack.unpackb(fetched)
+                    return peer, fetched_decoded
 
-        except Exception:
+        except Exception as e:
+            print(e)
             retries -= 1
             time.sleep(0.3)
 
@@ -112,10 +116,13 @@ async def announce_self(peer, logger, fail_storage, retries=3):
             timeout = aiohttp.ClientTimeout(total=3)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(url_construct) as response:
-                    fetched = await response.text()
+                    fetched = await response.read()
                     return fetched
 
-        except Exception:
+
+        except Exception as e:
+
+            print(e)
             retries -= 1
             time.sleep(0.3)
 
