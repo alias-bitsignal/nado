@@ -282,7 +282,7 @@ class CoreClient(threading.Thread):
             self.logger.info(f"Error: {e}")
             raise
 
-    def incorporate_block(self, block):
+    def incorporate_block(self, block): #fixme
         transactions = sort_list_dict(block["block_transactions"])
         try:
             for transaction in transactions:
@@ -303,7 +303,7 @@ class CoreClient(threading.Thread):
             self.logger.error(f"Failed to incorporate block: {e}")
             raise
 
-    def validate_transactions_in_block(self, block, logger, remote_peer, remote):
+    def validate_transactions_in_block(self, block, logger, remote_peer, remote): #fixme
 
         transactions = sort_list_dict(block["block_transactions"])
 

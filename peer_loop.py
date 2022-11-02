@@ -103,7 +103,7 @@ class PeerClient(threading.Thread):
 
                 if self.memserver.period in [0, 1]:
                     self.purge_peers()
-                    self.memserver.merge_remote_transactions(user=False)
+                    self.memserver.merge_remote_transactions(user=False) #fixme
                     self.sniff_peers_and_producers()
 
                 announce_me(

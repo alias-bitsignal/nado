@@ -85,7 +85,7 @@ class MemServer:
     def get_uptime(self) -> int:
         return get_timestamp_seconds() - self.start_time
 
-    def merge_remote_transactions(self, user=False) -> None:
+    def merge_remote_transactions(self, user=False) -> None: #fixme first
         """reach out to all peers and merge their transactions to our transaction pool"""
         remote_transactions = asyncio.run(
             compound_get_list_of(
@@ -148,7 +148,7 @@ class MemServer:
         for transaction in transactions:
             self.merge_transaction(transaction, user)
 
-    def purge_txs_of_sender(self, sender) -> None:
+    def purge_txs_of_sender(self, sender) -> None: #fixme
         """remove all transactions of sender to prevent possible double spending attempt"""
         """of sender sending different txs to different nodes both exhausting balance"""
         for transaction in self.transaction_pool:
