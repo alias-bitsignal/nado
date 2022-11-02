@@ -107,6 +107,7 @@ class MemServer:
         self.waiting -= 1
 
         with self.buffer_lock:
+            print(transaction)
             transaction_message = list(dict.values(transaction))[0]
             txid = create_txid(transaction_message)  # recreate to prevent txid collusion attacks
             sender = transaction_message["sender"]

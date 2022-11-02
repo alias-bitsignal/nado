@@ -74,7 +74,7 @@ def validate_transaction(transaction, logger):
 
 def max_fee_transaction(transactions: dict) -> dict: #fixme
     """returns dictionary from dictionary of dictionaries with max value"""
-    max_fee = 0
+    max_fee = -1
     max_fee_key = None
     for key, value in transactions.items():
         if value["fee"] > max_fee:
@@ -85,6 +85,7 @@ def max_fee_transaction(transactions: dict) -> dict: #fixme
 def sort_transaction_pool(transactions: dict) -> dict:
     """sorts dictionary of dictionaries based on a dictionary value"""
     return dict(sorted(transactions.items()))
+
 
 def unindex_transaction(transaction):
     tx_path = f"transactions/{transaction['txid']}.dat"
