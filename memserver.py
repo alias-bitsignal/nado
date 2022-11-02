@@ -6,7 +6,7 @@ from transaction_ops import create_txid
 from block_ops import load_block_producers
 from compounder import compound_get_list_of
 from config import get_timestamp_seconds, get_config
-from data_ops import set_and_sort, sort_list_dict
+from data_ops import set_and_sort
 from hashing import blake2b_hash
 from keys import load_keys
 from transaction_ops import (
@@ -108,7 +108,7 @@ class MemServer:
 
         with self.buffer_lock:
             transaction_message = list(dict.values(transaction))[0]
-            txid = list(transaction_message.keys())[0]
+            txid = create_txid(transaction_message)  # recreate to prevent txid collusion attacks
             sender = transaction_message["sender"]
 
             if not get_account(sender, create_on_error=False):

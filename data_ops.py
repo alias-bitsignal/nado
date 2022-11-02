@@ -27,15 +27,6 @@ def average(list) -> int:
         sum = sum + value
     return int(sum / len(list))
 
-
-def sort_list_dict(entries) -> list:
-    clean_list = []
-    for entry in entries:
-        if entry not in clean_list:
-            clean_list.append(entry)
-    return clean_list
-
-
 def get_byte_size(object) -> int:
     return sys.getsizeof(repr(object))
 
