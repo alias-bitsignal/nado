@@ -1,0 +1,130 @@
+"""EVERY GENESIS ADDRESS MUST BE DERIVABLE BY A KEY UNDER THE CURRENT FORMAT.
+
+THE BUG THIS EXISTS FOR. alphanet-14 removed the "mldsa44" prefix, but genesis_data/genesis_alloc.dat still
+held 115 addresses in the OLD 53-char format, carrying 72,420,002,894,736 raw of balance and
+35,432,837,933,564 raw of bonded stake. Every one of those accounts would have been credited at genesis to a
+string that NO key can derive: make_address(pk) now returns 42 hex + a 4-hex checksum, which can never equal
+"mldsa44" + 42 hex + checksum. The founder's own GENESIS_ADDRESS had the same defect via protocol._GENESIS_BODY.
+
+WHAT MADE IT INVISIBLE. validate_address() only re-checks the trailing 4-hex checksum, and the old JS computed
+that checksum over "mldsa44"+body — so the stale addresses PASS validate_address. Genesis would have loaded
+all 115 without a warning, credited them, and produced a chain where the balances exist and nobody owns them.
+Nothing raises; the money is simply gone. `is_address()` is the check that actually distinguishes them, which
+is exactly why the prefix removal replaced the old startswith() sniffs with it.
+
+It is also NOT fixable by stripping the prefix: the checksum covered prefix+body, so "mldsa44abc…" minus its
+first seven characters is a 46-char string with the WRONG checksum. The body must be kept and the checksum
+RE-DERIVED — which is what scripts/rekey_alloc.py does, and what nothing in the reroll path was calling.
+
+The checks below are cheap and run every time, because the failure mode is silent, total, and only observable
+after a reroll has already happened.
+"""
+import os as _os, tempfile as _tempfile  # ISOLATION FIRST (CLAUDE.md rule 4): never the live node's HOME or exec files
+_os.environ["HOME"] = _tempfile.mkdtemp(prefix="nado-test-")
+_os.environ["NADO_EXEC_STATE"] = _os.path.join(_os.environ["HOME"], "exec_state.json")
+_os.environ["NADO_EXEC_DA"] = _os.path.join(_os.environ["HOME"], "exec_da")
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import protocol as P
+from ops.address_ops import is_address, validate_address, make_checksum
+
+fails = []
+
+
+def check(cond, label):
+    print(("PASS  " if cond else "FAIL  ") + label)
+    if not cond:
+        fails.append(label)
+
+
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ALLOC = os.path.join(HERE, "genesis_data", "genesis_alloc.dat")
+
+with open(ALLOC) as fh:
+    entries = json.load(fh)
+
+addrs = [e["address"] for e in entries]
+keyed = [a for a in addrs if a not in P.RESERVED_RECIPIENTS and len(a) == P.ADDRESS_LENGTH]
+named = [a for a in addrs if a in P.RESERVED_RECIPIENTS]
+other = [a for a in addrs if a not in P.RESERVED_RECIPIENTS and len(a) != P.ADDRESS_LENGTH]
+
+# AN EMPTY ALLOCATION IS A VALID, DELIBERATE STATE. The betanet launch (834f3246, CHAIN_GENERATION 19)
+# shipped a fresh genesis with ALL BALANCES ZERO, so genesis_alloc.dat is `{}` — and this file's real job
+# (catching un-rekeyed / malformed / duplicated addresses) is vacuously satisfied by an empty alloc rather
+# than violated by it. Asserting non-emptiness unconditionally turned an intended launch decision into a
+# red test. Report the shape instead, and run the value checks only when there IS an allocation.
+EMPTY = len(entries) == 0
+print(f"      allocation entries: {len(entries)}" + ("   (empty — a zero-balance genesis)" if EMPTY else ""))
+
+# ---------------------------------------------------------------- THE DEFECT ITSELF
+stale = [a for a in addrs if a.startswith("mldsa44")]
+check(not stale,
+      f"NO allocation address carries the removed 'mldsa44' prefix "
+      f"(found {len(stale)}: {stale[:2]})")
+
+bad = [a for a in keyed if not is_address(a)]
+check(not bad,
+      f"every keyed allocation address passes is_address() — i.e. a key can derive it "
+      f"({len(keyed)} checked, {len(bad)} bad: {bad[:2]})")
+
+# The trap: these would ALL have passed a checksum-only check, which is why the old format slipped through.
+check(all(validate_address(a) for a in keyed),
+      "...and they also pass validate_address (which alone would NOT have caught the old format)")
+
+# ---------------------------------------------------------------- the checksum is re-derived, not stripped
+CK = P.ADDRESS_CHECKSUM * 2                                      # 8 hex (format 2; format 1 had 4)
+for a in keyed[:5]:
+    check(a[-CK:] == make_checksum(a[:-CK]),
+          f"{a[:10]}… carries a checksum over its OWN body (a stripped prefix would leave a stale one)")
+
+# ---------------------------------------------------------------- reserved sinks pass through untouched
+check(all(not is_address(n) for n in named),
+      f"reserved protocol names are NOT keyed addresses and are left alone ({sorted(named)})")
+
+# `burn` predates this change: a deliberately unspendable sink that is not in RESERVED_RECIPIENTS.
+# Pinned so it stays a known, named exception rather than quietly becoming a class of stale entries.
+# FORMAT 2 (gen 28): an account whose key no chain ever recorded cannot be re-keyed, so it carries at its OLD format-1
+# address — rejected by shape as a sender or recipient, claimable only by its own key (legacy_claim). Those, and only
+# those, may be the old length: a valid format-1 address with NO public key and nothing bonded.
+by_addr = {e["address"]: e for e in entries}
+legacy = [a for a in other if a != "burn" and len(a) == 46 and a[-4:] == make_checksum(a[:-4], 2)]
+check(all(not by_addr[a].get("public_key") and not int(by_addr[a].get("bonded", 0) or 0) for a in legacy),
+      f"every old-format entry is keyless and unbonded — claimable only by its key ({len(legacy)} of them)")
+other = [a for a in other if a not in legacy]
+check(set(other) <= {"burn"},
+      f"the only non-address, non-reserved allocation entry is the burn sink (got {sorted(other)[:5]})")
+
+# ---------------------------------------------------------------- the founder's own address
+check(not P._GENESIS_BODY.startswith("mldsa44"),
+      "protocol._GENESIS_BODY is de-prefixed — otherwise GENESIS_ADDRESS belongs to nobody")
+check(len(P.GENESIS_ADDRESS) == P.ADDRESS_LENGTH,
+      f"GENESIS_ADDRESS is {P.ADDRESS_LENGTH} chars (got {len(P.GENESIS_ADDRESS)})")
+check(is_address(P.GENESIS_ADDRESS),
+      "GENESIS_ADDRESS is a derivable keyed address — the founder still controls the treasury source")
+check(len(P._GENESIS_BODY) == P.ADDRESS_BODY,
+      f"_GENESIS_BODY is exactly the {P.ADDRESS_BODY}-hex pubkey body")
+
+# ---------------------------------------------------------------- value must be conserved by a re-key
+# A re-key changes STRINGS, never amounts. If a future format switch drops or duplicates an account this
+# catches it, because the totals are what the chain actually mints at genesis.
+total_bal = sum(int(e.get("balance", 0) or 0) for e in entries)
+total_bond = sum(int(e.get("bonded", 0) or 0) for e in entries)
+# Only meaningful for a carrying reroll: a NON-empty alloc must actually carry value, or the carry
+# silently produced zero balances. A deliberately empty genesis has nothing to check here.
+if not EMPTY:
+    check(total_bal > 0 and total_bond > 0,
+          f"genesis carries real value (balance={total_bal}, bonded={total_bond})")
+check(len(set(addrs)) == len(addrs),
+      "no allocation address appears twice (a re-key that collided two accounts would double-credit one)")
+
+print()
+if fails:
+    print(f"{len(fails)} CHECK(S) FAILED:")
+    for f in fails:
+        print("  - " + f)
+    sys.exit(1)
+print("ALL GENESIS ALLOCATION FORMAT CHECKS PASSED")

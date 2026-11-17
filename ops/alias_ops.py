@@ -19,15 +19,16 @@ from ops.address_ops import validate_address
 from protocol import (RESERVED_RECIPIENTS, ALIAS_MIN_LEN, ALIAS_MAX_LEN,
 
                       ALIAS_REGISTRATION_FEE, MIN_TX_FEE)
-from protocol import ADDRESS_PREFIX, MSIG_PREFIX
+from protocol import MSIG_PREFIX
 
 _ALIAS_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 
 
 def valid_alias_name(name) -> bool:
     """A syntactically valid, non-colliding alias name: ALIAS_MIN_LEN..ALIAS_MAX_LEN chars, lowercase
-    [a-z0-9_-] starting with a letter, NOT a reserved word, and NOT address-shaped (does not start with
-    ADDRESS_PREFIX or MSIG_PREFIX — derived from the constants, so a rebrand cannot leave this stale)."""
+    [a-z0-9_-] starting with a letter, NOT a reserved word, and NOT address-shaped (does not VALIDATE as an
+    address, and does not carry MSIG_PREFIX). Address-shapedness is a real check rather than a prefix sniff:
+    the keyed-address prefix was removed at betanet-14, and startswith("") matches everything."""
     if not isinstance(name, str):
         return False
     if not (ALIAS_MIN_LEN <= len(name) <= ALIAS_MAX_LEN):
@@ -36,7 +37,10 @@ def valid_alias_name(name) -> bool:
         return False
     if name in RESERVED_RECIPIENTS:
         return False
-    if name.startswith(ADDRESS_PREFIX) or name.startswith(MSIG_PREFIX):   # never alias-as-address
+    # is_address() rather than a prefix sniff: with the prefix removed, startswith("") is true for every
+    # name and this would reject the entire alias namespace.
+    from ops.address_ops import is_address
+    if is_address(name) or (MSIG_PREFIX and name.startswith(MSIG_PREFIX)):   # never alias-as-address
         return False
     return True
 

@@ -1,6 +1,6 @@
 # Consensus-load aggregation — scaling L1 into the mainstream
 
-> **Status: IMPLEMENTED** (live on alphanet-6). The two shipped pieces of the scaling envelope from
+> **Status: IMPLEMENTED** (live on the current betanet). The two shipped pieces of the scaling envelope from
 > [scaling-analysis.md](scaling-analysis.md) §A/§B/#1: a **native ML-DSA verify backend** (constant-factor,
 > the immediate win) and the **merged committee-gated epoch duty** (the asymptotic fix, O(N)→O(seats)).
 > Companion to [mining.md](mining.md) (selection), the FFG/RANDAO design, and
@@ -36,7 +36,7 @@ The Rust crate is a thin `cdylib` over the audited RustCrypto [`ml-dsa`](https:/
 implementation, exposing exactly the three **FIPS 204 *internal*-mode** primitives the seam expects
 (`keygen_internal`, `sign_internal`, `verify_internal` — **no context/domain wrapping**, matching
 dilithium-py and the browser's `@noble/post-quantum`). It is bound by `ctypes` (stdlib, no pyo3), the same
-pattern as the Rust Goldilocks prover in `wasm/goldilocks`.
+pattern as the other native crates (`native/stwo_js` via `execnode/stwo_js_native.py`).
 
 **Consensus safety is unconditional.** `signatures.py` adopts a native backend ONLY after a startup **interop
 self-test**: it cross-verifies the candidate against the pure-Python signer in *both* directions and checks
@@ -100,7 +100,7 @@ mirroring `_weighted_draw`). So:
 
 ### 3c. Backward compatibility — none at runtime, full for history
 
-Per alphanet's **no-legacy-tolerance** policy: the historical `attest`/`commit`/`reveal` recipients stay
+Per betanet's **no-legacy-tolerance** policy: the historical `attest`/`commit`/`reveal` recipients stay
 **consensus-valid forever** (genesis sync must replay the blocks that contain them), but the mempool
 **refuses new ones** — every honest validator emits the merged `duty`. Block-level uniqueness is enforced
 across both forms: a `duty`-carried attest and a bare `attest` for the same `(sender, epoch)` (or two reveals

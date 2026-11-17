@@ -2,20 +2,24 @@
 // Every pet is an on-chain asset: a future block hash decides its species/rarity/stats at hatch (via
 // pets-genes.js, byte-identical to the contract and differentially verified), it eats real NADO to stay
 // alive, trains with a rarity-scaled limit-function success chance, battles other pets for stakes (loser
-// has a 20% chance to die), and transfers between wallets like any NFT. All money moves happen in the
+// has a 10% chance to die) — each battle decided by both owners' committed secrets (commit-reveal: this file
+// keeps the secret in localStorage before the call and reveals it automatically; a missed reveal forfeits) —
+// and transfers between wallets like any NFT. Gear finds and re-rolls resolve from a LATER epoch beacon. All money moves happen in the
 // contract (execnode/contracts/pets.json); this file is reads + UI + the wallet-signed calls.
-import { NadoDapp, rawToNado, nadoToRaw, randId, _m, $, base, gate, canPay, orderCards, alertBar, notify, blocksToTime, lsLoad, lsSave, wireWallet, stickyInputs, renderWallet, loadQR, drawQR, resolveAliases, disp, shareInvite, confirmingLabel, esc } from "./nadodapp.js?v=db1a59d7";
-import * as G from "./pets-genes.js?v=084b6d26";
-import { HAND_ART } from "./pets-art-hand.js?v=666a1afd";   // bespoke per-animal art (grows toward the full roster)
-import { loadCrypto, ADDR_PREFIX } from "./nadotx.js?v=6d199166";
+import { NadoDapp, rawToNado, nadoToRaw, randId, randSecret, algHashn, ALG_P, EPOCH_LENGTH, _m, $, base, gate, canPay, orderCards, alertBar, notify, blocksToTime, lsLoad, lsSave, wireWallet, stickyInputs, renderWallet, loadQR, drawQR, resolveAliases, disp, shortAddr, shareInvite, confirmingLabel, esc, BLOCK_TIME } from "./nadodapp.js";
+import * as G from "./pets-genes.js";
+import { HAND_ART } from "./pets-art-hand.js";   // bespoke per-animal art (grows toward the full roster)
+import { loadCrypto, ADDR_PREFIX, ADDR_LEN } from "./nadotx.js";
 
-const CID = "f49e01a823d2bbf380587dce47bc1b9d";   // execnode/games/pets.py (zkVM, nonce "a5")
+const CID = "46490de9bfb9db59e0124fbdbef3c152";   // execnode/games/pets.py (zkVM, nonce "a5")
 const dapp = new NadoDapp({ cid: CID, app: "Pets" });
 
 const petSlug = (x) => String(x).toLowerCase().replace(/[^a-z0-9]+/g, "");
 const AN = (a) => a ? window.t("pets.an_" + petSlug(a.n), a.n) : "";     // translated animal name
 const CN = (c) => c ? window.t("pets.coat_" + petSlug(c.name), c.name) : "";  // translated coat name
-const BLOCK_SECS = 6, BLOCKS_PER_DAY = 86400 / BLOCK_SECS;
+// BLOCK_TIME: protocol.BLOCK_TIME from the relay's /protocol.js via the SDK — never a literal copy (tests/test_constant_mirrors.py)
+const BLOCK_SECS = BLOCK_TIME, BLOCKS_PER_DAY = 86400 / BLOCK_SECS;
+const LS_B = "nado_pets_bsec";                    // {bid: {s, side: "a"|"b", ts}} — commit-reveal battle secrets
 const LS_P = "nado_pets_mine";                    // {pid: {ts, hatchPending?, trainPending?}} local flags
 
 
@@ -497,7 +501,7 @@ function graveSvg() {
 // draw a pet: its animal's archetype body in its gene-derived coat, inside a rarity-aura span
 function drawOf(a) { return ART[petSlug(a.n)] || ART[a.a] || quadArt; }   // per-animal HAND art wins; archetype is the fallback
 function petBody(p, cls = "pet-idle") {
-  const a = p.animal, coat = G.coatOf(p.gene, a);
+  const a = p.animal, coat = G.coatOf(p.gene, a, p.rolls);
   const aura = G.auraOf(p.sp, coat.shiny);
   const floats = a.float || FLOATERS.has(a.a);
   return `<span class="aura ${aura}">${wrap(cls + (floats && cls ? " swim" : ""), drawOf(a)(coat, a.v || {}), floats)}</span>`;
@@ -507,7 +511,7 @@ const petArt = (p, cls = "pet-idle") => p.dead ? graveSvg() : (p.hatched ? petBo
 // ---- CHALLENGER CARD: a downloadable PNG — the pet's WARRIOR face, name, power and a QR to its page ---
 const rr = (x, y, w, h, r) => { const p = new Path2D(); p.roundRect(x, y, w, h, r); return p; };
 async function challengerCanvas(p) {
-  const an = p.animal, coat = G.coatOf(p.gene, an), tier = p.tier;
+  const an = p.animal, coat = G.coatOf(p.gene, an, p.rolls), tier = p.tier;
   FIERCE = 1;                                    // same body, angry face
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="4 4 112 112">${drawOf(an)(coat, an.v || {})}</svg>`;
   FIERCE = 0;
@@ -599,8 +603,12 @@ const _geneCache = {};
 function petsFrom(sto) {
   const ow = _m(sto, "ow"), cur = dapp.cursor, out = {};
   for (const pid of Object.keys(ow)) {
-    const gl = _m(sto, "gl")[pid], gh = _m(sto, "gh")[pid];
-    const gs = gl != null || gh != null ? G.geneFromHalves(gl || 0, gh || 0).toString() : null;
+    const gl = _m(sto, "gl")[pid], gh = _m(sto, "gh")[pid], gn = _m(sto, "gn")[pid];
+    // THE WHOLE GENE WHEN THE VIEW HAS IT (G6, pets.py _view "gn"): on gen 29 the gene is a 256-bit word and gl/gh are
+    // its low 64 bits, so combine's preview (combineStatOf) needs gn; a view without it (gen 28: gl|gh is the whole gene)
+    // reads the halves. A value >= 2^53 arrives as a decimal string (execnode/state.py), so it is read through BigInt.
+    const gs = gn != null && gn !== 0 ? BigInt(gn).toString()
+      : gl != null || gh != null ? G.geneFromHalves(gl || 0, gh || 0).toString() : null;
     const p = { id: pid, owner: ow[pid], bh: _m(sto, "bh")[pid] || 0, gs, sp: _m(sto, "sp")[pid] || 0,
       si: _m(sto, "si")[pid] || 0, ex: _m(sto, "ex")[pid] || 0,
       ap: _m(sto, "ap")[pid] || 0, pw: _m(sto, "pw")[pid] || 0, fu: _m(sto, "fu")[pid] || 0,
@@ -608,12 +616,13 @@ function petsFrom(sto) {
       ti: _m(sto, "ti")[pid] || 0, tr: _m(sto, "tr")[pid] || 0, price: _m(sto, "mp")[pid] || 0,
       wins: _m(sto, "wins")[pid] || 0, loss: _m(sto, "loss")[pid] || 0 };
     p.hatched = !!gs;
-    if (gs) {   // memoized immutable decode (gene / species / base stats) — keyed by the immutable gene
-      const k = pid + "|" + gs;
+    p.rolls = G.rollsFrom(sto, pid);    // gen 29: the contract's stored trait rolls (the roll table); null on gen 28
+    if (gs) {   // memoized immutable decode (gene / species / base stats) — keyed by the immutable gene and its rolls
+      const k = pid + "|" + gs + (p.rolls ? "|r" : "");
       let d = _geneCache[k];
       // species is re-derived from the IMMUTABLE gene (not the stored si) so the 1007-animal roster remap
       // applies to every pet with zero on-chain writes — stored si is legacy/ignored. sp is unchanged (TIER_CUM).
-      if (!d) { const gene = BigInt(gs); d = _geneCache[k] = { gene, animal: G.animalOf(G.speciesIdOf(gene, p.sp), p.sp), base: G.baseStats(gene, p.sp) }; }
+      if (!d) { const gene = BigInt(gs); d = _geneCache[k] = { gene, animal: G.animalOf(G.speciesIdOf(gene, p.sp, p.rolls), p.sp), base: G.baseStats(gene, p.sp, p.rolls) }; }
       p.gene = d.gene; p.animal = d.animal; p.base = d.base;
     } else { p.gene = null; p.animal = null; p.base = null; }
     p.dead = cur != null && cur > p.fu;
@@ -649,7 +658,12 @@ function battlesFrom(sto) {
   for (const bid of Object.keys(wa)) {
     out[bid] = { id: bid, a: String(wa[bid]), b: String(_m(sto, "wb")[bid]), ws: _m(sto, "ws")[bid] || 0,
       wp: _m(sto, "wp")[bid] || 0, wh: _m(sto, "wh")[bid] || 0, wn: _m(sto, "wn")[bid] || 0,
-      ww: String(_m(sto, "ww")[bid] || ""), wd: _m(sto, "wd")[bid] || 0 };
+      ww: String(_m(sto, "ww")[bid] || ""), wd: _m(sto, "wd")[bid] || 0,
+      // commit-reveal (wm == 1): commitments + revealed secrets ride as strings (256-bit words > 2^53)
+      wm: Number(_m(sto, "wm")[bid] || 0), wrd: Number(_m(sto, "wrd")[bid] || 0),
+      wc1: String(_m(sto, "wc1")[bid] || ""), wc2: String(_m(sto, "wc2")[bid] || ""),
+      wr1: Number(_m(sto, "wr1")[bid] || 0), wr2: Number(_m(sto, "wr2")[bid] || 0),
+      wx1: String(_m(sto, "wx1")[bid] || "0"), wx2: String(_m(sto, "wx2")[bid] || "0") };
   }
   return out;
 }
@@ -657,7 +671,7 @@ function battlesFrom(sto) {
 // A pet is born to a TRADE (its species decides it, so every Beagle is the same kind of worker) and a base
 // of that trade can be staffed with it. Production accrues lazily against the block cursor: nothing runs on
 // a timer, so the numbers below are computed the same way the contract will when you collect.
-// MIRRORS execnode/games/pets.py — tests/pets_homestead_test.py asserts these match, because they silently
+// MIRRORS execnode/games/pets.py — tests/test_pets_homestead.py asserts these match, because they silently
 // drifted once (RATE_DIV and FODDER_BLOCKS were left at their pre-tuning values and RARITY_RATE was never
 // declared at all, which threw on every refresh and froze the whole page — nothing rendered, nothing hatched).
 const NJOBS = 5, GEAR_SLOTS = 4, RATE_DIV = 9000, ACCRUE_CAP = 20000, MAX_LEVEL = 5;
@@ -671,6 +685,8 @@ const REROLL_ESSENCE = 10, REROLL_TIMBER = 10, REROLL_STONE = 10, REROLL_ORE = 1
 const FUSE_TIMBER = 20, FUSE_STONE = 20, FUSE_ORE = 20, FUSE_ESSENCE = 25;
 const FUSE_MAX_TIER = 4;
 const REROLL_FEE = 500000000n, FUSE_FEE = 1000000000n;   // burned — the sink that replaces the food burn
+// = pets.py REROLL_STALE_EPOCHS: a pin this old may be re-pinned by a PAID reroll (its beacon nears pruning)
+const REROLL_STALE_EPOCHS = 3900;
 const BUILD_FEE = 5000000000n;                 // 0.5 NADO per level — mirrors the contract
 const RES = [
   { k: "fodder", icon: "🌾", name: () => window.t("pets.resFodder", "Fodder") },
@@ -699,7 +715,8 @@ function basesFrom(sto) {
   for (const bid of Object.keys(bo)) {
     const b = { id: bid, owner: String(bo[bid] || ""), trade: Number(_m(sto, "bt")[bid] || 0),
       level: Number(_m(sto, "bl")[bid] || 0), op: String(_m(sto, "bp")[bid] || "0"),
-      since: Number(_m(sto, "bsi")[bid] || 0) };
+      since: Number(_m(sto, "bsi")[bid] || 0),
+      pin: Number(_m(sto, "bdp")[bid] || 0) };                // the next find's beacon epoch (0 = none yet)
     b.mine = dapp.me && b.owner === dapp.me;
     b.staffed = b.op !== "0" && b.op !== "";
     const pet = b.staffed ? PETS[b.op] : null;
@@ -722,7 +739,8 @@ function itemsFrom(sto) {
     const worn = String(_m(sto, "ie")[iid] || "0");
     const it = { id: iid, owner, kind: Number(_m(sto, "it")[iid] || 0),
       rarity: Number(_m(sto, "ir")[iid] || 1), worn: worn !== "0" ? worn : null,
-      mine: dapp.me && owner === dapp.me, affixes: [] };
+      mine: dapp.me && owner === dapp.me, affixes: [],
+      pin: Number(_m(sto, "irp")[iid] || 0) };                   // a paid re-roll waiting for this beacon epoch
     for (let k = 0; k < 3; k++) {
       const packed = Number(_m(sto, "ia")[iid * 3 + k] || 0);
       if (packed > 0) it.affixes.push({ stat: Math.floor(packed / 256), points: packed % 256 });
@@ -803,7 +821,11 @@ function maybeAutoHatch() {
   if (!eggs.length) { try { localStorage.removeItem("nado_pets_hatchall"); } catch (e) {} return; }
   hatch(eggs[0].id);
 }
-const rebirth = (pid) => dapp.call("rebirth", [Number(pid)], null, "re-roll egg #" + pid, { pid, phase: "hatch" });   // int pid (consistency + the pid rides into the gene at the next hatch)
+// rebirth costs G.REBIRTH_FEE (burned, like every pets fee) — the contract refuses it without exactly that value
+function rebirth(pid) {
+  if (!canPay(dapp, G.REBIRTH_FEE, window.t("pets.thisRebirth", "Re-rolling the egg"))) return;
+  dapp.call("rebirth", [Number(pid)], G.REBIRTH_FEE, window.t("pets.callRebirth", "re-roll egg #{id} · {fee} NADO", { id: pid, fee: rawToNado(G.REBIRTH_FEE) }), { pid, phase: "hatch" });   // int pid (consistency + the pid rides into the gene at the next hatch)
+}
 function feed(pid, raw) {
   const p = PETS[pid]; if (!p) return;
   const blocks = G.feedBlocks(raw, p.ap);
@@ -885,9 +907,19 @@ function fuseItems(targetId, foodId) {
 }
 const scrapItem = (iid) => { if (dapp.busy("scrap", "iid", iid)) return notify(confirmingLabel());
   dapp.call("scrap", [Number(iid)], null, window.t("pets.callScrap", "scrap item #{id} for essence", { id: iid }), { iid, phase: "scrap" }); };
+// A beacon pin is ready once the exec cursor enters its epoch (the contract's own gate).
+const pinReady = (pin) => !!pin && dapp.cursor != null && dapp.cursor >= pin * EPOCH_LENGTH;
+const pinWait = (pin) => blocksToTime(Math.max(0, pin * EPOCH_LENGTH - (dapp.cursor || 0)));
+// INVARIANT: pinStale matches the contract's re-pin gate (cursor >= (irp + REROLL_STALE_EPOCHS) * EPOCH_LENGTH),
+// because the reroll button only offers the paid re-pin when the contract would accept it.
+const pinStale = (pin) => !!pin && dapp.cursor != null && dapp.cursor >= (pin + REROLL_STALE_EPOCHS) * EPOCH_LENGTH;
+// RE-ROLL is two calls: this one PAYS and pins a later epoch beacon (the affixes do not change yet); once that
+// beacon exists, resolveReroll (value-free, anyone may send it) rolls the affixes from it.
 function rerollItem(iid) {
   const it = ITEMS[iid];
   if (!it || dapp.busy("reroll", "iid", iid)) return notify(confirmingLabel());
+  // a STALE pin (its beacon may already be pruned) is re-pinned by a fresh, fully paid reroll below
+  if (it.pin && !pinStale(it.pin)) return pinReady(it.pin) ? resolveReroll(iid) : notify(window.t("pets.rerollPendingN", "🎲 Re-roll pending — decided by the epoch {e} beacon (~{time})", { e: it.pin, time: pinWait(it.pin) }));
   const cost = it.rarity * REROLL_ESSENCE;
   const mt = it.rarity * REROLL_TIMBER, ms = it.rarity * REROLL_STONE, mo = it.rarity * REROLL_ORE;
   if (RESOURCES[4] < cost || RESOURCES[1] < mt || RESOURCES[2] < ms || RESOURCES[3] < mo)
@@ -895,7 +927,15 @@ function rerollItem(iid) {
       { e: cost, t: mt, s: ms, o: mo, f: rawToNado(REROLL_FEE) }));
   if (!canPay(dapp, REROLL_FEE, window.t("pets.thisReroll", "This re-roll"))) return;
   dapp.call("reroll", [Number(iid)], REROLL_FEE,
-    window.t("pets.callReroll", "re-roll item #{id}", { id: iid }), { iid, phase: "reroll", a0: (it.affixes[0] || {}).points });
+    window.t("pets.callReroll", "re-roll item #{id}", { id: iid }), { iid, phase: "reroll", pin0: it.pin || 0 });
+}
+const resolveReroll = (iid) => { if (dapp.busy("rerollres", "iid", iid)) return;
+  dapp.call("reroll", [Number(iid)], null, window.t("pets.callRerollRes", "reveal the re-roll of item #{id}", { id: iid }), { iid, phase: "rerollres" }); };
+// a re-roll whose beacon exists resolves itself (value-free -> signs in the background), one per tick
+function maybeAutoRerollResolve() {
+  // a stale pin is left to its owner's paid re-roll: its beacon may be pruned, and phase 2 would only revert
+  const ready = myItems().filter((it) => it.pin && pinReady(it.pin) && !pinStale(it.pin));
+  dapp.autoCollect(ready, (it) => resolveReroll(it.id), { phase: "rerollres", key: (it) => "rr:" + it.id + ":" + it.pin });
 }
 
 // trainBusy(pid): a train call is between click and its session appearing on-chain. The contract allows ONE
@@ -933,7 +973,11 @@ function challenge(theirPid) {
   if (stake == null) return alertBar(window.t("pets.enterStake", "Enter a stake in NADO (0 for a friendly-but-deadly match)."));
   if (stake > 0n && !canPay(dapp, stake, "This challenge")) return;
   const bid = randId();
-  dapp.call("challenge", [bid, myPid, Number(theirPid)], stake > 0n ? stake : null,
+  // COMMIT-REVEAL: a fresh secret only this browser knows; the chain gets HASH(secret) now and the secret after
+  // the other side has committed. Stored BEFORE the call, so a crash or redirect can never lose it.
+  const commit = keepSecret(bid, "a");
+  if (commit == null) return alertBar(window.t("pets.noStorage", "This browser can't store the battle secret (storage blocked) — enable site storage to battle."));
+  dapp.call("challenge", [bid, myPid, Number(theirPid), commit], stake > 0n ? stake : null,
     "challenge " + PETS[theirPid].label + " with " + PETS[myPid].label + (stake > 0n ? " · stake " + rawToNado(stake) + " NADO" : ""),
     { bid, phase: "challenge" });   // no forced confirm — the WALLET decides (like chess/farkle joins): default wallets still get the visible confirm via needui→redirect, auto-sign-all plays uninterrupted
 }
@@ -941,7 +985,45 @@ function acceptBattle(bid) {
   const b = BATTLES[bid]; if (!b) return;
   const stake = BigInt(b.ws || 0);
   if (stake > 0n && !canPay(dapp, stake, "Accepting this battle")) return;
-  dapp.call("accept", [Number(bid)], stake > 0n ? stake : null, "accept battle #" + bid + (stake > 0n ? " · stake " + rawToNado(stake) + " NADO" : ""), { bid, phase: "accept" });   // wallet-policy confirm (see challenge)
+  let commit = 0n;                                   // a challenge issued before commit-reveal ignores it
+  if (b.wm === 1) {
+    commit = keepSecret(bid, "b");
+    if (commit == null) return alertBar(window.t("pets.noStorage", "This browser can't store the battle secret (storage blocked) — enable site storage to battle."));
+  }
+  dapp.call("accept", [Number(bid), commit], stake > 0n ? stake : null, "accept battle #" + bid + (stake > 0n ? " · stake " + rawToNado(stake) + " NADO" : ""), { bid, phase: "accept" });   // wallet-policy confirm (see challenge)
+}
+// keepSecret(bid, side): mint a CSPRNG secret (field-sized: it rides as a zkVM int arg), persist it, and return
+// its commitment algHashn([secret]) == the VM's HASH(secret). null when storage is unavailable (no secret = no
+// way to reveal = a certain forfeit, so the call is not sent at all).
+function keepSecret(bid, side) {
+  const x = randSecret() % ALG_P();
+  const all = lsLoad(LS_B); all[bid] = { s: x.toString(), side, ts: Date.now() }; lsSave(LS_B, all);
+  const back = lsLoad(LS_B)[bid];
+  if (!back || back.s !== x.toString()) return null;
+  return algHashn([x]);
+}
+// mySecret(b): the secret this browser holds for battle b, if it opens one of b's two commitments
+function mySecret(b) {
+  const rec = lsLoad(LS_B)[b.id];
+  if (!rec || rec.s == null) return null;
+  const c = algHashn([BigInt(rec.s)]).toString();
+  if (c === b.wc1) return { s: BigInt(rec.s), side: "a", done: !!b.wr1 };
+  if (c === b.wc2) return { s: BigInt(rec.s), side: "b", done: !!b.wr2 };
+  return null;
+}
+const revealOpen = (b) => b.wm === 1 && b.wn === 2 && dapp.cursor != null && dapp.cursor <= b.wrd;
+function revealBattle(bid) {
+  const b = BATTLES[bid]; if (!b) return;
+  const m = mySecret(b);
+  if (!m) return alertBar(window.t("pets.secretElsewhere", "This browser doesn't hold your secret for battle #{id} — reveal it from the browser you issued or accepted it with.", { id: bid }));
+  if (m.done || dapp.busy("revealb", "bid", bid)) return;
+  dapp.call("reveal_battle", [Number(bid), m.s], null, window.t("pets.callRevealB", "reveal your secret · battle #{id}", { id: bid }), { bid, phase: "revealb", side: m.side });
+}
+// AUTO-REVEAL: an accepted commit-reveal battle reveals this browser's secret on its own (value-free) — missing
+// the deadline forfeits the battle, so nobody should have to remember a button.
+function maybeAutoRevealBattle() {
+  const ready = Object.values(BATTLES).filter((b) => revealOpen(b) && (() => { const m = mySecret(b); return m && !m.done; })());
+  dapp.autoCollect(ready, (b) => revealBattle(b.id), { phase: "revealb", key: (b) => "rb:" + b.id, retryMs: 30000 });
 }
 const resolveBattle = (bid) => dapp.call("resolve_battle", [Number(bid)], null, "settle battle #" + bid, { bid, phase: "resolveb" });
 const cancelBattle = (bid) => dapp.call("cancel_battle", [Number(bid)], null, "withdraw challenge #" + bid, { bid, phase: "cancelb" });
@@ -980,9 +1062,9 @@ async function transfer(pid) {
     catch { to = ""; }
     if (!to) return alertBar(window.t("pets.aliasNoResolve", "That @alias doesn't resolve to an address."));
   }
-  if (!to || !to.startsWith(ADDR_PREFIX)) return alertBar(window.t("pets.enterRecipient", "Enter the receiving NADO address or a registered @alias."));
+  if (!to || to.length !== ADDR_LEN) return alertBar(window.t("pets.enterRecipient", "Enter the receiving NADO address or a registered @alias."));
   if (to === dapp.me) return alertBar(window.t("pets.thatsYou", "That's you — pick another wallet."));
-  dapp.call("transfer", [Number(pid), to], null, "transfer " + PETS[pid].label + " to " + to.slice(0, 10) + "…", { pid, phase: "xfer" }, { confirm: 1 });
+  dapp.call("transfer", [Number(pid), to], null, "transfer " + PETS[pid].label + " to " + shortAddr(to), { pid, phase: "xfer" }, { confirm: 1 });
 }
 // same-species duplicates you own that could be MERGED INTO p (hatched + rested; dead ones count — they're
 // cleanup fodder). `q.animal === p.animal` is exact-species (animalOf returns the one roster object per si).
@@ -1023,7 +1105,7 @@ async function refreshAll() {
       if (!p.hatched && dapp.cursor != null && dapp.cursor >= p.bh + 1 && dapp.cursor < p.bh + G.STALE) want.push(p.bh, p.bh + 1);
       if (p.th && dapp.cursor != null && dapp.cursor >= p.th + 1) want.push(p.th, p.th + 1);
     }
-    for (const b of Object.values(BATTLES)) if (b.wn === 2 && dapp.cursor != null && dapp.cursor >= b.wh + 1) want.push(b.wh, b.wh + 1);
+    for (const b of Object.values(BATTLES)) if (b.wn === 2 && !b.wm && dapp.cursor != null && dapp.cursor >= b.wh + 1) want.push(b.wh, b.wh + 1);
     // FAST provisional: genes/training/battles are PUBLIC randomness the contract re-validates at
     // hatch/resolve — a pre-finality reorg just reverts that tx visibly, never a silent unfairness
     if (want.length) await dapp.blockHashes(want.slice(0, 40), { fast: true });
@@ -1062,13 +1144,18 @@ async function refreshAll() {
         || (f.phase === "equip" && ITEMS[f.iid] && ITEMS[f.iid].worn)
         || (f.phase === "unequip" && ITEMS[f.iid] && !ITEMS[f.iid].worn)
         || (f.phase === "scrap" && !ITEMS[f.iid])
-        || (f.phase === "reroll" && ITEMS[f.iid] && (ITEMS[f.iid].affixes[0] || {}).points !== f.a0)
+        // pin0 = the pin the call replaced (a stale re-pin): the call landed once the pin is a different one
+        || (f.phase === "reroll" && ITEMS[f.iid] && !!ITEMS[f.iid].pin && ITEMS[f.iid].pin !== (f.pin0 || 0))
+        || (f.phase === "rerollres" && (!ITEMS[f.iid] || !ITEMS[f.iid].pin))
+        || (f.phase === "revealb" && b && (f.side === "a" ? !!b.wr1 : !!b.wr2))
         || (f.phase === "fuse" && ITEMS[f.iid] && ITEMS[f.iid].rarity > (f.r0 || 0));
     });
     maybeAutoCollect(); // continue a "Collect all" sweep once the previous base has settled
     maybeAutoHatch();   // continue a "Hatch all" run once the previous hatch has confirmed
     maybeAutoMint();    // continue a "Adopt N eggs" batch once the previous mint has confirmed
     maybeAutoReveal();  // auto-reveal any finished training the moment its result blocks finalize
+    maybeAutoRevealBattle();   // reveal my battle secrets inside their window (a missed reveal forfeits)
+    maybeAutoRerollResolve();  // roll a paid re-roll once its beacon exists
   }
   render();
 }
@@ -1110,7 +1197,7 @@ function renderActive() {
     $("petStage").innerHTML = petArt(p);
   }
   $("petName").textContent = p.label + (p.dead ? " ✝" : "");
-  const coat = p.gene && an ? G.coatOf(p.gene, an) : null;
+  const coat = p.gene && an ? G.coatOf(p.gene, an, p.rolls) : null;
   $("petSpecies").innerHTML = p.hatched
     ? an.e + " " + esc(CN(coat)) + " " + esc(AN(an)) + (coat.shiny ? ' <span style="color:#ffd35a">' + window.t("pets.shiny", "✦ shiny") + '</span>' : "") + ' · <span class="dim">' + window.t("pets.oneOfN", "1 of {n} animals", { n: G.ANIMALS.length }) + '</span>' + (p.nm ? ' · <span class="dim">#' + p.id + "</span>" : "")
     : window.t("pets.unhatchedEgg", "Unhatched egg");
@@ -1191,6 +1278,7 @@ function renderActive() {
     $("hatchHint").textContent = p.hatchReady ? window.t("pets.hatchReadyHint", "Anyone may hatch it; the animal was already decided by blocks {a}–{b}.", { a: p.bh, b: p.bh + 1 })
       : window.t("pets.hatchWaitHint", "Hatchable once blocks {a}–{b} are finalized", { a: p.bh, b: p.bh + 1 }) + (dapp.cursor ? window.t("pets.hatchWaitNow", " (now at {cur}, ~{time} + finality)", { cur: dapp.cursor, time: blocksToTime(Math.max(0, p.bh + 1 - dapp.cursor)) }) : "") + ".";
     $("btnRebirth").classList.toggle("hidden", !(p.stale && p.mine));
+    $("btnRebirth").textContent = window.t("pets.rerollEggFee", "♻ Re-roll the egg · {fee} NADO (its gene block was pruned)", { fee: rawToNado(G.REBIRTH_FEE) });
   }
   if (p.hatched && !p.dead) {
     $("feed1d").textContent = window.t("pets.feed1d", "+7 days · {cost} N", { cost: rawToNado(G.feedCost(7 * BLOCKS_PER_DAY, p.ap)) });
@@ -1343,8 +1431,12 @@ function renderBattles() {
         ${out ? `<button class="mini ghost" data-cxl="${b.id}">${window.t("pets.withdraw", "Withdraw")}</button>` : ""}
         <button class="mini ghost" data-view="${b.id}">${window.t("pets.view", "View")}</button></div></div>`);
     } else if (b.wn === 2 && (involved || String(activeBattle) === b.id)) {
-      rows.push(`<div class="btl">⚡ <span class="who">${esc(pa.label)}</span> ${window.t("pets.vsLc", "vs")} <span class="who">${esc(pb.label)}</span> ${window.t("pets.fighting", "— fighting!")} · ${stakeTxt}
+      const sealed = b.wm === 1 && !(b.wr1 && b.wr2)
+        ? " · " + window.t("pets.secretsN", "🔒 {n}/2 secrets revealed", { n: (b.wr1 ? 1 : 0) + (b.wr2 ? 1 : 0) }) : "";
+      rows.push(`<div class="btl">⚡ <span class="who">${esc(pa.label)}</span> ${window.t("pets.vsLc", "vs")} <span class="who">${esc(pb.label)}</span> ${window.t("pets.fighting", "— fighting!")} · ${stakeTxt}${sealed}
         <div class="act"><button class="mini primary" data-view="${b.id}">${window.t("pets.watchBattle", "Watch the battle")}</button></div></div>`);
+    } else if (b.wn === 3 && involved && rows.length < 14 && !b.ww && b.wm === 1) {
+      rows.push(`<div class="btl">↩ <span class="who">${esc(pa.label)}</span> ${window.t("pets.vsLc", "vs")} <span class="who">${esc(pb.label)}</span> · ${window.t("pets.voidRow", "void — nobody revealed, stakes returned")}</div>`);
     } else if (b.wn === 3 && involved && rows.length < 14 && b.ww) {
       const w = PETS[b.ww];
       rows.push(`<div class="btl">✓ <span class="who">${esc(w ? w.label : "#" + b.ww)}</span> ${window.t("pets.wonResult", "won {a} vs {b}", { a: esc(pa.label), b: esc(pb.label) })}${b.wd ? window.t("pets.diedSuffix", " · ☠ {d} died", { d: esc((PETS[b.wd] || {}).label || "#" + b.wd) }) : ""}
@@ -1367,21 +1459,60 @@ function renderArena() {
   }
   $("arenaLName").textContent = pa.label; $("arenaRName").textContent = pb.label;
   $("arenaLPow").textContent = "⚡ " + pa.pw + " · " + recordOf(pa); $("arenaRPow").textContent = "⚡ " + pb.pw + " · " + recordOf(pb);
-  const effA = effOf(pa), effB = effOf(pb);
-  const res = (b.wh && effA && effB) ? G.battleOf(dapp.bh(b.wh), dapp.bh(b.wh + 1), Number(b.id), effA, effB) : null;
-  gate({ btnResolve: b.wn === 2 && !!res && !dapp.busy("resolveb", "bid", b.id),
+  const effA = effOf(pa), effB = effOf(pb), bid = Number(b.id);
+  // wm == 1: the duel runs over HASH(s1 + s2 + bid) once BOTH secrets are revealed; a battle issued before the
+  // commit-reveal upgrade (wm == 0) still runs over the block-hash pair bh(wh), bh(wh+1).
+  const cr = b.wm === 1;
+  const res0 = !(effA && effB) ? null
+    : cr ? (b.wr1 && b.wr2 ? G.battleOfSeed(G.battleSeedOf(b.wx1, b.wx2, bid), bid, effA, effB) : null)
+    : (b.wh ? G.battleOf(dapp.bh(b.wh), dapp.bh(b.wh + 1), bid, effA, effB) : null);
+  // A SETTLED BATTLE IS REPLAYED ONLY WHEN THE REPLAY IS ITS BATTLE (G6). The turns come from the VM hash over its seed
+  // (or block hashes) and the pets' CURRENT stats: a battle carried across the reroll was fought under gen 28's hash
+  // (and a legacy one's blocks were re-pinned to this chain's block 2), and a pet trained since has other stats, so a
+  // replay could show the loser winning. The stored winner (ww) is what the contract paid: a replay that does not reach
+  // it is dropped for the plain flourish (playBattle with no log).
+  const res = b.wn === 3 && res0 && res0.aWins !== (b.ww === b.a) ? null : res0;
+  const nRev = (b.wr1 ? 1 : 0) + (b.wr2 ? 1 : 0);
+  const past = cr && dapp.cursor != null && dapp.cursor > b.wrd;
+  const forfeit = cr && nRev === 1 && (past || (b.wn === 3 && !!b.ww));
+  const voided = cr && nRev === 0 && (past || b.wn === 3);
+  const mine = cr ? mySecret(b) : null;
+  gate({ btnResolve: b.wn === 2 && (!!res || (forfeit && past)) && !dapp.busy("resolveb", "bid", b.id),
          btnCancelBattle: b.wn === 1 && pa.mine,
-         btnRefundBattle: b.wn === 2 && !res && dapp.cursor != null && dapp.cursor > b.wh + G.STALE });
+         btnRevealBattle: b.wn === 2 && revealOpen(b) && !!mine && !mine.done,
+         btnRefundBattle: b.wn === 2 && (cr ? voided : (!res && dapp.cursor != null && dapp.cursor > b.wh + G.STALE)) });
   $("btnResolve").onclick = () => resolveBattle(b.id);
   $("btnCancelBattle").onclick = () => cancelBattle(b.id);
   $("btnRefundBattle").onclick = () => refundBattle(b.id);
+  $("btnRevealBattle").onclick = () => revealBattle(b.id);
   if (b.wn === 1) { $("arenaVerdict").textContent = window.t("pets.awaitingConsent", "Awaiting consent…"); hint.textContent = window.t("pets.awaitConsentHint", "The challenged pet's owner must accept (matching the stake) before the chain schedules the fight."); }
+  else if (cr && forfeit) {
+    const winP = b.wr1 ? pa : pb, loseP = b.wr1 ? pb : pa;
+    $("arenaVerdict").innerHTML = window.t("pets.forfeitWin", "🏳 <b>{w}</b> wins by forfeit — <b>{l}</b>'s owner did not reveal in time.", { w: esc(winP.label), l: esc(loseP.label) });
+    hint.textContent = b.wn === 3 ? window.t("pets.settledOnchain", "Settled on-chain.")
+      : window.t("pets.forfeitHint", "Settling hands the pot and the silent side's pet to the side that revealed. Anyone may settle.");
+  }
+  else if (cr && voided) {
+    $("arenaVerdict").textContent = window.t("pets.voidVerdict", "↩ Neither side revealed — the battle is void.");
+    hint.textContent = b.wn === 3 ? window.t("pets.voidDone", "Each side got its own stake back; no pet changed hands.")
+      : window.t("pets.voidHint", "Reclaiming returns each side's own stake; no pet changes hands. Anyone may send it.");
+  }
+  else if (cr && b.wn === 2 && !res) {
+    $("arenaVerdict").textContent = window.t("pets.sealedVerdict", "🔒 Sealed secrets — {n}/2 revealed", { n: nRev });
+    hint.textContent = window.t("pets.sealedHint", "Each owner's browser reveals its secret automatically. {time} left to reveal — a side that has not revealed by then forfeits the battle (the side that revealed wins); if neither reveals, both stakes go back.", { time: blocksToTime(Math.max(0, b.wrd - (dapp.cursor || 0))) })
+      + (mine ? "" : " " + window.t("pets.sealedNoSecret", "Your secret isn't in this browser — open this battle where you issued or accepted it."));
+  }
   else if (b.wn === 2 && !res) { $("arenaVerdict").textContent = window.t("pets.fightLocked", "⚡ Fight locked to blocks {a}–{b}", { a: b.wh, b: b.wh + 1 }); hint.textContent = window.t("pets.fightLockedHint", "Nobody can know the outcome until those blocks are finalized (~{time} + finality).", { time: blocksToTime(Math.max(0, b.wh + 1 - (dapp.cursor || b.wh))) }); }
-  else if ((b.wn === 2 && res) || b.wn === 3) {
+  else if ((b.wn === 2 && res) || (b.wn === 3 && res)) {
     const aWins = b.wn === 3 ? b.ww === b.a : res.aWins;
     const died = b.wn === 3 ? b.wd : (res.dies ? (aWins ? b.b : b.a) : 0);
     playBattle(b, pa, pb, aWins, died, res);
     hint.textContent = b.wn === 3 ? window.t("pets.settledOnchain", "Settled on-chain.") + (b.ws ? "" : window.t("pets.friendlyNoStake", " (friendly match — no stakes moved)")) : window.t("pets.chainDecided1", "The chain has decided — settling records it and pays the pot") + (b.ws ? window.t("pets.potAmount", " ({amt} NADO) ", { amt: rawToNado(2 * b.ws) }) : " ") + window.t("pets.chainDecided2", "to the winner's owner. Anyone may settle.");
+  }
+  else if (b.wn === 3) {
+    const aWins = b.ww === b.a;
+    playBattle(b, pa, pb, aWins, b.wd, null);
+    hint.textContent = window.t("pets.settledOnchain", "Settled on-chain.");
   }
 }
 function playBattle(b, pa, pb, aWins, died, res) {
@@ -1440,7 +1571,7 @@ function maybePlayHatch(p) {
       stage.style.position = "relative"; sp.style.left = "50%"; sp.style.top = "45%"; stage.appendChild(sp);
       setTimeout(() => sp.remove(), 1100);
     }
-    const an = p.animal, coat = G.coatOf(p.gene, an);
+    const an = p.animal, coat = G.coatOf(p.gene, an, p.rolls);
     alertBar(window.t("pets.hatchReveal", "🎉 It's a {rarity} — {coat} {emoji} {animal}{shiny}! One of {total} possible animals across six rarity tiers — its species, coat and 10 abilities are all written into its gene, locked forever. Name it, feed it, train it.",
       { rarity: p.tier.rarity.toUpperCase(), coat: CN(coat), emoji: an.e, animal: AN(an), total: G.ANIMALS.length, shiny: coat.shiny ? window.t("pets.shinySuffix", " ✦ SHINY") : "" }), null, null, { tone: "ok" });
   }, t + 600);
@@ -1518,6 +1649,10 @@ function renderHomestead() {
         "🧺 {n} {res} — full, collect to keep earning", { n: b.pending, res: RES[b.trade].name() }) + "</span>";
       else yieldLine = window.t("pets.basePending", "🧺 {n} {res} ready · {rate}/1k blocks",
         { n: b.pending, res: RES[b.trade].name(), rate: Math.floor(b.rate * 1000 / RATE_DIV) });
+      // the find roll is two-phase: a collect pins a LATER epoch beacon, and the next collect after it reveals
+      const findLine = !b.pin ? window.t("pets.findNone", "🎲 Collect to start a find roll (a later beacon decides it)")
+        : pinReady(b.pin) ? window.t("pets.findReady", "🎲 A find roll is ready — collect to reveal it")
+        : window.t("pets.findPending", "🎲 Next find decided by the epoch {e} beacon (~{time})", { e: b.pin, time: pinWait(b.pin) });
       return '<div class="base" data-b="' + b.id + '">'
         + '<div class="top"><span class="ttl">' + T.icon + " " + esc(T.build())
         + ' <span class="dim small">' + window.t("pets.lvl", "lv{n}", { n: b.level }) + "</span></span>"
@@ -1532,6 +1667,7 @@ function renderHomestead() {
         + "</div>"
         + (op ? '<div class="small dim" style="margin-top:5px">' + window.t("pets.workedBy", "worked by {pet}", { pet: esc(op.label) })
                 + (busyS ? " · " + confirmingLabel() : "") + "</div>" : "")
+        + '<div class="small dim" style="margin-top:3px">' + findLine + "</div>"
         + "</div>";
     }).join("");
     list.querySelectorAll(".bColl").forEach((el) => el.onclick = () => collectBase(el.dataset.b));
@@ -1578,10 +1714,10 @@ function itemTitle(it) {
 // it — the rules (same slot, food at least as good, below the cap, not worn) are visible up front rather
 // than discovered as a revert.
 function fuseRow(it) {
-  if (it.worn) return "";
+  if (it.worn || it.pin) return "";
   if (it.rarity >= FUSE_MAX_TIER) return '<div class="small dim mt">'
     + window.t("pets.fuseCapped", "At the fusing cap — better than this has to be FOUND by a rarer pet.") + "</div>";
-  const food = myItems().filter((x) => x.id !== it.id && !x.worn && x.kind === it.kind && x.rarity >= it.rarity);
+  const food = myItems().filter((x) => x.id !== it.id && !x.worn && !x.pin && x.kind === it.kind && x.rarity >= it.rarity);
   if (!food.length) return '<div class="small dim mt">'
     + window.t("pets.fuseNoFood", "To fuse this up a tier, feed it another {kind} of the same tier or better.",
         { kind: (GEAR_KIND[it.kind] || GEAR_KIND[0]).name() }) + "</div>";
@@ -1627,8 +1763,23 @@ function renderBag() {
         '<div class="aff">+' + a.points + " " + esc(G.STAT_NAMES[a.stat] || "?") + "</div>").join("")
     + "</div>"
     + (worn ? '<div class="small dim mt">' + window.t("pets.wornBy", "worn by {pet}", { pet: esc(worn.label) }) + "</div>" : "")
+    + (it.pin ? '<div class="small mt" style="color:var(--gold)">' + (pinStale(it.pin)
+        ? window.t("pets.rerollExpired", "🎲 This re-roll waited too long and its beacon is expiring — re-roll again (full cost) to free the item.")
+        : pinReady(it.pin)
+        ? window.t("pets.rerollReady", "🎲 Its beacon is out — revealing the re-roll…")
+        : window.t("pets.rerollPendingN", "🎲 Re-roll pending — decided by the epoch {e} beacon (~{time})", { e: it.pin, time: pinWait(it.pin) }))
+        + " " + window.t("pets.rerollPendingNote", "It can't be worn or fused until then.") + "</div>" : "")
     + '<div class="rowb">'
-    + (it.worn
+    + (it.pin && pinStale(it.pin)
+        ? '<button class="ghost" id="btnReroll"' + (RESOURCES[4] >= it.rarity * REROLL_ESSENCE ? "" : " disabled") + ">"
+          + (dapp.busy("reroll", "iid", it.id) ? confirmingLabel()
+             : window.t("pets.rerollAgain", "🎲 Re-roll again (the pending roll expired) · {n} ✨", { n: it.rarity * REROLL_ESSENCE })) + "</button>"
+          + '<button class="ghost" id="btnScrap">' + (dapp.busy("scrap", "iid", it.id) ? confirmingLabel() : window.t("pets.scrap", "♻ Scrap")) + "</button>"
+        : it.pin
+        ? '<button class="ghost" id="btnReroll"' + (pinReady(it.pin) ? "" : " disabled") + ">"
+          + (dapp.busy("rerollres", "iid", it.id) ? confirmingLabel() : window.t("pets.rerollReveal", "🎲 Reveal the re-roll")) + "</button>"
+          + '<button class="ghost" id="btnScrap">' + (dapp.busy("scrap", "iid", it.id) ? confirmingLabel() : window.t("pets.scrap", "♻ Scrap")) + "</button>"
+        : it.worn
         ? '<button class="ghost" id="btnUnequip">' + (dapp.busy("unequip", "iid", it.id) ? confirmingLabel() : window.t("pets.unequip", "Take off")) + "</button>"
         : '<select id="equipTo">' + wearers.map((p) => '<option value="' + p.id + '">' + esc(p.label) + "</option>").join("") + "</select>"
           + '<button class="primary" id="btnEquip"' + (wearers.length ? "" : " disabled") + ">"
@@ -1730,7 +1881,9 @@ dapp.onReturn((pend, ok, err) => {
     mint: window.t("pets.rtMint", "Egg adopted — confirming on-chain (~1 min)…"), hatch: window.t("pets.rtHatch", "Hatching — confirming on-chain…"),
     feed: window.t("pets.rtFeed", "Nom nom — the meal is confirming…"), train: window.t("pets.rtTrain", "Training session booked — confirming…"),
     trainres: window.t("pets.rtTrainres", "Revealing the result — confirming…"), challenge: window.t("pets.rtChallenge", "Challenge sent — the owner must accept it."),
-    accept: window.t("pets.rtAccept", "Battle on! The chain decides in ~2 blocks…"), resolveb: window.t("pets.rtResolveb", "Settling the battle…"),
+    accept: window.t("pets.rtAccept2", "Battle on! Both secrets are revealed automatically, then the chain decides."), resolveb: window.t("pets.rtResolveb", "Settling the battle…"),
+    revealb: window.t("pets.rtRevealb", "Revealing your secret — confirming…"), reroll: window.t("pets.rtReroll", "Re-roll paid — its result waits for a later beacon."),
+    rerollres: window.t("pets.rtRerollres", "Revealing the re-roll — confirming…"),
     cancelb: window.t("pets.rtCancelb", "Withdrawing…"), rename: window.t("pets.rtRename", "Naming — it's for life; confirming…"), xfer: window.t("pets.rtXfer", "Transferring your pet — confirming…"),
     market: window.t("pets.rtMarket", "Updating the listing — confirming…"), buy: window.t("pets.rtBuy", "Buying — confirming on-chain (~1 min)…"),
     offer: window.t("pets.rtOffer", "Offer sent — escrowed until the owner accepts."), offeract: window.t("pets.rtOfferact", "Confirming…") });

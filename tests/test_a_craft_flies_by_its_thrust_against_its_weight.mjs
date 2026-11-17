@@ -1,0 +1,272 @@
+/*
+ * test_a_craft_flies_by_its_thrust_against_its_weight.mjs — static/land-flight.js, the physics the pilot's page flies a
+ * craft by (#147, "you must add actual physics like engines and gravity to the game and build a real usable xfighter",
+ * operator 2026-11-09), with the numbers from static/land-recipes.json "flight":
+ *   1. a craft whose thrusters beat its weight climbs on Up, hovers when let go (the climb damps out), sinks on Down;
+ *   2. one too heavy for its thrust never leaves the ground, whatever the pilot asks — and gravity brings a craft down;
+ *   3. forward pushes along the facing; it never passes the top speed; drag slows it;
+ *   4. the ground holds it: it never sinks below the surface by its lowest piece, and it lands at rest;
+ *   5. the engines' work: the share of its thrust it uses, idle, climbing, hovering, pushing, sinking, straining;
+ *   6. its body meets the world (#171, "x has no collision in the air"): a wall stops it — by any piece, not only its
+ *      seat, and turned with its yaw — it slides along a wall and under a roof, and a craft already inside something
+ *      flies out of it;
+ *   6b. a point of its body standing in the ground's rounding is still stopped by a wall: bodyInside carries WHAT each
+ *      point is in, so the sweep's "already inside" set does not let it slide from the turf into steel;
+ *   8. it STANDS AT THE GROUND'S GRADE (#184): at rest on a slope its pitch and roll are the slope's along and across
+ *      its nose (the right side higher: the right wing up), capped at STAND_MAX, level on flat ground and level again
+ *      once it lifts; its pose carries the two angles;
+ *   7. it lands on its FEET (#184): on a slope it comes to rest where the highest ground under any foot meets that foot,
+ *      every foot clear of the ground and one touching, turned with its yaw — not where the ground under the seat meets
+ *      its lowest piece, which sank the uphill feet into the hill; a craft with no feet measured lands as before.
+ *
+ * Run: node tests/test_a_craft_flies_by_its_thrust_against_its_weight.mjs
+ */
+import { readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+const { craftStep, flightOf, craftBody, bodyHits, bodyInside, navSays, NAV_BIAS, craftArea, craftFeet, restAt, standOf, STAND_MAX } = await import(join(ROOT, "static", "land-flight.js"));
+const Pl = await import(join(ROOT, "static", "land-planet.js"));
+const Wd = await import(join(ROOT, "static", "land-world.js"));
+const F = JSON.parse(readFileSync(join(ROOT, "static", "land-recipes.json"), "utf8")).flight;
+let fails = 0;
+const ok = (c, m) => { console.log((c ? "ok   " : "FAIL ") + m); if (!c) fails++; };
+
+const flat = () => 100;                                         // flat ground at 100 m
+const craft = (mass, thrusters) => ({ pose: [0, 500, 500, 100.5, 0], vel: [0, 0, 0], mass, thrust: thrusters * F.thrust_kn, bottom: -0.5, grounded: true });
+const run = (c, input, secs) => { for (let t = 0; t < secs; t += 0.05) craftStep(c, input, 0.05, F, flat); return c; };
+
+// 1. a light fighter: 2 t, 2 thrusters (60 kN against 19.6 kN)
+const x = craft(2, 2);
+ok(flightOf(F, x.mass, x.thrust).lifts, `two thrusters lift 2 t (${x.thrust} kN against ${(x.mass * F.g).toFixed(1)} kN)`);
+run(x, { up: true }, 2);
+const climbed = x.pose[3];
+ok(climbed > 110 && !x.grounded, `Up climbs (to ${climbed.toFixed(1)} m in 2 s)`);
+run(x, {}, 3);
+ok(Math.abs(x.vel[2]) < 0.5 && x.pose[3] > climbed, `let go, it hovers — the climb damps out (vertical speed ${x.vel[2].toFixed(2)} m/s at ${x.pose[3].toFixed(1)} m)`);
+const hov = x.pose[3];
+run(x, { down: true }, 1);
+ok(x.pose[3] < hov - 1, `Down sinks (${hov.toFixed(1)} -> ${x.pose[3].toFixed(1)} m)`);
+
+// 2. too heavy: 10 t on one thruster (30 kN against 98 kN)
+const brick = craft(10, 1);
+ok(!flightOf(F, brick.mass, brick.thrust).lifts, "one thruster cannot lift 10 t");
+run(brick, { up: true, fwd: 1 }, 3);
+ok(brick.grounded && Math.abs(brick.pose[3] - 100.5) < 1e-6 && brick.pose[1] === 500, "…it never leaves the ground, nor drives off, whatever the pilot asks");
+const drop = craft(2, 0); drop.pose[3] = 150; drop.grounded = false;
+run(drop, {}, 1);
+ok(drop.pose[3] < 150 - 4 && drop.vel[2] < -8, `with no thrust gravity brings it down (${drop.pose[3].toFixed(1)} m, ${drop.vel[2].toFixed(1)} m/s after 1 s)`);
+
+// 3. forward, top speed, drag
+const f = craft(2, 4); f.pose[3] = 150; f.grounded = false; f.pose[4] = Math.PI / 2;         // facing east
+run(f, { fwd: 1, yaw: Math.PI / 2 }, 20);
+const sp = Math.hypot(...f.vel);
+ok(f.pose[1] > 600 && Math.abs(f.pose[2] - 500) < 1, `forward pushes along the facing (east: u ${f.pose[1].toFixed(0)}, v ${f.pose[2].toFixed(1)})`);
+ok(sp <= F.vmax + 1e-9, `never past the top speed (${sp.toFixed(1)} of ${F.vmax} m/s)`);
+const v0 = Math.hypot(f.vel[0], f.vel[1]);
+run(f, { yaw: Math.PI / 2 }, 3);
+// THE AIR (#174): ½ρv²c_dA on a 2 t craft of 4 m² — v(t) = v₀ / (1 + k v₀ t), k = ½ρc_dA/m (quadratic drag, solved)
+const kAir = (0.5 * Pl.airAt(150 - Pl.SEA_LEVEL).rho * Pl.FLAT_PLATE_CD * 4) / 2000, vAir = v0 / (1 + kAir * v0 * 3);
+ok(Math.abs(Math.hypot(f.vel[0], f.vel[1]) - vAir) / vAir < 0.02, `let go, the air slows it as ½ρv²c_dA does: ${v0.toFixed(1)} → ${Math.hypot(f.vel[0], f.vel[1]).toFixed(1)} m/s in 3 s (the solved drag: ${vAir.toFixed(1)})`);
+const hi = craft(2, 4); hi.pose[3] = Pl.SEA_LEVEL + Pl.ATM_TOP + 500; hi.grounded = false; hi.vel = [40, 0, 0];
+run(hi, {}, 3);
+ok(Math.abs(hi.vel[0] - 40) < 1e-9, "above the air's top nothing slows it");
+const g150 = Pl.gravityAt(150), down = craft(2, 0); down.pose[3] = 20000; down.grounded = false;
+craftStep(down, {}, 0.05, F, flat);
+ok(Math.abs(-down.vel[2] / 0.05 - Pl.gravityAt(20000) * 1) < 0.3 && Pl.gravityAt(20000) < g150, `gravity weakens with height: ${Pl.gravityAt(20000).toFixed(2)} m/s² at 20 km (${g150.toFixed(3)} at 150 m)`);
+ok(Math.abs(craftArea([[0, 0, 0, 400, 200, 100, 64]], (b) => b) - (4 * 2 + 2 * 1 + 1 * 4) / 3) < 1e-9, "a craft's frontal area is the mean of its bounding box's faces");
+
+// 4. the ground
+const d = craft(2, 2); d.pose[3] = 140; d.grounded = false; d.vel = [0, 0, -30];
+let lowest = Infinity;
+for (let t = 0; t < 4; t += 0.05) { craftStep(d, {}, 0.05, F, flat); lowest = Math.min(lowest, d.pose[3] + d.bottom); }
+ok(lowest >= 100 - 1e-9, `it never sinks below the ground by its lowest piece (lowest ${lowest.toFixed(3)} m over ground at 100)`);
+const fall = craft(2, 0); fall.pose[3] = 120; fall.grounded = false;
+run(fall, {}, 4);
+ok(fall.grounded && fall.vel[2] === 0 && Math.abs(fall.pose[3] + fall.bottom - 100) < 1e-9, "it lands at rest on the ground");
+
+// 5. THE ENGINES' WORK (#171: "it should be visible that x is 'fighting gravity'"): the share of its thrust a craft uses
+const e = craft(8.8, 4);                                          // the rebuilt X fighter: 8.8 t, 120 kN
+run(e, {}, 0.5);
+ok(e.engine && e.engine.throttle === 0, "resting on the ground, the engines idle (throttle 0)");
+run(e, { up: true }, 1);
+ok(e.engine.lift === 1 && e.engine.throttle === 1, "climbing, they give all they have (throttle 1)");
+run(e, {}, 2);
+const wShare = 8.8 * Pl.gravityAt(e.pose[3]) / e.thrust;                // its weight at its height (#174)
+ok(!e.grounded && Math.abs(e.engine.throttle - wShare) < 1e-4, `hovering, they hold exactly its weight: ${(e.engine.throttle * 100).toFixed(0)} % (${(8.8 * F.g).toFixed(0)} of ${e.thrust} kN)`);
+run(e, { fwd: 1 }, 0.5);
+ok(e.engine.throttle > wShare && e.engine.push > 0 && Math.abs(Math.hypot(...e.engine.dir) - 1) < 1e-9, `pushing forward adds to it (${(e.engine.throttle * 100).toFixed(0)} %), along the facing`);
+run(e, { down: true }, 0.3);
+ok(Math.abs(e.engine.lift - wShare * 0.2) < 1e-4, "sinking, they hold a fifth of its weight");
+const strain = craft(10, 1);
+run(strain, { up: true }, 0.5);
+ok(strain.grounded && strain.engine.throttle === 1, "a craft too heavy to lift strains at full throttle and stays down");
+
+// 6. ITS BODY (#171): a craft 4 m long — a hull 300 x 150 cm, its seat 40 cm from the back, a nose 3 m ahead of the seat
+const pieces = [[-150, -40, 0, 300, 150, 10, 64], [-40, -45, 10, 80, 90, 110, 66], [-30, 110, 0, 60, 300, 60, 64], [-130, -140, 0, 100, 100, 140, 65]];
+const body = craftBody(pieces, Wd.boxAabb);
+const inBox = (p) => pieces.some((b) => p[0] >= b[0] / 100 && p[0] <= (b[0] + b[3]) / 100 && p[1] >= b[1] / 100 && p[1] <= (b[1] + b[4]) / 100 && p[2] >= b[2] / 100 && p[2] <= (b[2] + b[5]) / 100);
+ok(body.length > 8 && body.every(inBox), `its body is ${body.length} points, every one inside a piece`);
+ok(body.some((p) => p[1] > 3.5) && body.some((p) => p[1] < -1), "…reaching its nose 4 m ahead and its thruster behind");
+ok(body.every((p) => p[2] >= 0.05), "…none at its very bottom: resting on the ground is not being inside it");
+// a wall: solid where v >= 520 (north), at any height
+const wall = (f, u, v, h) => v >= 520 || h < 100;
+const hits = (pose) => bodyHits(body, pose, wall), inside = (pose) => bodyInside(body, pose, wall);   // how many in; which
+const w = { pose: [0, 500, 510, 105, 0], vel: [0, 0, 0], mass: 2, thrust: 2 * F.thrust_kn, bottom: 0, grounded: false };
+for (let t = 0; t < 6; t += 0.05) craftStep(w, { fwd: 1 }, 0.05, F, flat, inside);
+ok(w.pose[2] + 4.1 > 520 - 0.7 && w.pose[2] + 4.1 < 520 + 0.2 && !hits(w.pose), `flying north at a wall, its nose stops at it — not its seat (its nose at v ${(w.pose[2] + 4.1).toFixed(2)}, the wall at 520)`);
+ok(Math.abs(w.vel[1]) < 1e-9 && w.bumped, "…and it loses the speed it hit with");
+const noHit = { pose: [0, 500, 510, 105, 0], vel: [0, 0, 0], mass: 2, thrust: 2 * F.thrust_kn, bottom: 0, grounded: false };
+for (let t = 0; t < 6; t += 0.05) craftStep(noHit, { fwd: 1 }, 0.05, F, flat);
+ok(noHit.pose[2] > 530, "(without its body it flew through: the bug)");
+// turned to face east, the same wall is beside it: it flies on along it
+const e2 = { pose: [0, 500, 518, 105, Math.PI / 2], vel: [0, 0, 0], mass: 2, thrust: 2 * F.thrust_kn, bottom: 0, grounded: false };
+ok(!hits(e2.pose), "facing east, 2 m from the wall to its left, it is clear of it — its body turns with its yaw");
+for (let t = 0; t < 2; t += 0.05) craftStep(e2, { fwd: 1, side: -0.3 }, 0.05, F, flat, inside);
+ok(e2.pose[1] > 510 && !hits(e2.pose), `pressed against the wall as it flies, it slides along it (${(e2.pose[1] - 500).toFixed(1)} m east)`);
+// a roof at 112 m: it climbs to it, not through it, and still flies along under it
+const roof = (f, u, v, h) => h >= 112 || h < 100;
+const r = { pose: [0, 500, 500, 105, 0], vel: [0, 0, 0], mass: 2, thrust: 2 * F.thrust_kn, bottom: 0, grounded: false };
+for (let t = 0; t < 4; t += 0.05) craftStep(r, { up: true, fwd: 1 }, 0.05, F, flat, (p) => bodyInside(body, p, roof));
+ok(r.pose[3] < 112 && r.pose[3] > 107 && r.pose[2] > 505, `climbing under a roof at 112 m it stops beneath it (${r.pose[3].toFixed(2)} m) and flies on under it`);
+// at speed: a step is longer than a plate is thick — the points jumped over a 20 cm wall in the first page walk
+const plate = (f, u, v, h) => (v >= 520 && v < 520.2) || h < 100;
+const fast = { pose: [0, 500, 480, 105, 0], vel: [0, 55, 0], mass: 2, thrust: 2 * F.thrust_kn, bottom: 0, grounded: false };
+for (let t = 0; t < 3; t += 0.05) craftStep(fast, { fwd: 1 }, 0.05, F, flat, (p) => bodyInside(body, p, plate));
+ok(fast.pose[2] + 4.1 < 520.3, `at 55 m/s into a 20 cm plate it stops at it, not past it (nose at ${(fast.pose[2] + 4.1).toFixed(2)})`);
+// turning into a wall is not taken: 2 m short of the wall facing east, its 4 m nose would swing into it
+const tw = { pose: [0, 500, 518, 105, Math.PI / 2], vel: [0, 0, 0], mass: 2, thrust: 2 * F.thrust_kn, bottom: 0, grounded: false };
+ok(!hits(tw.pose) && hits([0, 500, 518, 105, 0]), "beside a wall, facing along it — turned north its nose would be in it");
+craftStep(tw, { yaw: 0 }, 0.05, F, flat, inside);
+ok(tw.pose[4] === Math.PI / 2 && !hits(tw.pose) && tw.bumped, "…so it does not turn into it");
+// already inside (built through a wall): it moves, so it can always fly out
+const s2 = { pose: [0, 500, 519, 105, 0], vel: [0, 0, 0], mass: 2, thrust: 2 * F.thrust_kn, bottom: 0, grounded: false };
+ok(hits(s2.pose), "a craft whose nose is in the wall…");
+const s3 = { pose: [0, 500, 519, 105, 0], vel: [0, 0, 0], mass: 2, thrust: 2 * F.thrust_kn, bottom: 0, grounded: false }, in0 = hits(s3.pose);
+for (let t = 0; t < 2; t += 0.05) craftStep(s3, { fwd: 1 }, 0.05, F, flat, inside);
+ok(hits(s3.pose) <= in0 && s3.pose[2] < 519.2, `…cannot push on further into it (${in0} points in, then ${hits(s3.pose)}; seat at ${s3.pose[2].toFixed(2)})`);
+for (let t = 0; t < 2; t += 0.05) craftStep(s2, { fwd: -1 }, 0.05, F, flat, inside);
+ok(!hits(s2.pose), "…backs out of it");
+// a thin wall that appears where the craft is (built through it, or it arrived late): it cannot slide on through it row
+// by row, the points in front going in as fast as those behind come out
+const noseN = Math.max(...body.map((p) => p[1])), rowN = Math.max(...body.map((p) => p[1]).filter((n) => n < noseN - 0.05));   // its nose's row, the next
+const thin = (f, u, v, h) => (v >= 511 + noseN - 0.1 && v < 511 + noseN + 0.1) || h < 100, tin = (p) => bodyInside(body, p, thin);
+const th = { pose: [0, 500, 511, 105, 0], vel: [0, 0, 0], mass: 2, thrust: 2 * F.thrust_kn, bottom: 0, grounded: false };
+const caught = new Set(tin(th.pose));
+for (let t = 0; t < 4; t += 0.05) craftStep(th, { fwd: 1 }, 0.05, F, flat, tin);
+ok(caught.size > 0 && tin(th.pose).every((i) => caught.has(i)) && th.pose[2] + rowN < 511 + noseN - 0.1,
+  `a wall built through its nose holds it: the nose may come out of it, no point that was clear goes in (seat ${th.pose[2].toFixed(2)})`);
+// a wall standing on the ground the craft rests on: its belly is at the wall's very foot — the first point in under the
+// foot carried the whole hull through it in the page walk
+const foot = (f, u, v, h) => (v >= 520 && v < 520.2 && h >= 100.05) || h < 100;
+const g = { pose: [0, 500, 510, 100, 0], vel: [0, 0, 0], mass: 2, thrust: 2 * F.thrust_kn, bottom: 0, grounded: true };
+for (let t = 0; t < 6; t += 0.05) craftStep(g, { fwd: 1 }, 0.05, F, flat, (p) => bodyInside(body, p, foot));
+ok(g.pose[2] + 4.1 < 520.35, `driven along the ground at a wall standing on it, it stops at the wall (nose at ${(g.pose[2] + 4.1).toFixed(2)})`);
+
+// a long craft over uneven ground: its nose comes down on a bank 1 m higher than the ground under its seat — held up by
+// its body, it has landed (the X fighter hovered "1.4 m up" on its belly, Down doing nothing)
+const bank = (f, u, v, h) => h < 100 || (v > 512 && h < 101);
+const lb = { pose: [0, 500, 509, 108, 0], vel: [0, 0, 0], mass: 2, thrust: 2 * F.thrust_kn, bottom: 0, grounded: false };
+for (let t = 0; t < 6; t += 0.05) craftStep(lb, { down: true }, 0.05, F, flat, (p) => bodyInside(body, p, bank));
+ok(lb.grounded && lb.pose[3] > 100.5 && lb.engine.throttle === 0, `brought down with its nose over a bank, it lands on it — grounded, engines idle (seat ${(lb.pose[3] - 100).toFixed(2)} m over the ground under it)`);
+for (let t = 0; t < 1; t += 0.05) craftStep(lb, { up: true }, 0.05, F, flat, (p) => bodyInside(body, p, bank));
+ok(!lb.grounded && lb.pose[3] > 102, "…and takes off from it again");
+
+// 7. THE NAV UNIT (#173): dead reckoning from a fix, its error growing as ½·b·t² (Inertial navigation system l.31)
+const at0 = navSays([0, 500, 500, 100, 0], 0, [1, 0], [600, 500]);
+ok(at0.err === 0 && Math.abs(at0.dist - 100) < 1e-9 && Math.abs(at0.bearing - 90) < 1e-9 && Math.abs(at0.turn - 90) < 1e-9,
+  "at its fix it knows where it is: the town hall 100 m east, bearing 90°, 90° right of a craft facing north");
+ok(Math.abs(navSays([0, 500, 500, 100, Math.PI], 0, [1, 0], [600, 500]).turn + 90) < 1e-9, "…facing south, it is 90° left");
+const best = navSays([0, 0, 0, 0, 0], 17 * 60, [1, 0], [1000, 0], 10e-6 * 9.8);
+ok(Math.abs(best.err - 50) < 1.5, `with the best accelerometers (10 micro-g) it is ~50 m out after 17 minutes, as its source says (${best.err.toFixed(1)} m)`);
+const fiveMin = navSays([0, 500, 500, 100, 0], 300, [0, 1], [500, 1500]);
+ok(Math.abs(fiveMin.err - 0.5 * NAV_BIAS * 300 * 300) < 1e-9 && fiveMin.err > 40 && Math.abs(fiveMin.est[1] - (500 + fiveMin.err)) < 1e-9,
+  `the game's unit (ten times worse) is ${fiveMin.err.toFixed(0)} m out after five minutes, and believes itself that far along its error`);
+
+// 6b. a hull whose points stand in the turf's rounding is still stopped by a wall (the pilot's page walk, 2026-11-13)
+{
+  const hull = [[-150, -75, 0, 300, 150, 10, 64], [-40, -45, 10, 80, 90, 110, 66]];
+  const body = craftBody(hull, Wd.boxAabb);
+  const wallV = 502.0;                                                                   // a wall 1.25 m ahead of the hull's front (at v 500.75), 20 cm thick, 4 m tall
+  const solid = (f, u, v, h) => (v >= wallV && v <= wallV + 0.2 && h >= 99 && h <= 104) ? 2 : (h < 100.08 ? 1 : false);   // the turf's rounding reaches 8 cm up: the hull's points (5 cm) stand in it
+  const c = { pose: [0, 500, 500, 100, 0], vel: [0, 0, 0], mass: 1.6, thrust: 60, bottom: 0, grounded: true, body, bodyLow: 0 };
+  const hits = (pose) => bodyInside(body, pose, solid);
+  const inTurf = hits(c.pose);
+  ok(inTurf.length === body.filter((p) => p[2] < 0.08).length && inTurf.every((k) => k % 4 === 1), `at rest the hull's points stand in the turf (${inTurf.length} of ${body.length}, each marked as in the ground)`);
+  let front = -Infinity;
+  for (let t = 0; t < 4; t += 0.05) { craftStep(c, { fwd: 1, yaw: 0 }, 0.05, F, () => 100, hits); front = Math.max(front, c.pose[2] + 0.75); }
+  ok(front <= wallV + 0.13 && front > wallV - 0.3, `held forward, its hull stops at the wall (front ${(front - wallV).toFixed(3)} m past the face: within the body's inset), not its seat 30 cm behind`);
+  ok(/i \* 4 \+ \(s === 2 \? 2 : 1\)/.test(readFileSync(join(ROOT, "static", "land-flight.js"), "utf8")) && /if \(boxAt\(f, u, v, h\)\) return 2;/.test(readFileSync(join(ROOT, "static", "land.js"), "utf8")), "bodyInside keeps the kind, and the page's craftSolid tells a piece (2) from the ground (1)");
+}
+
+// 7. it lands on its FEET (#184): a 6 m plate with a skid under each end, the seat in the middle, on a 6 % slope rising east
+{
+  const skids = [[-300, -50, 0, 600, 100, 10, 64], [-40, -45, 10, 80, 90, 110, 66], [-300, -30, -40, 60, 60, 40, 64], [240, -30, -40, 60, 60, 40, 64]];
+  const feet = craftFeet(skids, Wd.boxAabb), low = feet.filter((p) => p[2] < -0.39);
+  ok(feet.length === 12 && low.length === 8 && low.every((p) => Math.abs(p[2] + 0.4) < 1e-9), `its feet are the two skids' bottom corners and the plate's, 40 cm over them (${feet.length} points, ${low.length} at ${low[0][2]} m)`);
+  const slope = (u, v) => 100 + 0.06 * (u - 500);
+  const land = (yaw) => {                                            // yaw 0: the craft's long axis (x) runs east, up the slope
+    const c = { pose: [0, 500, 500, 120, yaw], vel: [0, 0, 0], mass: 2, thrust: 0, bottom: -0.4, feet, grounded: false };
+    for (let t = 0; t < 8; t += 0.05) craftStep(c, {}, 0.05, F, slope);
+    const cy = Math.cos(yaw), sy = Math.sin(yaw);
+    const clear = low.map(([x, y, z]) => c.pose[3] + z - slope(c.pose[1] + x * cy + y * sy, c.pose[2] + y * cy - x * sy));
+    return { c, clear };
+  };
+  const along = land(0);                                             // the skids 3 m up and 3 m down the slope
+  ok(along.c.grounded && Math.min(...along.clear) > -1e-9 && Math.min(...along.clear) < 1e-6, `landed along the slope, every skid is clear of the ground and one touches it (lowest clearance ${Math.min(...along.clear).toExponential(1)} m)`);
+  ok(Math.max(...along.clear) > 0.3, `…the downhill skid stands in the air (${Math.max(...along.clear).toFixed(2)} m), the craft level`);
+  const seatRule = slope(along.c.pose[1], along.c.pose[2]) + 0.4;
+  ok(along.c.pose[3] > seatRule + 0.1, `…higher than the seat-column rule put it (${along.c.pose[3].toFixed(2)} against ${seatRule.toFixed(2)} m): that rule sank the uphill skid ${(along.c.pose[3] - seatRule).toFixed(2)} m into the hill`);
+  const across = land(Math.PI / 2);                                  // turned a quarter: both skids at one height along the slope
+  ok(across.c.grounded && Math.max(...across.clear) - Math.min(...across.clear) < 0.04 && Math.min(...across.clear) > -1e-9, `turned across the slope both skids touch (clearances within ${(Math.max(...across.clear) - Math.min(...across.clear)).toFixed(3)} m): the feet turn with the yaw`);
+  const bare = { pose: [0, 500, 500, 120, 0], vel: [0, 0, 0], mass: 2, thrust: 0, bottom: -0.4, grounded: false };
+  for (let t = 0; t < 8; t += 0.05) craftStep(bare, {}, 0.05, F, slope);
+  ok(Math.abs(bare.pose[3] - (slope(500, 500) + 0.4)) < 1e-9, "a craft with no feet measured lands by its bottom under the seat, as before");
+  ok(Math.abs(restAt({ feet, bottom: -0.4 }, 500, 500, 0, slope) - (slope(503, 500) + 0.4)) < 1e-9, "restAt: the seat's height is the highest foot-ground meeting plus that foot's depth");
+  const src = readFileSync(join(ROOT, "static", "land-flight.js"), "utf8");
+  ok((src.match(/const rest = restAt\(c, u, vv?, yaw, groundAt\)/g) || []).length === 2 && !/h \+ c\.bottom <= g/.test(src), "both the hovering and the winged model land through restAt (the seat-column rule is gone from each)");
+  const page = readFileSync(join(ROOT, "static", "land.js"), "utf8");
+  ok(/feet: craftFeet\(c\.pieces, Wd\.boxAabb\)/.test(page), "the page measures a craft's feet when the pilot takes the seat");
+}
+
+// 8. it stands at the ground's grade (#184)
+{
+  const skids = [[-300, -50, 0, 600, 100, 10, 64], [-40, -45, 10, 80, 90, 110, 66], [-300, -30, -40, 60, 60, 40, 64], [240, -30, -40, 60, 60, 40, 64]];
+  const feet = craftFeet(skids, Wd.boxAabb), deg = (a) => a * 180 / Math.PI;
+  const slope = (u, v) => 100 + 0.06 * (u - 500);                  // rising east
+  const stand = (yaw) => { const c = { pose: [0, 500, 500, 120, yaw], vel: [0, 0, 0], mass: 2, thrust: 0, bottom: -0.4, feet, grounded: false }; for (let t = 0; t < 8; t += 0.05) craftStep(c, {}, 0.05, F, slope); return c; };
+  const along = stand(0);                                            // the craft's x (its right) east, up the slope
+  ok(along.pose.length === 7 && Math.abs(deg(along.pose[6]) + 3.43) < 0.3 && Math.abs(deg(along.pose[5])) < 0.3, `across a 6 % slope its right side uphill, it rolls ${deg(along.pose[6]).toFixed(2)}° (the right wing up: −3.43°), no pitch`);
+  const nose = stand(Math.PI / 2);                                   // the nose east, up the slope
+  ok(Math.abs(deg(nose.pose[5]) - 3.43) < 0.3 && Math.abs(deg(nose.pose[6])) < 0.3, `nose up the slope it pitches ${deg(nose.pose[5]).toFixed(2)}° (3.43°), no roll`);
+  const flat = { pose: [0, 500, 500, 120, 0.7], vel: [0, 0, 0], mass: 2, thrust: 0, bottom: -0.4, feet, grounded: false }; for (let t = 0; t < 8; t += 0.05) craftStep(flat, {}, 0.05, F, () => 100);
+  ok(Math.abs(flat.pose[5]) < 1e-6 && Math.abs(flat.pose[6]) < 1e-6, "on flat ground it stands level");
+  const steep = stand.call(null, 0); for (let t = 0; t < 8; t += 0.05) craftStep(steep, {}, 0.05, F, (u, v) => 100 + 0.6 * (u - 500));
+  ok(Math.abs(Math.abs(steep.pose[6]) - STAND_MAX) < 1e-6, `on a 60 % slope the stand is capped at ${deg(STAND_MAX).toFixed(0)}°`);
+  const lift = stand(Math.PI / 2); lift.thrust = 2 * F.thrust_kn; for (let t = 0; t < 3; t += 0.05) craftStep(lift, { up: true }, 0.05, F, slope);
+  ok(!lift.grounded && Math.abs(deg(lift.pose[5])) < 0.2, `lifting off, it comes back to level (pitch ${deg(lift.pose[5]).toFixed(2)}° after 3 s)`);
+  ok(standOf({ feet: feet.slice(0, 2) }, 500, 500, 0, slope).every((a) => a === 0), "a craft with fewer than three feet stands level");
+}
+
+// the page's side of "at speed the craft gets stopped in place" (operator 2026-11-14): a refusal keeps the craft's speed,
+// "not flying that" steps the page out instead of flying on, and a held Q acts once a press
+{
+  const page = readFileSync(join(ROOT, "static", "land.js"), "utf8"), fix = page.slice(page.indexOf('} else if (m.t === "craft_fix") {'), page.indexOf("ws.onclose = () =>"));
+  ok(/else flying\.pose = m\.pose\.slice\(\);/.test(fix) && !/flying\.vel = \[0, 0, 0\]/.test(fix), "a refused pose puts the craft where the server holds it and keeps its speed (it was zeroed: the craft stopped dead)");
+  ok(/if \(m\.error === "you are not flying that"\) \{ flying = null;/.test(fix), "…and \"you are not flying that\" steps the page out of the controls");
+  ok(/if \(e\.code === "KeyQ" && !e\.repeat\) useDoor\(\);/.test(page), "a held Q boards or leaves once, not on every key repeat");
+}
+
+// THE ENERGY CANNON on the page (#171 item 3): a cannon is a gadget, bound keys fire it from the flight step, the bolt is
+// traced to the first animal or tree cell, drawn and named to the world server; the key bar marks a cannon key
+{
+  const page = readFileSync(join(ROOT, "static", "land.js"), "utf8"), W2 = await import(join(ROOT, "static", "land-world.js")), Sh2 = await import(join(ROOT, "static", "land-shapes.js"));
+  const gun = [0, 0, 0, 40, 200, 40, 64, Sh2.code(Sh2.CANNON, 0)];
+  ok(W2.isCannon(gun) && !W2.isCannon([0, 0, 0, 40, 200, 40, 64]) && /const isGadget = \(b\) => Wd\.engineCount\(b\) > 0 \|\| Wd\.isCannon\(b\);/.test(page), "a cannon part is a gadget on the page (it takes a key at the cannon)");
+  ok(/cannons: cannonsOf\(c\.pieces, c\.slots\),/.test(page) && /cannonTick\(c, input\.slots \|\| heldSlots\(\)\);/.test(page) && /boltsFrame\(now, cam\);/.test(page), "boarding finds the bound cannons, the flight step fires the held keys', the frame draws the bolts");
+  ok(/net\.send\(\{ t: "bolt", craft: c\.id, dir: d, target, len: target \? undefined : end \}\);/.test(page) && /target = \{ animal: id \}/.test(page) && /target = \{ cell: \[f, cu, cv, ch\] \}/.test(page), "a bolt names the first animal or tree cell it meets to the world server");
+  ok(/gunKeys\.includes\(n\) \? " ⚡" : ""/.test(page), "the controls' key bar marks a key that fires cannons");
+}
+
+if (fails) { console.log(`${fails} FAILURES`); process.exit(1); }
+console.log("ALL PASS");

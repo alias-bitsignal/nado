@@ -1,0 +1,203 @@
+"""
+FLIGHT on the world server (#147, doc/land-tech-to-flight.md; "you must add actual physics like engines and gravity to
+the game and build a real usable xfighter", operator 2026-11-09). scripts/land_server.py board / fly / leave / dock:
+
+  1. a craft is the pieces touching a pilot seat (and those touching them): boarding the seat, where the caller may build,
+     lifts exactly those off the plot into a craft — the plot keeps what does not touch; its mass is the pieces' volume x
+     their density (a unit part by its own mass), its thrust 30 kN a thruster;
+  2. no thruster touching, no craft; another's plot, no take-off; a stranger cannot board someone's parked craft;
+  3. the pilot's poses are taken within the craft's top speed (vmax x time + slack) and refused beyond it — no teleport;
+     the server answers a refused pose with the one it holds;
+  4. leaving parks it; a restart keeps the craft, and its pilot in the seat (a craft parked by a restart was left in
+     mid-air, out of its owner's reach — #171);
+  5. docking sets it down as pieces on the plot under the seat, turned to the nearest quarter turn — refused where the
+     owner may not build; the craft is then gone; turn_pieces turns a point (x, z) to (z, -x) at +90°;
+  6. players near are sent the craft — its pieces the first time, then its pose;
+  7. its owner gives it to another player (#171): they own it and are its pilot; only its owner gives it, only to a player
+     the world knows;
+  8. a player is told where every craft they own is (#171, "i left the x somewhere").
+
+Run: python3 tests/test_a_craft_of_pieces_takes_off_flies_within_its_thrust_and_docks.py
+"""
+import os, tempfile  # ISOLATION FIRST (CLAUDE.md rule 4)
+os.environ["HOME"] = tempfile.mkdtemp(prefix="nado-test-land-craft-")
+import atexit, shutil; atexit.register(shutil.rmtree, os.environ["HOME"], ignore_errors=True)
+import asyncio, importlib.util, math, sys, time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.join(ROOT, "tests"))
+from aiohttp import web
+from aiohttp.test_utils import TestServer
+from signatures import generate_keydict
+from execnode.games import land as L
+
+spec = importlib.util.spec_from_file_location("land_server", os.path.join(ROOT, "scripts", "land_server.py"))
+S = importlib.util.module_from_spec(spec); spec.loader.exec_module(S)
+import _harness
+_report = _harness.Report()
+check = _report.check
+
+A, Bk = generate_keydict(), generate_keydict()
+PA = 4995 * L.FACE_N + 3435                          # A's titled plot
+PB = PA + 1                                          # B's
+PLATE, THR, SEAT, PLANKS = 64, 65, 66, 9
+
+
+def fake_exec():
+    holders = {"7001": A["address"], "7002": Bk["address"]}
+
+    async def assets(req):
+        return web.json_response({"assets": [{"id": "7001", "issuer": L.ISSUER, "seed": str(L.plot_seed(PA))},
+                                             {"id": "7002", "issuer": L.ISSUER, "seed": str(L.plot_seed(PB))}]})
+
+    async def asset(req):
+        return web.json_response({"asset": {"id": req.query["id"]}, "holders": {holders[req.query["id"]]: "1"}})
+
+    async def view(req):
+        return web.json_response({"result": None})
+    app = web.Application()
+    app.add_routes([web.get("/exec/assets", assets), web.get("/exec/asset", asset), web.get("/exec/view", view)])
+    return app
+
+
+async def main():
+    ex = TestServer(fake_exec()); await ex.start_server()
+    data = tempfile.mkdtemp(prefix="nado_land_craft_", dir=os.environ["HOME"])
+    world = S.World(data, str(ex.make_url("")).rstrip("/"), "b" * 32)
+    world.http = __import__("aiohttp").ClientSession()
+    a, b = A["address"], Bk["address"]
+    world.player(a)["items"].update({"steel_plate": 3, "thruster": 2, "pilot_seat": 2, "planks": 2})
+
+    # 1. a small craft: a plate hull 4 m x 1.5 m x 5 cm, a seat on it, a thruster behind; a plank shed apart from it
+    hull = [600, 600, 20000, 400, 150, 5, PLATE]
+    seat = [760, 640, 20005, 80, 90, 110, SEAT]
+    thr = [700, 500, 20000, 100, 100, 140, THR]                   # touches the hull's south edge (z 500..600)
+    shed = [100, 100, 20000, 100, 100, 100, PLANKS]
+    added, _, refused = await world.boxes(a, PA, [hull, seat, thr, shed], [])
+    check("the craft's pieces and a shed apart are built", len(added) == 4 and not refused, refused)
+    c, parts, err = await world.board(a, PA, seat)
+    check("boarding the seat makes a craft of exactly the pieces touching it", err is None and sorted(parts) == sorted([hull, seat, thr]), (err, parts))
+    check("…they leave the plot, the shed stays", world.plots[PA]["boxes"] == [shed], world.plots[PA]["boxes"])
+    mass = 4 * 1.5 * 0.05 * 1.5 + 0.15 + 0.4
+    check("its mass is volume x density, unit parts by their own mass", abs(c["mass"] - mass) < 1e-6 and c["thrust"] == 30, (c["mass"], mass, c["thrust"]))
+    check("…kept relative to the seat, which is the craft's origin", [0, 0, 0] == [c["pieces"][[x[6] for x in c["pieces"]].index(SEAT)][i] + (40, 45, 0)[i] for i in range(3)], c["pieces"])
+
+    # 2. the rules
+    s2 = [1200, 1200, 20005, 80, 90, 110, SEAT]
+    await world.boxes(a, PA, [s2], [])
+    _, _, err = await world.board(a, PA, s2)
+    check("no thruster touching, no craft", err and "thruster" in err, err)
+    world.player(b)["items"].update({"pilot_seat": 1, "thruster": 1})
+    await world.boxes(b, PB, [[500, 500, 20000, 80, 90, 110, SEAT], [580, 500, 20000, 100, 100, 140, THR]], [])
+    _, _, err = await world.board(a, PB, [500, 500, 20000, 80, 90, 110, SEAT])
+    check("no take-off from another's plot", err and "not your plot" in err, err)
+
+    # 3. flying within its top speed
+    cid = c["id"]
+    p0 = list(c["pose"])
+    time.sleep(0.2)
+    ok_pose = [p0[0], p0[1] + 5, p0[2], p0[3] + 3, 0.5]
+    check("a pose within its speed is taken", world.fly(a, cid, ok_pose) is None and world.crafts[cid]["pose"][1] == round(p0[1] + 5, 3))
+    check("a jump of 500 m is refused (no teleport)", world.fly(a, cid, [p0[0], p0[1] + 500, p0[2], p0[3], 0.5]) and world.crafts[cid]["pose"][1] == round(p0[1] + 5, 3))
+    check("only its pilot says where it is", world.fly(b, cid, ok_pose) is not None)
+
+    # 3b. the engines' work (#171): kept as its pilot says it, for others to see its exhaust; nonsense never stored
+    time.sleep(0.1)
+    world.fly(a, cid, ok_pose, [0.724, 0.72, 0.0, 0.0])
+    check("the pilot's engine work is kept with the craft", world.crafts[cid].get("eng") == [0.72, 0.72, 0.0, 0.0], world.crafts[cid].get("eng"))
+    for bad in ([2, 0, 0, 0], [0.5, 0.5, 0, 9], ["x", 0, 0, 0], [0.5, 0.5, 0], [float("nan"), 0, 0, 0], [True, 0, 0, 0], "full"):
+        world.fly(a, cid, ok_pose, bad)
+    check("engine work out of range or not numbers is never stored", world.crafts[cid].get("eng") == [0.72, 0.72, 0.0, 0.0], world.crafts[cid].get("eng"))
+
+    # 3c. A FIGHTER AT SPEED AND HEIGHT (operator 2026-11-14: "at speed the craft gets stopped in place"; his trace: 70
+    #     refusals "not a place" at 656 m, the old ceiling, and "faster than it can fly" at 292 m/s on a bunched network)
+    real_time = S.time
+    class Clock:
+        t = real_time.time()
+        def time(self): return Clock.t
+        def __getattr__(self, n): return getattr(real_time, n)
+    S.time = Clock()
+    try:
+        cr = world.crafts[cid]; cr.pop("anc", None); base = list(cr["pose"]); vmax = S.FLIGHT["vmax"]
+        cr["pose"] = [base[0], base[1], base[2], S.H + 2000, 0.5]; cr.pop("anc", None)
+        Clock.t += 0.2; check("a pose 2,000 m over the world's top is a place (the walking ceiling is 656 m)", world.fly(a, cid, [base[0], base[1] + 10, base[2], S.H + 2000, 0.5]) is None, world.crafts[cid]["pose"])
+        cr["pose"] = [base[0], base[1], base[2], 5_000_000.0, 0.5]; cr.pop("anc", None)
+        Clock.t += 0.2; check("…and so is one 5,000 km up, on the way to another planet: a craft has no ceiling", world.fly(a, cid, [base[0], base[1] + 10, base[2], 5_000_000.0, 0.5]) is None, world.crafts[cid]["pose"])
+        check("…while a height that is not a number still is not a place", world.fly(a, cid, [base[0], base[1] + 10, base[2], float("inf"), 0.5]) == "not a place")
+        cr["pose"] = [base[0], base[1], base[2], S.H + 2000, 0.5]; cr.pop("anc", None)
+        # at top speed, five reports a second, the network bunching two of them 10 ms apart
+        cr.pop("anc", None); u0 = cr["pose"][1]; h0 = cr["pose"][3]; errs = []
+        for k in range(1, 26):
+            Clock.t += 0.01 if k % 5 == 0 else 0.2475                  # every fifth report arrives right behind the last
+            errs.append(world.fly(a, cid, [base[0], u0 + vmax * 0.2 * k, base[2], h0, 0.5]))
+        check(f"at {vmax} m/s for five seconds, with reports bunched by the network, every pose is taken", errs == [None] * 25, errs)
+        Clock.t += 0.2
+        check("…and a jump of 2 km in a fifth of a second is still refused", world.fly(a, cid, [base[0], u0 + vmax * 5 + 2000, base[2], h0, 0.5]) == "faster than it can fly")
+        Clock.t += 3600; cr.pop("anc", None)
+        check("…and after an hour parked the anchor starts afresh: no jump of the hour's distance",
+              world.fly(a, cid, [base[0], cr["pose"][1] + 5000, base[2], h0, 0.5]) == "faster than it can fly")
+    finally:
+        S.time = real_time
+
+    # 4. parked, and kept
+    check("leaving parks it, and its engines stop", world.leave(a, cid) is None and world.crafts[cid]["pilot"] is None and world.crafts[cid].get("eng") is None)
+    _, _, err = await world.board(b, cid=cid)
+    check("a stranger cannot board it", err and "owner" in err, err)
+    _, _, err = await world.board(a, cid=cid)
+    check("its owner boards it again", err is None and world.crafts[cid]["pilot"] == a, err)
+    world.flush()
+    w2 = S.World(data, "http://127.0.0.1:1", "")
+    check("a restart keeps the craft and its pilot in the seat, its engines stopped until they say again",
+          cid in w2.crafts and w2.crafts[cid]["pilot"] == a and w2.crafts[cid]["pieces"] == world.crafts[cid]["pieces"] and w2.crafts[cid]["eng"] is None)
+
+    # 5. docking: over B's plot refused; over A's, turned a quarter (yaw ~ 90°), it becomes pieces again
+    world.crafts[cid]["pose"] = [0, (PB % L.FACE_N) * L.PLOT + 8.0, (PB // L.FACE_N) * L.PLOT + 8.0, 200.0, 0.0]
+    _, _, err = await world.dock(a, cid)
+    check("docking where the owner may not build is refused", err and "not your plot" in err, err)
+    world.crafts[cid]["pose"] = [0, (PA % L.FACE_N) * L.PLOT + 8.0, (PA // L.FACE_N) * L.PLOT + 8.0, 200.0, math.pi / 2 + 0.2]
+    p, add, err = await world.dock(a, cid)
+    turned = S.turn_pieces(world.crafts.get(cid, {"pieces": []})["pieces"], 1) if cid in world.crafts else None
+    check("docking on its owner's plot sets it down as pieces, and the craft is gone", err is None and p == PA and len(add) == 3 and cid not in world.crafts, (err, p, add))
+    hullp = next(x for x in add if x[6] == PLATE)
+    check("…turned a quarter: the 4 m hull now runs north-south", hullp[3] == 150 and hullp[4] == 400, hullp)
+    check("turn_pieces at +90° sends (x, z) to (z, -x)", S.turn_pieces([[10, 20, 0, 30, 40, 5, 9]], 1) == [[20, -40, 0, 40, 30, 5, 9]])
+    check("…a slope rising east rises south", S.turn_pieces([[0, 0, 0, 10, 10, 10, 9, 1]], 1)[0][7] == 4)
+    # two tilted wing plates of the X fighter, flush (odd widths): turned by any quarter — docking — they still touch; at
+    # a 1 cm pad quarter 3 parted them and the fighter took off again as 228 of its 267 pieces (2026-11-11)
+    pair = [[16.0, 346.0, 71, 12, 59, 4, 64, 0, 104, 22, -1197], [22.0, 287.0, 70, 19, 59, 4, 64, 0, 71, -19, -1217]]
+    check("two flush tilted pieces of odd width still touch when the craft is docked at any quarter turn",
+          S.boxes_touch(*pair) and all(S.boxes_touch(*S.turn_pieces(pair, q)) for q in range(4)), [S.boxes_touch(*S.turn_pieces(pair, q)) for q in range(4)])
+
+    # 6. players near are sent it
+    c2, _, err = await world.board(a, PA, next(x for x in add if x[6] == SEAT))
+    class Sock:
+        def __init__(self): self.sent = []
+        async def send_json(self, m): self.sent.append(m)
+    hub, sk = S.Hub(), Sock()
+    hub.socks = {sk: {"id": 1, "who": b, "pos": list(c2["pose"]), "watch": set()}}
+    await hub.positions(world); await hub.positions(world)
+    first, second = sk.sent[0]["crafts"], sk.sent[1]["crafts"]
+    check("a player near is sent the craft with its pieces, then only its pose", err is None and first and "pieces" in first[0] and second and "pieces" not in second[0] and second[0]["pose"] == c2["pose"], (err, first[:1], second[:1]))
+
+    # 7. HANDING IT OVER (#171): its owner gives it to another player, who owns it and is at its controls at once
+    cid2 = c2["id"]
+    world.player(b)                                              # b is a player the world knows
+    check("only its owner gives it away", world.give_craft(b, cid2, b) is not None and world.crafts[cid2]["owner"] == a)
+    check("…to a player's address, never anything else", world.give_craft(a, cid2, "not an address") is not None and world.give_craft(a, cid2, "ab" * 25 + "x") is not None)
+    check("…to a player the world knows", world.give_craft(a, cid2, "0" * 50) == "no such player")
+    check("…not to themselves", world.give_craft(a, cid2, a) is not None)
+    check("given by the owner flying it, the receiver owns it and is its pilot — at its controls wherever it is",
+          world.give_craft(a, cid2, b) is None and world.crafts[cid2]["owner"] == b and world.crafts[cid2]["pilot"] == b)
+    _, _, err = await world.board(a, cid=cid2)
+    check("…and the one who gave it cannot board it any more", err is not None)
+    check("…nor give it away while another flies it", world.give_craft(a, cid2, a) is not None)
+    # 8. FINDING ONE'S CRAFTS (#171, "i left the x somewhere"): every craft a player owns, wherever it is
+    mine = world.crafts_of(b)
+    check("a player is told every craft they own, wherever it is, with its pose", [c["id"] for c in mine] == [cid2] and mine[0]["pose"] == world.crafts[cid2]["pose"], mine)
+    check("…and none they do not", all(c["id"] != cid2 for c in world.crafts_of(a)))
+    await world.http.close(); await ex.close()
+
+
+asyncio.run(main())
+_report.done()

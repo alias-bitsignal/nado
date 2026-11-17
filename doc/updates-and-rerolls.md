@@ -15,8 +15,11 @@ remote or branch refuses):
   call updates the reachable fleet; current peers don't re-forward, so the wave dies out), then restarts
   its services detached.
 - **Daily self-check** — 10 minutes after boot, then every 24 h.
-- **`nado_cli.py update`** — triggers a wave from the terminal.
-- Opt out with `"auto_update": false` in `private/config.json`. This also **disables the `/update` and
+- **`scripts/nado_cli.py update`** — triggers a wave from the terminal.
+- Opt out with `"auto_update": false` in `private/config.json`. Relatedly, `"auto_ip": false` pins the
+  configured `"ip"`: self-detection then never overwrites it — the escape hatch for a node whose reachable
+  address is one no detector can see from inside (IPv4 CGNAT + native IPv6, #86); detection also skips any
+  non-routable result (the 100.64/10 CGNAT egress) on its own. This also **disables the `/update` and
   `/update_peer` endpoints** (they answer 403), so an opted-out node can neither be update-triggered
   remotely nor used as a proxy to trigger other peers. Read per-request — no restart needed to flip it.
 - `"auto_heal": false` additionally disables the boot-time **installer self-repair**: a node diagnosed
@@ -24,6 +27,17 @@ remote or branch refuses):
   logs the defect and advertises it in `/status`, instead of running the local `scripts/install.sh`.
 - `/status` advertises `running_commit`, `latest_main` and `update_available`, so a lagging node is
   visible at a glance.
+- **Config is never rewritten by an update.** The `config_version` migration mechanism still stamps the
+  version, but its rewrite steps are disabled by operator decision (2026-08-17, `dd085b9f`): on disk, a
+  value the installer wrote is indistinguishable from a value the operator chose, so "flip the old
+  default" is a guess about intent — and when the v1 step guessed wrong it silently converted archive
+  nodes to rolling. Re-enabling any rewrite is a deliberate act that belongs in release notes.
+- **The wave is also how consensus-behaviour changes deploy.** The two-floor finality change
+  ([finality.md](finality.md)) shipped with no height gate: its only new persistent key is outside the
+  consensus root, so a mixed fleet commits identical roots mid-rollout, and the wave (plus
+  `/update_peer` for stragglers and the peer-hint cascade from status gossip) converged all eight nodes
+  within minutes. That pattern only works when the change is root-neutral — anything that moves the
+  root still needs a generation reroll, exactly as below.
 
 ## No backward compatibility — the consensus policy
 
@@ -37,20 +51,99 @@ is operational, not code-level:
    with every breaking consensus change.
 2. **Chain generation bump (full genesis reroll)** — see below.
 
+**The one sanctioned exception: a generation-keyed activation.** A rule that must NOT re-split
+history activates at a height on the CURRENT generation and from block 1 on any later one:
+
+    RULE_HEIGHT = <height> if CHAIN_GENERATION == <current> else 1
+
+(`else 0` means the rule NEVER turns on — it marks dead code for the cleanup pass, never a new rule. The GATE LEDGER in
+`protocol.py` lists every gate; `tests/test_gate_reroll_transfer.py` pins them.)
+
+This is not a compatibility window — every node enforces the identical rule at every height — it is
+a replay guard: fresh sync, reindex, rollback and the fraud-proof reconstruction must reproduce what
+the fleet applied live before the height. It retires ITSELF: the reroll commit bumps
+`CHAIN_GENERATION`, the expression becomes 1 (live from block 1) with no gate edit, and the dead branch is
+deleted in the cleanup pass after the reroll (doc/reroll.md). This is now the form of every consensus gate. The first
+was the 2026-08-25 dividend-rules gate, which rode the last hours of gen 22 and shipped ungated at the betanet-5
+(gen 23) reroll; `tests/test_dividend_rules.py` pins that NO gate survives for it.
+
 ## Chain generations (genesis rerolls)
 
 `protocol.CHAIN_GENERATION` counts **genesis lineages** — nothing to do with the 60-slot consensus
 epochs. Each generation is one genesis; the counter bumps only when the chain rerolls.
 
 A reroll ships as **one commit**: the new genesis (typically with balances frozen forward from a chosen
-settled state, as in the alphanet-6 reroll) plus the bumped `CHAIN_GENERATION`. Every node stamps the
+settled state, as in the betanet-6 reroll) plus the bumped `CHAIN_GENERATION`. Every node stamps the
 generation its on-disk data was built under (`~/nado/chain_generation`); a post-update boot that sees
 the code's generation ahead of its stamp **wipes all chain-derived data** — blocks, index, peers,
 snapshots, exec state + DA; **never `private/`** (keys, config) — and regenesis/resyncs fresh. The exec
 node performs the same check for its own files, so a stale execution layer can never replay a new chain.
 
 Combined with the updater, **one `/update` wave fully deploys a reroll**: pull → restart → purge →
-fresh chain. No manual steps on any operator's box.
+fresh chain. No manual steps on any operator's box. (Two operational notes from gen 23: a node
+brought up with `systemctl start` after a manual stop does not forward the wave — call `GET /update`
+on it once so its peers get the ping; and the node-local telemetry files that survive the purge —
+`daily_stats.json`, `treasury_history.json`, `rollback_stats.json` — are stamped `CHAIN_ID/CHAIN_GENERATION`
+and drop themselves when it changes, so the Stats page never shows a previous lineage's reorgs.)
+
+### Pre-reroll checklist — what a "balances carry forward" promise actually has to cover
+
+Betanet's promise is that **balances persist and carry to mainnet**. The purge above deletes *exec state*
+as well as blocks, and several kinds of user value live **only** in exec state. Building the genesis alloc
+from L1 account balances alone silently destroys them. Verified on betanet-2, 2026-08-13:
+
+| Value | Where it lives | What a naive alloc does |
+|---|---|---|
+| L1 account balances | `accounts` sub-DB | carried — this is the easy part |
+| **Bridged coins** | L1 escrow holds the COINS (`bridge` account, keyless); **exec state holds who owns them** | coins land in a keyless account nobody can spend; the real owners get nothing |
+| **Faucet donations** | same shape — `faucet` is a keyless reserved account | same |
+| **Accrued dividends** | exec-side, unclaimed until `collect_dividend` + `dividend_withdraw` | lost |
+| **Contract-held stakes** | contract storage (open games, bets, LP positions) | lost |
+| **Asset balances** | exec `abal` | lost |
+
+Measured at the time of writing so the scale is known rather than guessed: L1 `bridge` escrow held
+**1.43017 NADO** against an exec-side ledger of **1.192822 NADO across 4 holders**; contract storage was
+**8 412 slots**, of which **99.3% sat in one contract** (`386cc6bd021c`, the bet book), with only 3 of 27
+contracts holding any state at all. Small today — but the mechanism does not get safer as it grows, and
+the numbers are only small because nobody is using contracts yet.
+
+**So, before rerolling:**
+
+1. **Every exec-side claim is carried** (since 2026-10-10; doc/reroll.md "What crosses a reroll"): uncollected
+   dividends and pending exits are folded into L1 balances, exec assets, the Stwo pool and every contract travel in
+   the carry. Do not carry a keyless escrow account as if it were a holder; the carry credits its beneficiaries.
+2. **Resolve contract positions that are in flight.** Every contract is carried by its id with all of its storage
+   and its pot; one with something in flight (open bets, an unsettled game, …) refuses the carry.
+   `python3 tools/carry.py <copy of exec_state.json>` names every blocker — resolve them on the old chain first.
+3. **Contracts are carried, not redeployed** (execnode/exec_genesis.py); `python3 -m execnode.games.redeploy --check`
+   confirms every cid resolves. The background below applies when a contract does have to be deployed fresh:
+   **contract ids are
+   deterministic**. `ExecState.contract_id` is `H(deployer, code, nonce)` and the deploy nonce is PINNED
+   (`execnode/games/deploy.py --nonce`, default `a5`), so the same deployer key + unchanged code
+   reproduces byte-identical cids across a genesis reroll. Every hardcoded cid in `static/*.js` stays
+   valid.
+
+   `python3 -m execnode.games.redeploy` is idempotent on exactly that basis: it computes every target cid
+   offline, deploys only what is missing, then rewires and restamps. `--check` reports without touching
+   anything — verified on betanet-2, 26/26 up to date, every frontend + reward-table cid resolving.
+
+   Two things that DO move a cid, and therefore break the wiring: changing the contract's **code**, or
+   deploying from a **different key**. Both are ordinary reasons to redeploy; neither is caused by the
+   reroll itself.
+
+   Contracts are deployed **upgradable** (`upgradable: True`, one deployer), so a
+   code change afterwards goes through `deploy.py --upgrade <cid>` and keeps the cid and its storage —
+   never a fresh deploy, which would strand the address.
+4. **Re-check every height/epoch-gated constant** — see [`SCHEDULED_CLEANUPS.md`](../SCHEDULED_CLEANUPS.md).
+   Epoch numbering restarts, so an activation constant that was 2 days out lands weeks into the new chain
+   and silently leaves the old behaviour live until then. Every gated rule must ship **unconditional** at
+   a reroll — a fresh chain has no pre-activation history to preserve. A generation-keyed gate (above)
+   does this by itself (`else 1`); its dead branch is deleted in the cleanup pass after the reroll.
+5. **Check the carried balances are not exploit-inflated.** Cheap aggregate test for the fidelity case:
+   `mining_status` gives `total_open_weight / open_registry_size`. 2.0 means everyone is at fidelity 1;
+   10.0 means everyone is maxed. Betanet-2 measured **2.27**, i.e. no meaningful farming, so its balances
+   were safe to carry. Do the equivalent check for whatever the current known exploit is — carrying
+   balances makes an exploit's proceeds permanent.
 
 ## Abandoning a fork WITHOUT a reroll (per-node reset)
 
@@ -63,3 +156,28 @@ The reborn node re-syncs from its peers; where strict rules refuse an old-rules 
 joins above it via the **snapshot bootstrap** (a donor's finalized checkpoint, verified against the
 quorum-settled root) and tail-syncs from there. This is the lightweight alternative to a generation
 bump: the canonical chain keeps running, only the stranded nodes reset.
+
+
+## 2026-09-01 — betanet-6 (gen 24)
+
+Same runbook as gen 23 (backup → stop nado-exec + nado → `tools/alphanet6_carryforward.py --write` → bump
+CHAIN_ID / GENESIS_TIMESTAMP / CHAIN_GENERATION / protocol → retire the gen-23 SYBIL gate → commit → purge →
+start → push → `/update` wave → `execnode.games.redeploy` → `scripts/operator/_fund_faucet.py` → manual refunds of the pots the
+tool attributes to the operator). Audit before the wipe: DEX pool had a single LP (the operator), OTC escrow
+refunds summed to 0, lend/pool held nothing, shielded pools empty, one open HTLC (the operator's, expired).
+
+## betanet-7 (gen 25) — the real-device reroll (2026-09-07)
+
+Runbook (same order as gen 22/23/24, doc above): stop nado + nado-exec on the relay → `tools/alphanet6_carryforward.py`
+dry run, then `--write` (refuses unless supply Δ = 0) → rm private/genesis_alloc.dat is NOT needed (the tool writes
+it) → set GENESIS_TIMESTAMP (~10 min in the past), CHAIN_ID betanet-7, CHAIN_GENERATION 25, get_protocol 12 (all
+in this commit except the timestamp) → tests/test_genesis_alloc_format.py + tests/test_gen25_retirements.py →
+commit/push → `curl localhost:9173/update` to kick the wave → verify purge + regenesis on every peer by comparing
+a hash at a COMMON height → `python3 -m execnode.games.redeploy` (do not push while it runs) →
+`scripts/operator/_fund_faucet.py <refunded pots>`.
+
+What this reroll changes (doc/device-attestation.md): every register tx carries a hardware attestation
+(DEVICE_ATTEST_HEIGHT = 1, unconditional); PoSW, reg_difficulty, the per-IP entry budget and identity cap,
+probation, the node auto-register and the gen-24 gates are retired (pinned by tests/test_gen25_retirements.py).
+Nodes no longer join the open lane themselves; they earn in the bonded lane. Wallets attest at every
+registration; a device that cannot attest sees why on the Mining page.

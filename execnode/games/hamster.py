@@ -30,7 +30,8 @@ void()ed by anyone past fh + VOID_AFTER, so a pot can never be stranded.
 
 zkVM data model: race ids are ints < 2^32. Money is tracked in UNITs of 10^4 raw NADO (stakes must be UNIT
 multiples) so stake×pot stays inside the DIVMODW soundness window; a race's pot caps at 2^31 UNITs. Per-user
-positions live in alghash-keyed slots the frontend reads via /exec/view (claimable_of / stake_of / total_of).
+positions live in hash-keyed slots (the VM's BLAKE2s word hash) the frontend reads via /exec/view (claimable_of /
+stake_of / total_of).
 
 Race fields (key = race id): 1 ra(exists=1)  2 gh(gene height)  3 lk(bet-close height)  4 fh(finish height)
   5 tot(pot, UNITs)  6 sd(settled)  7 wn(winner lane +1)  8 vd(void)  9 bc(distinct bettors)
@@ -54,7 +55,7 @@ BK, BR, BS, BD = 10, 11, 12, 13        # bank digest · bankroll(UNITs) · stake
 OD_BASE = 30                            # 30..35: quoted odds per lane, in PERCENT (100 = 1.00x)
 BP_BASE = 41                            # 41..46: per-lane TOTAL committed payout (UNITs)
 TG_BSTK, TG_BPAY, TG_BCL = 104, 105, 106
-ODDS_CAP = 100_000                      # 1000x — a sane bound so odds*stake stays far inside the field
+ODDS_CAP = 100_000                      # 1000x — a sane bound so odds*stake stays small
 # --- free Daily Derby board (provable practice, faucet-rewarded — doc/provable-practice.md) ---
 DCNT_SLOT, ECNT_SLOT = 2, 3                         # bare index-count slots (slot 0 = races count)
 E_DAY, E_ADDR, E_SCORE, E_N = 50, 51, 52, 53       # per-entry fields
@@ -430,4 +431,25 @@ ABI["_view"]["board4"] = {"name": "bp", "base": BP_BASE, "cells": NH, "stride": 
 
 
 def build():
-    return zkvmasm.assemble_contract(SRC)
+    # C2 (security review 2026-09-23): every id-taking method refuses an id >= 2^32 before touching a slot;
+    # see _lib.id_guard. The ABI, the field layout and every honest call are unchanged.
+    ID_GUARDS = {m: ["r0"] for m in ("bet", "settle", "claim", "void", "book", "quote", "back", "bclaim", "bsweep", "claimable_of")}
+    return zkvmasm.assemble_contract(_lib.guard_ids(SRC, ID_GUARDS))
+
+
+def carry_in_flight(storage):
+    """Why this contract cannot cross a reroll yet ([] = it can): a race neither settled nor voided — its genes and run
+    are old-chain block hashes and its stakes are in the pot. Settle it (or void it past the window) on the old chain.
+    A settled or voided race is at rest: claim() reads only stakes and the result."""
+    slots = (storage or {}).get("slots") or {}
+    g = lambda f, k: int(slots.get(str((f << 32) + k), 0))
+    return [f"race {r} is not settled" for r in _lib.carry_ids(slots, 0, RLIST) if g(RA, r) and not g(SD, r) and not g(VD, r)]
+
+
+def carry_rebase(storage, tip):
+    """This contract's storage on a new chain whose block 0 stands where the old chain's `tip` stood: only the daily
+    board's unresolved anchors move (_lib.rebase_daily_anchors); everything else is at rest once carry_in_flight is []."""
+    slots = {str(k): v for k, v in ((storage or {}).get("slots") or {}).items()}
+    out = dict(storage or {})
+    out["slots"] = _lib.rebase_daily_anchors(slots, tip, A_H, A_V, DCNT_SLOT, DLIST)
+    return out

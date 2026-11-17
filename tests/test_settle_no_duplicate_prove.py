@@ -1,0 +1,101 @@
+"""Only ONE proof-carrying settle may be in flight at a time.
+
+MEASURED 2026-08-06 13:12:06-13:13:42 — three proves and three 8.92 MiB transactions in 96 seconds:
+
+    [settle-prove] cursor=46892 ... total 11.7s   ->  "span→46892: 1 segment(s), tx 8.92 MiB"
+    [settle-prove] cursor=46893 ... total 13.3s   ->  "span→46893: 1 segment(s), tx 8.92 MiB"
+    [settle-prove] cursor=46897 ... total 11.9s   ->  "span→46897: 1 segment(s), tx 8.92 MiB"
+
+all for the SAME root 1b00b000dd28252d. Only one can ever land: the moment one is justified the others fail
+"pre_root must extend the settled tip". That is ~27 MiB of gossip and 3x the prove CPU for one settlement.
+
+THE HOLD ALREADY EXISTED AND DID NOT COVER THIS. It reads `if proof is None and (...)`, so it suppressed a
+redundant BARE settle but never a redundant PROOF — the loop proved FIRST and then skipped the hold. That
+was invisible while a prove took 300+ s, because `_settle_proving` covered the whole window; 1affffac took
+a prove to ~12 s and the gap opened. A guard that only fires on the cheap path is not a guard.
+
+THE SECOND HALF MATTERS AS MUCH AS THE FIRST. Declining to prove is only correct if the same pass also
+declines to settle BARE. Otherwise the pass that notices the pending proof has landed would fall straight
+through to a bare settle, and every landed proof would be followed by a bare one — quietly halving the
+proof rate, the opposite of the intent.
+
+G9 deleted the Goldilocks prove itself, so every settle is bare until the Stwo settlement (G8) builds its proof on
+the SAME pipeline; what remains pinned here is that pipeline's hold and release, which G8 inherits unchanged.
+
+Run: python3 tests/test_settle_no_duplicate_prove.py
+"""
+import os
+import sys
+import traceback
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+SRC = open(os.path.join(ROOT, "execnode", "execnode.py")).read()
+
+import _harness
+_report = _harness.Report()
+check = _report.run
+
+
+# t_the_prove_is_gated_on_no_pending_proof retired in G9: _build_settlement_proof (the Goldilocks prove) was deleted
+
+
+def t_the_hold_also_covers_the_declined_pass():
+    assert "or _pend_active or _pend_hold)" in SRC, \
+        "the bare-settle hold must include _pend_hold, or a landed proof is followed by a bare settle"
+
+
+# t_only_one_build_call_exists retired in G9: there is no _build_settlement_proof call site left to count
+
+
+def t_pending_is_always_released():
+    """The gate can only be safe if the pending entry is cleared on every outcome — landed, resubmitted,
+    or given up — otherwise a stuck entry would stop proving forever."""
+    assert SRC.count("_settle_pending.pop(ns, None)") >= 4, \
+        "the resolution block must release the pending entry on every failure path"
+    assert "GIVING " in SRC and "SETTLE_RESUBMIT_MAX_S" in SRC, \
+        "there must be a bounded give-up path so a pending entry cannot wedge the prover"
+
+
+def t_the_pending_marker_is_recorded_before_the_lookup():
+    """THE GATE HAD A HOLE ONE ROUND TRIP WIDE. MEASURED 2026-08-06 16:08:54-16:09:13: two proof-carrying
+    settles 19 s apart for the same root (48582 then 48585, 7.19 MiB each), AFTER the gate shipped.
+
+    _settle_publishing guards the publish/submit window and is cleared once the submit returns; the prove
+    gate keys on _settle_pending, which was recorded only AFTER an awaited /get_settled. Between those two
+    moments nothing held the tip, and a fresh prove started inside the gap. The fetch was for `pre_cursor`,
+    which nothing needs immediately — so the marker goes down first and the value is filled in after.
+
+    An unknown pre_cursor is SAFE: the resubmit path requires `_sc_now == int(_pend["pre_cursor"])`, which
+    -1 can never satisfy, so it declines to resubmit rather than guessing."""
+    i = SRC.index('_settle_pending[ns] = {"cursor": cur')
+    j = SRC.index('/get_settled?ns={ns}"', i - 4000)
+    assert j > i, "the pending marker must be recorded BEFORE the /get_settled lookup, not after"
+    assert '"pre_cursor": -1' in SRC, "the marker must go down with a not-yet-known pre_cursor"
+    assert '_settle_pending[ns]["pre_cursor"] =' in SRC, "pre_cursor must be filled in afterwards"
+
+
+# t_the_hold_is_continuous_from_prove_to_submit and t_the_pending_marker_is_RE_CHECKED_at_the_launch_point
+# retired in G9: both pinned statement order around the Goldilocks prove (_build_settlement_proof), which was deleted
+
+
+def t_the_measurement_is_recorded():
+    i = SRC.index("_pend_hold = _settle_pending.get(ns) is not None")
+    ctx = SRC[max(0, i - 1800):i]
+    assert "46892" in ctx and "8.92 MiB" in ctx, \
+        "the three-duplicate-proves measurement must be recorded beside the gate"
+    assert "pre_root must extend the settled tip" in ctx, \
+        "the comment must say WHY only one can land"
+
+
+for nm, fn in [("the hold also covers the declined pass", t_the_hold_also_covers_the_declined_pass),
+               ("the pending entry is always released", t_pending_is_always_released),
+               ("the pending marker precedes the lookup", t_the_pending_marker_is_recorded_before_the_lookup),
+               ("the measurement is recorded beside the gate", t_the_measurement_is_recorded)]:
+    check(nm, fn)
+
+print()
+if _report.fails:
+    print(f"{_report.fails} FAILURES")
+    sys.exit(1)
+print("ALL PASS")

@@ -6,14 +6,14 @@
 // rigged. All information is public on-chain (open-hand play); the skill is the deck-building itself.
 // This module owns ONLY the Stormhold-specific half: engine replay, the supply/hand/decision UI, and the
 // move encodings; everything else (escrow actions, lobby, invites, settle chrome) lives in duelgame.js.
-import { NadoDapp, $, notify, confirmingLabel, disp, randSecret, algHashn, ALG_P, installModes } from "./nadodapp.js?v=db1a59d7";
-import { DuelGame } from "./duelgame.js?v=e1ea366f";
-import * as E from "./stormhold-engine.js?v=9d8be3f7";
-import { ART } from "./stormhold-art.js?v=bb298f4c";
-import { prng, randomMove } from "./stormhold-bot.js?v=3c4fb297";   // powers the free practice-vs-computer mode
-import { prand } from "./practice.js?v=69d3a659";
+import { NadoDapp, $, notify, confirmingLabel, disp, randSecret, algHashn, ALG_P, installModes } from "./nadodapp.js";
+import { DuelGame } from "./duelgame.js";
+import * as E from "./stormhold-engine.js";
+import { ART } from "./stormhold-art.js";
+import { prng, randomMove } from "./stormhold-bot.js";   // powers the free practice-vs-computer mode
+import { prand } from "./practice.js";
 
-const CID = "0b6a833377a99fc1e524af3c1d0329c0";
+const CID = "9fcfa11f570cb3b2d720e3db71c602d8";
 const dapp = new NadoDapp({ cid: CID, app: "Stormhold" });
 const T = (k, d, v) => (typeof window !== "undefined" && window.t) ? window.t("storm." + k, d, v) : d;
 const SKIP = 4095;
@@ -31,7 +31,7 @@ const PICK_FRAMES = { bur: 1, burH: 1, remT: 1, minT: 1, thr: 1, artT: 1 };
 const GAIN_FRAMES = { remG: 1, minG: 1, wsh: 1, artG: 1 };
 
 // ---- hidden hands (commit-reveal) ------------------------------------------------------------------
-// The per-game SECRET lives only in this browser (localStorage). Its alghash commit rides open()/join();
+// The per-game SECRET lives only in this browser (localStorage). Its HASH commit (algHashn) rides open()/join();
 // at game end reveal() posts the secret and every client runs the exact verification replay.
 let hiddenWant = false;                                   // the "hidden hands" toggle for NEW games
 const SKEY = (g) => "nado_stormhold_secret_" + g;

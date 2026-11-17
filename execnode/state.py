@@ -14,10 +14,9 @@ import json
 import os
 import threading
 
-from hashing import blake2b_hash, canonical_bytes
-from execnode.zkvm import ZkVMError
+from execnode.zkvm2 import ZkVMError
+from execnode import zkvm2                # method_reads_actx (C1 rule, EXEC_RULES_V2_HEIGHT)
 from execnode import runtimes   # pluggable contract-runtime registry (zkvm is the only runtime)
-from execnode.shielded import ShieldedPool, apply_transfer
 
 # RANDOMNESS-WINDOW RETENTION — the horizons below which advance_beacons/record_block_hash prune. They also
 # define window_canonical(): a node holds a CANONICAL window iff its floors reach at least this far back, i.e.
@@ -26,40 +25,52 @@ from execnode.shielded import ShieldedPool, apply_transfer
 _BEACON_RETENTION_EPOCHS = 4000     # advance_beacons keeps beacons for [cur_epoch - this, cur_epoch]
 _BLOCKHASH_RING = 20000             # record_block_hash keeps the most recent this-many finalized L1 heights
 _GENESIS_BEACON_FLOOR = 2           # the beacon_floor a from-genesis node sets (epoch 0 first advance -> 0+2)
-import base64
-import zstandard as _zstd
 
 # Contract code may arrive zstd-compressed as `codez` (base64 of a zstd frame) instead of raw `code`. The
 # verbose JSON-opcode format is ~16-26x compressible, so a big verifier fits a small blob (battleship 110K->4.3K).
 # Deterministic across nodes (zstd decode + json parse are canonical), and cid still hashes the DECODED code dict,
 # so compression is transparent to the contract id. Decompress is STREAMING + bounded (anti zstd-bomb).
-CONTRACT_CODE_MAX_BYTES = 4 * 1024 * 1024
-def _bounded_unzstd(body, cap):
-    dctx = _zstd.ZstdDecompressor(); parts, total = [], 0
-    with dctx.stream_reader(body) as r:
-        while True:
-            ch = r.read(65536)
-            if not ch: break
-            total += len(ch)
-            if total > cap: raise ValueError("contract code decompresses beyond cap")
-            parts.append(ch)
-    return b"".join(parts)
-def _decode_code(payload):
-    cz = payload.get("codez")
-    if cz is None: return payload.get("code")
-    return json.loads(_bounded_unzstd(base64.b64decode(cz), CONTRACT_CODE_MAX_BYTES))
+# The decoder, the cid derivation and the fixed-name allowlist moved to execnode/code_codec.py (2026-09-23,
+# S1): L1's block summary and the settlement verifier's event replay need them too, and must not import this
+# module to get them. These names stay as aliases for the callers that grew up with them.
+from execnode.code_codec import (FIXED_CIDS, decode_code as _decode_code, contract_id as _contract_id)
 
-# Coin-amount ceiling for shielded values/exits — far below the Goldilocks field size (P ≈ 2^64). The
-# join-split circuit only constrains public_value/fee MODULO P, so without an absolute bound a wraparound
-# (e.g. public_value = -P) proves as "balanced" yet would record a P-coin exit (C-3). Any real amount is
-# many orders of magnitude below this, so bounding to it blocks every P·k residue while passing legit exits.
-#
-# C-3b: this MUST match the in-circuit range bound (2^61, top-3-bits-zero in c_rng_top). The 2-output
-# join-split conserves v_in + public_value == v_out1 + v_out2 + fee; the worst-case |LHS - RHS| across the
-# range-bounded values is 2*2^61 (two outputs) + 2^61 (fee) + 2^61 (|public_value|) = 2^63 < P, so mod-P
-# conservation equals INTEGER conservation and no -P wraparound assignment exists. At 2^62 it did (a 1-coin
-# input could record a 2^62-coin exit and drain the escrow).
+# Coin-amount ceiling for exits and shielded public values: CONSENSUS, at every height. The Stwo pool's
+# parse_transfer refuses an unshield or fee above it (execnode/shielded_stwo.py), every exit record is created under
+# it (transaction_ops asserts it), and ops/stwo_relay.py admits by it — so changing it changes which transfers are
+# valid, and it stays 2^61. Any real amount is many orders of magnitude below it.
+# ORIGIN (history): it was the Goldilocks join-split's range bound (C-3/C-3b) — that circuit conserved value only
+# modulo P ≈ 2^64, and 2^61 was the largest bound with no -P wraparound. That circuit was deleted in G9; the bound
+# outlived it as the rule above.
 MAX_EXIT_VALUE = 1 << 61
+
+
+def field_transfer_bundle(payload):
+    """A field_transfer payload -> (bundle dict, None) or (None, the skip reason) — THE parse apply_blob dispatches on
+    (inline `bundle`, or `bundle_json` decoded by json.loads, DA bytes injected into it by execnode).
+    INVARIANT (review 2026-10-11, traced): execnode._block_carries_stwo_spend must decide on THIS result, never on raw
+    text. It used to look for the substring "stwo_js" in the JSON string, and `{"stark": {"stwo\\u005fjs": ...}}` has no
+    such substring while json.loads makes the key `stwo_js`: a node without the native verifier then raised NativeMissing
+    inside apply_blob, whose catch-all made it a "skip", while every node with the library applied the spend — an exec
+    state fork for one blob. One parse, called by both, closes the class."""
+    bj = payload.get("bundle_json")
+    if bj is not None:
+        try:
+            bundle = json.loads(bj)
+        except Exception:
+            return None, "skip: bad bundle_json"
+    else:
+        bundle = payload.get("bundle")
+    if not isinstance(bundle, dict):
+        return None, "skip: bad field_transfer"
+    return bundle, None
+
+
+def carries_stwo_spend(bundle):
+    """Whether apply_field_transfer would hand `bundle` to the Stwo verifier at or above STWO_POOL_HEIGHT — the same key
+    test it dispatches on (`"stwo_js" in bundle["stark"]`)."""
+    stark_b = bundle.get("stark") if isinstance(bundle, dict) else None
+    return isinstance(stark_b, dict) and "stwo_js" in stark_b
 
 
 def _normalize_bundle(bundle):
@@ -68,10 +79,15 @@ def _normalize_bundle(bundle):
     strings; the on-device proof now rides the DA layer and is applied via apply_blob->apply_field_transfer
     (no HTTP handler in between), so normalization MUST live here, not in a route. Idempotent — int() on an
     already-int is a no-op, so Python-generated bundles pass through untouched. No-op for non-joinsplit2."""
-    js = (bundle.get("stark") or {}).get("joinsplit2")
+    stark_b = bundle.get("stark") if isinstance(bundle.get("stark"), dict) else {}
+    js = stark_b.get("joinsplit2")
+    wide = False
+    if not js:
+        js = stark_b.get("joinsplit3")                # SHIELD_WIDE_HEIGHT: digests stay 64-hex, only the
+        wide = True                                    # scalars and the proof's numbers are coerced
     if not js:
         return
-    for k in ("root", "nf", "cm_out1", "cm_out2", "public_value", "fee"):
+    for k in (("public_value", "fee") if wide else ("root", "nf", "cm_out1", "cm_out2", "public_value", "fee")):
         if k in js and js[k] is not None:
             js[k] = int(js[k])
     p = js.get("proof") or {}
@@ -84,13 +100,23 @@ def _normalize_bundle(bundle):
     if "pow" in fr and fr["pow"] is not None:
         fr["pow"] = int(fr["pow"])                 # C-1 grinding nonce (JSON number -> int)
     if "final" in fr:
-        fr["final"] = [int(x) for x in fr["final"]]
+        fr["final"] = [_coerce_fri_value(x) for x in fr["final"]]
     for q in fr.get("queries", []):
         for s in q.get("steps", []):
-            s["lo"] = int(s["lo"]); s["hi"] = int(s["hi"])
+            s["lo"] = _coerce_fri_value(s["lo"]); s["hi"] = _coerce_fri_value(s["hi"])
     for op in p.get("openings", []):
         for c in op.get("cols", []):
-            c["cur"] = int(c["cur"]); c["nxt"] = int(c["nxt"])
+            c["cur"] = _coerce_fri_value(c["cur"]); c["nxt"] = _coerce_fri_value(c["nxt"])
+
+
+def _coerce_fri_value(v):
+    """A FRI leaf / opening value after a JSON round trip. A base-field proof carries scalars (int); an
+    EXTENSION-field proof (the GF(p^2) challenge upgrade) carries limb TUPLES that JSON delivers as lists.
+    Coerce element-wise for the latter — a bare int([lo, hi]) raised TypeError and killed every ext proof on
+    apply, so this must never assume the value is scalar."""
+    if isinstance(v, (list, tuple)):
+        return [int(x) for x in v]
+    return int(v)
 
 
 
@@ -98,17 +124,24 @@ def _normalize_bundle(bundle):
 # Fixed-name SYSTEM contracts (doc/faucet.md §4): literal cid -> the ONLY address allowed to deploy it.
 # The operator key that deployed the game-contract fleet; a constant, so the rule is identical on every
 # exec node replaying the same blob stream.
-# alphanet-7 debrand: the SAME operator key, re-derived under the current ADDRESS_PREFIX (mldsa44…). The
-# old ndo… string was a leftover of the pre-cutover prefix and blocked (re)deploying these system contracts.
-FIXED_CIDS = {"faucet": "mldsa44ebd27698662f14ee2389e509781d5ff57487f4289afd34",
-              "sovereign": "mldsa44ebd27698662f14ee2389e509781d5ff57487f4289afd34"}
+# RE-DERIVED AT EVERY ADDRESS-FORMAT CHANGE — the SAME operator key throughout, only the string moves.
+# betanet-7 debrand: ndo… -> mldsa44…. betanet-14 prefix removal: mldsa44… -> the bare 42-hex body plus a
+# checksum. That body (ebd27698662f14ee2389e509781d5ff57487f4289a) is identical across all three; the
+# checksum is RECOMPUTED, because it covers the whole preceding string — a stale prefix cannot just be
+# trimmed off or the result fails validation.
+#
+# Leaving the old literal would not have raised anything. It is a plain string compared against the deployer
+# of a fixed-name contract, so the operator's key would silently stop matching and `faucet` and `sovereign`
+# could never be (re)deployed on the new chain — precisely the failure the betanet-7 note above describes,
+# repeating itself one format change later.
+# FIXED_CIDS: see execnode/code_codec.py (imported above).
 
 # ---- ASSETS (doc/assets.md) ------------------------------------------------------------------------
 # A fungible asset other than native NADO. There is exactly ONE ledger for them, at the exec layer, so an
 # asset composes with the zkVM the way the bridge balance already does — a contract can hold, receive, move,
 # mint and burn assets, and every one of those is a public io entry the settlement machinery replays.
 #
-# The id is DERIVED, never assigned: asset_id = alghash.hashn([issuer_digest, seed]). Two consequences that
+# The id is DERIVED, never assigned: asset_id = zkvm2.hash_words([issuer_digest, seed]). Two consequences that
 # are the whole point: an issuer knows its asset's id before creating it, and a CONTRACT can compute the id
 # of its own assets IN-CIRCUIT with the ordinary `hash` macro (`hash aid <- me seed`) — no registry lookup,
 # no oracle, no id passed in on trust. That is what makes an AMM able to own its LP token and a launchpad
@@ -123,10 +156,12 @@ ASSET_URI_MAX = 128             # a metadata/logo pointer (an https/ipfs/ar URL)
 
 
 def asset_id(issuer, seed):
-    """The deterministic id of `issuer`'s asset number `seed` — the same field element the contract computes
-    in-circuit as `hash aid <- me seed`. `issuer` is an L1 address / cid string."""
-    from execnode.stark import alghash, field as _F
-    return alghash.hashn([runtimes.zkvm_addr_digest(issuer), int(seed) % _F.P]) % _F.P
+    """The deterministic id of `issuer`'s asset number `seed` — the same word the contract computes as
+    `hash aid <- me seed`: the VM's hash over the issuer's 256-bit digest, so the node's id stays the contract's.
+    `issuer` is an L1 address / cid string."""
+    # ONE ID FORMAT: the gen-28 alghash id (and the `v2=` switch that chose it) went with the field VM in G9 slice 3b;
+    # BLAKE_EXEC_HEIGHT was 1 from gen 29 and covered the genesis, so this is the only id generation 29 ever computed
+    return zkvm2.hash_words([runtimes.zkvm_addr_digest(issuer), int(seed)])
 
 
 # ---- asset ledger: the money rules, in ONE place (doc/assets.md §8) --------------------------------------
@@ -202,7 +237,7 @@ def stage_asset_effects_pure(abal, assets, actor, effects):
                 return fail(f"{meta['sym']} minting was renounced")
             if to is None:
                 return fail("unresolvable mint recipient")
-            if meta["supply"] + sup.get(aid, 0) + amt > ASSET_SUPPLY_CAP:
+            if meta["supply"] + sup.get(aid, 0) + amt >= ASSET_SUPPLY_CAP:   # strict: keep every balance < 2^62 (RANGE window)
                 return fail(f"{meta['sym']} supply cap exceeded")
             deltas[(aid, to)] = deltas.get((aid, to), 0) + amt
             sup[aid] = sup.get(aid, 0) + amt
@@ -226,7 +261,43 @@ def commit_asset_effects_pure(abal, assets, deltas, sup, meta_ops=()):
         assets[aid]["mintable"] = False
 
 
+def _hist_arg(a):
+    """One call argument as the asset-history index stores it: ints as DECIMAL STRINGS (a JSON number past 2^53 is
+    truncated by every browser), strings as-is, anything else as compact JSON — each bounded so one blob carrying a
+    megabyte of args cannot bloat a node-local index row."""
+    if isinstance(a, bool):
+        return "true" if a else "false"
+    if isinstance(a, int):
+        return str(a)
+    if isinstance(a, str):
+        return a[:_HIST_ARG_MAX]
+    try:
+        return json.dumps(a, separators=(",", ":"), sort_keys=True)[:_HIST_ARG_MAX]
+    except Exception:
+        return repr(type(a).__name__)
+
+
+_HIST_ARG_MAX = 256       # chars kept per call argument in the asset-history index
+_HIST_ARGS_MAX = 32       # arguments kept per call
+
+
 class ExecState:
+    # NODE-LOCAL ASSET HISTORY (execnode/asset_history.py) — NOT CONSENSUS. `asset_sink` is a callable the exec node
+    # attaches to its OWN finalized states; while a blob applies, every asset balance change is buffered in `_hist_buf`
+    # and handed to the sink once the blob returns. Both are CLASS attributes defaulting to None, and deliberately
+    # outside _snapshot()/_restore()/clone(): a clone (the provisional tail, settle_b2's prove_span), a WitnessState
+    # (built by __new__), tools/replay_exec.py and every test get None and pay one `is None` check per balance move.
+    # INVARIANT: nothing here may feed back into a value a block's application computes — the sink sees copies of
+    # what moved, its failures are swallowed (_emit_history), and the return string of apply_blob never changes.
+    # tests/test_the_asset_history_index_changes_no_consensus_value.py pins all of that.
+    asset_sink = None
+    _hist_buf = None
+    # NODE-LOCAL DEX TRADE INDEX (execnode/dex_trades.py) — NOT CONSENSUS, the same rules as asset_sink: a CLASS
+    # attribute (None on every clone, WitnessState, replay and test), attached only to the exec node's own finalized
+    # states; its before()/after() READ the contract's slots around a `call` blob and never write. INVARIANT: a failure in
+    # either is swallowed here (_call_capture) and apply_blob's return value never depends on it.
+    call_sink = None
+
     def __init__(self, path):
         """Initialise every state component empty, then load() the last snapshot from `path` if one
         exists — so a restarted exec node resumes from its persisted cursor instead of re-replaying L1."""
@@ -255,7 +326,7 @@ class ExecState:
         self.withdrawals = {}      # nonce(str) -> {"addr":.., "amount":..} : provable exit records
         self.wd_nonce = 0          # monotonic withdrawal-nonce counter (deterministic)
         # CROSS-DOMAIN OUTBOX: messages emitted by this layer (via the `emit` blob op), each committed as a
-        # Merkle leaf in state_root and provable via outbox_proof(seq). This is the sound foundation for
+        # Merkle leaf in state_root and provable via /exec/outbox_proof?seq= (record_proof_at). This is the sound foundation for
         # cross-rollup / L1-bound messaging; CONSUMPTION (verifying against the sender's SETTLED root) is a
         # separate step, see doc/rollups-and-settlement.md §7.4. Keyed by seq; a message is GC'd once its
         # finalized xmsg delivery burns the (from_ns, seq) L1 nullifier (drop_consumed_outbox).
@@ -272,20 +343,30 @@ class ExecState:
         self.div_carry = 0         # undistributed remainder carried to the next accrual (no dust lost)
         self.dividend_withdrawals = {}  # nonce(str) -> {"addr":.., "amount":..} : provable dividend claims
         self.dw_nonce = 0          # monotonic dividend-withdrawal nonce counter (deterministic)
-        # SHIELDED POOL (doc/privacy.md): a Zerocash-style commitment tree + nullifier set built from L1
-        # `shield` deposits + `shielded_transfer` blobs. Only the pool ROOT + a nullifier DIGEST are committed
-        # in state_root (compact — not one leaf per note/nullifier), so this scales independently of pool size.
-        self.shielded = ShieldedPool()
+        # THE LEGACY BLAKE2b POOL IS GONE (G9 slice 5c): no deposit ever reached it on generation 29 and its
+        # `shielded_transfer` is a skip at every height (apply_blob), so it was empty at every height. Its only trace is
+        # its two constant records in exec_root_b2.records_projection; an old snapshot's "shielded" key is ignored by
+        # _restore.
         self.unshield_withdrawals = {}  # nonce(str) -> {"addr":.., "amount":..} : provable unshield exits
         self.uw_nonce = 0          # monotonic unshield-withdrawal nonce counter (deterministic)
-        # PHASE-2 FIELD-NATIVE POOL (doc/privacy.md): notes over the STARK-friendly hash; the exec node acts as
-        # a DELEGATED PROVER (client sends the witness -> exec builds the path + proves the full join-split).
-        from execnode.shielded_field import FieldShieldedPool
-        self.field_pool = FieldShieldedPool()
+        # THE FIELD, WIDE AND SHIELDED-CONTRACT POOLS ARE GONE (G9 slice 5): on generation 29 no entry point could add a
+        # note to any of them (a field shield lands in the Stwo pool from block 1, their transfers and private_call are
+        # refused from block 1), so they were empty at every height. Their only trace is the empty field pool's two
+        # constant records in exec_root_b2.records_projection; an old snapshot's field_pool / wide_pool / app_state keys
+        # are ignored by _restore.
+        # STWO POOL (STWO_POOL_HEIGHT, doc/stwo-migration.md §5.1): present on every state for a uniform code path,
+        # in the root and the snapshot only once it holds a note or a nullifier (empty is absent).
+        from execnode.shielded_stwo import StwoShieldedPool
+        self.stwo_pool = StwoShieldedPool()
         # Shielded aggregate supply — see _restore. Note VALUES are private; every CHANGE to their total is
         # public, so the pool's total is auditable without seeing into it (ops/invariants.py).
         self.pool_value = 0        # live total value of all notes in both pools
         self.pool_fees = 0         # cumulative fee burned inside the pool (leaves the notes, not the escrow)
+        # STWO VALUE (review 2026-10-11, defence in depth): the value that entered the Stwo pool by deposit and has not
+        # left it by unshield or fee. A Stwo spend whose unshield + fee exceeds it is refused before any mutation
+        # (stwo_spend_refusal), so even a forged proof cannot take out of the Stwo pool more than went in — and never
+        # the frozen wide pool's value, which pool_value still counts. In the snapshot and the exec root, zero is absent.
+        self.stwo_value = 0
         # M-10: the delegated-prover POST handlers apply field transfers in worker threads
         # (asyncio.to_thread), so the nullifier check->add and the state serialization can run concurrently.
         # This reentrant lock makes the double-spend check + the mutation atomic, and gives save() a
@@ -300,6 +381,21 @@ class ExecState:
         self.beacons = {}          # epoch(int) -> beacon(int), cached
         self.beacon_floor = None   # first epoch we witness in full (set on first advance) — below it, unavailable
         self.blockhash_floor = None  # first L1 height we recorded (set on first record_block_hash) — provenance:
+        # STATE PROVENANCE (2026-08-19, settle-quorum incident): three flags that decide whether this
+        # state may be ATTESTED on L1 (see state_complete). Persisted in the payload but NOT committed to
+        # state_root (the root is derived from the sparse trees), so they are node-local metadata.
+        self.replay_gap = False    # a body-less finalized block was SKIPPED during replay -> state is
+                                   # provably missing exec txs; PERMANENT until a verified bootstrap
+        self.bootstrapped = False  # state was adopted from a quorum-verified settled checkpoint
+        self.attested = {}         # cursor(int) -> root we ATTESTED on L1 (bounded memo)
+        self._root_ring = {}       # root hex -> (kv half-root, records projection); see note_root_point
+        self.anchor_adopted_at = -1  # cursor at which this state last ADOPTED the anchor lineage (rate-limit)
+        self.boundary_roots = {}   # epoch-boundary cursor (int, k*EPOCH_LENGTH) -> state_root AT that cursor.
+                                   # The exec-layer HASH POOL entry: settle cursors are batch-timing-staggered
+                                   # and never line up across nodes, but every node passes through the SAME
+                                   # boundary cursors — the exactly-comparable points the L1's hash-pool
+                                   # pattern needs. Bounded ring (last ~32); payload-only, root-neutral. — lets the node
+                                   # self-disqualify when a later-justified root contradicts its own
         # together with beacon_floor this is how far back our randomness windows reach. A node that cold-started
         # mid-flight (pruned L1 / failed bootstrap) has RAISED floors and must not settle (see window_canonical).
         # BLOCKHASH randomness (#randao): finalized L1 block hashes, height(int) -> hash(int). Like the beacon this
@@ -314,15 +410,14 @@ class ExecState:
         # committed bridge leaves).
         self.zk_addrs = {}        # str(field digest) -> addr
         # STATE-ROOT CACHE: state_root() is a pure function of the root-committed state. The root is the
-        # FROZEN alphanet-6 scheme (execnode/exec_root.py): rnode(kv half, records half), two persistent
-        # depth-256 sparse alghash2 trees that are DIFF-APPLIED per recompute — O(changed·depth) hashing
+        # gen-29 BLAKE2s scheme (execnode/exec_root_b2.py): (kv half, records half), two persistent
+        # compressed sparse trees (execnode/csmt.py) that are DIFF-APPLIED per recompute — O(changed·depth) hashing
         # per block, never a whole-state rebuild (the cold build happens once, at load/bootstrap). Every
         # root-affecting mutator calls _touch() (under _mutate_lock) to invalidate the cached hex; the
         # trees themselves persist across touches. _mut_gen versions the whole state so the provisional
         # rebuild can skip cloning when nothing changed.
         self._root_cache = None
-        self._kv_store = None            # persistent KV half-tree (lazy cold build, then incremental)
-        self._rec_store = None           # persistent RECORDS half-tree
+        self._b2_trees = None            # the BLAKE2s halves: lazy cold build, then diff-applied (incremental)
         self._mut_gen = 0
         self.load()
 
@@ -332,27 +427,39 @@ class ExecState:
         across touches and are diff-applied on the next state_root()."""
         self._root_cache = None
         self._mut_gen = getattr(self, "_mut_gen", 0) + 1
-        if not hasattr(self, "_kv_store"):
-            self._kv_store = None
-            self._rec_store = None
+        if not hasattr(self, "_b2_trees"):
+            self._b2_trees = None
 
     # --- persistence -----------------------------------------------------------------------------
     def _restore(self, d):
         """Populate every field from a payload dict (what load() does after json.load). Every key is
         optional with an empty default, so old snapshots (pre-dividend/shielded/…) still load AND it works
         on a bare (un-__init__'d) instance — see clone()."""
-        from execnode.shielded_field import FieldShieldedPool
         self.contracts = d.get("contracts", {})
         self.cursor = d.get("cursor", -1)
+        # THE CLOCK FOLLOWS THE CURSOR (review 2026-09-25, reproduced): block_ts is not in the snapshot, so a restored
+        # state kept 0 and its FIRST applied block ran every TIME read as 0 — a different root from nodes that did not
+        # restart (every /update wave). After applying block h the exec node sets block_ts = chain_clock(h), a pure
+        # function of the cursor, so the restored value is derived the same way. (Rewind, repair and anchor-adopt all
+        # restore through here.)
+        try:
+            from protocol import chain_clock as _cc
+            self.block_ts = _cc(int(self.cursor)) if int(self.cursor) >= 0 else 0
+        except Exception:
+            self.block_ts = 0
         self.bridge = d.get("bridge", {})
         self.assets = d.get("assets", {})
         self.abal = {a: dict(h) for a, h in d.get("abal", {}).items()}
         self.allow = {a: {o: dict(s) for o, s in owners.items()} for a, owners in d.get("allow", {}).items()}
         self.withdrawals = d.get("withdrawals", {})
-        self.wd_nonce = d.get("wd_nonce", 0)
+        # EXIT COUNTERS ARE FLOORED at the highest pending key (zk audit 2026-09-26, F2): the counter holds the LAST nonce
+        # used, and a snapshot counter below a pending record's key made the next exit OVERWRITE that record. Honest
+        # counters are always >= every key, so the floor never moves them; outbox_seq below does the same.
+        _floor = lambda cnt, recs: max(int(cnt or 0), max((int(k) for k in (recs or {}) if str(k).isdigit()), default=0))
+        self.wd_nonce = _floor(d.get("wd_nonce", 0), d.get("withdrawals"))
         ob = d.get("outbox", {})
         if not isinstance(ob, dict):
-            # NO legacy shapes on alphanet: a pre-dict outbox snapshot must not half-load — fail
+            # NO legacy shapes on betanet: a pre-dict outbox snapshot must not half-load — fail
             # loudly; the operator re-bootstraps from a settled checkpoint (NADO_EXEC_BOOTSTRAP).
             raise ValueError("exec state has a legacy outbox shape — re-bootstrap this node")
         self.outbox = ob
@@ -364,11 +471,15 @@ class ExecState:
         self.last_div_epoch = d.get("last_div_epoch", -1)
         self.div_carry = d.get("div_carry", 0)
         self.dividend_withdrawals = d.get("dividend_withdrawals", {})
-        self.dw_nonce = d.get("dw_nonce", 0)
-        self.shielded = ShieldedPool.from_dict(d["shielded"]) if "shielded" in d else ShieldedPool()
+        self.dw_nonce = _floor(d.get("dw_nonce", 0), d.get("dividend_withdrawals"))
         self.unshield_withdrawals = d.get("unshield_withdrawals", {})
-        self.uw_nonce = d.get("uw_nonce", 0)
-        self.field_pool = FieldShieldedPool.from_dict(d["field_pool"]) if "field_pool" in d else FieldShieldedPool()
+        self.uw_nonce = _floor(d.get("uw_nonce", 0), d.get("unshield_withdrawals"))
+        # "field_pool", "wide_pool" and "app_state" are IGNORED (G9 slice 5), and so is "shielded" (slice 5c): every
+        # gen-29 snapshot on the fleet carries an empty "shielded" and "field_pool" (and an old one may carry the others),
+        # and those pools no longer exist. They were empty on every gen-29 state, so nothing they held is dropped.
+        # INVARIANT: never fail a load on these keys.
+        from execnode.shielded_stwo import StwoShieldedPool
+        self.stwo_pool = StwoShieldedPool.from_dict(d["stwo_pool"]) if "stwo_pool" in d else StwoShieldedPool()
         # SHIELDED SUPPLY (ops/invariants.py). Individual note VALUES are private, but every CHANGE to the
         # pool's total is public by construction — a deposit carries its L1 amount, and a transfer's
         # public_value/fee are public inputs. So the pool's aggregate value is auditable even though its
@@ -379,6 +490,7 @@ class ExecState:
         # re-derived from the blocks that follow.
         self.pool_value = int(d.get("pool_value", 0))
         self.pool_fees = int(d.get("pool_fees", 0))
+        self.stwo_value = int(d.get("stwo_value", 0))     # absent = 0 (empty is absent, as in _snapshot)
         self.randao_reveals = {int(e): set(v) for e, v in d.get("randao_reveals", {}).items()}
         self.beacons = {int(e): int(v) for e, v in d.get("beacons", {}).items()}
         self.beacon_floor = d.get("beacon_floor")
@@ -391,27 +503,42 @@ class ExecState:
         if self.blockhash_floor is None and self.block_hashes:
             self.blockhash_floor = min(self.block_hashes)
         self.zk_addrs = d.get("zk_addrs", {})
+        self.replay_gap = bool(d.get("replay_gap", False))
+        self.bootstrapped = bool(d.get("bootstrapped", False))
+        self.anchor_adopted_at = int(d.get("anchor_adopted_at", -1))
+        self.boundary_roots = {int(c): str(r) for c, r in (d.get("boundary_roots") or {}).items()}
+        self.attested = {int(c): str(r) for c, r in (d.get("attested") or {}).items()}
         self._touch()          # also (re)creates the cache fields on a bare clone() instance
 
     def _snapshot(self):
         """The full serializable payload (identical to what save() writes), taken UNDER the mutate lock so a
         concurrent thread-apply can't tear it. Shared by save() and clone()."""
         with self._mutate_lock:
+            # NO "field_pool" (G9 slice 5) and NO "shielded" (slice 5c): the pools are gone. Nothing hashes this payload —
+            # a peer that adopts it recomputes the root — and an older node reading it treats an absent key as the empty
+            # pool it always was.
             return {"contracts": self.contracts, "cursor": self.cursor, "bridge": self.bridge,
                     "assets": self.assets, "abal": self.abal, "allow": self.allow,
                     "withdrawals": self.withdrawals, "wd_nonce": self.wd_nonce,
                     "outbox": self.outbox, "outbox_seq": self.outbox_seq, "inbox": self.inbox,
                     "dividend": self.dividend, "last_div_epoch": self.last_div_epoch,
                     "div_carry": self.div_carry, "dividend_withdrawals": self.dividend_withdrawals,
-                    "dw_nonce": self.dw_nonce, "shielded": self.shielded.to_dict(),
+                    "dw_nonce": self.dw_nonce,
                     "unshield_withdrawals": self.unshield_withdrawals, "uw_nonce": self.uw_nonce,
-                    "field_pool": self.field_pool.to_dict(),
+                    # EMPTY IS ABSENT: a snapshot must not change by a key it never needed
+                    **({"stwo_pool": self.stwo_pool.to_dict()} if self.stwo_pool.commitments or self.stwo_pool.nullifiers else {}),
+                    # zero is absent: a snapshot from before the Stwo pool's first deposit keeps its exact bytes
+                    **({"stwo_value": self.stwo_value} if self.stwo_value else {}),
                     "pool_value": self.pool_value, "pool_fees": self.pool_fees,
                     "randao_reveals": {str(e): sorted(v) for e, v in self.randao_reveals.items()},
                     "beacons": {str(e): str(v) for e, v in self.beacons.items()}, "beacon_floor": self.beacon_floor,
                     "blockhash_floor": self.blockhash_floor,
                     "block_hashes": {str(h): str(v) for h, v in self.block_hashes.items()},
-                    "zk_addrs": self.zk_addrs}
+                    "zk_addrs": self.zk_addrs,
+                    "replay_gap": self.replay_gap, "bootstrapped": self.bootstrapped,
+                    "anchor_adopted_at": self.anchor_adopted_at,
+                    "boundary_roots": {str(c): r for c, r in self.boundary_roots.items()},
+                    "attested": {str(c): r for c, r in self.attested.items()}}
 
     def clone(self):
         """A deep, independent, DISK-FREE copy for provisional/speculative apply (the unfinalized L1 tail).
@@ -472,133 +599,174 @@ class ExecState:
         except OSError:
             pass
 
-    def _sparse_stores(self):
-        """The two persistent depth-256 half-trees of the FROZEN root scheme (execnode/exec_root.py),
-        diff-applied to the CURRENT state: contract storage in the KV half; bridged/dividend balances,
-        withdrawal records, pool digests and cross-domain messages in the RECORDS half. Every honest node
-        derives identical projections → identical root. Called ONLY under _mutate_lock (state_root), so a
-        concurrent thread-apply can never tear the diff. First call is the cold build; afterwards each
-        recompute hashes only what changed (O(changed·depth))."""
-        from execnode import exec_root as ER
-        from execnode.stark import storage_tree as SST
-        kv_p = ER.kv_projection(self.contracts)
-        rec_p = ER.records_projection(self)
-        if self._kv_store is None:
-            self._kv_store = SST.SparseStore(ER.DEPTH, kv_p)
-            self._rec_store = SST.SparseStore(ER.DEPTH, rec_p)
+    def _blake_trees(self):
+        """The two BLAKE2s half-trees (execnode/exec_root_b2.py) diff-applied to the CURRENT state, memoised on the
+        mutation generation. Called only under _mutate_lock."""
+        from execnode import csmt, exec_root_b2 as R2
+        gen = getattr(self, "_mut_gen", 0)
+        if self._b2_trees is not None and getattr(self, "_b2_gen", None) == gen:
+            return self._b2_trees
+        kv_p, rec_p = R2.kv_projection(self.contracts), R2.records_projection(self)
+        if self._b2_trees is None:
+            self._b2_trees = (csmt.Tree(kv_p), csmt.Tree(rec_p))
         else:
-            ER.apply_projection(self._kv_store, kv_p)
-            ER.apply_projection(self._rec_store, rec_p)
-        return self._kv_store, self._rec_store
+            self._b2_trees[0].apply(kv_p)
+            self._b2_trees[1].apply(rec_p)
+        self._b2_gen = gen
+        return self._b2_trees
 
     def unshields_for(self, addr):
         """Pending unshield exits recorded for an L1 address — a wallet uses this to find the nonce(s) of its
-        own unshields, then fetches unshield_withdrawal_proof(nonce) to claim once the root is settled."""
+        own unshields, then fetches /exec/unshield_proof?nonce= (record_proof_at) to claim once the root is settled."""
         return [{"nonce": n, "amount": w["amount"]} for n, w in sorted(self.unshield_withdrawals.items())
                 if w["addr"] == addr]
 
-    def shielded_note_proof(self, cm):
-        """Locate a note commitment in the pool and return its position + Merkle authentication path against
-        the current root — what a wallet needs to SPEND the note (build the input witness). Commitments are
-        public, so this leaks nothing about value/owner. None if the commitment isn't in the pool."""
-        try:
-            pos = self.shielded.commitments.index(cm)
-        except ValueError:
-            return None
-        from execnode.shielded import merkle_path
-        return {"pos": pos, "path": merkle_path(self.shielded.commitments, pos), "root": self.shielded.root()}
+    # RECENT-ROOT RING (exit proofs against a SETTLED root). Every exit proof — bridge/dividend/unshield
+    # withdrawals, outbox messages — must verify against the root L1 has SETTLED, but this state keeps
+    # moving: the settled cursor trails the live cursor by a settle cadence, and every dividend accrual
+    # (each 60 blocks) or contract call in that gap changes the live root. A proof built against the live
+    # root then fails L1's verifier, and the wallet's only option was to wait until the live root happened
+    # to equal the settled one again — on a busy chain that was a 5-12 HOUR wait for a dividend claim
+    # (reported 2026-08-23). The ring keeps the records half (a few hundred leaves) and the kv half-root at
+    # each of the last _ROOT_RING_KEEP distinct roots, so a proof can be served against whichever recent
+    # root L1 settled. The records leaf being proven is immutable once written; only its siblings differ
+    # per root, which is exactly what the ring restores.
+    _ROOT_RING_KEEP = 128
 
-    def unshield_withdrawal_proof(self, nonce):
-        """(addr, amount, nonce, proof) for a recorded unshield exit, provable against state_root; None if absent."""
-        from execnode import exec_root as ER
-        w = self.unshield_withdrawals.get(str(nonce))
-        if not w:
-            return None
-        return {"addr": w["addr"], "amount": w["amount"], "nonce": str(nonce),
-                "proof": self._record_proof(ER.T_UNSHIELD_WD, w["addr"], str(nonce))}
+    def note_root_point(self):
+        """Remember (kv half-root, records projection) at the CURRENT root if it is new. Called by the
+        finalized tail after each applied block; free when the block changed nothing (cached root)."""
+        ring = getattr(self, "_root_ring", None)
+        if ring is None:
+            ring = self._root_ring = {}
+        with self._mutate_lock:
+            root = self.state_root()
+            if root in ring:
+                return root
+            # a BLAKE2s root remembers its format with it ("b2"): record_proof_at rebuilds THAT tree for it, and
+            # execnode._seed_root_ring_sync seeds the same shape (INVARIANT: keep the two identical)
+            from execnode import exec_root_b2 as R2
+            kv, _rec = self._blake_trees()
+            ring[root] = ("b2", kv.root(), R2.records_projection(self))
+            while len(ring) > self._ROOT_RING_KEEP:
+                del ring[next(iter(ring))]
+            return root
 
-    def dividend_withdrawal_proof(self, nonce):
-        """(addr, amount, nonce, proof) for a recorded dividend collection, provable against state_root."""
-        from execnode import exec_root as ER
-        w = self.dividend_withdrawals.get(str(nonce))
-        if not w:
-            return None
-        return {"addr": w["addr"], "amount": w["amount"], "nonce": str(nonce),
-                "proof": self._record_proof(ER.T_DIV_WD, w["addr"], str(nonce))}
+    def record_proof_at(self, root_hex, tag, *parts, value=None):
+        """({"kv","path"}, root) for the record at record_key(tag, *parts) against `root_hex` — the live
+        root (root_hex None/equal), else a root remembered by note_root_point. None if that root is not
+        held (too old, or this node has not applied the settled cursor yet) OR if `value` is given and the
+        record did not yet hold it under that root (e.g. a withdrawal collected after the settle): a proof
+        built from those siblings could never verify, so the caller waits for the next settle instead."""
+        with self._mutate_lock:
+            live = self.state_root()
+            if not root_hex or root_hex == live:
+                return self._record_proof(tag, *parts), live
+            ent = getattr(self, "_root_ring", {}).get(root_hex)
+            if not ent:
+                return None
+            # every ring entry is BLAKE2s ("b2", kv root, records projection) since G9 deleted the Goldilocks root
+            return self._b2_record_proof_at(root_hex, ent, tag, *parts, value=value)
 
-    def accrue_dividend_epoch(self, inflow, weights):
+    def accrue_dividend_epoch(self, inflow, weights, epoch=None):
         with self._mutate_lock:
             try:
-                return self._accrue_dividend_epoch_inner(inflow, weights)
+                return self._accrue_dividend_epoch_inner(inflow, weights, epoch)
             finally:
                 self._touch()
 
-    def _accrue_dividend_epoch_inner(self, inflow, weights):
-        """DETERMINISTIC per-epoch accrual. Distribute `inflow` — the TOTAL DIVIDEND_POOL inflow credited
-        during one epoch (from L1 `dividend_inflow_get(E)`, revert-safe) — plus the carried remainder among
-        `weights` = weights_at_epoch(E) (fidelity-weighted, from L1), pro-rata and integer-only. This is a
-        PURE FUNCTION of (inflow, weights): every node that accrues the same epoch reaches the identical
-        `dividend` map, so the committed state_root can't diverge (the old accrue_dividend read a LIVE pool
-        balance + LIVE current-epoch weights per poll batch — non-deterministic, which broke settlement of
-        the default layer). No present miners this epoch → the whole inflow carries forward (no raw lost).
-        Returns the amount distributed. The caller advances last_div_epoch and never re-accrues an epoch."""
-        pot = int(inflow) + self.div_carry
-        total_w = sum(max(1, int(w)) for w in weights.values()) if weights else 0
-        if pot <= 0 or total_w <= 0:
-            self.div_carry = max(0, pot)                         # carry forward until there's a present set
-            return 0
+    def _accrue_dividend_epoch_inner(self, inflow, weights, epoch=None):
+        """DETERMINISTIC per-epoch accrual of `inflow` (L1 dividend_inflow_get(E)) over `weights`
+        (weights_at_epoch(E)), plus the carried backlog under the carry rule for `epoch`. THE arithmetic
+        lives in ONE place — execnode/records_effects.dividend_accrual_effects — which the settle
+        binding re-derives from L1 state; this method only applies its effects, so the live map and the
+        proven records half cannot drift (they used to be two hand-mirrored copies). Returns the amount
+        distributed. The caller advances last_div_epoch and never re-accrues an epoch."""
+        from execnode import records_effects as _RE
+        effects, self.div_carry = _RE.dividend_accrual_effects(inflow, weights, self.div_carry, epoch)
         distributed = 0
-        for addr, w in sorted(weights.items()):                  # sorted -> deterministic across nodes
-            share = pot * max(1, int(w)) // total_w
-            if share:
-                self.dividend[addr] = self.dividend.get(addr, 0) + share
-                distributed += share
-        self.div_carry = pot - distributed                       # keep the sub-unit remainder for next time
+        for _tag, parts, share in effects:
+            addr = parts[0]
+            self.dividend[addr] = self.dividend.get(addr, 0) + share
+            distributed += share
         return distributed
 
     def state_root(self):
-        """THE settled execution-layer root (frozen alphanet-6 scheme, execnode/exec_root.py):
-        rnode(kv half, records half) of the two depth-256 sparse alghash2 trees, 64-hex — identical on
+        """THE settled execution-layer root (the gen-29 BLAKE2s scheme, execnode/exec_root_b2.py):
+        full_root(kv half, records half) of the two compressed sparse trees, 64-hex — identical on
         every honest node at the same cursor. This is the root the bonded quorum settles on L1 and every
         bridge/dividend/unshield/xmsg exit is proven against. Cached; invalidated by _touch."""
         root = self._root_cache
         if root is None:
             with self._mutate_lock:
                 if self._root_cache is None:
-                    from execnode import exec_root as ER
-                    kv, rec = self._sparse_stores()
-                    self._root_cache = ER.full_root_hex(kv.root(), rec.root())
+                    from execnode import exec_root_b2 as R2
+                    kv, rec = self._blake_trees()
+                    self._root_cache = R2.full_root(kv.root(), rec.root()).hex()
                 root = self._root_cache
         return root
 
+    @staticmethod
+    def snapshot_view(d):
+        """A read-only ExecState VIEW over a serialized snapshot payload — disk-free, no instance mutated.
+
+        Factored out of records_root_from_snapshot so the settle prover can build the records half's PRE
+        store from the same stashed payload it already uses for the pre-root. Built __new__ + _restore, so
+        it never reads or writes disk, and `path` is a sentinel because a view must never be save()d."""
+        import threading as _th
+        v = ExecState.__new__(ExecState)
+        v.path = "<snapshot-view>"
+        v._mutate_lock = _th.RLock()
+        v._restore(d)
+        v.block_ts = 0                      # not in _snapshot() and not in the root; see clone()
+        return v
+
+    def settle_snapshot(self):
+        """(cursor, state_root_hex, records_root, mut_gen) captured ATOMICALLY under the mutate lock.
+
+        A settle-with-proof pins one (cursor, root) pair and then spends MINUTES proving it. Settling runs
+        DETACHED from the block-application tail (execnode e1000cbd), so the tail keeps mutating THIS live
+        object throughout — the prove itself, and the ~one-HTTP-round-trip-per-block span walk before it.
+
+        state_root is rnode(kv half, RECORDS half), and the records half is read straight off the live
+        balances. So reading the root at cursor C and then recomputing the records half later yields the
+        records of some LATER cursor, and the proof's self-check compares two roots that were never
+        simultaneously true. Observed live 2026-08-04: "self-check failed (span 19154->19184 not
+        conforming)" on a span entirely inside one dividend epoch, where the epoch gate guarantees no
+        dividend moved the records at all.
+
+        mut_gen lets a caller confirm afterwards that the state did not advance under it."""
+        with self._mutate_lock:                       # RLock: state_root/_blake_trees re-enter safely
+            root = self.state_root()
+            _kv, rec = self._blake_trees()
+            return self.cursor, root, rec.root(), getattr(self, "_mut_gen", 0)
+
+    def _b2_record_proof_at(self, root_hex, ent, tag, *parts, value=None):
+        """record_proof_at for a remembered BLAKE2s root: the same contract (None when the record did not hold
+        `value` under that root), the tree rebuilt from the remembered projection and cached with the ring"""
+        from execnode import csmt, exec_root_b2 as R2
+        _fmt, kv_root, proj = ent
+        key = R2.record_key(tag, *parts)
+        if value is not None and proj.get(key) != R2.int_value(int(value)):
+            return None
+        cache = getattr(self, "_ring_stores", None)
+        if cache is None:
+            cache = self._ring_stores = {}
+        tree = cache.get(root_hex)
+        if tree is None:
+            tree = cache[root_hex] = csmt.Tree(proj)
+            for k in [k for k in cache if k not in self._root_ring]:
+                del cache[k]
+        return R2.record_proof(kv_root, tree, key), root_hex
+
     def _record_proof(self, tag, *parts):
         """Sparse exit proof {"kv": hex, "path": packed} for the record at record_key(tag, *parts) —
-        the wire format L1's exec_root.verify_record checks against the settled root."""
-        from execnode import exec_root as ER
+        in the gen-29 format {"kv", "s", "t"} that L1's exec_root_b2.verify_record checks against the settled root
+        (at every cursor: BLAKE_EXEC_HEIGHT, gen 28's gate, inlined in G9)."""
+        from execnode import exec_root_b2 as R2
         with self._mutate_lock:
-            kv, rec = self._sparse_stores()
-            return ER.record_proof(kv.root(), rec, ER.record_key(tag, *parts))
-
-    def withdrawal_proof(self, nonce):
-        """(addr, amount, nonce, proof) for a recorded withdrawal, provable against state_root; None if absent."""
-        from execnode import exec_root as ER
-        w = self.withdrawals.get(str(nonce))
-        if not w:
-            return None
-        return {"addr": w["addr"], "amount": w["amount"], "nonce": str(nonce),
-                "proof": self._record_proof(ER.T_BRIDGE_WD, w["addr"], str(nonce))}
-
-    def outbox_proof(self, seq):
-        """(msg, proof) for outbox message `seq`, provable against state_root; None if absent. Mirrors
-        withdrawal_proof: a consumer verifies exec_root.verify_outbox_msg(proof) against the sender
-        rollup's SETTLED root (from L1 /get_settled?ns=) to accept the message trust-minimized."""
-        from execnode import exec_root as ER
-        try:
-            msg = self.outbox[str(int(seq))]
-        except (KeyError, ValueError, TypeError):
-            return None
-        dg = ER.leaf_digest(ER.msg_outbox_leaf(msg))
-        return {"message": msg, "proof": self._record_proof(ER.T_DIGEST, "outbox", dg)}
+            kv, rec = self._blake_trees()
+            return R2.record_proof(kv.root(), rec, R2.record_key(tag, *parts))
 
     def apply_xmsg(self, from_ns, message):
         """Deliver an L1-VERIFIED cross-domain message into this rollup's inbox. L1 already verified the
@@ -636,6 +804,18 @@ class ExecState:
             if self.outbox.pop(key, None) is not None:
                 self._touch()
 
+    def bump_contract_slot(self, cid, key, delta):
+        """Add `delta` to one raw slot of a contract's storage from the exec node itself (consensus-side,
+        inside apply — every node does the same at the same block). Used for records a contract cannot
+        observe on its own, e.g. the faucet's DONATED counter fed by L1 donations."""
+        with self._mutate_lock:
+            c = self.contracts.get(cid)
+            if not c:
+                return
+            slots = c.setdefault("storage", {}).setdefault("slots", {})
+            slots[str(int(key))] = int(slots.get(str(int(key)), 0)) + int(delta)
+            self._touch()
+
     def credit_deposit(self, addr, amount):
         """Credit an exec-side bridge balance from an L1 `bridge` deposit (read from the ordered stream)."""
         with self._mutate_lock:
@@ -667,6 +847,33 @@ class ExecState:
         from ops.mining_ops import compute_beacon
         return int(compute_beacon(GENESIS_BEACON, list(reveals) + [str(int(epoch))]), 16)
 
+    @classmethod
+    def exec_beacon_at(cls, epoch, reveals_of, final_epoch):
+        """The BEACON value for `epoch`, or None while it is not final at `final_epoch` (the epoch the reader's
+        finalized position is in). Epoch 0, and any epoch with reveals, is exec_beacon_int(epoch, reveals[epoch]).
+        Any later epoch with NO reveals takes the reveals of the first later epoch that has some — searched up
+        to BEACON_EXTEND_MAX epochs ahead, after which the plain value stands so a chain with no reveals at all
+        still settles — and is final once that epoch is.
+        INVARIANT: the exec node (advance_beacons) and the L1 settle-proof check (transaction_ops) both read the
+        BEACON value through this one function, so they agree for every epoch."""
+        from protocol import BEACON_EXTEND_MAX
+        e0 = int(epoch)
+        if e0 > int(final_epoch):
+            return None
+        reveals = list(reveals_of(e0) or ())
+        # BEACON_EXTEND_HEIGHT (gen 28's gate, 1 from gen 29, inlined in G9): the test was `e0 * EPOCH_LENGTH < 1`, i.e.
+        # only epoch 0 keeps its plain value when reveal-less. Keep `e0 < 1`: the exec node and the settlement's
+        # chain reads both come through here, so epoch 0's value must stay what every committed exec root used.
+        if reveals or e0 < 1:
+            return cls.exec_beacon_int(e0, reveals)
+        for e in range(e0 + 1, e0 + 1 + BEACON_EXTEND_MAX):
+            if e > int(final_epoch):
+                return None
+            r = list(reveals_of(e) or ())
+            if r:
+                return cls.exec_beacon_int(e0, r)
+        return cls.exec_beacon_int(e0, [])
+
     def advance_beacons(self, cursor):
         """Cache every epoch beacon now FINAL at `cursor`. Each beacon depends ONLY on that epoch's finalized
         reveals — beacon(E) = compute_beacon(GENESIS_BEACON, sorted(reveals[E]) + [E]) — NOT a cross-epoch chain,
@@ -684,7 +891,12 @@ class ExecState:
             self.beacon_floor = cur_epoch + 2
         start = max(self.beacon_floor, (max(self.beacons) + 1) if self.beacons else 0)
         for e in range(start, cur_epoch + 1):
-            self.beacons[e] = self.exec_beacon_int(e, self.randao_reveals.get(e, set()))
+            # BEACON EXTEND: a reveal-less epoch waits for a later epoch's reveals, and every epoch after it
+            # waits too (start resumes at the first missing epoch), so beacons stays a gap-free range.
+            v = self.exec_beacon_at(e, lambda x: self.randao_reveals.get(x, set()), cur_epoch)
+            if v is None:
+                break
+            self.beacons[e] = v
         keep = cur_epoch - _BEACON_RETENTION_EPOCHS
         if keep > 0:
             for e in [e for e in self.beacons if e < keep]:
@@ -714,6 +926,28 @@ class ExecState:
                  and self.blockhash_floor <= max(1, self.cursor - _BLOCKHASH_RING))
         return beacon_ok and bh_ok
 
+    def state_complete(self):
+        """PROVENANCE-COMPLETE gate for ATTESTING (maybe_settle): True iff every exec-relevant tx since
+        genesis is provably reflected in this state. window_canonical above is NOT enough — it compares
+        floors against a MOVING retention horizon, so a cold-started node's gap simply AGES PAST the
+        check (observed 2026-08-19: nodes gated for ~40h then began attesting roots computed from
+        0-contract state, and no two settlers ever agreed on a root again — settlement froze fleet-wide).
+        Contract/dividend completeness never heals with time; only two provenances are sound:
+          * built from GENESIS: the floors prove it (beacon_floor at its genesis value, blockhash_floor
+            at the first block) AND no body-less finalized block was ever skipped (replay_gap), or
+          * adopted from a QUORUM-VERIFIED settled checkpoint (bootstrapped) with no skip since.
+        replay_gap is PERMANENT until a verified bootstrap replaces the state — a missing block body
+        can carry a deploy or a collect, and a silent skip there is exactly the divergence mechanism
+        (state.py call/collect_dividend skip paths)."""
+        if self.replay_gap:
+            return False
+        if self.bootstrapped:
+            return True
+        if self.cursor is None or self.cursor < 0:
+            return False
+        return (self.beacon_floor is not None and self.beacon_floor <= _GENESIS_BEACON_FLOOR
+                and self.blockhash_floor is not None and self.blockhash_floor <= 1)
+
     def record_block_hash(self, height, block_hash):
         """Record one finalized L1 block hash for the BLOCKHASH opcode. `block_hash` is the block's hex hash;
         it becomes readable only once the cursor has reached `height` (a game can pin a FUTURE settle height
@@ -734,102 +968,41 @@ class ExecState:
             pass
 
     def apply_field_shield(self, amount, owner, rho):
-        """Add a field-native note for an L1 field-shield deposit. C-2: the note value is BOUND to the L1
-        escrow — the exec node computes the commitment itself as commit(amount, owner, rho) from the
-        authoritative on-chain `amount`, rather than trusting a client-supplied `cm` (which let a 1-coin
-        deposit mint a note "worth" anything). The depositor supplies only (owner, rho); they know `amount`
-        from their own tx, so they can still reconstruct and spend the note."""
-        from execnode.stark import alghash, field as _F
+        """Add the note of an L1 field-shield deposit. C-2: the note value is BOUND to the L1 escrow — the commitment is
+        computed here from the authoritative on-chain `amount`; the depositor supplies only (owner, rho).
+        From block 1 (rules_stwo_pool) the note lands in the Stwo pool. The legacy field pool (and the wide pool) that a
+        deposit below block 1 reached are DELETED (G9 slice 5): only genesis is applied below block 1, and generation 29's
+        genesis carries no transaction, so that branch never ran on the chain. INVARIANT: the amount bound is checked
+        FIRST, before the pool dispatch, with its own string — the order generation 29 always judged in."""
         try:
             amount = int(amount)
             if not (0 < amount < MAX_EXIT_VALUE):     # note values must be < 2^61 to satisfy the range gadget
                 return f"skip field-shield: amount out of range ({amount})"
-            cm = alghash.commit(amount, int(owner) % _F.P, int(rho) % _F.P)
-            with self._mutate_lock:                       # M-10: serialize field_pool mutation vs thread-applies
-                self.field_pool.append(cm)
-                self.pool_value += amount                 # shielded supply (ops/invariants): escrow-backed entry
-                self._touch()
-            return f"field-shield {amount} -> field note #{len(self.field_pool.commitments)}"
+            if self.rules_stwo_pool():
+                return self._apply_stwo_shield(amount, owner, rho)
+            return "skip field-shield: no shielded pool before block 1"
         except Exception as e:
             return f"skip field-shield: {e}"
 
     def apply_field_transfer(self, bundle):
-        """Apply a Phase-2 STARK transfer: verify the join-split proof, reject a double-spend, then record the
-        nullifier + append the output commitment. public_value<0 records a provable unshield exit."""
-        from execnode import shielded
+        """Apply a `stwo_js` spend (from block 1, rules_stwo_pool). The legacy field pool's joinsplit / joinsplit2 and the
+        wide pool's joinsplit3 paths are DELETED (G9 slice 5): from block 1 every bundle without `stwo_js` was already
+        refused here, and below block 1 only genesis is applied, which carries no transaction on generation 29."""
+        # KEPT, AND KEPT FIRST (G9 slice 5): _normalize_bundle int()s any joinsplit2/joinsplit3 member a bundle carries, and
+        # a bundle whose such member does not coerce RAISES here — apply_blob's catch-all then makes the whole spend a
+        # "skip", even a valid stwo_js spend riding beside it. That refusal is part of generation 29's verdict on a stwo
+        # bundle; dropping the call would apply spends every gen-29 node skipped.
         _normalize_bundle(bundle)   # browser bundles carry big ints as strings (JS can't JSON BigInt) -> ints
         stark_b = bundle.get("stark") or {}
-        if "joinsplit2" in stark_b:                     # 2-output transfer (send + change)
-            js = stark_b["joinsplit2"]
-            cm_outs = [int(js["cm_out1"]), int(js["cm_out2"])]
-        else:                                           # 1-output transfer / unshield
-            js = stark_b.get("joinsplit") or {}
-            cm_outs = [int(js["cm_out"])]
-        public = {"root": js.get("root"), "nullifiers": [js.get("nf")], "out_commitments": [str(c) for c in cm_outs],
-                  "public_value": js.get("public_value"), "fee": js.get("fee")}
-        ok, reason = shielded.verify_transfer(public, bundle, self.field_pool.knows_root)
-        if not ok:
-            return f"skip field-transfer: {reason}"
-        from execnode.stark import field as _F
-        # C-3: the circuit constrains only public_value % P and fee % P, but the exit payout below uses the
-        # RAW signed value — so public_value = -P proves as "balanced" yet would record a P-coin exit. Bound
-        # both to a real coin range BEFORE any state mutation, so no field residue can be inflated into a P·k
-        # payout. (Note VALUES are field elements mod P; the only realizable exit is via public_value.)
-        pv, fee = int(js["public_value"]), int(js["fee"])
-        # UNBACKED-MINT FENCE: public_value > 0 means coins ENTER the pool, and the ONLY thing that may
-        # authorise that is an L1 `shield` tx whose escrowed amount drives apply_field_shield. A transfer
-        # blob is user-supplied and escrow-free, so a positive public_value here would let anyone conjure
-        # notes from nothing (the circuit happily proves 0 + pv == v_out + fee — `pv` is a PUBLIC INPUT the
-        # prover chooses, not a fact about escrow) and unshield them back out against SHIELD_ESCROW,
-        # draining every other depositor. Entry is escrow-driven; a transfer may only be neutral or exiting.
-        if not (-MAX_EXIT_VALUE <= pv <= 0) or not (0 <= fee <= MAX_EXIT_VALUE):
-            return "skip field-transfer: public_value/fee out of range"
-        # Validate the exit destination BEFORE any mutation: the old order added the nullifier + appended the
-        # outputs and only then rejected a missing withdraw_addr, burning the note for a malformed unshield.
-        addr = None
-        if pv < 0:
-            addr = bundle.get("withdraw_addr")
-            if not addr:
-                return "skip field-transfer: unshield missing withdraw_addr"
-        nf = int(js["nf"]) % _F.P
-        # M-10: the check->add->append must be atomic vs concurrent thread-applies (two racing identical
-        # unshields could otherwise both pass has_nullifier and each record an exit for one spent note).
-        with self._mutate_lock:
-            if self.field_pool.has_nullifier(nf):
-                return "skip field-transfer: nullifier already spent (double-spend)"
-            self.field_pool.nullifiers.add(nf)
-            for c in cm_outs:
-                self.field_pool.append(c)
-            # shielded supply: pv is <=0 (fenced above), so this only ever DECREASES the live note total.
-            # fee leaves the notes but never leaves escrow, so it is tracked separately.
-            self.pool_value += pv - fee
-            self.pool_fees += fee
-            if pv < 0:
-                self.uw_nonce += 1
-                nonce = str(self.uw_nonce)
-                self.unshield_withdrawals[nonce] = {"addr": addr, "amount": -pv}
-            self._touch()
-        if pv < 0:
-            return f"field-unshield {-pv} -> {addr[:12]}… nonce {nonce}"
-        return "field-transfer ok"
-
-    def apply_shield(self, amount, out_commitments, outputs):
-        """Add the output notes of an L1 `shield` deposit (read from the ordered stream). A shield is a
-        join-split with NO inputs and public_value = the escrowed `amount`, so the verifier enforces
-        sum(output values) == amount (transparent phase). Never raises; a malformed shield is skipped (the
-        depositor's escrowed coins are then simply unspendable — their own risk)."""
-        try:
-            public = {"root": self.shielded.root(), "nullifiers": [], "out_commitments": list(out_commitments),
-                      "public_value": int(amount), "fee": 0}
-            proof = {"inputs": [], "outputs": list(outputs)}
-            with self._mutate_lock:
-                ok, reason = apply_transfer(self.shielded, public, proof, self.shielded.knows_root)
-                if ok:
-                    self.pool_value += int(amount)        # shielded supply (ops/invariants)
-                self._touch()
-            return f"shield {amount} -> {len(out_commitments)} note(s)" if ok else f"skip shield: {reason}"
-        except Exception as e:
-            return f"skip shield: {e}"
+        if not isinstance(stark_b, dict):
+            return "skip field-transfer: bad bundle"
+        if self.rules_stwo_pool():
+            if "stwo_js" not in stark_b:
+                return "skip field-transfer: the Stwo pool takes a stwo_js bundle"
+            return self._apply_stwo_transfer(bundle)
+        if "stwo_js" in stark_b:
+            return "skip field-transfer: stwo_js is not live before STWO_POOL_HEIGHT"
+        return "skip field-transfer: no shielded pool before block 1"
 
     @staticmethod
     def _rt_run(rt, *a, **kw):
@@ -866,6 +1039,16 @@ class ExecState:
         """Move `delta` (signed) of asset `aid` on `holder`'s row, pruning to absence at zero. Callers have
         already validated solvency — this is the commit half of a staged, all-or-nothing settlement."""
         asset_credit_dict(self.abal, aid, holder, delta)
+        # asset history (non-consensus, see the class note): record AFTER the move, so a move that raised is never recorded
+        if self._hist_buf is not None and delta:
+            self._hist_buf.append((str(aid), holder, int(delta)))
+
+    def _hist_drop(self):
+        """A call's escrow was refunded: what it moved has been put back exactly, so the blob's history is NOTHING.
+        INVARIANT: every refund path of a call ends here (the _refund closure in _apply_blob_inner) — a reverted call
+        must leave no record, or an NFT page shows a listing that never happened."""
+        if self._hist_buf is not None:
+            self._hist_buf.clear()
 
     def asset_allowance(self, aid, owner, spender):
         """How much of `aid` `spender` may move on `owner`'s behalf. Absent == 0, same canonical rule as a
@@ -896,19 +1079,230 @@ class ExecState:
     def commit_asset_effects(self, deltas, sup, meta_ops=()):
         """Apply what stage_asset_effects validated. Never called without that validation."""
         commit_asset_effects_pure(self.abal, self.assets, deltas, sup, meta_ops)
+        # asset history: the contract's APAY/AMINT/ABURN, in the staged order (dict insertion order — identical on
+        # every node). commit_asset_effects_pure writes abal through asset_credit_dict, NOT _asset_credit, so this is
+        # the second (and last) place a balance moves. INVARIANT: a new abal writer records here too.
+        if self._hist_buf is not None:
+            for (aid, who), d in deltas.items():
+                if d:
+                    self._hist_buf.append((str(aid), who, int(d)))
 
     def contract_id(self, deployer, code, nonce):
         """Deterministic contract id H(deployer, code, nonce) (truncated) — identical on every exec node,
         so a deployer can know its cid before the blob even lands (submit_blob echoes it)."""
-        return blake2b_hash(["deploy", deployer, code, nonce])[:32]
+        return _contract_id(deployer, code, nonce)
 
     # --- applying blobs --------------------------------------------------------------------------
+    def applying_height(self):
+        """The block whose blobs are being applied: `_applying` when _apply_block set it (it must, because
+        under EXEC_CTX_CURRENT_HEIGHT the cursor is advanced BEFORE the loop), else cursor + 1."""
+        h = getattr(self, "_applying", None)
+        return int(h) if h is not None else int(self.cursor) + 1
+
+    # THE RULE HELPERS BELOW ALL HOLD FROM HEIGHT 1. Each was a gen-25 gate (EXEC_ROOT_V2_HEIGHT, REVIEW_R2_HEIGHT,
+    # EXEC_RULES_V2_HEIGHT; SHIELD_WIDE_HEIGHT and PRIVACY_PAUSE_HEIGHT went with their pools in G9 slice 5) whose value from gen 26 is 1; the constants are
+    # deleted. The `>= 1` stays because applying_height() is 0 for a state at cursor -1 applying genesis, where every
+    # one of them was off — every live blob sits in a block >= 1, so on the chain they are always on.
+    def rules_budget_v2(self):
+        """Reverting and raising calls count against the block's step budget, and each sender has a share of it
+        (protocol.EXEC_SENDER_STEP_SHARE). EXEC_BUDGET_V2_HEIGHT (gen 28's gate, 1 from gen 29, inlined in G9): `>= 1`
+        is kept because a fresh exec state applies at height 0, where the old gate answered False."""
+        return self.applying_height() >= 1
+
+    def _charge_reverted_steps(self, gas, sender=None):
+        """Add a reverted call's steps (None = it raised: GAS_LIMIT, the most one call may execute) to the block's
+        budget count, from block 1 (rules_budget_v2) and under the same rules_r2 the budget itself lives under.
+        At height 0 it does nothing, exactly as the gated code did."""
+        if not (self.rules_r2() and self.rules_budget_v2()):
+            return
+        from execnode.zkvm2 import GAS_LIMIT
+        g = int(GAS_LIMIT) if gas is None else int(gas)
+        self._block_steps = int(getattr(self, "_block_steps", 0)) + g
+        if sender is not None:                          # and against that sender's share (EXEC_SENDER_STEP_SHARE)
+            _by = self.__dict__.setdefault("_block_steps_by", {})
+            _by[sender] = _by.get(sender, 0) + g
+
+    # STWO_FEE_TO_HEIGHT and STWO_POOL_HEIGHT (gen 28's gates, 1 from gen 29, inlined in G9): the same `>= 1` as the
+    # helpers above, for the same reason — applying_height() is 0 for a state at cursor -1 applying genesis, where both
+    # were off; every live blob sits in a block >= 1. INVARIANT: never a height above 1 here again without a new gate.
+    def rules_stwo_fee_to(self):
+        """A Stwo spend may name its fee's payee in the block being applied (from block 1)."""
+        return self.applying_height() >= 1
+
+    def rules_stwo_pool(self):
+        """The Stwo pool in force for the block being applied (from block 1)."""
+        return self.applying_height() >= 1
+
+    def _apply_stwo_shield(self, amount, owner, rho):
+        """STWO_POOL_HEIGHT: the deposit's note in the Stwo pool, cm = shielded_stwo.commit(amount, owner, rho) computed
+        HERE from the authoritative L1 amount (C-2), the owner a 64-hex BLAKE2s digest. Z6 (no duplicate commitment) as on
+        every pool; the tree is 2^48 deep, so Z4 (full) is the pool's own refusal. EVERY CHECK BEFORE THE FIRST MUTATION
+        (review 2026-10-11): the owner in its one canonical spelling (shielded_stwo.is_digest), capacity, duplicate."""
+        from execnode import shielded_stwo as _S
+        try:
+            if not (0 < int(amount) < (1 << 64)):
+                return f"skip field-shield: amount out of range ({amount})"
+            if not _S.is_digest(owner):
+                return "skip field-shield: the Stwo owner is not 64 lowercase hex"
+            cm = _S.commit(int(amount), owner, int(rho))
+        except Exception as e:
+            return f"skip field-shield: bad Stwo note ({e})"
+        with self._mutate_lock:
+            if self.stwo_pool.has_commitment(cm):
+                return "skip field-shield: duplicate note commitment"
+            if not self.stwo_pool.room_for(1):
+                return "skip field-shield: the pool is full"
+            self.stwo_pool.append(cm, self.applying_height())
+            self.pool_value += int(amount)
+            self.stwo_value += int(amount)     # the Stwo pool's own total (stwo_spend_refusal caps every exit by it)
+            self._touch()
+        return f"field-shield {amount} -> stwo note #{len(self.stwo_pool.commitments)}"
+
+    def stwo_spend_refusal(self, root, nf, cm1, cm2, unshield, fee, height):
+        """The STATEFUL half of a Stwo spend's checks, without the proof: None when a spend of (root, nf, cm1, cm2)
+        moving unshield + fee out of the pool could apply at block `height`, else the reason it would be skipped.
+        INVARIANT: _apply_stwo_transfer (under the mutate lock, before verifying) and the exec node's
+        /exec/stwo_spendable (what the spend relay asks before it pays an L1 fee) both decide through THIS method, so
+        the relay refuses exactly what the exec layer would skip."""
+        # THE STAGED EMERGENCY PAUSE (protocol.STWO_PAUSE_HEIGHT, never until an emergency release sets it): first, so
+        # a paused pool refuses every spend before any other check — at the exec layer and at every relay at once.
+        from protocol import STWO_PAUSE_HEIGHT
+        if int(height) >= int(STWO_PAUSE_HEIGHT):
+            return "skip field-transfer: the Stwo pool is paused (STWO_PAUSE_HEIGHT)"
+        if not self.stwo_pool.knows_root(root, height):
+            return "skip field-transfer: unknown anchor root"
+        if self.stwo_pool.has_nullifier(nf):
+            return "skip field-transfer: nullifier already spent (double-spend)"
+        if cm1 == cm2 or self.stwo_pool.has_commitment(cm1) or self.stwo_pool.has_commitment(cm2):
+            return "skip field-transfer: duplicate note commitment"
+        if not self.stwo_pool.room_for(2):
+            return "skip field-transfer: the pool is full"
+        # STWO VALUE CAP (defence in depth, review 2026-10-11): the proof's conservation is the real guarantee; this is
+        # what holds if it ever fails. A spend may not move out more than Stwo deposits put in and Stwo spends left —
+        # never pool_value, which also counts the frozen wide pool's notes and would let a forged Stwo proof drain them.
+        if int(unshield) + int(fee) > self.stwo_value:
+            return "skip field-transfer: the spend exits more than the Stwo pool holds"
+        return None
+
+    def _apply_stwo_transfer(self, bundle):
+        """STWO_POOL_HEIGHT: apply a `stwo_js` bundle. ALL-OR-NOTHING (review 2026-10-11): every check — shape, canonical
+        digests, destination, value bounds, anchor, double-spend, duplicate and capacity of the outputs, the proof — runs
+        BEFORE the first mutation, and the mutation below cannot raise, so a refused transfer leaves the state byte for
+        byte as it was (apply_blob's catch-all would otherwise have turned a mid-mutation exception into a "skip" over a
+        half-applied spend). The proof is verified by the native Stwo verifier (execnode/stwo_js_native), loaded
+        on first use; a node that cannot load it never reaches here (execnode._apply_block stalls the block first)."""
+        from execnode import shielded_stwo as _S
+        # THE ONE READING (shielded_stwo.parse_transfer): shape, canonical digests, proof hex, u64 bounds, the
+        # destination's form. The node's spend relay (ops/stwo_relay.py) reads bundles through the same function.
+        why, sp = _S.parse_transfer(bundle, MAX_EXIT_VALUE, fee_to_ok=self.rules_stwo_fee_to())
+        if why:
+            return why
+        root, nf, cm1, cm2, proof = sp["root"], sp["nf"], sp["cm1"], sp["cm2"], sp["proof"]
+        unshield, fee, addr, fee_to = sp["unshield"], sp["fee"], sp["addr"], sp["fee_to"]
+        if addr and addr in self.contracts:
+            return "skip field-transfer: withdraw_addr is not a spendable account"
+        if fee_to is not None:                 # only from STWO_FEE_TO_HEIGHT (parse_transfer ignores it below); a contract is never the payee
+            if fee_to in self.contracts:
+                return "skip field-transfer: fee_to is not a spendable account"
+        with self._mutate_lock:
+            why = self.stwo_spend_refusal(root, nf, cm1, cm2, unshield, fee, self.applying_height())
+            if why:
+                return why
+            from execnode import stwo_js_native
+            # the config is the one of the block this spend is applied in (STWO_JS_128_HEIGHT), never the prover's
+            ok, reason = stwo_js_native.verify(proof, root, nf, cm1, cm2, unshield, fee, sp["dest"],
+                                               int(self.applying_height()))
+            if not ok:
+                return f"skip field-transfer: {reason}"
+            # ---- the mutation: nothing below can raise (every input checked above) ----
+            self.stwo_pool.spend(nf)
+            for c in (cm1, cm2):
+                self.stwo_pool.append(c, self.applying_height())
+            self.pool_value -= unshield + fee
+            # STWO VALUE (defence in depth): the Stwo pool's own total falls with every exit; the refusal above kept
+            # it >= 0, so a spend can never take out more than Stwo deposits put in
+            self.stwo_value -= unshield + fee
+            if unshield:
+                self.uw_nonce += 1
+                self.unshield_withdrawals[str(self.uw_nonce)] = {"addr": addr, "amount": unshield}
+            if fee_to is not None:
+                # the fee leaves the escrow as an exit its payee claims on L1 (the relay's auto-collect), not pool_fees
+                self.uw_nonce += 1
+                self.unshield_withdrawals[str(self.uw_nonce)] = {"addr": fee_to, "amount": fee}
+            else:
+                self.pool_fees += fee
+            self._touch()
+        return f"field-transfer stwo nf {nf[:12]}… unshield {unshield} fee {fee}"
+
+    def rules_root_v2(self):
+        """The EXEC_ROOT_V2 rules in force for the block being applied (same convention as rules_v2). (Their mirror,
+        exec_state_bind.apply_event, went with the Goldilocks settle verifier in G9: a settlement prover that replays
+        code events must replay THESE rules.)"""
+        return self.applying_height() >= 1
+
+    def rules_r2(self):
+        """The review-round-2 exec rules in force for the block being applied (same convention as rules_v2)."""
+        return self.applying_height() >= 1
+
+    def rules_v2(self):
+        """The exec call rules v2 in force for the block being applied. _apply_block advances `cursor` to h only
+        AFTER applying block h's blobs, so during application the block is cursor + 1 — the same height the
+        settlement prover stamps on each call (block_calls: cursor = h), so exec and proof refuse identically."""
+        return self.applying_height() >= 1
+
     def apply_blob(self, payload, sender, txid):
         with self._mutate_lock:
+            sink = self.asset_sink
+            if sink is not None:
+                self._hist_buf = []        # per BLOB: a revert drops it whole (_hist_drop)
+            csink, pre = self.call_sink, None
+            if csink is not None and isinstance(payload, dict) and payload.get("op") == "call":
+                pre = self._call_capture(csink.before, payload)
             try:
                 return self._apply_blob_inner(payload, sender, txid)
             finally:
                 self._touch()
+                if sink is not None:
+                    buf, self._hist_buf = self._hist_buf, None
+                    if buf:
+                        self._emit_history(sink, buf, payload, sender, txid)
+                if pre is not None:
+                    self._call_capture(csink.after, payload, sender, txid, pre)
+
+    def _call_capture(self, fn, payload, *rest):
+        """Run one DEX-index capture step (execnode/dex_trades.DexCallSink). NEVER RAISES — a raise here would escape
+        apply_blob's `finally` into block dispatch — and never touches state (the sink only reads)."""
+        try:
+            return fn(self, payload, *rest)
+        except Exception as e:
+            try:
+                print(f"[execnode] dex index: capture failed ({type(e).__name__}: {e})", flush=True)
+            except Exception:
+                pass
+            return None
+
+    def _emit_history(self, sink, buf, payload, sender, txid):
+        """Hand one blob's asset moves to the node-local history sink. NEVER RAISES and never touches state: the index
+        is a convenience, and a full disk or a corrupt sqlite file must not stop the chain (a raise here would escape
+        apply_blob's `finally` into block dispatch)."""
+        try:
+            p = payload if isinstance(payload, dict) else {}
+            op = p.get("op")
+            is_call = op == "call"
+            args = p.get("args") if is_call else None
+            meta = {"cursor": self.applying_height(), "txid": str(txid or ""), "sender": str(sender or ""),
+                    "op": str(op or "")[:32],
+                    "method": str(p.get("method") or "")[:64] if is_call else "",
+                    "args": [_hist_arg(a) for a in args[:_HIST_ARGS_MAX]] if isinstance(args, list) else [],
+                    "value": str(p.get("value") or 0) if is_call and isinstance(p.get("value"), int) else "0",
+                    "call_asset": str(p.get("asset") or "") if is_call else ""}
+            sink([dict(meta, aid=aid, holder=holder, delta=str(delta)) for aid, holder, delta in buf])
+        except Exception as e:
+            try:
+                print(f"[execnode] asset history: dropped {len(buf)} record(s) of {str(txid)[:12]} ({type(e).__name__}: {e})",
+                      flush=True)
+            except Exception:
+                pass
 
     def _apply_blob_inner(self, payload, sender, txid):
         """Apply ONE blob payload from sender (the blob tx's L1 sender). Returns a short human string.
@@ -921,10 +1315,16 @@ class ExecState:
             if op == "deploy":
                 code = _decode_code(payload)              # raw `code` or zstd `codez`
                 rt_name = payload.get("runtime", runtimes.DEFAULT_RUNTIME)   # pluggable: which VM runs it
+                if self.rules_r2() and not isinstance(rt_name, str):
+                    return "skip: runtime must be a string"                  # F7: never store a raw non-name
+                if self.rules_root_v2() and not runtimes.runtime_name_ok(rt_name):
+                    return f"skip: unknown runtime {rt_name!r}"              # EXEC_ROOT_V2: exact name only
                 rt = runtimes.get(rt_name)
                 if rt is None:
                     return f"skip: unknown runtime {rt_name!r}"
-                rt.validate_code(code)                    # raises ZkVMError on bad code (caught below)
+                # the gen-29 deploy gate at every cursor (BLAKE_EXEC_HEIGHT, gen 28's gate, 1 from gen 29, inlined in G9):
+                # a deploy validates as zkvm2 code, never as the old VM's
+                rt.validate_code(code)   # zkvm2's gate; raises ZkVMError (caught below)
                 # FIXED-NAME deploy (doc/faucet.md §4): a SYSTEM contract may claim a well-known literal
                 # cid instead of the derived hash, so the L1 reserved recipient, the exec ledger key and
                 # the contract address are all the same word. Allowlisted per name to a sole deployer —
@@ -944,12 +1344,24 @@ class ExecState:
                     ok, _ret, storage, _pay, _fx = self._rt_run(rt, code, "constructor", sender, [], {}, cursor=self.cursor, timestamp=self.block_ts, beacons=self.beacons, block_hashes=self.block_hashes, selfd=runtimes.zkvm_addr_digest(cid), abal=self.holder_assets(cid), **kw)
                     if not ok:
                         storage = {}                      # constructor reverted -> deploy with empty state
+                    elif self.rules_r2() and _fx:
+                        # F8: a constructor's asset effects (an AMINT of its own token, say) were computed and
+                        # DROPPED. Stage and commit them exactly as a call's are; an illegal effect reverts the
+                        # constructor, so the contract deploys with empty state rather than half-applied effects.
+                        a_ok, _why, a_deltas, a_sup, a_meta = self.stage_asset_effects(cid, _fx)
+                        if a_ok:
+                            self.commit_asset_effects(a_deltas, a_sup, a_meta)
+                        else:
+                            storage = {}
                 abi = payload.get("abi")   # optional, non-consensus UX metadata {method:{args,doc}}
                 # UPGRADABILITY (per-contract, opt-out): a contract is upgradable by its deployer unless it
                 # deploys with {"upgradable": false}. A stable contract can later renounce upgradability
                 # permanently via the `lock` op. This keeps mainnet safe (lockable/immutable) while letting a
-                # deployer iterate freely until they lock. Default True preserves the alphanet workflow.
-                upgradable = payload.get("upgradable", True) is not False
+                # deployer iterate freely until they lock. Default True preserves the betanet workflow.
+                _up = payload.get("upgradable", True)
+                # F10: only JSON `false` locked; 0, "false", "0" and "no" deployed UPGRADABLE while the deployer
+                # believed the contract locked. From REVIEW_R2_HEIGHT every false-like value locks.
+                upgradable = (_up not in (False, 0, "false", "0", "no")) if self.rules_r2() else (_up is not False)
                 self.contracts[cid] = {"code": code, "storage": storage, "deployer": sender,
                                        "runtime": rt_name, "abi": abi if isinstance(abi, dict) else {},
                                        "upgradable": upgradable}
@@ -963,6 +1375,13 @@ class ExecState:
                 c = self.contracts.get(cid)
                 if not c:
                     return f"skip: no contract {cid}"
+                _v2 = self.rules_v2()
+                # F2 (2026-09-23): a non-string method used to pass every check here, be DEBITED below, and
+                # raise TypeError at the VM's `method not in code` — caught by the outer except with the
+                # escrow kept. Refuse it before any ledger moves. Legacy blocks keep the old outcome (the
+                # exception path), which is why the check is gated.
+                if _v2 and not isinstance(method, str):
+                    return "skip: method must be a string"
                 if not isinstance(args, list):
                     return "skip: args must be a list"
                 if not isinstance(value, int) or isinstance(value, bool) or value < 0:
@@ -980,6 +1399,18 @@ class ExecState:
                 rt = runtimes.get(c.get("runtime", runtimes.DEFAULT_RUNTIME))
                 if rt is None:
                     return f"skip: unknown runtime for {cid}"
+                # C1 (2026-09-23, reproduced): "one `value` field, two ledgers" is exactly the hole. A method
+                # that never reads ACTX cannot tell a token from NADO: it books `value`, and its later PAY
+                # draws native coins from the contract's shared holding — escrowed by OTHER players. So an
+                # asset-denominated value may only enter a method whose program reads ACTX (dex, otc,
+                # reserve today; all of them compare it and require asset 0 on their native-only methods).
+                # The settlement prover applies the same test (settlement_proofs._run_call), so a refused
+                # call is refused identically on every exec node and unprovable in every settle proof.
+                if _v2 and in_asset and value > 0 and not (
+                        c.get("runtime", runtimes.DEFAULT_RUNTIME) == "zkvm"
+                        and zkvm2.method_reads_actx(c["code"], method)):
+                    return (f"skip: asset-denominated value into {cid[:12]}….{method}, which never reads "
+                            f"ACTX and would pay it out as native NADO")
                 # VALUE ESCROW: debit the caller's bridge INTO the contract (keyed by cid) BEFORE running, so the
                 # VALUE opcode reflects it and PAY can draw on it. A revert refunds exactly — no NADO created or lost.
                 if value > 0:
@@ -996,24 +1427,60 @@ class ExecState:
                             del self.bridge[sender]
                         self.bridge[cid] = self.bridge.get(cid, 0) + value
                 kw = {"registry": self.zk_addrs} if getattr(rt, "wants_registry", False) else {}
-                ok, _ret, new_storage, payouts, effects = self._rt_run(
-                    rt, c["code"], method, sender, args, c["storage"],
-                    value=value, cursor=self.cursor, timestamp=self.block_ts, beacons=self.beacons,
-                    block_hashes=self.block_hashes, asset=int(in_asset or 0),
-                    selfd=runtimes.zkvm_addr_digest(cid), abal=self.holder_assets(cid), **kw)
                 def _refund():
                     if value > 0:
                         if in_asset:
                             self._asset_credit(in_asset, cid, -value)
                             self._asset_credit(in_asset, sender, value)
+                            self._hist_drop()      # escrow + refund = nothing happened (asset history, non-consensus)
                             return
                         self.bridge[cid] = self.bridge.get(cid, 0) - value
                         if self.bridge.get(cid, 0) == 0:
                             self.bridge.pop(cid, None)
                         self.bridge[sender] = self.bridge.get(sender, 0) + value
+                    self._hist_drop()              # INVARIANT: every refund leaves the blob with no history
+                _meter = {}
+                try:
+                    ok, _ret, new_storage, payouts, effects = self._rt_run(
+                        rt, c["code"], method, sender, args, c["storage"],
+                        value=value, cursor=self.cursor, timestamp=self.block_ts, beacons=self.beacons,
+                        block_hashes=self.block_hashes, asset=int(in_asset or 0),
+                        selfd=runtimes.zkvm_addr_digest(cid), abal=self.holder_assets(cid), meter=_meter, **kw)
+                except Exception as e:
+                    # F2: the VM raising (rather than reverting) must not keep the escrow. Below the gate the
+                    # exception keeps propagating to the outer except, exactly as it always did.
+                    if not _v2:
+                        raise
+                    _refund()
+                    self._charge_reverted_steps(None, sender)  # EXEC_BUDGET_V2_HEIGHT: GAS_LIMIT, it may not have metered
+                    return f"skip: call {cid[:12]}….{method} raised {type(e).__name__} — escrow refunded"
                 if not ok:
                     _refund()
+                    # INVARIANT (EXEC_BUDGET_V2_HEIGHT): a revert's executed steps count against the block's
+                    # budget like an applied call's — a reverting call was the way around EXEC_BLOCK_STEP_BUDGET
+                    self._charge_reverted_steps(_meter.get("gas", 0), sender)
                     return f"call {cid}.{method} by {sender[:12]}… -> revert (no-op)"
+                # F4 (REVIEW_R2_HEIGHT): a PER-BLOCK execution budget. Only GAS_LIMIT per call bounded the
+                # exec CPU a block could demand, and a 1 MiB block of cheap calls was measured at ~2 h. The
+                # steps this call executed are counted against the block's budget in tx order; a call that
+                # would take the block past it is treated as a revert (escrow refunded, nothing applied), and
+                # settlement_proofs mirrors the same count so the prover skips exactly what the chain skipped.
+                if self.rules_r2():
+                    from protocol import EXEC_BLOCK_STEP_BUDGET, EXEC_SENDER_STEP_SHARE
+                    _gas = int(_meter.get("gas", 0))
+                    _used = int(getattr(self, "_block_steps", 0)) + _gas
+                    if _used > int(EXEC_BLOCK_STEP_BUDGET):
+                        _refund()
+                        return f"call {cid}.{method} -> revert (block execution budget exhausted)"
+                    # EXEC_BUDGET_V2_HEIGHT: a sender's share of the block (applied + reverted calls), so a txid-ground
+                    # sender at the front of the block cannot burn the budget everyone else's calls need
+                    _by = self.__dict__.setdefault("_block_steps_by", {})
+                    if self.rules_budget_v2() and _by.get(sender, 0) + _gas > int(EXEC_SENDER_STEP_SHARE):
+                        _refund()
+                        return f"call {cid}.{method} -> revert (sender's share of the block execution budget exhausted)"
+                    self._block_steps = _used
+                    if self.rules_budget_v2():
+                        _by[sender] = _by.get(sender, 0) + _gas
                 # A contract can only pay out what it HOLDS: reject (revert + refund) an over-pay so its balance
                 # can never go negative and no NADO is minted.
                 total_pay = sum(a for _t, a in payouts)
@@ -1084,7 +1551,7 @@ class ExecState:
                     if c.get("deployer") != sender:
                         return "skip: only a contract's deployer may issue an asset for it"
                     issuer = for_cid
-                aid = str(asset_id(issuer, seed))
+                aid = str(asset_id(issuer, seed))   # the id the gen-29 VM computes (the only one since G9 slice 3b)
                 if aid in self.assets:
                     return f"skip: asset {aid[:12]}… already exists"
                 # MINT AUTHORITY is opt-IN and renounceable, never implicit: an asset created with
@@ -1190,7 +1657,7 @@ class ExecState:
                     return "skip: asset_mint needs a `to` address"
                 if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:
                     return "skip: asset_mint amount must be positive"
-                if meta["supply"] + amount > ASSET_SUPPLY_CAP:
+                if meta["supply"] + amount >= ASSET_SUPPLY_CAP:   # strict: keep every balance < 2^62 (RANGE window)
                     return f"skip: {meta['sym']} supply cap exceeded"
                 self._asset_credit(aid, to, amount)
                 meta["supply"] += amount
@@ -1263,17 +1730,39 @@ class ExecState:
                 if c.get("upgradable", True) is False:
                     return f"skip: contract {cid} is locked (immutable)"
                 rt_name = payload.get("runtime", c.get("runtime", runtimes.DEFAULT_RUNTIME))
+                if self.rules_root_v2():
+                    # EXEC_ROOT_V2: an absent OR null runtime keeps
+                    # the contract's; anything else must be an exact registered name. Before the gate a null
+                    # stored None as the runtime and "" stored "" — records the prover could not replay.
+                    rt_name = payload.get("runtime")
+                    if rt_name is None:
+                        rt_name = c.get("runtime", runtimes.DEFAULT_RUNTIME)
+                    if not runtimes.runtime_name_ok(rt_name):
+                        return f"skip: unknown runtime {rt_name!r}"
                 rt = runtimes.get(rt_name)
                 if rt is None:
                     return f"skip: unknown runtime {rt_name!r}"
                 try:
-                    rt.validate_code(code)
+                    rt.validate_code(code)   # zkvm2 at every cursor (BLAKE_EXEC_HEIGHT inlined in G9)
                 except Exception as e:
                     return f"skip: invalid code ({e})"
                 c["code"] = code
                 c["runtime"] = rt_name
                 if isinstance(payload.get("abi"), dict):
                     c["abi"] = payload["abi"]
+                # FAUCET DONATION RECORD SEED, once, at the block that lands defund(): everything the faucet
+                # held until then was the operator's own funding (the treasury has never paid into it —
+                # verified against the ordered stream before this shipped), so DONATED starts at the balance
+                # at this exact block. Deterministic: every node applies this upgrade at the same height and
+                # reads the same balance. A treasury payout after this line is NOT counted, by design.
+                # GEN-25 ONLY (off from EXEC_ROOT_V2_HEIGHT): it writes a storage slot from the RECORDS half,
+                # which no settlement proof can derive — the verifier replays an upgrade as a code/meta change
+                # and nothing else, so a span carrying this write would prove a
+                # root the chain does not hold. The next generation deploys the faucet with DONATED accounting
+                # from block 1 and never needs the seed.
+                if (cid == "faucet" and "defund" in (code or {}) and not self.rules_root_v2()
+                        and not (c.get("storage") or {}).get("slots", {}).get("7")):
+                    self.bump_contract_slot("faucet", 7, int(self.bridge.get("faucet", 0)))
                 return f"upgrade {cid} by {sender[:12]}… (code replaced, storage kept)"
 
             if op == "transfer_contract":
@@ -1294,7 +1783,7 @@ class ExecState:
 
             if op == "emit":
                 # Emit a cross-domain MESSAGE: append {seq, from, to_ns, data} to the outbox, committed in
-                # state_root as an outbox leaf and provable via outbox_proof(seq). This blob only COMMITS the
+                # state_root as an outbox leaf and provable via /exec/outbox_proof (record_proof_at). This blob only COMMITS the
                 # message; a consumer (another rollup / L1) verifies + delivers it against this rollup's
                 # SETTLED root separately (doc/rollups-and-settlement.md §7.4). Append-only, seq == index.
                 to_ns = payload.get("to_ns")
@@ -1338,50 +1827,34 @@ class ExecState:
             # the VALUE/PAY escrow primitive; see doc/exec-instructions.md)
 
             if op == "field_transfer":
-                # PHASE-2: a full join-split STARK proof (delegated-prover output). The bundle rides as an
-                # OPAQUE JSON STRING so its big field ints survive JSON (JS would lose >2^53 precision).
-                bj = payload.get("bundle_json")
-                if bj is not None:
-                    try:
-                        bundle = json.loads(bj)
-                    except Exception:
-                        return "skip: bad bundle_json"
-                else:
-                    bundle = payload.get("bundle")
-                if not isinstance(bundle, dict):
-                    return "skip: bad field_transfer"
+                # A Stwo spend (apply_field_transfer). The privacy pause that once stood here refused the LEGACY field
+                # pool's transfers between PRIVACY_PAUSE_HEIGHT and SHIELD_WIDE_HEIGHT, a window that was empty from gen
+                # 26 (both 1), so on generation 29 it never fired; it went with the pool (G9 slice 5).
+                # The bundle rides as an OPAQUE JSON STRING so its big ints survive JSON.
+                # THE ONE PARSE (field_transfer_bundle): execnode._block_carries_stwo_spend decides whether to stall on
+                # exactly this bundle, so the two can never disagree about what a payload carries.
+                bundle, err = field_transfer_bundle(payload)
+                if bundle is None:
+                    return err
                 return self.apply_field_transfer(bundle)
 
             if op == "shielded_transfer":
-                # PRIVATE transfer / UNSHIELD (doc/privacy.md): apply a join-split to the pool (double-spend +
-                # value-conservation checked by the verifier). If public_value < 0 the coins LEAVE the pool ->
-                # record a provable unshield exit for L1 to release from SHIELD_ESCROW against the settled root.
-                public = payload.get("public")
-                proof = payload.get("proof")
-                if not isinstance(public, dict) or not isinstance(proof, dict):
-                    return "skip: bad shielded_transfer"
-                # UNBACKED-MINT FENCE (see apply_field_transfer): coins may only ENTER the pool via an L1
-                # `shield` tx, whose escrowed amount drives apply_shield. A transfer blob is user-supplied
-                # and escrow-free, so public_value > 0 here would mint notes backed by nothing. Checked
-                # BEFORE apply_transfer so a rejected blob never mutates the pool.
-                pv = int(public.get("public_value", 0))
-                if pv > 0:
-                    return "skip shielded_transfer: public_value > 0 (coins enter only via an L1 shield)"
-                ok, reason = apply_transfer(self.shielded, public, proof, self.shielded.knows_root)
-                if not ok:
-                    return f"skip shielded_transfer: {reason}"
-                _fee = int(public.get("fee", 0) or 0)
-                self.pool_value += pv - _fee              # shielded supply (ops/invariants)
-                self.pool_fees += _fee
-                if pv < 0:
-                    addr = public.get("withdraw_addr")
-                    if not addr:
-                        return "skip: unshield missing withdraw_addr"
-                    self.uw_nonce += 1
-                    nonce = str(self.uw_nonce)
-                    self.unshield_withdrawals[nonce] = {"addr": addr, "amount": -pv}
-                    return f"unshield {-pv} -> {addr[:12]}… nonce {nonce}"
-                return f"shielded_transfer ok ({len(public.get('out_commitments', []))} out)"
+                # THE LEGACY POOL'S TRANSFER IS A SKIP AT EVERY HEIGHT (G9 slice 5c). From LEGACY_TRANSFER_CLOSE_HEIGHT
+                # (14000 on gen 29) the op was skipped before anything was parsed, with exactly this string; below it the
+                # transparent transfer applied to execnode/shielded.py (deleted), but the gen-29 chain carries NO
+                # `shielded_transfer` blob in 0..13999 (0..12758 measured 2026-10-28; the rest once 14000 was final — the
+                # precondition of this deletion), so returning the gate's skip everywhere is the same verdict on every
+                # block the chain holds. INVARIANT: keep it its own op and keep it a pure no-op — never let it fall through to "unknown op" or touch any state.
+                return "skip shielded_transfer: the legacy shielded pool is closed (LEGACY_TRANSFER_CLOSE_HEIGHT)"
+
+            if op == "private_call":
+                # SHIELDED CONTRACT NOTES ARE CLOSED AT EVERY HEIGHT (PRIVACY_PAUSE_HEIGHT, 1 from gen 26): a deposit could
+                # commit a note worth more than it paid, against ANY contract's whole balance (review 2026-09-24,
+                # reproduced). Refused before any parsing or balance movement, so a refused call is a pure no-op. The
+                # transition code (shielded_state.py, appnote_circuit) is deleted (G9 slice 5); below block 1 only
+                # genesis is applied, which carries no transaction on generation 29. INVARIANT: keep it its own op — a
+                # `call` the chain refuses would poison the settlement calls list (calls_commit.block_calls).
+                return "skip private_call: shielded contract notes are paused (PRIVACY_PAUSE_HEIGHT)"
 
             return f"skip: unknown op {op!r}"
         except ZkVMError as e:
@@ -1430,6 +1903,11 @@ class ExecState:
                     continue
                 if name in addr_fields:                    # resolve the stored digest back to its L1 address
                     val = self.zk_addrs.get(str(val), val)
+                elif isinstance(val, int) and val >= (1 << 53):
+                    # a JSON number above 2^53 is silently ROUNDED by every browser (asset ids, digests):
+                    # the dex shipped rounded asset ids in every token-side call. Send it as a string —
+                    # BigInt("…")/String(…) on the client already accept either form.
+                    val = str(val)
                 m[str(k)] = val
             if m:
                 out[name] = m

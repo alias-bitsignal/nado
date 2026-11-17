@@ -1,0 +1,346 @@
+/*
+ * test_a_pilot_takes_off_flies_lands_and_docks_a_craft_in_the_page.mjs — FLIGHT (#147, "you must add actual physics like
+ * engines and gravity to the game and build a real usable xfighter", operator 2026-11-09), walked in the real page
+ * against the real world server (tests/_land_live_fixture.py) as a player on a phone, with the on-screen buttons:
+ *   1. a small craft built on the owner's plot — a steel-plate hull, a pilot seat on it, two thrusters behind;
+ *   (3b: a reload in the air brings the page back to the controls — 2026-11-10; 5: Use on a thruster, not the seat, boards it;
+ *   4b: /crafts tells how far, which way and how high your craft is; 6: held forward at a wall, its hull stops at the wall; 7: /handover hands it to a player near, whose page takes its
+ *   controls — #171)
+ *   2. Use on the seat takes the controls: the HUD says flying, with its thrust against its weight; a visitor near is sent
+ *      the craft, its pieces and its engines' work (#171);
+ *   3. holding Jump climbs — the HUD shows the height and the engines at full, and the world server holds the craft
+ *      higher and its engines' work (it was told; #171);
+ *   4. holding Down lands it; Use leaves it parked (no pilot); /dock sets it down as pieces on the plot again;
+ *   5. no page errors.
+ *
+ * Run:  node tests/test_a_pilot_takes_off_flies_lands_and_docks_a_craft_in_the_page.mjs   (needs chrome, python3)
+ */
+import { spawn } from "node:child_process";
+import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { sweepStaleProfiles } from "./_cdp_profiles.mjs";
+import { tmpdir } from "node:os";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { PROTOCOL_JS } from "./protocol_hook.mjs";
+
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+const Wd = await import(join(ROOT, "static", "land-world.js"));
+let fails = 0;
+const ok = (c, m) => { console.log((c ? "ok   " : "FAIL ") + m); if (!c) fails++; };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ---- the fixture: page + world server + fake exec on one origin ----------------------------------------------------
+const work = mkdtempSync(join(tmpdir(), "nado-land-live-"));
+writeFileSync(join(work, "protocol.js"), PROTOCOL_JS);
+// TMPDIR: everything the fixture makes (its HOME, the world server's) lands in work, which cleanup removes — it is killed,
+// so its own exit handlers never run (640 such directories were left in /tmp by 2026-11-08)
+const fx = spawn("python3", [join(ROOT, "tests", "_land_live_fixture.py"), join(work, "protocol.js")], { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, TMPDIR: work } });
+let fxOut = "";
+fx.stdout.on("data", (d) => { fxOut += d; });
+fx.stderr.on("data", (d) => { fxOut += d; });
+let HTTP = 0;
+for (let i = 0; i < 240 && !HTTP; i++) { const m = fxOut.match(/PORT (\d+)/); if (m) HTTP = Number(m[1]); else await sleep(250); }
+if (!HTTP) { console.log("FAIL the fixture did not start:\n" + fxOut.slice(-2000)); fx.kill("SIGKILL"); process.exit(1); }
+const base = `http://127.0.0.1:${HTTP}`;
+const getJ = async (p) => (await fetch(base + p)).json();
+const { plot: PA } = await getJ("/fixture/plot");
+const q = Wd.plotCoords(PA);
+function spot(du, dv) {
+  for (let d = 0; d < 8; d++) {
+    const u = q.u0 + du + d, v = q.v0 + dv, top = Wd.column(q.face, u, v).top;
+    if (Wd.terrainBlock(q.face, u, v, top + 1) === Wd.B.air && Wd.terrainBlock(q.face, u, v, top + 2) === Wd.B.air
+        && Wd.column(q.face, u, v + 1).top === top && Wd.terrainBlock(q.face, u, v + 1, top + 1) === Wd.B.air)
+      return { u: u + 0.5, v: v + 0.5, h: top + 1 };
+  }
+  throw new Error("no standing spot");
+}
+const SV = spot(3, 3), SO = spot(9, 3);
+
+// ---- the browser -----------------------------------------------------------------------------------------------
+const PORT = 9300 + ((process.pid + 491) % 600);
+sweepStaleProfiles();                                     // what a killed run left (tests/_cdp_profiles.mjs)
+const prof = mkdtempSync(join(tmpdir(), "cdp-landlive-"));
+let chrome = null, ver = null;
+const tried = [];
+for (const bin of [process.env.CHROME, "google-chrome", "google-chrome-stable", "chromium-browser", "chromium"].filter(Boolean)) {
+  const c = spawn(bin, ["--headless", "--disable-gpu", "--no-sandbox", "--use-angle=swiftshader", "--remote-debugging-port=" + PORT,
+    "--user-data-dir=" + prof, "about:blank"], { stdio: "ignore", detached: true });   // its own group: the helpers die with it
+  let gone = false;
+  c.on("error", () => { gone = true; }); c.on("exit", () => { gone = true; });
+  for (let i = 0; i < 60 && !ver && !gone; i++) { try { ver = await (await fetch(`http://127.0.0.1:${PORT}/json/version`)).json(); } catch (e) { await sleep(250); } }
+  if (ver) { chrome = c; break; }
+  tried.push(bin + (gone ? " (exited)" : " (no CDP in 15 s)"));
+  try { c.kill("SIGKILL"); } catch (e) {}
+  await sleep(300);
+}
+function cleanup() { try { chrome && process.kill(-chrome.pid, "SIGKILL"); } catch (e) {} try { fx.kill("SIGKILL"); } catch (e) {} for (const d of [prof, work]) try { rmSync(d, { recursive: true, force: true }); } catch (e) {} }
+if (!chrome) { cleanup(); console.log(`SKIP  no browser served CDP (tried ${tried.join(", ") || "none"})`); process.exit(0); }
+
+const ws = new WebSocket(ver.webSocketDebuggerUrl);
+await new Promise((r) => ws.addEventListener("open", r, { once: true }));
+let id = 0; const pend = new Map(), frames = new Map(), errors = [];
+ws.addEventListener("message", (ev) => {
+  const m = JSON.parse(ev.data);
+  if (m.id && pend.has(m.id)) { pend.get(m.id)(m); pend.delete(m.id); return; }
+  if (m.method === "Network.webSocketFrameReceived") (frames.get(m.sessionId) || frames.set(m.sessionId, []).get(m.sessionId)).push(m.params.response.payloadData);
+  if (m.method === "Runtime.exceptionThrown") errors.push(JSON.stringify(m.params.exceptionDetails).slice(0, 300));
+});
+const send = (sid, method, params) => new Promise((r) => { const i = ++id; pend.set(i, r); ws.send(JSON.stringify({ id: i, method, params, sessionId: sid })); });
+async function tab() {
+  const t = await send(undefined, "Target.createTarget", { url: "about:blank" });
+  const sid = (await send(undefined, "Target.attachToTarget", { targetId: t.result.targetId, flatten: true })).result.sessionId;
+  for (const d of ["Runtime", "Page", "Network"]) await send(sid, d + ".enable", {});
+  await send(sid, "Emulation.setTouchEmulationEnabled", { enabled: true, maxTouchPoints: 5 });
+  await send(sid, "Emulation.setDeviceMetricsOverride", { width: 900, height: 600, deviceScaleFactor: 1, mobile: true });
+  return sid;
+}
+const evl = async (sid, expr) => {
+  const r = await send(sid, "Runtime.evaluate", { expression: expr, returnByValue: true, awaitPromise: true });
+  if (r.result.exceptionDetails) throw new Error("page threw: " + JSON.stringify(r.result.exceptionDetails).slice(0, 300));
+  return r.result.result.value;
+};
+const until = async (sid, expr, ms = 20000) => { for (let t = 0; t < ms; t += 250) { if (await evl(sid, expr).catch(() => false)) return true; await sleep(250); } return false; };
+const hudText = (sid) => evl(sid, "document.getElementById('hudPos').textContent + ' | ' + document.getElementById('hudPlot').textContent");
+async function open(sid, s) {
+  await send(sid, "Page.navigate", { url: base + "/" });
+  await until(sid, "document.readyState === 'complete'");
+  await evl(sid, `localStorage.setItem("nado_land_v1", JSON.stringify({ p: [${q.face}, ${s.u}, ${s.v}, ${s.h}, 0, -1.0] })); true`);
+  await send(sid, "Page.reload", {});
+  await until(sid, "document.getElementById('loading') && document.getElementById('loading').classList.contains('hidden')", 30000);
+}
+
+
+
+const EYE = 1.62;
+async function stand(sid, u, v, h, yaw, pitch) {
+  // the place is written from a page of the same origin that runs no game: written from the game page, the game still
+  // booting there could save its own place over it before the reload (a test stood where the last one left it)
+  await send(sid, "Page.navigate", { url: base + "/static/land-world.js" });
+  await until(sid, "document.readyState === 'complete'");
+  await evl(sid, `localStorage.setItem("nado_land_v1", JSON.stringify({ p: [${q.face}, ${u}, ${v}, ${h}, ${yaw}, ${pitch}] })); true`);
+  await send(sid, "Page.navigate", { url: base + "/" });
+  await until(sid, "document.getElementById('loading') && document.getElementById('loading').classList.contains('hidden')", 30000);
+  await until(sid, "/Your plot/.test(document.getElementById('hudPlot').textContent)", 20000);
+  await evl(sid, "document.getElementById('help') && document.getElementById('help').classList.add('hidden'), true");
+  await sleep(2500);
+}
+const shot = async (sid, name) => {
+  if (!process.env.SHOTS) return;
+  const r = await send(sid, "Page.captureScreenshot", { format: "png" });
+  writeFileSync(join(process.env.SHOTS, name + ".png"), Buffer.from(r.result.data, "base64"));
+};
+try {
+  const PAid = (await getJ("/fixture/plot")).plot;
+  await getJ("/fixture/seed?who=owner&items=" + encodeURIComponent(JSON.stringify({ steel_plate: 2, thruster: 2, pilot_seat: 1 })) + "&tools=" + encodeURIComponent(JSON.stringify(["pick"])));
+  const { token } = await getJ("/fixture/owner_token");
+  // 1. the craft: on a flat strip, resting on the ground
+  let site = null;
+  for (let du = 2; du < 12 && !site; du++) for (let dv = 4; dv < 12 && !site; dv++) {
+    const u = q.u0 + du, v = q.v0 + dv, top = Wd.column(q.face, u, v).top;
+    const cols = []; for (let a = 0; a < 4; a++) for (let b = -1; b < 3; b++) cols.push([u + a, v + b]);
+    if (cols.every(([cu, cv]) => Wd.column(q.face, cu, cv).top === top && Wd.terrainBlock(q.face, cu, cv, top + 1) === Wd.B.air && Wd.terrainBlock(q.face, cu, cv, top + 2) === Wd.B.air))
+      site = { du, dv, top };
+  }
+  ok(!!site, "a flat site for the craft");
+  const X = site.du * 100, Z = site.dv * 100, Y = (site.top + 1) * 100;
+  const hull = [X, Z, Y, 300, 150, 10, 64], seat = [X + 110, Z + 30, Y + 10, 80, 90, 110, 66];
+  const thr1 = [X + 20, Z - 100, Y, 100, 100, 140, 65], thr2 = [X + 180, Z - 100, Y, 100, 100, 140, 65];
+  const built = await (await fetch(base + "/land/api/boxes", { method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
+    body: JSON.stringify({ plot: PAid, add: [hull, seat, thr1, thr2] }) })).json();
+  ok(built.added === 4 || (Array.isArray(built.added) && built.added.length === 4), "a hull, a seat and two thrusters are built: " + JSON.stringify(built).slice(0, 200));
+
+  const B = await tab();
+  await send(B, "Network.setCookie", { name: "land_session", value: token, url: base + "/", httpOnly: true });
+  // stand 2.6 m north of the seat, looking at it
+  const su = q.u0 + (X + 150) / 100, sv = q.v0 + (Z + 75) / 100;
+  const pu = su, pv = sv + 2.6, ph = site.top + 1;
+  const pitch = -Math.atan2(ph + EYE - (Y + 60) / 100, 2.6);
+  await stand(B, pu, pv, ph, Math.PI, pitch);
+
+  // 2. Use on the seat
+  await evl(B, "document.getElementById('tUse').click(), true");
+  ok(await until(B, "/Flying/.test(document.getElementById('hudPos').textContent)", 15000), "Use on the seat takes the controls: " + await hudText(B));
+  ok(/thrust 60 kN/.test(await evl(B, "document.getElementById('hudPos').textContent")), "…the HUD shows its thrust (two thrusters, 60 kN) against its weight");
+  const crafts0 = (await getJ(`/land/api/crafts?face=${q.face}&u=${su}&v=${sv}`)).crafts;
+  ok(crafts0.length === 1 && crafts0[0].pilot && crafts0[0].pieces.length === 4, "the world server holds one craft of four pieces, piloted");
+  const h0 = crafts0[0].pose[3];
+  // 2b. another player's page — a visitor, signed out, in a browser context of its own — is sent the craft, its pieces and
+  // its engines' work, to draw it and its exhaust (#171). A boarded craft stands on its feet with its engines idle (#184:
+  // it used to float a hand over the turf, engines at its weight), so it is lifted a moment first and left hovering.
+  {
+    await evl(B, "document.getElementById('tJump').dispatchEvent(new Event('touchstart', { cancelable: true })), true");
+    await sleep(1500);
+    await evl(B, "document.getElementById('tJump').dispatchEvent(new Event('touchend')), true");
+    const ctx = (await send(undefined, "Target.createBrowserContext", {})).result.browserContextId;
+    const t = await send(undefined, "Target.createTarget", { url: "about:blank", browserContextId: ctx });
+    const V = (await send(undefined, "Target.attachToTarget", { targetId: t.result.targetId, flatten: true })).result.sessionId;
+    for (const d of ["Runtime", "Page"]) await send(V, d + ".enable", {});
+    const cp = crafts0[0].pose, vu = cp[1] + 5, vv = cp[2] + 6, vh = Wd.column(q.face, Math.floor(vu), Math.floor(vv)).top + 1;
+    await send(V, "Page.navigate", { url: base + "/static/land-world.js" });
+    await until(V, "document.readyState === 'complete'");
+    await evl(V, `localStorage.setItem("nado_land_v1", JSON.stringify({ p: [${q.face}, ${vu}, ${vv}, ${vh}, ${Math.atan2(-5, -6)}, -0.3] })); true`);
+    // what its page is told, read off its own socket
+    await send(V, "Page.addScriptToEvaluateOnNewDocument", { source: "(() => { window.__crafts = []; const W0 = window.WebSocket; window.WebSocket = function (...a) { const w = new W0(...a); w.addEventListener('message', (e) => { try { const m = JSON.parse(e.data); if (m.t === 'players') for (const c of m.crafts || []) window.__crafts.push([c.id, c.pieces ? c.pieces.length : 0, c.eng]); } catch (x) {} }); return w; }; window.WebSocket.prototype = W0.prototype; Object.assign(window.WebSocket, W0); })();" });
+    await send(V, "Page.navigate", { url: base + "/" });
+    await send(V, "Page.bringToFront", {});                       // a hidden tab draws nothing and says nowhere it stands
+    await until(V, "window.__crafts && window.__crafts.some((c) => c[1] === 4) && window.__crafts.some((c) => c[2] && c[2][0] > 0)", 60000);
+    const told = await evl(V, "window.__crafts");
+    ok(told.some((c) => c[0] === crafts0[0].id && c[1] === 4), "a visitor near is sent the craft with its four pieces, to draw it");
+    ok(told.some((c) => c[0] === crafts0[0].id && c[2] && c[2][0] > 0 && c[2][0] <= 1), "…and its engines' work, to draw its exhaust: " + JSON.stringify(told.find((c) => c[2]) || null));
+    await send(undefined, "Target.closeTarget", { targetId: t.result.targetId });
+    await send(undefined, "Target.disposeBrowserContext", { browserContextId: ctx });
+    await send(B, "Page.bringToFront", {});
+  }
+
+  // 3. hold Jump
+  await evl(B, "document.getElementById('tJump').dispatchEvent(new Event('touchstart', { cancelable: true })), true");
+  await sleep(2500);
+  // the engines' work is shown, and told (#171: "the engines have 0 effects" — "it should be visible that x is fighting gravity")
+  await until(B, "/engines 100 %/.test(document.getElementById('hudPos').textContent)", 10000);   // a slow page draws the HUD late
+  const climbing = await evl(B, "document.getElementById('hudPos').textContent");
+  ok(/engines 100 %/.test(climbing), "…climbing, the HUD shows the engines at full: " + climbing.slice(0, 90));
+  const engUp = (await getJ(`/land/api/crafts?face=${q.face}&u=${su}&v=${sv}`)).crafts[0].eng;
+  ok(engUp && engUp[0] === 1 && engUp[1] === 1, "…and the world server holds that, for others to draw its exhaust: " + JSON.stringify(engUp));
+  await evl(B, "document.getElementById('tJump').dispatchEvent(new Event('touchend')), true");
+  await sleep(1500);
+  const up = Number(((await evl(B, "document.getElementById('hudPos').textContent")).match(/([\d.]+) m up/) || [])[1]);
+  ok(up > 3, `holding Jump climbs: ${up} m up`);
+  await shot(B, "flying");
+  let h1 = h0;
+  for (let t = 0; t < 20 && h1 < h0 + 3; t++) { await sleep(500); h1 = (await getJ(`/land/api/crafts?face=${q.face}&u=${su}&v=${sv}`)).crafts[0].pose[3]; }
+  ok(h1 > h0 + 3, `…and the world server holds it higher (${h0.toFixed(2)} -> ${h1.toFixed(2)} m)`);
+  // 3b. RELOADED IN THE AIR ("on respawn i fell out of the x and cannot reenter it … by respawn i mean browser reload",
+  // operator 2026-11-10): the page comes back at the controls of the craft it was flying, where the world server holds it
+  // from the reload on, the page's socket messages about pieces are kept (window.__boxes): step 6 waits for the wall to
+  // REACH the page before driving at it — on a slow page it came seconds late, the hull's front already past its line,
+  // and the sweep rightly treated a wall built through the hull as no wall to it (the seat stopped it 30 cm later)
+  await send(B, "Page.addScriptToEvaluateOnNewDocument", { source: "(() => { window.__boxes = []; const W0 = window.WebSocket; window.WebSocket = function (...a) { const w = new W0(...a); w.addEventListener('message', (e) => { try { const m = JSON.parse(e.data); if (m.t === 'boxes') window.__boxes.push(m); } catch (err) {} }); return w; }; window.WebSocket.prototype = W0.prototype; })();" });
+  await send(B, "Page.reload", {});
+  await until(B, "document.getElementById('loading') && document.getElementById('loading').classList.contains('hidden')", 30000);
+  ok(await until(B, "/Flying/.test(document.getElementById('hudPos').textContent)", 20000), "reloaded in the air, the page is back at the controls: " + await hudText(B));
+  const again = (await getJ(`/land/api/crafts?face=${q.face}&u=${su}&v=${sv}`)).crafts[0];
+  ok(again && again.pilot && again.pose[3] > h0 + 2, "…of the same craft, still in the air, still piloted");
+
+  // 4. land, leave, dock
+  await evl(B, "document.getElementById('tDown').dispatchEvent(new Event('touchstart', { cancelable: true })), true");
+  ok(await until(B, "/ 0\\.0 m up/.test(document.getElementById('hudPos').textContent)", 20000), "holding Down lands it: " + await hudText(B));
+  await evl(B, "document.getElementById('tDown').dispatchEvent(new Event('touchend')), true");
+  await sleep(800);
+  await evl(B, "document.getElementById('tUse').click(), true");
+  let parked = null;
+  for (let t = 0; t < 20 && !(parked && parked.pilot === null); t++) { await sleep(500); parked = (await getJ(`/land/api/crafts?face=${q.face}&u=${su}&v=${sv}`)).crafts[0]; }
+  ok(parked && parked.pilot === null && parked.eng === null, "Use again leaves it parked, its engines stopped");
+  // 4b. /crafts finds it (#171, "i left the x somewhere"): how far, which way, how high
+  await send(B, "Input.dispatchKeyEvent", { type: "keyDown", code: "Slash", key: "/", windowsVirtualKeyCode: 191 });
+  await send(B, "Input.dispatchKeyEvent", { type: "keyUp", code: "Slash", key: "/", windowsVirtualKeyCode: 191 });
+  await until(B, "document.activeElement && document.activeElement.id === 'conIn'", 8000);
+  await send(B, "Input.insertText", { text: "crafts" });
+  await send(B, "Input.dispatchKeyEvent", { type: "keyDown", code: "Enter", key: "Enter", windowsVirtualKeyCode: 13 });
+  await send(B, "Input.dispatchKeyEvent", { type: "keyUp", code: "Enter", key: "Enter", windowsVirtualKeyCode: 13 });
+  await until(B, "/Your craft/.test(document.getElementById('conLog').textContent)", 10000);
+  const found = (await evl(B, "document.getElementById('conLog').textContent")).match(/Your craft (\w+): (\d+) m away, bearing (\d+)° \(north 0°, east 90°\), (\d+) m up/);
+  const me = JSON.parse(await evl(B, "localStorage.getItem('nado_land_v1')") || "{}").p || [];
+  const want = me.length ? Math.round(Math.hypot(parked.pose[1] - me[1], parked.pose[2] - me[2])) : -1;
+  ok(found && parked.id.startsWith(found[1]) && Math.abs(Number(found[2]) - want) <= 3 && Number(found[4]) <= 2,
+    `/crafts tells where the parked craft is — how far, which way, how high: ${found ? found[0] : "(nothing)"} (measured ${want} m)`);
+  await send(B, "Input.dispatchKeyEvent", { type: "keyDown", code: "Slash", key: "/", windowsVirtualKeyCode: 191 });
+  await send(B, "Input.dispatchKeyEvent", { type: "keyUp", code: "Slash", key: "/", windowsVirtualKeyCode: 191 });
+  await until(B, "document.activeElement && document.activeElement.id === 'conIn'", 8000);
+  await send(B, "Input.insertText", { text: "dock" });
+  await send(B, "Input.dispatchKeyEvent", { type: "keyDown", code: "Enter", key: "Enter", windowsVirtualKeyCode: 13 });
+  await send(B, "Input.dispatchKeyEvent", { type: "keyUp", code: "Enter", key: "Enter", windowsVirtualKeyCode: 13 });
+  let boxes = [];
+  for (let t = 0; t < 20 && !boxes.some((b) => b[6] === 66); t++) { await sleep(500); boxes = (await getJ("/land/api/plot?plot=" + PAid)).boxes || []; }
+  ok(boxes.filter((b) => [64, 65, 66].includes(b[6])).length === 4, "/dock sets it down as its four pieces on the plot again: " + JSON.stringify(boxes.filter((b) => [64, 65, 66].includes(b[6]))));
+  if (!boxes.some((b) => b[6] === 66)) console.log("what the page said:", await evl(B, "document.getElementById('conLog').textContent.slice(-300) + ' || ' + document.body.innerText.slice(0, 600)"), JSON.stringify((await getJ(`/land/api/crafts?face=${q.face}&u=${su}&v=${sv}`)).crafts.map((c) => [c.pose, c.pilot])));
+  ok((await getJ(`/land/api/crafts?face=${q.face}&u=${su}&v=${sv}`)).crafts.length === 0, "…and the craft is gone");
+  // 5. USE ON ANY PART OF A CRAFT boards it: a seat inside a closed cockpit cannot be aimed at past its canopy (the X
+  // fighter, #169, 2026-11-10) — Use on another part of it (a thruster) takes the seat it is built round
+  const part = boxes.filter((b) => b[6] === 65).sort((a, b) => b[0] - a[0])[0];       // the eastmost thruster
+  const pc = { u: q.u0 + (part[0] + part[3] / 2) / 100, v: q.v0 + (part[1] + part[4] / 2) / 100, h: (part[2] + part[5] / 2) / 100 };
+  const tu = pc.u + 2.6, tv = pc.v, th = Wd.column(q.face, Math.floor(tu), Math.floor(tv)).top + 1;
+  await stand(B, tu, tv, th, -Math.PI / 2, -Math.atan2(th + EYE - pc.h, 2.6));
+  await send(B, "Input.dispatchKeyEvent", { type: "keyDown", code: "Slash", key: "/", windowsVirtualKeyCode: 191 });
+  await send(B, "Input.dispatchKeyEvent", { type: "keyUp", code: "Slash", key: "/", windowsVirtualKeyCode: 191 });
+  await until(B, "document.activeElement && document.activeElement.id === 'conIn'", 8000);
+  await send(B, "Input.insertText", { text: "aim" });
+  await send(B, "Input.dispatchKeyEvent", { type: "keyDown", code: "Enter", key: "Enter", windowsVirtualKeyCode: 13 });
+  await send(B, "Input.dispatchKeyEvent", { type: "keyUp", code: "Enter", key: "Enter", windowsVirtualKeyCode: 13 });
+  await sleep(1500);
+  const aimed = await evl(B, "document.getElementById('conLog').textContent.slice(-120)");
+  ok(/Aiming at Thruster/.test(aimed), "aiming at a thruster of the craft, not its seat: " + aimed.slice(-80));
+  await evl(B, "document.getElementById('tUse').click(), true");
+  ok(await until(B, "/Flying/.test(document.getElementById('hudPos').textContent)", 15000), "Use on it takes the craft's seat: " + await hudText(B));
+  // 6. ITS BODY MEETS THE WORLD (#171, "x has no collision in the air"): a steel wall 2 m ahead of its hull; held forward,
+  // the craft goes up to the wall and no farther — its hull stops at it, not its seat (which was all that collided)
+  await getJ("/fixture/seed?who=owner&items=" + encodeURIComponent(JSON.stringify({ steel_plate: 8 })));
+  const hullN = boxes.find((b) => b[6] === 64), wallZ = hullN[1] + hullN[4] + 200;
+  // the wall is FOUNDED 20 cm into the ground under the resting hull: a boarded craft stands on its feet on the smooth
+  // ground (#184), a hand lower than the block grid the docked pieces sit on, and a wall built at the grid's height stood
+  // over a gap the 10 cm hull slid under — the seat stopped it 30 cm later (this walk, 2026-11-13)
+  const cRest = (await getJ(`/land/api/crafts?face=${q.face}&u=${su}&v=${sv}`)).crafts[0];
+  const restBottom = cRest.pose[3] + Math.min(0, ...cRest.pieces.map((b) => Wd.boxAabb(b)[2])) / 100;
+  const wallY = Math.floor(restBottom * 100) - 20;
+  const wallB = await (await fetch(base + "/land/api/boxes", { method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
+    body: JSON.stringify({ plot: PAid, add: [[hullN[0] - 200, wallZ, wallY, hullN[3] + 400, 20, 420, 64]] }) })).json();
+  ok(wallB.added === 1 || (Array.isArray(wallB.added) && wallB.added.length === 1), "a wall is built 2 m ahead of the craft's hull: " + JSON.stringify(wallB).slice(0, 120));
+  ok(await until(B, `window.__boxes && window.__boxes.some((m) => m.plot === ${PAid} && (m.add || []).some((b) => b[2] === ${wallY} && b[4] === 20))`, 60000), "…and the wall has reached the pilot's page");
+  await sleep(1000);
+  const seatV0 = (await getJ(`/land/api/crafts?face=${q.face}&u=${su}&v=${sv}`)).crafts[0].pose[2];
+  await send(B, "Input.dispatchKeyEvent", { type: "keyDown", code: "KeyW", key: "w", windowsVirtualKeyCode: 87 });
+  await sleep(5000);
+  await send(B, "Input.dispatchKeyEvent", { type: "keyUp", code: "KeyW", key: "w", windowsVirtualKeyCode: 87 });
+  await sleep(1500);
+  const seatV1 = (await getJ(`/land/api/crafts?face=${q.face}&u=${su}&v=${sv}`)).crafts[0].pose[2];
+  const hullFront = seatV1 + (hullN[1] + hullN[4] - (boxes.find((b) => b[6] === 66)[1] + boxes.find((b) => b[6] === 66)[4] / 2)) / 100, wallFace = q.v0 + wallZ / 100;
+  ok(seatV1 > seatV0 + 0.8, `held forward, the craft goes toward the wall (${(seatV1 - seatV0).toFixed(2)} m)`);
+  ok(hullFront <= wallFace + 0.2, `…and its hull stops at the wall, not through it (hull front ${hullFront.toFixed(2)}, wall at ${wallFace.toFixed(2)})`);
+  // 7. HANDING IT OVER (#171: the operator could not board the X fighter the agent built for them): the owner types /handover
+  // and the start of the address of a player standing near; that player owns it now, and their page takes its controls
+  {
+    const agentAddr = (await getJ("/fixture/plot")).agent, { token: atok } = await getJ("/fixture/agent_token");
+    const ctx = (await send(undefined, "Target.createBrowserContext", {})).result.browserContextId;
+    const t = await send(undefined, "Target.createTarget", { url: "about:blank", browserContextId: ctx });
+    const A = (await send(undefined, "Target.attachToTarget", { targetId: t.result.targetId, flatten: true })).result.sessionId;
+    for (const d of ["Runtime", "Page", "Network"]) await send(A, d + ".enable", {});
+    await send(A, "Network.setCookie", { name: "land_session", value: atok, url: base + "/", httpOnly: true });
+    const cp = (await getJ(`/land/api/crafts?face=${q.face}&u=${su}&v=${sv}`)).crafts[0].pose;
+    const au = cp[1] - 4, av = cp[2] - 3, ah = Wd.column(q.face, Math.floor(au), Math.floor(av)).top + 1;
+    await send(A, "Page.navigate", { url: base + "/static/land-world.js" });
+    await until(A, "document.readyState === 'complete'");
+    await evl(A, `localStorage.setItem("nado_land_v1", JSON.stringify({ p: [${q.face}, ${au}, ${av}, ${ah}, 0, 0] })); localStorage.setItem("nado_land_welcome_seen", "1"); true`);
+    await send(A, "Page.navigate", { url: base + "/" });
+    await send(A, "Page.bringToFront", {});
+    await until(A, "document.getElementById('loading') && document.getElementById('loading').classList.contains('hidden')", 60000);
+    await sleep(4000);
+    await send(B, "Page.bringToFront", {});
+    let said = "";
+    for (let k = 0; k < 12 && !/Given to/.test(said); k++) {      // the player near shows up in the owner's page
+      await send(B, "Input.dispatchKeyEvent", { type: "keyDown", code: "Slash", key: "/", windowsVirtualKeyCode: 191 });
+      await send(B, "Input.dispatchKeyEvent", { type: "keyUp", code: "Slash", key: "/", windowsVirtualKeyCode: 191 });
+      await until(B, "document.activeElement && document.activeElement.id === 'conIn'", 8000);
+      await send(B, "Input.insertText", { text: "handover " + agentAddr.slice(0, 8) });
+      await send(B, "Input.dispatchKeyEvent", { type: "keyDown", code: "Enter", key: "Enter", windowsVirtualKeyCode: 13 });
+      await send(B, "Input.dispatchKeyEvent", { type: "keyUp", code: "Enter", key: "Enter", windowsVirtualKeyCode: 13 });
+      await sleep(2500);
+      said = await evl(B, "document.getElementById('conLog').textContent.slice(-200)");
+    }
+    ok(/Given to/.test(said), "/handover and the start of a near player's address hands the craft over: " + said.slice(-90));
+    const given = (await getJ(`/land/api/crafts?face=${q.face}&u=${su}&v=${sv}`)).crafts[0];
+    ok(given.owner === agentAddr && given.pilot === agentAddr, "…the world server holds them as its owner and its pilot");
+    ok(!/Flying/.test(await evl(B, "document.getElementById('hudPos').textContent")), "…the giver has stepped out of it");
+    await send(A, "Page.bringToFront", {});
+    ok(await until(A, "/Flying/.test(document.getElementById('hudPos').textContent)", 30000), "…and the receiver's page is at its controls: " + await evl(A, "document.getElementById('hudPos').textContent"));
+    await send(undefined, "Target.closeTarget", { targetId: t.result.targetId });
+    await send(undefined, "Target.disposeBrowserContext", { browserContextId: ctx });
+    await send(B, "Page.bringToFront", {});
+  }
+  ok(errors.length === 0, "no page errors" + (errors.length ? ": " + errors.join(" | ") : ""));
+  // the pilot sees their craft: flying, the camera hangs behind and above it (from the seat it was never in view)
+  const page = (await import("node:fs")).readFileSync(join(ROOT, "static", "land.js"), "utf8");
+  ok(/if \(!flying\) return e;[\s\S]{0,300}up = craftUp \|\| fr\.up;[\s\S]{0,200}e\[i\] - fw\[i\] \* CHASE_BACK \+ up\[i\] \* CHASE_UP/.test(page), "flying, the view is a chase view behind and above the craft");
+} catch (e) {
+  ok(false, "harness: " + (e && e.message || e) + "\n" + fxOut.slice(-1500));
+} finally { cleanup(); }
+console.log(fails ? `${fails} FAILED` : "all passed");
+process.exit(fails ? 1 : 0);

@@ -20,14 +20,15 @@ explorer/history only and are rebuilt by replaying the tail. Snapshots verify ag
 chain by anchoring to the block hash at C and replaying the tail through normal validation.
 """
 import hashlib
+import threading
 import os
 import shutil
 
 from ops import codec
+from protocol import INDEX_RETENTION_NUM, INDEX_RETENTION_HASH, EPOCHW_ROOT_WINDOWED
 
 from ops.data_ops import get_home
 from ops import kv_ops
-from ops import segment_store
 
 # how many state entries (db, key, value triples) go into one transferable chunk
 CHUNK_ROWS = int(os.environ.get("NADO_SNAPSHOT_CHUNK_ROWS", "25000"))
@@ -55,10 +56,37 @@ def _leaf(triple) -> bytes:
     return codec.pack([name, key, value])
 
 
+# triple -> 32B leaf digest, shared across every merkle_root call (see the cache note there). Keys are
+# the (db, key, value) tuples themselves: identical bytes hash identically regardless of which walk
+# produced them, and a changed value is simply a different key — no invalidation protocol needed.
+_leaf_cache = {}
+
+
 def merkle_root(triples) -> str:
     """deterministic blake2b Merkle root over the FULL consensus state. `triples` MUST already be in
-    canonical sorted order (caller sorts). Every honest node re-derives the identical root from its own DB."""
-    leaves = [hashlib.blake2b(_leaf(t), digest_size=32).digest() for t in triples]
+    canonical sorted order (caller sorts). Every honest node re-derives the identical root from its own DB.
+
+    LEAF-DIGEST CACHE (2026-08-20): the per-block state-root walk was 31% of ALL process CPU (measured
+    by py-spy at ~100k rows / ~3.5s a walk — the docstring on l1_state_root predicted exactly this
+    scaling), yet between consecutive walks only ~a dozen rows actually change. Caching each triple's
+    leaf digest is PURE memoization — blake2b(_leaf(t)) is a pure function of the triple, so the root
+    stays bit-identical — and turns an unchanged row's pack+hash into a dict hit. Bounded by a clear()
+    at 500k entries (stale entries from deleted/rewritten rows just age out with the flush)."""
+    if len(_leaf_cache) > 500_000:
+        _leaf_cache.clear()
+    _lc = _leaf_cache
+    leaves = []
+    for t in triples:
+        d = _lc.get(t)
+        if d is None:
+            d = hashlib.blake2b(_leaf(t), digest_size=32).digest()
+            _lc[t] = d
+        leaves.append(d)
+    return _merkle_from_leaves(leaves)
+
+
+def _merkle_from_leaves(leaves):
+    """the tree fold over leaf digests (in canonical leaf order) — shared by merkle_root and the root walk"""
     if not leaves:
         return _blake2b(b"")
     while len(leaves) > 1:
@@ -81,7 +109,7 @@ def read_state(home=None):
     # ONE MVCC snapshot across ALL sub-DBs (all_db_pairs) — a per-sub-DB txn could tear the state if a block
     # commits mid-walk, yielding a root for no committed height. CANONICALIZE empty accounts: skip any
     # all-default (absent-equivalent) account row — a zero doc reads identically to a missing one, so dropping
-    # it makes the state_root INVARIANT to read-created-account residue (an alphanet-7 h76000 seed-split cause).
+    # it makes the state_root INVARIANT to read-created-account residue (an betanet-7 h76000 seed-split cause).
     for name, k, v in kv_ops.all_db_pairs(kv_ops.SNAPSHOT_DBS):
         if name == "accounts" and kv_ops.account_value_is_default(v):
             continue
@@ -99,7 +127,7 @@ def read_state(home=None):
 #   (1) ROOT_EXCLUDED_DBS — whole sub-DBs. block_by_num/block_by_hash are written on block ARRIVAL
 #       (save_block), so their contents depend on a node's height, history-retention/pruning, and
 #       orphan/fork bodies accumulated across reorgs. Including them made the root diverge between nodes
-#       that agree on every block — the alphanet-8 fresh-sync wedge (a catching-up node computed a different
+#       that agree on every block — the betanet-8 fresh-sync wedge (a catching-up node computed a different
 #       as-of-parent root than the producer, tripping the gate at ~h62).
 #         treasury_proposals — a WRITE-ONLY display index (the /treasury tab), NOT read by any consensus
 #           path (treasury_execute takes its spend from the tx's own `data`, and quorum from treasury_votes).
@@ -125,7 +153,21 @@ def read_state(home=None):
 # Blocks are already secured by their own hash chain, and finality/pruning by their own monotonic rules;
 # none of this belongs in the state commitment.
 ROOT_EXCLUDED_DBS = frozenset(("block_by_num", "block_by_hash", "treasury_proposals"))
-ROOT_EXCLUDED_META_KEYS = frozenset((b"finalized_height", b"pruned_below"))
+#         index_pruned_below_num / index_pruned_below_hash — the number<->hash INDEX prune watermarks,
+#           advanced by LOCAL retention progress exactly like pruned_below. Omitting them forked the fleet
+#           on 2026-08-14: the index prune first fires when finality crosses INDEX_RETENTION_HASH (10 000),
+#           so at block 10047 every ROLLING node wrote index_pruned_below_hash into meta, its committed root
+#           moved, and every ARCHIVE node — which never prunes and so never writes the row — computed the
+#           old root and correctly refused to extend. A node's disk-retention policy must never be able to
+#           move the consensus root; that is the whole reason this list exists.
+#         hard_finality — the un-crossable floor (two-floor model): FFG checkpoint folded with the wide
+#           liveness backstop, advanced through the node-LOCAL corroboration gate — so two honest nodes
+#           at the same tip can legitimately hold different values (one was partitioned, one was not).
+#           Including it would be the h10047 index-watermark fork all over again. Root-excluded from the
+#           key's FIRST deploy, so a mixed fleet during the update wave computes identical roots: old
+#           nodes never write the key, new nodes write it outside the commitment.
+ROOT_EXCLUDED_META_KEYS = frozenset((b"finalized_height", b"pruned_below", b"hard_finality",
+                                     b"index_pruned_below_num", b"index_pruned_below_hash"))
 
 #   (3) ROOT_EXCLUDED_META_PREFIXES — families of `meta` rows whose PRESENCE is retention / rollback-path
 #       dependent rather than a pure function of the applied block sequence — the same exclusion class as
@@ -134,7 +176,7 @@ ROOT_EXCLUDED_META_KEYS = frozenset((b"finalized_height", b"pruned_below"))
 #           one falling out of the retention window (exec_summary_del(h - EXEC_SUMMARY_RETENTION)); but
 #           rollback_one_block only deletes the block's OWN height and never restores the retention-dropped
 #           row. So a node that has rolled back holds a DIFFERENT execsum set than a forward-only node at the
-#           same tip — which forked the root and wedged the fleet (alphanet-8 h4260: an emergency-mode
+#           same tip — which forked the root and wedged the fleet (betanet-8 h4260: an emergency-mode
 #           rollback storm dropped execsum:3301..3305 on the catching-up nodes; their l1_state_root diverged
 #           from the canonical forward-only chain and the FATAL gate correctly refused them, forever). The
 #           summaries stay CARRIED in the snapshot (settle-with-proof binding needs the window) — only the
@@ -148,20 +190,529 @@ ROOT_EXCLUDED_META_KEYS = frozenset((b"finalized_height", b"pruned_below"))
 ROOT_EXCLUDED_META_PREFIXES = (b"execsum:", b"tvprevE:", b"tvprevW:")
 
 
+#   (4) ROOT RETENTION WINDOW (2026-08-20) — the per-block-cost-must-not-scale-with-chain-age fix.
+#       Six row families grow by construction every epoch forever (RANDAO commits/reveals, FFG
+#       attestations, the att:/divnull:/settle: replay guards, settlement attestations, recert_by_epoch),
+#       and l1_state_root walks + merkleizes ALL of them on EVERY block: measured 31% of process CPU at
+#       ~100k rows on betanet-3 (O(chain²) total work; the leaf cache bought 9x but not a bound).
+#       The root now commits only the LAST ROOT_RETENTION_EPOCHS epochs of those families. Nothing is
+#       DELETED — readers keep full history on disk (deleting would need a revert journal, the exact
+#       rollback-asymmetry class that corrupted roots at h4260) — rows merely leave the commitment.
+#       The reference epoch is derived from the triples THEMSELVES (the max committed `epochw:<E>` row,
+#       written unconditionally at every epoch boundary), so the filter is a pure function of committed
+#       state: identical on every node, and rollback-symmetric for free (reverting a boundary block
+#       deletes that epochw row, the window slides back one epoch, and the edge rows re-enter — exactly
+#       the inverse of applying it). An unparseable key is KEPT (never silently excluded).
+#       No activation gate: the window covers the whole chain until the reference epoch reaches
+#       ROOT_RETENTION_EPOCHS, so old and new code compute IDENTICAL roots until then — the fleet has
+#       until that epoch (60 epochs ≈ 6 h on a fresh chain) to carry the code, then the rule simply is.
+#       The window (60 epochs) exceeds every consensus lookback that reads these rows: the settlement
+#       activity window (SETTLE_ACTIVITY_CURSORS = 24 epochs), FFG justification, the RANDAO reveal lag.
+#       divinflow: is NOT windowed — one row per epoch, the dividend replay's ground truth, which a
+#       from-genesis exec reads in full. epochw:/epochwacc: were permanent on gen 23 and join the window on
+#       gen 24+ (protocol.EPOCHW_ROOT_WINDOWED, just below); the rows themselves stay readable either way.
+ROOT_RETENTION_EPOCHS = 60
+ROOT_WINDOWED_DBS = frozenset(("commits", "reveals", "attestations", "settlements", "recert_by_epoch"))
+# gen 24+: the per-epoch weight rows and their accumulator join the window (protocol.EPOCHW_ROOT_WINDOWED —
+# an expression, so on gen 23 this tuple is byte-for-byte the old one and the root is unchanged).
+# regsnap:<E> (the registry snapshot, protocol.py "RANDAO DUTY CONSISTENCY") grows one row per epoch like epochw and
+# joins the window; no row existed before its (gen-28) gate, so adding the prefix moved no existing root.
+ROOT_WINDOWED_META_PREFIXES = ((b"att:", b"divnull:", b"settle:", b"regsnap:")
+                               + ((b"epochw:", b"epochwacc:") if EPOCHW_ROOT_WINDOWED else ()))
+_EPOCHW_PREFIX = b"epochw:"
+
+
+def _row_epoch(name, key):
+    """The epoch a windowed row belongs to, derived from its KEY alone, or None when the key does not
+    carry one (such a row is always kept). Formats (see ops/kv_ops.py writers):
+      commits            <addr>|<epoch>              reveals / attestations / recert_by_epoch   8-byte BE epoch
+      settlements        <ns>\\x00<8-byte BE cursor>   meta att:<addr>:<epoch>   divnull:<addr>:<epoch>
+      meta settle:<ns>:<addr>:<cursor>                 (cursors map to epochs by // EPOCH_LENGTH)"""
+    from protocol import EPOCH_LENGTH
+    try:
+        if name == "commits":
+            return int(key.rsplit(b"|", 1)[1])
+        if name in ("reveals", "attestations", "recert_by_epoch"):
+            return int.from_bytes(key[:8], "big") if len(key) >= 8 else None
+        if name == "settlements":
+            return int.from_bytes(key[-8:], "big") // EPOCH_LENGTH if len(key) > 8 else None
+        if name == "meta":
+            if key.startswith((b"att:", b"divnull:", b"epochw:", b"epochwacc:", b"regsnap:")):
+                return int(key.rsplit(b":", 1)[1])
+            if key.startswith(b"settle:"):
+                return int(key.rsplit(b":", 1)[1]) // EPOCH_LENGTH
+    except (ValueError, IndexError):
+        return None
+    return None
+
+
+def _root_reference_epoch(triples):
+    """max committed epochw:<E> epoch among `triples`, or None when none is committed yet."""
+    best = None
+    for name, key, _v in triples:
+        if name == "meta" and key.startswith(_EPOCHW_PREFIX):
+            try:
+                e = int(key[len(_EPOCHW_PREFIX):])
+            except ValueError:
+                continue
+            if best is None or e > best:
+                best = e
+    return best
+
+
 def _root_triples(triples):
     """the consensus subset of a full read_state() list — everything the state root commits (block storage
     and node-local / retention-dependent meta rows excluded; see ROOT_EXCLUDED_DBS / ROOT_EXCLUDED_META_KEYS
-    / ROOT_EXCLUDED_META_PREFIXES). Order-preserving, so a pre-sorted input stays sorted."""
-    return [t for t in triples
+    / ROOT_EXCLUDED_META_PREFIXES), then the RETENTION WINDOW over the epoch-growing families (see (4)
+    above). Order-preserving, so a pre-sorted input stays sorted."""
+    base = [t for t in triples
             if t[0] not in ROOT_EXCLUDED_DBS
             and not (t[0] == "meta" and t[1] in ROOT_EXCLUDED_META_KEYS)
             and not (t[0] == "meta" and t[1].startswith(ROOT_EXCLUDED_META_PREFIXES))]
+    ref = _root_reference_epoch(base)
+    if ref is None or ref < ROOT_RETENTION_EPOCHS:
+        return base                    # window covers the whole chain: byte-identical to the unwindowed root
+    floor = ref - ROOT_RETENTION_EPOCHS
+    out = []
+    for t in base:
+        name, key = t[0], t[1]
+        if name in ROOT_WINDOWED_DBS or (name == "meta" and key.startswith(ROOT_WINDOWED_META_PREFIXES)):
+            e = _row_epoch(name, key)
+            if e is not None and e < floor:
+                continue
+        out.append(t)
+    return out
 
 
 # state-root cache: a SINGLE ((env_path, home, write_generation), root) tuple, held as one reference so a
 # reader can never pair a stale key with a newer root under concurrent replacement (GIL-atomic load/store).
 # Same pattern, and the same justification, as account_ops._bonded_reg_cache.
 _root_cache = [None]
+# herd lock (the latest_settled pattern, e2396baf): /state_health sweeps, _record_reject and the block path
+# can all miss the generation at once — one walk per generation, the rest read the cached root.
+_root_lock = threading.Lock()
+
+
+# Sub-DBs whose keys START with the 8-byte big-endian epoch (kv_ops.be8): the retention floor is a single
+# cursor seek instead of a walk over every windowed-out row. Every writer of these DBs keys by be8(epoch)
+# (recert_put / reveal + attestation puts), so a key shorter than 8 bytes cannot exist — the slow path
+# would KEEP such a key (_row_epoch → None), and the seek would skip it if it sorted below the floor;
+# test_root_fast_walk pins the writers so the two paths stay identical.
+_EPOCH_PREFIXED_DBS = frozenset(("reveals", "attestations", "recert_by_epoch"))
+
+# (db, key) -> (value_bytes, leaf_digest) for the PLAIN (non-DUPSORT) root sub-DBs, so the per-block walk
+# neither copies nor re-hashes an unchanged value: the LMDB buffer is compared against the cached bytes
+# (memcmp, no allocation) and only a CHANGED row is materialised and hashed. Matters because `meta`
+# carries the epochw:<E> weight snapshots — one ~18 KB row per epoch, ~25 MB at epoch 1.4k and growing
+# with the chain — which the old walk copied and tuple-hashed on every block. Bounded like _leaf_cache.
+_plain_leaf_cache = {}
+
+
+def _walk_root_rows(home=None):
+    """Yield the consensus-root rows as (db, key_bytes, value_buffer) in CANONICAL order, materialising
+    only what survives the filter. Byte-for-byte the row set of _root_triples(read_state(home)) — the
+    exclusions and the retention window are applied to KEYS before a value is ever copied — but the
+    walk touches only the root sub-DBs (ROOT_EXCLUDED_DBS never opened: block_by_num/block_by_hash are
+    ~2 rows per block of the chain, more than half of what read_state used to read and discard), and the
+    epoch-prefixed families seek straight to the retention floor.
+
+    Order: sub-DBs in sorted name order (SNAPSHOT_DBS is sorted), keys in LMDB order, DUPSORT values in
+    LMDB order. LMDB compares keys and dup values as unsigned byte strings — exactly Python's bytes
+    ordering — so this IS the (db, key, value) sort the slow path performs; test_root_fast_walk asserts it.
+
+    The whole walk is ONE read txn (a single MVCC snapshot, the same tearing argument as all_db_pairs).
+    Values are yielded as LMDB buffers valid only until the cursor advances — the consumer must copy
+    (bytes(v)) anything it keeps beyond the current row."""
+    kv_ops.init_env(home)
+    env = kv_ops.get_env(home)
+    dbs = kv_ops.db_handles(home)
+    names = [n for n in kv_ops.SNAPSHOT_DBS if n not in ROOT_EXCLUDED_DBS]
+    with env.begin(write=False, buffers=True) as txn:
+        # Reference epoch first: the max committed epochw:<E> row (keys only — the values are the big ones).
+        # `epochw:` keys are DECIMAL, so lexicographic order is not numeric order: scan the prefix range.
+        ref = None
+        with txn.cursor(db=dbs["meta"]) as cur:
+            if cur.set_range(_EPOCHW_PREFIX):
+                for k in cur.iternext(keys=True, values=False):
+                    k = bytes(k)
+                    if not k.startswith(_EPOCHW_PREFIX):
+                        break
+                    try:
+                        e = int(k[len(_EPOCHW_PREFIX):])
+                    except ValueError:
+                        continue
+                    if ref is None or e > ref:
+                        ref = e
+        floor = None if (ref is None or ref < ROOT_RETENTION_EPOCHS) else ref - ROOT_RETENTION_EPOCHS
+        for name in names:
+            windowed_db = floor is not None and name in ROOT_WINDOWED_DBS
+            windowed_meta = floor is not None and name == "meta"
+            with txn.cursor(db=dbs[name]) as cur:
+                if windowed_db and name in _EPOCH_PREFIXED_DBS:
+                    if not cur.set_range(kv_ops.be8(floor)):
+                        continue
+                elif not cur.first():
+                    continue
+                for k, v in cur.iternext(keys=True, values=True):
+                    k = bytes(k)
+                    if name == "meta":
+                        if k in ROOT_EXCLUDED_META_KEYS or k.startswith(ROOT_EXCLUDED_META_PREFIXES):
+                            continue
+                        if windowed_meta and k.startswith(ROOT_WINDOWED_META_PREFIXES):
+                            e = _row_epoch(name, k)
+                            if e is not None and e < floor:
+                                continue
+                    elif windowed_db:
+                        e = _row_epoch(name, k)
+                        if e is not None and e < floor:
+                            continue
+                    if name == "accounts" and kv_ops.account_value_is_default(bytes(v)):
+                        continue
+                    yield name, k, v
+
+
+def read_root_state(home=None):
+    """The consensus-root triples (db, key_bytes, value_bytes), canonical order — identical to
+    _root_triples(read_state(home)), via the root-only walk. For diagnostics (state_fingerprint) and
+    tests; l1_state_root hashes straight off the walk without materialising."""
+    return [(n, k, bytes(v)) for n, k, v in _walk_root_rows(home)]
+
+
+def _root_from_walk(home=None):
+    """merkle_root over the root walk, with the plain-DB (db, key) → (value, digest) cache so an unchanged
+    row costs one memcmp. DUPSORT rows (small values) go through the triple-keyed _leaf_cache as before.
+    Same tree, same leaves, same root as merkle_root(read_root_state(home))."""
+    if len(_plain_leaf_cache) > 500_000:
+        _plain_leaf_cache.clear()
+    if len(_leaf_cache) > 500_000:
+        _leaf_cache.clear()
+    plain, dup, dup_dbs = _plain_leaf_cache, _leaf_cache, kv_ops.DUP_DBS
+    leaves = []
+    for name, k, v in _walk_root_rows(home):
+        if name in dup_dbs:
+            t = (name, k, bytes(v))
+            d = dup.get(t)
+            if d is None:
+                d = hashlib.blake2b(_leaf(t), digest_size=32).digest()
+                dup[t] = d
+        else:
+            ck = (name, k)
+            hit = plain.get(ck)
+            if hit is not None and hit[0] == v:          # buffer == bytes: memcmp, no copy
+                d = hit[1]
+            else:
+                vb = bytes(v)
+                d = hashlib.blake2b(_leaf((name, k, vb)), digest_size=32).digest()
+                plain[ck] = (vb, d)
+        leaves.append(d)
+    return _merkle_from_leaves(leaves)
+
+
+# ---- INCREMENTAL ROOT (2026-09-06) -----------------------------------------------------------------------
+# _root_from_walk re-walks every windowed row from LMDB on every block: 11 % of the core thread on the relay
+# (~90k rows). kv_ops now publishes the (db, key) set each commit touched (ROOT WRITE TRACKING there); this
+# keeps, per root sub-DB, the sorted key list and each key's leaf digests, re-reads ONLY the touched keys
+# and folds the same leaves in the same canonical order — bit-identical to the walk by construction, and
+# CHECKED against it:
+#   NADO_ROOT_INC=verify            incremental AND walk every block; the walk's root is the one used; any
+#                                    mismatch is logged and rebuilds the structure. Costs slightly MORE than
+#                                    the walk alone — this mode existed to prove equivalence on live data first.
+#   NADO_ROOT_INC=trust (default)   incremental only, a full walk cross-check every ROOT_INC_VERIFY_EVERY
+#                                    roots (NADO_ROOT_INC_VERIFY_EVERY, default 25; mismatch: log, rebuild,
+#                                    use the walk). PER-NODE: the mode is an env var, so a node that trusts a
+#                                    wrong incremental root diverges alone and resyncs — the fleet default
+#                                    stays verify. Measured on the relay 2026-09-06 (verify mode, 200/200
+#                                    matches): inc 143-165 ms vs walk 1075-1307 ms per block.
+#   NADO_ROOT_INC=off               the walk, as before.
+#
+# TRUST IS THE DEFAULT (operator decision 2026-10-19). The relay ran trust from 2026-09-06 with ZERO mismatches (760
+# walk cross-checks in its latest run alone), while every other node paid verify's walk on EVERY block: measured inc
+# 57 ms + walk 577 ms per block on the relay, the floor on a resync's speed. What makes trusting safe is
+# confirm_l1_state_root: verify_block never REFUSES a block over its root without first confirming ours by the full
+# walk, so a wrong incremental root can cost at most a block we build (it loses; the network's block is then accepted
+# after the confirming walk, which also drops the structure), never a valid block we reject. INVARIANT: any new caller
+# that refuses or purges because the root differs must confirm it first.
+# Rebuilt from a full walk whenever: nothing is cached yet, a txn dropped a sub-DB, a commit landed without
+# publishing (write generation moved more than the listener saw), the env object changed, or the retention
+# floor moved (once per epoch boundary — the window edge drops rows nobody touched).
+ROOT_INC_VERIFY_EVERY = int(os.environ.get("NADO_ROOT_INC_VERIFY_EVERY") or 25)   # trust mode: walk cross-check cadence
+_inc_lock = threading.Lock()
+_inc_dirty = set()
+_inc_flags = {"dropped": False, "gen": None}
+_inc = None            # {"env": id, "gen", "floor", "keys": {name: [key,...] sorted}, "leaves": {name: {key: [digest,...]}}}
+_inc_stats = {"inc": 0, "walk": 0, "mismatch": 0, "inc_ms": 0.0, "walk_ms": 0.0, "rebuilds": 0, "trusted": 0}
+
+
+def _root_inc_mode():
+    return (os.environ.get("NADO_ROOT_INC") or "trust").strip().lower()
+
+
+def _on_commit_touched(touched, dropped, gen):
+    with _inc_lock:
+        _inc_dirty.update(touched)
+        if dropped:
+            _inc_flags["dropped"] = True
+        _inc_flags["gen"] = gen
+
+
+kv_ops.register_root_listener(_on_commit_touched)
+
+
+def _inc_floor(txn, dbs):
+    """(reference epoch, retention floor) exactly as _walk_root_rows derives them."""
+    ref = None
+    with txn.cursor(db=dbs["meta"]) as cur:
+        if cur.set_range(_EPOCHW_PREFIX):
+            for k in cur.iternext(keys=True, values=False):
+                k = bytes(k)
+                if not k.startswith(_EPOCHW_PREFIX):
+                    break
+                try:
+                    e = int(k[len(_EPOCHW_PREFIX):])
+                except ValueError:
+                    continue
+                if ref is None or e > ref:
+                    ref = e
+    return None if (ref is None or ref < ROOT_RETENTION_EPOCHS) else ref - ROOT_RETENTION_EPOCHS
+
+
+def _inc_digest(name, k, v):
+    """leaf digest through the SAME caches _root_from_walk uses (v: bytes)."""
+    if name in kv_ops.DUP_DBS:
+        t = (name, k, v)
+        d = _leaf_cache.get(t)
+        if d is None:
+            d = hashlib.blake2b(_leaf(t), digest_size=32).digest()
+            _leaf_cache[t] = d
+        return d
+    ck = (name, k)
+    hit = _plain_leaf_cache.get(ck)
+    if hit is not None and hit[0] == v:
+        return hit[1]
+    d = hashlib.blake2b(_leaf((name, k, v)), digest_size=32).digest()
+    _plain_leaf_cache[ck] = (v, d)
+    return d
+
+
+def _inc_row_kept(name, k, floor):
+    """the KEY-level filter of _walk_root_rows (exclusions + retention window); value filters are separate"""
+    if name == "meta":
+        if k in ROOT_EXCLUDED_META_KEYS or k.startswith(ROOT_EXCLUDED_META_PREFIXES):
+            return False
+        if floor is not None and k.startswith(ROOT_WINDOWED_META_PREFIXES):
+            e = _row_epoch(name, k)
+            if e is not None and e < floor:
+                return False
+    elif floor is not None and name in ROOT_WINDOWED_DBS:
+        e = _row_epoch(name, k)
+        if e is not None and e < floor:
+            return False
+    return True
+
+
+def _inc_leaves_for(txn, dbs, name, k, floor):
+    """current leaf digests of (name, key) in canonical order — [] when the row is absent or filtered"""
+    if not _inc_row_kept(name, k, floor):
+        return []
+    if name in kv_ops.DUP_DBS:
+        out = []
+        with txn.cursor(db=dbs[name]) as cur:
+            if cur.set_key(k):
+                for v in cur.iternext_dup(keys=False, values=True):
+                    out.append(_inc_digest(name, k, bytes(v)))
+        return out
+    v = txn.get(k, db=dbs[name])
+    if v is None:
+        return []
+    v = bytes(v)
+    if name == "accounts" and kv_ops.account_value_is_default(v):
+        return []
+    return [_inc_digest(name, k, v)]
+
+
+def _inc_rebuild(home):
+    """full walk -> fresh structure (one MVCC snapshot); returns the structure"""
+    # the per-DB key lists built here are SORTED: _root_from_inc keeps them so with bisect.insort
+    keys, leaves = {}, {}
+    names = [n for n in kv_ops.SNAPSHOT_DBS if n not in ROOT_EXCLUDED_DBS]
+    for n in names:
+        keys[n] = []
+        leaves[n] = {}
+    gen_before = kv_ops.write_generation()
+    env = kv_ops.get_env(home)
+    dbs = kv_ops.db_handles(home)
+    with env.begin(write=False, buffers=True) as txn:
+        floor = _inc_floor(txn, dbs)
+    for name, k, v in _walk_root_rows(home):
+        d = _inc_digest(name, k, bytes(v))
+        kl = keys[name]
+        if not kl or kl[-1] != k:
+            kl.append(k)                      # the walk yields keys in LMDB (= bytes) order
+            leaves[name][k] = [d]
+        else:
+            leaves[name][k].append(d)         # further DUPSORT values of the same key
+    _inc_stats["rebuilds"] += 1
+    return {"env": id(env), "gen": gen_before, "floor": floor, "keys": keys, "leaves": leaves, "names": names}
+
+
+def _root_from_inc(home=None):
+    """merkle root from the incremental structure (caller holds _root_lock). Rebuilds when it cannot
+    prove the structure current — see the mode note above."""
+    global _inc
+    import bisect
+    with _inc_lock:
+        dirty = set(_inc_dirty)
+        _inc_dirty.clear()
+        dropped = _inc_flags["dropped"]
+        _inc_flags["dropped"] = False
+        seen_gen = _inc_flags["gen"]
+    env = kv_ops.get_env(home)
+    dbs = kv_ops.db_handles(home)
+    cur_gen = kv_ops.write_generation()
+    st = _inc
+    rebuild = (st is None or dropped or st["env"] != id(env)
+               or (seen_gen is not None and seen_gen != cur_gen))
+    if not rebuild:
+        with env.begin(write=False, buffers=True) as txn:
+            floor = _inc_floor(txn, dbs)
+            if floor != st["floor"]:
+                rebuild = True
+            else:
+                root_names = set(st["names"])
+                for name, k in dirty:
+                    if name not in root_names:
+                        continue
+                    ds = _inc_leaves_for(txn, dbs, name, k, floor)
+                    kl, lv = st["keys"][name], st["leaves"][name]
+                    present = k in lv
+                    if ds:
+                        if not present:
+                            bisect.insort(kl, k)
+                        lv[k] = ds
+                    elif present:
+                        del lv[k]
+                        i = bisect.bisect_left(kl, k)
+                        if i < len(kl) and kl[i] == k:
+                            del kl[i]
+    if rebuild:
+        with _inc_lock:
+            _inc_dirty.clear()
+        st = _inc = _inc_rebuild(home)
+    st["gen"] = cur_gen
+    flat = []
+    ext = flat.extend
+    for name in st["names"]:
+        lv = st["leaves"][name]
+        for k in st["keys"][name]:
+            ext(lv[k])
+    root, st["levels"] = _fold_levels(st.get("levels"), flat)
+    return root
+
+
+def _changed_positions(old, new):
+    """indices of `new` whose digest differs from `old` at the same index, plus every index past old's end.
+    Compared in slices first (C speed, identity-short-circuited — an untouched key keeps the same digest object),
+    so a block that changed a handful of rows costs a few slice compares, not a Python loop over every leaf."""
+    lo, out, step = min(len(old), len(new)), [], 512
+    for a in range(0, lo, step):
+        b = min(a + step, lo)
+        if old[a:b] != new[a:b]:
+            first = next(i for i in range(a, b) if old[i] != new[i])
+            if len(old) != len(new):
+                return range(first, len(new))     # an insert/delete shifted everything after it: no point comparing
+            out.extend(i for i in range(first, b) if old[i] != new[i])
+    out.extend(range(lo, len(new)))
+    return out
+
+
+def _fold_levels(levels, flat):
+    """(root, levels): _merkle_from_leaves(flat), BIT-IDENTICAL, re-hashing only the pairs whose inputs changed
+    since `levels` (the previous call's tree, level 0 = its flat leaf list; None = fold everything).
+
+    WHY (2026-10-19): the incremental root kept the LEAVES current but re-folded the whole tree every block — ~2N
+    blake2b calls, 57 ms of the relay's 57 ms incremental root and the largest node cost in a resync, growing with
+    the state. Most blocks only change values (balances, counters): positions do not move, so only the k changed
+    leaves' paths to the top are re-hashed, O(k log N). An insertion or deletion shifts every later position and
+    re-hashes from there on — never more than the full fold.
+    THE ARGUMENT, per level: pair j hashes elements 2j and 2j+1 (or 2j twice when 2j is the last, odd element).
+    If neither index changed and both exist in the old and new level alike, the pair is unchanged and is copied.
+    So the next level's changed set is {i // 2 for changed i}, plus every pair past the old level's end, plus the
+    last pair whenever the level's length changed (its partner, or its padding, may differ though no element did).
+    tests/test_the_incremental_state_root_refolds_only_what_changed.py checks it against _merkle_from_leaves over
+    random edit sequences; trust mode's periodic walk cross-checks it on live data."""
+    if not flat:
+        return _blake2b(b""), None
+    new_levels = [flat]
+    changed = range(len(flat)) if not levels else _changed_positions(levels[0], flat)
+    lvl, k, h = flat, 0, hashlib.blake2b
+    while len(lvl) > 1:
+        n, m = len(lvl), (len(lvl) + 1) // 2
+        old_next = levels[k + 1] if levels and k + 1 < len(levels) and levels[k + 1] else None
+        if old_next is None:
+            nxt, todo = [None] * m, range(m)
+        else:
+            todo = {i >> 1 for i in changed}
+            todo.update(range(len(old_next), m))
+            if n != len(levels[k]):
+                todo.add((n - 1) >> 1)
+            nxt = old_next[:m]
+            if m > len(nxt):
+                nxt.extend([None] * (m - len(nxt)))
+            todo = sorted(todo)
+        for j in todo:
+            a = lvl[2 * j]
+            nxt[j] = h(a + (lvl[2 * j + 1] if 2 * j + 1 < n else a), digest_size=32).digest()
+        new_levels.append(nxt)
+        changed, lvl, k = todo, nxt, k + 1
+    return lvl[0].hex(), new_levels
+
+
+def _root_current(home=None):
+    """the root for l1_state_root's cache miss, by NADO_ROOT_INC mode (caller holds _root_lock)"""
+    import time as _t
+    mode = _root_inc_mode()
+    if mode == "off" or (home is not None and home != get_home()):
+        return _root_from_walk(home)
+    t0 = _t.perf_counter()
+    try:
+        inc_root = _root_from_inc(home)
+    except Exception as e:                       # never let the fast path take the node down
+        _inc_stats["mismatch"] += 1
+        _log_inc("error", f"state root incremental path raised {e!r} — using the walk")
+        return _root_from_walk(home)
+    t1 = _t.perf_counter()
+    _inc_stats["inc"] += 1
+    _inc_stats["inc_ms"] += (t1 - t0) * 1000
+    verify = mode != "trust" or (_inc_stats["inc"] % ROOT_INC_VERIFY_EVERY == 0)
+    if not verify:
+        _inc_stats["trusted"] += 1
+        return inc_root
+    walk_root = _root_from_walk(home)
+    t2 = _t.perf_counter()
+    _inc_stats["walk"] += 1
+    _inc_stats["walk_ms"] += (t2 - t1) * 1000
+    if walk_root != inc_root:
+        _inc_stats["mismatch"] += 1
+        global _inc
+        _inc = None
+        _log_inc("error", f"STATE ROOT INCREMENTAL MISMATCH: inc={inc_root[:16]} walk={walk_root[:16]} "
+                          f"(mismatch #{_inc_stats['mismatch']}, gen {kv_ops.write_generation()}) — "
+                          f"structure dropped, walk root used")
+    if _inc_stats["inc"] % 100 == 0:
+        n, w = max(1, _inc_stats["inc"]), max(1, _inc_stats["walk"])
+        _log_inc("warning", f"state root incremental: {_inc_stats['inc']} roots, {_inc_stats['walk']} walk "
+                            f"cross-checks, {_inc_stats['mismatch']} mismatches, {_inc_stats['rebuilds']} "
+                            f"rebuilds; inc {_inc_stats['inc_ms']/n:.0f} ms vs walk {_inc_stats['walk_ms']/w:.0f} ms "
+                            f"per root (mode {mode})")
+    return walk_root
+
+
+def _log_inc(level, msg):
+    try:
+        import logging
+        getattr(logging.getLogger("main_logger"), level)(msg)
+    except Exception:
+        pass
 
 
 def l1_state_root(home=None):
@@ -185,19 +736,52 @@ def l1_state_root(home=None):
     entry = _root_cache[0]
     if entry is not None and entry[0] == key:
         return entry[1]
-    root = merkle_root(_root_triples(read_state(home)))
-    _root_cache[0] = (key, root)
+    with _root_lock:
+        entry = _root_cache[0]                    # re-check: a herd resolves to ONE walk per generation
+        if entry is not None and entry[0] == key:
+            return entry[1]
+        root = _root_current(home)
+        _root_cache[0] = (key, root)
     return root
+
+
+def confirm_l1_state_root(home=None):
+    """l1_state_root by the FULL WALK, bypassing the incremental structure — the root to rely on before refusing
+    anything over a root mismatch (see TRUST IS THE DEFAULT above). Memoised per write generation, so a diverged node
+    retrying the same parent walks once, not once per retry. When the walk disagrees with the incremental root that
+    is a mismatch: counted, logged, the structure dropped (rebuilt on the next call), and l1_state_root's cache
+    corrected to the walk's root so every later reader sees it."""
+    if kv_ops.in_write_txn():
+        return merkle_root(_root_triples(read_state(home)))   # mid-txn: l1_state_root walks here too, uncached
+    key = (kv_ops.env_path(home), home, kv_ops.write_generation())
+    entry = _confirmed_cache[0]
+    if entry is not None and entry[0] == key:
+        return entry[1]
+    with _root_lock:
+        global _inc
+        walk_root = _root_from_walk(home)
+        entry = _root_cache[0]
+        if entry is not None and entry[0] == key and entry[1] != walk_root:
+            _inc_stats["mismatch"] += 1
+            _inc = None
+            _log_inc("error", f"STATE ROOT INCREMENTAL MISMATCH (confirmed before a refusal): inc={entry[1][:16]} "
+                              f"walk={walk_root[:16]} (mismatch #{_inc_stats['mismatch']}) — structure dropped, walk root used")
+        _root_cache[0] = (key, walk_root)
+        _confirmed_cache[0] = (key, walk_root)
+    return walk_root
+
+
+_confirmed_cache = [None]
 
 
 def state_fingerprint(home=None):
     """(l1_state_root, {sub_db: (merkle_root, row_count)}) derived from ONE read_state() walk — a single
     MVCC snapshot, so the overall root and its per-DB breakdown are guaranteed consistent with EACH OTHER.
     Pure DIAGNOSTIC (no consensus path): comparing the map between two nodes at the same tip localizes a
-    state divergence to the exact sub-DB in one shot (the alphanet-8 h4260 wedge needed a replay harness for
+    state divergence to the exact sub-DB in one shot (the betanet-8 h4260 wedge needed a replay harness for
     this). Computing root and breakdown from separate walks would let a block commit between them and produce
     a root that doesn't correspond to its own breakdown — a self-inconsistent diagnostic."""
-    triples = _root_triples(read_state(home))
+    triples = read_root_state(home)
     by = {}
     for name, key, value in triples:
         by.setdefault(name, []).append((name, key, value))
@@ -239,7 +823,23 @@ def _pack_chunks(triples):
 # case that split NEVER heals: nothing ever deletes the ghost. block_by_num/block_by_hash stay CARRIED —
 # a joiner needs them for deep hash-lookbacks, and their index writes are exact inverses that no path prunes.
 SNAPSHOT_PAYLOAD_EXCLUDED_DBS = frozenset(("treasury_proposals",))
-SNAPSHOT_PAYLOAD_EXCLUDED_META_KEYS = frozenset((b"finalized_height", b"pruned_below"))
+# hard_finality + the index-pruning watermarks joined finalized_height/pruned_below on 2026-08-19,
+# after a live payload diff at checkpoint 81000 found them as the ONLY divergence (3 rows of 156277)
+# between an archive node and the rolling fleet — state_root IDENTICAL, snapshot_hash split anyway:
+#   meta:hard_finality            80390 vs 80400   (backstop pacing vs the objective FFG boundary —
+#                                                   node-LOCAL pacing, exactly like finalized_height)
+#   meta:index_pruned_below_hash  56954 vs 70954   (retention POLICY watermarks: archive prunes less;
+#   meta:index_pruned_below_num   16954 vs 30954    the WINDOW is already normalized to a pure function
+#                                                   of C by _index_row_in_window, but the watermark rows
+#                                                   still leaked the local policy into the digest)
+# Every one of these was introduced AFTER this exclusion set was written and never added — the h10047
+# lesson ("any new meta row enters consensus surfaces unless excluded") applying to the DIGEST instead
+# of the root. A split digest splits agree_snapshot's bootstrap vote for no state reason at all. All
+# three rows are node-derivable: a joiner re-grows hard_finality from FFG/backstop exactly as it already
+# re-derives finalized_height, and absent watermarks merely make its first prune sweep start from 0.
+SNAPSHOT_PAYLOAD_EXCLUDED_META_KEYS = frozenset((b"finalized_height", b"pruned_below",
+                                                 b"hard_finality",
+                                                 b"index_pruned_below_num", b"index_pruned_below_hash"))
 # execsum: is deliberately NOT excluded. Block VALIDITY depends on it — validate_transaction resolves
 # every summary in a settle-with-proof span and fails closed on a miss — so a joiner that lacked the
 # pre-checkpoint window would REJECT a settle-with-proof block its peers ACCEPT: a validity fork between
@@ -253,25 +853,60 @@ SNAPSHOT_PAYLOAD_EXCLUDED_META_KEYS = frozenset((b"finalized_height", b"pruned_b
 SNAPSHOT_PAYLOAD_EXCLUDED_META_PREFIXES = (b"tvprevE:", b"tvprevW:")
 
 
-def _payload_triples(triples):
+def _index_row_in_window(name, key, value, checkpoint_height):
+    """Is this number<->hash index row inside the carried window for a snapshot of `checkpoint_height`?
+
+    THE STANDARD (protocol.INDEX_RETENTION_NUM / INDEX_RETENTION_HASH, doc/index-pruning.md). These two
+    sub-DBs are the only stores that grow forever in every mode — 144 B/block, ~7 GiB per decade — and they
+    could not be pruned as a node policy because every carried row feeds state_digest: two nodes retaining
+    different depths emit different snapshot_hash values for the SAME checkpoint and fail quorum. So the
+    depth is fixed by a rule keyed on the one height every node already agrees on, the checkpoint height C
+    the snapshot is OF. The window is a pure function of C, so every honest node builds a byte-identical
+    payload — which is what makes local pruning below it unobservable, and therefore allowed.
+
+    Rows AT OR BELOW C only. A row above C cannot exist in an honest snapshot of C, and admitting one would
+    let a donor smuggle a forged future anchor past the filter that exists to stop exactly that.
+
+    Non-index rows are not this function's business and are passed through by the caller."""
+    if checkpoint_height is None:                     # unbounded (tests / callers with no checkpoint)
+        return True
+    if name == "block_by_num":
+        height = int.from_bytes(key, "big")           # key IS the height (8B BE)
+        lo = checkpoint_height - INDEX_RETENTION_NUM
+    elif name == "block_by_hash":
+        height = int.from_bytes(value, "big")         # key is the hash; the VALUE is the height
+        lo = checkpoint_height - INDEX_RETENTION_HASH
+    else:
+        return True
+    return lo <= height <= checkpoint_height
+
+
+def _payload_triples(triples, checkpoint_height=None):
     """The canonical TRANSFER payload: read_state() minus the rows two honest nodes can legitimately differ
-    on. Order-preserving. Everything dropped here is already outside the state root, so state_root is
-    unchanged whether it is computed over the full list or this one."""
+    on, and minus number<->hash index rows outside the retention window for `checkpoint_height`.
+    Order-preserving. Everything dropped here is already outside the state root, so state_root is
+    unchanged whether it is computed over the full list or this one.
+
+    `checkpoint_height` is threaded through BOTH sides on purpose. On export it bounds what we send; on
+    IMPORT it re-derives the same window from the manifest's own snapshot_height, so a donor that ships
+    out-of-window index rows has them dropped rather than trusted — the same reason finalized_height and
+    execsum rows are re-filtered here instead of being taken on faith."""
     return [t for t in triples
             if t[0] not in SNAPSHOT_PAYLOAD_EXCLUDED_DBS
             and not (t[0] == "meta"
                      and (t[1] in SNAPSHOT_PAYLOAD_EXCLUDED_META_KEYS
-                          or t[1].startswith(SNAPSHOT_PAYLOAD_EXCLUDED_META_PREFIXES)))]
+                          or t[1].startswith(SNAPSHOT_PAYLOAD_EXCLUDED_META_PREFIXES)))
+            and _index_row_in_window(t[0], t[1], t[2], checkpoint_height)]
 
 
-def state_digest(triples):
+def state_digest(triples, checkpoint_height=None):
     """blake2b over the FULL canonical (db, key, value) triple list — every row a snapshot carries, INCLUDING
     the ones _root_triples excludes from the consensus root. This is the payload authenticator: it rides in
     manifest_hash, so the quorum-agreed snapshot_hash commits to every transferred byte, while staying
     INVARIANT to how the payload is split into chunks (unlike the chunk sha256 list it replaces, which was
     keyed by the NADO_SNAPSHOT_CHUNK_ROWS env). Order is the caller's canonical sort."""
     h = hashlib.blake2b(digest_size=32)
-    for t in _payload_triples(triples):
+    for t in _payload_triples(triples, checkpoint_height):
         h.update(hashlib.blake2b(_leaf(t), digest_size=32).digest())
     return h.hexdigest()
 
@@ -287,7 +922,7 @@ def build_snapshot(snapshot_height, block_hash, protocol, version, home=None):
     # identifies it) over the canonical payload, so two honest nodes at the same checkpoint emit the
     # identical entry_count / chunks / state_digest / snapshot_hash.
     state_root = merkle_root(_root_triples(triples))
-    payload = _payload_triples(triples)
+    payload = _payload_triples(triples, snapshot_height)
     chunk_bytes, chunk_meta = _pack_chunks(payload)
 
     manifest = {
@@ -301,7 +936,7 @@ def build_snapshot(snapshot_height, block_hash, protocol, version, home=None):
         # manifest_hash + import_snapshot: without this, a donor matching an honest snapshot_hash could
         # substitute arbitrary EXCLUDED rows (a forged finalized_height permanently wedges rollback; a
         # forged block_by_num row forges the epoch-beacon anchor) — entry_count alone is only a count.
-        "state_digest": state_digest(payload),
+        "state_digest": state_digest(payload, snapshot_height),
         "entry_count": len(payload),
         "chunk_count": len(chunk_meta),
         "chunks": chunk_meta,
@@ -394,7 +1029,11 @@ def import_snapshot(manifest, chunk_bytes_list, home=None, logger=None):
     # 3) CANONICALIZE the received payload, then verify. Dropping the excluded rows here (rather than
     # trusting the donor to have omitted them) means an injected finalized_height / execsum row can never
     # reach our DB NOR shift entry_count/state_digest — it is simply not part of the identity.
-    triples = _payload_triples(triples)
+    # Re-derive the index window from the manifest's own snapshot_height, exactly as the donor should
+    # have. A donor shipping rows outside it has them dropped here, so they can neither enter our DB nor
+    # shift entry_count/state_digest — the same posture already applied to finalized_height and execsum.
+    _C = int(manifest.get("snapshot_height") or 0) or None
+    triples = _payload_triples(triples, _C)
     triples.sort(key=lambda t: (t[0], t[1], t[2]))
     if len(triples) != manifest["entry_count"]:
         _log(logger, "error", "snapshot entry_count mismatch")
@@ -406,7 +1045,7 @@ def import_snapshot(manifest, chunk_bytes_list, home=None, logger=None):
     # the quorum-agreed snapshot_hash could substitute any EXCLUDED row (a forged finalized_height wedges
     # rollback permanently; a forged block_by_num forges the epoch-beacon anchor). entry_count is a count,
     # not a digest, so an in-place value edit keeps it exact. state_digest covers every transferred row.
-    if manifest.get("state_digest") != state_digest(triples):
+    if manifest.get("state_digest") != state_digest(triples, _C):
         _log(logger, "error", "snapshot state_digest mismatch after reassembly (payload tampered)")
         return False
 
@@ -498,7 +1137,8 @@ async def fetch_block(target, port, block_hash, timeout=15):
     url = f"http://{hostport(target, port)}/get_block?hash={block_hash}&compress=zstd"
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
-            async with session.get(url) as r:
+            # allow_redirects=False: a peer's 302 to 127.0.0.1 would be a loopback-authorized GET here (ops/outbound_guard.py)
+            async with session.get(url, allow_redirects=False) as r:
                 if r.status != 200:
                     return None
                 block = unpack_zstd_peer(await read_capped(r, MAX_PEER_BODY))   # bomb-capped zstd wire
@@ -516,7 +1156,8 @@ async def fetch_snapshot(target, port, logger=None, concurrency=8, timeout=120):
     base = f"http://{hostport(target, port)}"
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
-            async with session.get(f"{base}/get_snapshot_manifest?compress=zstd") as r:
+            # allow_redirects=False: a peer's 302 to 127.0.0.1 would be a loopback-authorized GET here (ops/outbound_guard.py)
+            async with session.get(f"{base}/get_snapshot_manifest?compress=zstd", allow_redirects=False) as r:
                 if r.status != 200:
                     _log(logger, "info", f"No snapshot manifest from {target} (HTTP {r.status})")
                     return None, None
@@ -534,8 +1175,14 @@ async def fetch_snapshot(target, port, logger=None, concurrency=8, timeout=120):
             # entry_count = number of (db, key, value) state triples; each chunk's "rows" must sum to it.
             # (The full-consensus-state snapshot supersedes the old accounts-only "account_count" field.)
             cc, ec = manifest.get("chunk_count"), manifest.get("entry_count")
+            # chunk_count / chunks[] are NOT covered by manifest_hash (only state_root+state_digest+
+            # entry_count pin the payload bytes), so a source echoing the honest snapshot_hash can still
+            # serve an arbitrary chunk array. Require every chunk to carry >=1 row: with sum(rows)==ec that
+            # forces cc <= ec <= MAX_SNAPSHOT_ACCOUNTS, so a padded chunk_count (e.g. 4M empty chunks → OOM
+            # on `[None]*cc` + gather) cannot get past this gate before allocation.
             if not (isinstance(chunk_meta, list) and isinstance(cc, int) and cc == len(chunk_meta)
                     and isinstance(ec, int) and 0 <= ec <= MAX_SNAPSHOT_ACCOUNTS
+                    and all(int(m.get("rows", 0)) > 0 for m in chunk_meta)
                     and sum(int(m.get("rows", 0)) for m in chunk_meta) == ec):
                 _log(logger, "warning", f"Snapshot manifest from {target} has inconsistent counts — rejecting")
                 return None, None
@@ -552,10 +1199,13 @@ async def fetch_snapshot(target, port, logger=None, concurrency=8, timeout=120):
                 """fetch chunk `cid` under the concurrency semaphore, read-capped to chunk_meta[cid]['bytes']
                 (trusted because the manifest passed its self-hash) — the donor can't over-feed us"""
                 async with sem:
-                    async with session.get(f"{base}/get_snapshot_chunk?id={cid}&height={height}") as cr:
+                    # allow_redirects=False: a peer's 302 to 127.0.0.1 would be a loopback-authorized GET here (ops/outbound_guard.py)
+                    async with session.get(f"{base}/get_snapshot_chunk?id={cid}&height={height}", allow_redirects=False) as cr:
                         if cr.status != 200:
                             raise IOError(f"chunk {cid} HTTP {cr.status}")
-                        # manifest is hash-verified, so chunk_meta[cid]['bytes'] is a trusted cap for this read
+                        # chunk_meta[cid]['bytes'] is NOT self-hash-covered, but the per-read cap + the total
+                        # bytes ceiling (<= MAX_SNAPSHOT_TOTAL, checked above) still bound what the donor feeds
+                        # us; the imported state is re-derived and root-checked regardless.
                         chunks[cid] = await read_capped(cr, int(chunk_meta[cid].get("bytes", 0)))
 
             await __import__("asyncio").gather(*(_one(i) for i in range(cc)))
@@ -692,13 +1342,23 @@ def adopt_new_identity(logger=None, home=None):
       - the block-body segment store (orphaned fork bodies were the "donor knows my tip" bait),
       - our own persisted checkpoints (captured on the abandoned identity — the exact poison that
         wedged a fresh joiner at 13000).
-    After this returns, the node's disk makes no statement the new identity does not vouch for."""
-    kv_ops.wipe_non_carried_dbs()
-    segment_store.reset(home)
+    After this returns, the node's disk makes no statement the new identity does not vouch for.
+
+    BLOCK BODIES ARE THE EXCEPTION, AND THE INVARIANT STILL HOLDS. A body is keyed by its hash and the
+    hash covers its content, so a body whose hash sits on the adopted chain IS a statement the new
+    identity vouches for — byte for byte. Most of a re-anchoring node's bodies are exactly that: the
+    canonical chain below the fork point, common to both sides. Wiping them made every wedge recovery an
+    archive truncation (2026-08-17: history 0->49735, then ->56735, on a node nothing had pruned). So the
+    locators and segments are KEPT here and reconciled by loops/core_loop against the adopted chain via
+    ops/canonical_restore: canonical bodies stay referenced, fork bodies are unreferenced (the "donor knows
+    my tip" bait was fork bodies, and they still go), and missing canonical bodies are fetched. Until that
+    reconcile runs, a stale locator can only ever resolve to a body that verifies against its own hash."""
+    kv_ops.wipe_non_carried_dbs()          # keeps block_loc — see there
     dropped = drop_all_checkpoints(home)
     if logger:
-        logger.warning("Adopted new chain identity: wiped tx history, block bodies, local indexes and "
-                       f"{dropped} checkpoint(s) of the abandoned chain")
+        logger.warning("Adopted new chain identity: wiped tx history and local indexes and "
+                       f"{dropped} checkpoint(s) of the abandoned chain; block bodies retained for "
+                       "canonical reconcile")
 
 
 def load_checkpoint_manifest(height, home=None):

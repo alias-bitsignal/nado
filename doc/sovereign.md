@@ -1,7 +1,8 @@
 # Sovereign — a persistent nation-war MMO on NADO
 
-Status: **LIVE** on alphanet-6 (`sovereign.nadochain.com`). Engine + tests (`static/sovereign-engine.js`, `tests/sovereign_engine_test.mjs`,
-ALL PASS). Contract + client + practice next.
+Status: **LIVE** (`sovereign.nadochain.com`): engine (`static/sovereign-engine.js`), contract
+(`execnode/games/sovereign.py`), client (`static/sovereign.html`, `static/sovereign.js`) and tests
+(`tests/test_sovereign_engine.mjs`).
 
 ## 1. What it is
 
@@ -101,7 +102,7 @@ practice is the same rules with local opponents.
 - `static/sovereign-engine.js` — the deterministic simulation (done): resources, production/settle,
   buildings, governments, satisfaction, army, tech, combat, prestige. Pure, shared by contract + client +
   practice + tests.
-- `tests/sovereign_engine_test.mjs` — determinism / boundedness / action-legality / loot-conservation
+- `tests/test_sovereign_engine.mjs` — determinism / boundedness / action-legality / loot-conservation
   (done, ALL PASS).
 - `execnode/games/sovereign.py` — the contract: a **single global append-only ACTION LOG** (a thin
   recorder, NOT a per-nation referee — the economy + combat rules live in the browser engine, which
@@ -113,6 +114,6 @@ practice is the same rules with local opponents.
 
 ## 6. Rollout note
 
-The chain rerolled to **alphanet-6 today** (memory: `nado-alphanet6-reroll`), so the whole game fleet
-needs redeploy regardless — Sovereign deploys alongside that pass. Being brand-new, it has no legacy
+At launch the chain had just rerolled to **betanet-6** (memory: `nado-alphanet6-reroll`), so the whole game fleet
+was redeployed and Sovereign deployed alongside that pass. Being brand-new, it has no legacy
 state to carry.

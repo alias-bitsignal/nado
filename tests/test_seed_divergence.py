@@ -16,6 +16,10 @@ reach quorum). Each test targets one verified root cause and FAILS on the pre-fi
 
 Run: python3 tests/test_seed_divergence.py
 """
+import os as _os, tempfile as _tempfile  # ISOLATION FIRST (CLAUDE.md rule 4): never the live node's HOME or exec files
+_os.environ["HOME"] = _tempfile.mkdtemp(prefix="nado-test-")
+_os.environ["NADO_EXEC_STATE"] = _os.path.join(_os.environ["HOME"], "exec_state.json")
+_os.environ["NADO_EXEC_DA"] = _os.path.join(_os.environ["HOME"], "exec_da")
 import os, sys, tempfile, logging, inspect
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -191,13 +195,23 @@ def test_exec_summary_determinism_and_proof_disabled():
     from protocol import DEFAULT_NS
     from ops import kv_ops, settlement_ops
     from ops.account_ops import get_bonded_registry as _gbr
-    check("settle-with-proof trustless flag defaults OFF (quorum-only on this generation)",
-          protocol.SETTLE_PROOF_TRUSTLESS is False)
-    # With the flag off, a recorded proof marker must NOT justify a root that has no quorum attestation.
-    with kv_ops.write_txn():
-        kv_ops.settlement_proof_put(DEFAULT_NS, 999999, "ff" * 32)
-    check("with the flag OFF, a proof marker does not justify without quorum",
-          settlement_ops.settlement_justified(DEFAULT_NS, 999999, "ff" * 32, _gbr()) is False)
+    # TEST THE MECHANISM, NOT THE CONSTANT. This used to assert `SETTLE_PROOF_TRUSTLESS is False`, which
+    # was true when it was written and stopped being true at alphanet-11 when the flag was enabled — so it
+    # failed for years-equivalent of nobody looking, reporting a rotted expectation as a defect. A flag's
+    # SHIPPING VALUE is not an invariant; how the code responds to it is. Both directions are forced here,
+    # so this survives the next reroll whichever way the flag goes.
+    _saved_trustless = protocol.SETTLE_PROOF_TRUSTLESS
+    try:
+        with kv_ops.write_txn():
+            kv_ops.settlement_proof_put(DEFAULT_NS, 999999, "ff" * 32)
+        protocol.SETTLE_PROOF_TRUSTLESS = False
+        check("with the flag OFF, a proof marker does not justify without quorum",
+              settlement_ops.settlement_justified(DEFAULT_NS, 999999, "ff" * 32, _gbr()) is False)
+        protocol.SETTLE_PROOF_TRUSTLESS = True
+        check("with the flag ON, the same proof marker DOES justify (trustless settlement)",
+              settlement_ops.settlement_justified(DEFAULT_NS, 999999, "ff" * 32, _gbr()) is True)
+    finally:
+        protocol.SETTLE_PROOF_TRUSTLESS = _saved_trustless
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -352,9 +366,21 @@ def test_snapshot_payload_authenticated():
     # Tamper a root-excluded row that is NOT node-local: block storage. (finalized_height/pruned_below are
     # deliberately outside the digest — honest peers legitimately differ there — and are defended by the
     # import-time CLAMP instead; that is asserted separately below.)
-    poisoned = [(n, k, b"forged-orphan-body" if n == "block_by_hash" else v) for n, k, v in triples]
+    # TAMPER an EXISTING carried row. Seed a real reverse-index row first: since index retention landed
+    # (protocol.INDEX_RETENTION_*), block_by_hash values are read as heights, so a row INJECTED with a
+    # junk value now decodes outside the window and is dropped by _payload_triples rather than reaching
+    # the digest. Dropping an injected row is the stronger outcome — the forgery never touches our DB —
+    # but it is not the case this check is about, which is a donor EDITING a row we would otherwise take.
     if not any(n == "block_by_hash" for n, _, _ in triples):
-        poisoned = poisoned + [("block_by_hash", b"\x01" * 32, b"forged-orphan-body")]
+        kv_ops.block_index_put(0, "a" * 64) if hasattr(kv_ops, "block_index_put") else None
+        def _seed_rev(txn):
+            d = kv_ops._dbs()
+            txn.put((0).to_bytes(8, "big"), b"a" * 64, db=d["block_by_num"])
+            txn.put(b"a" * 64, (0).to_bytes(8, "big"), db=d["block_by_hash"])
+        kv_ops._write(_seed_rev)
+        triples = _payload_triples(read_state())
+        man, _mc = build_snapshot(1000, "bh" * 32, 10, "v1")
+    poisoned = [(n, k, b"forged-orphan-body" if n == "block_by_hash" else v) for n, k, v in triples]
     pchunk = codec.pack([[n, k, v] for n, k, v in poisoned])
     evil = dict(man)                                     # honest core fields, attacker's payload
     evil["chunks"] = [{"id": 0, "sha256": hashlib.sha256(pchunk).hexdigest(),
@@ -365,6 +391,12 @@ def test_snapshot_payload_authenticated():
           evil["snapshot_hash"] == man["snapshot_hash"])
     check("but a payload with a tampered ROOT-EXCLUDED row is REJECTED at import",
           import_snapshot(evil, [pchunk]) is False)
+    # INJECTION (as opposed to editing) of an index row is now DEFUSED rather than rejected: the window
+    # filter drops it, so it shifts neither the digest nor our DB. Weaker-looking, strictly stronger —
+    # a rejected import is a failed sync, a dropped row is an attack that simply did nothing.
+    injected = list(triples) + [("block_by_hash", b"\x02" * 32, b"forged-orphan-body")]
+    check("an INJECTED out-of-window index row is dropped, not trusted",
+          len(_payload_triples(injected, 1000)) == len(_payload_triples(list(triples), 1000)))
 
     # ---- TRANSFER-PAYLOAD CANONICALIZATION (four honest nodes advertised four different snapshot_hashes
     # for identical state_root: two had finalized_height, two did not, and their execsum: sets differed) ----
@@ -420,7 +452,7 @@ def test_da_binding_is_clock_independent():
     BLOCK_TIMESTAMP_DRIFT). Feeding it into call_leaf made the DA binding non-deterministic: measured live,
     one block produced completely different call leaves on two nodes, desynchronising every execsum row and
     splitting snapshot identity fleet-wide. The binding must commit only COMMITTED data."""
-    from execnode.stark.calls_commit import block_summary
+    from execnode.calls_commit import block_summary
 
     blk = {"block_number": 3135, "block_timestamp": 1785096230, "block_transactions": [
         {"recipient": "blob", "sender": "s1",
@@ -573,7 +605,12 @@ def test_rollback_stats_reject_emergency_schema():
     from ops import rollback_stats as rs
 
     today = time.strftime("%Y-%m-%d", time.gmtime())
-    json.dump({today: {"c": 5, "d": 3}}, open(rs._stats_path(), "w"))   # legacy: no r/e keys
+    # CHAIN-STAMPED (73d33a18): a file whose stamp is absent or differs is a previous lineage's history and is
+    # dropped whole — so "legacy" here means the r/e keys are missing, on a file of THIS chain.
+    json.dump({today: {"c": 5, "d": 3}}, open(rs._stats_path(), "w"))   # unstamped: foreign lineage
+    check("an unstamped stats file is a previous chain's history and loads as empty", rs._load() == {})
+    json.dump({today: {"c": 5, "d": 3}, rs._CHAIN_KEY: rs._chain_stamp()},
+              open(rs._stats_path(), "w"))                                # legacy: no r/e keys, our chain
     rs.record_emergency()
     rec = rs.daily_counts(1)[-1]
     check("a legacy today-record normalises rejects null -> 0 once we are measuring", rec["rejects"] == 0)
@@ -738,8 +775,27 @@ def test_node_local_meta_excluded_from_root():
     base = read_state()
     root_a = l1_state_root()
 
-    check("finalized_height / pruned_below are excluded from the root",
-          ROOT_EXCLUDED_META_KEYS == frozenset((b"finalized_height", b"pruned_below")))
+    # EVERY node-local meta row must be excluded — asserted as CONTAINMENT plus a behavioural check, not
+    # as equality with a literal set. The literal form is what let the 2026-08-14 fleet fork through: the
+    # index-prune watermarks were added to `meta` without being added here, and this check could only fail
+    # AFTER someone had already thought to list them — i.e. never. The behavioural half below cannot be
+    # satisfied by forgetting.
+    for _k in (b"finalized_height", b"pruned_below",
+               b"index_pruned_below_num", b"index_pruned_below_hash"):
+        check(f"{_k.decode()} is excluded from the root", _k in ROOT_EXCLUDED_META_KEYS)
+
+    # THE PROPERTY ITSELF: a node's disk-retention progress must not move the consensus root. Two nodes,
+    # identical in every block-derived row, differing only in how far each has pruned, must agree.
+    from ops import kv_ops as _kv
+    _root_clean = l1_state_root()
+    _kv.meta_set_int("index_pruned_below_hash", 1)
+    _kv.meta_set_int("index_pruned_below_num", 12345)
+    _kv.meta_set_int("pruned_below", 999)
+    check("a node that has PRUNED computes the same root as one that has not",
+          l1_state_root() == _root_clean)
+    _kv.meta_set_int("index_pruned_below_hash", 777_777)
+    check("...and the root does not move as pruning PROGRESSES",
+          l1_state_root() == _root_clean)
 
     # meta rows are key.encode() -> _pack(int) (see kv_ops.meta_set_int). Two nodes at the same tip, IDENTICAL
     # in every block-derived row, differing ONLY in the two node-local finality/prune values — plus one

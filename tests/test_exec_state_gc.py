@@ -4,7 +4,7 @@ Exec-layer state-root growth bounds (execnode/state.py):
      the leaf leaves state_root; unclaimed records stay provable
   2. drop_consumed_outbox: a finalized xmsg delivery GCs the SOURCE outbox message; seqs stay
      monotonic afterwards (no reuse)
-  3. field-nullifier DIGEST leaf: root is bounded in nullifier-set size but still binds it
+  3. nullifier DIGEST record (the Stwo pool's): root is bounded in nullifier-set size but still binds it
   4. a legacy (list) outbox snapshot is REFUSED loudly (no legacy shapes on alphanet)
 
 Run: python3 tests/test_exec_state_gc.py
@@ -12,15 +12,11 @@ Run: python3 tests/test_exec_state_gc.py
 import os, sys, tempfile, traceback
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from execnode.state import ExecState
-from execnode import exec_root as ER
 
-fails = 0
-def check(name, fn):
-    """Run fn; print PASS/FAIL and count failures."""
-    global fails
-    try: fn(); print(f"PASS  {name}")
-    except Exception as e:
-        fails += 1; print(f"FAIL  {name}: {e}"); traceback.print_exc()
+import _harness
+ER = _harness.exit_module()                    # L1's verifier for this generation's roots (exit_root_module)
+_report = _harness.Report()
+check = _report.run
 
 def _st():
     return ExecState(tempfile.mktemp(prefix="nado_execgc_", suffix=".json"))
@@ -39,8 +35,8 @@ def t1_drop_claimed():
     st.drop_claimed("unshield", 4)
     assert "1" not in st.withdrawals and "3" not in st.dividend_withdrawals and "4" not in st.unshield_withdrawals
     assert st.state_root() != r0, "claimed leaves must leave the root"
-    p = st.withdrawal_proof("2")
-    assert p and ER.verify_withdrawal(st.state_root(), "ndoB", 7, "2", p["proof"]), \
+    proof, root = st.record_proof_at(None, ER.T_BRIDGE_WD, "ndoB", "2", value=7)
+    assert ER.verify_withdrawal(root, "ndoB", 7, "2", proof), \
         "UNclaimed exits must stay provable"
     st.drop_claimed("bridge_withdraw", 999)        # unknown nonce -> no-op, no error
     st.drop_claimed("nonsense", 1)                 # unknown kind -> no-op
@@ -56,27 +52,30 @@ def t2_drop_consumed_outbox_and_monotonic_seq():
     assert st.state_root() != r0, "consumed outbox leaf must leave the root"
     st.apply_blob({"op": "emit", "to_ns": "b", "data": "m2"}, sender="ndoA", txid="t2")
     assert "2" in st.outbox and st.outbox["2"]["seq"] == 2, "seq counter is monotonic after GC (no reuse)"
-    p = st.outbox_proof(1)
-    m = p["message"]
-    assert p and ER.verify_outbox_msg(st.state_root(), m["seq"], m["from"], m["to_ns"], m.get("data"), p["proof"]), \
+    m = st.outbox["1"]
+    proof, root = st.record_proof_at(None, ER.T_DIGEST, "outbox", ER.leaf_digest(ER.msg_outbox_leaf(m)), value=1)
+    assert ER.verify_outbox_msg(root, m["seq"], m["from"], m["to_ns"], m.get("data"), proof), \
         "surviving outbox messages stay provable"
-    assert st.outbox_proof(0) is None, "consumed message is gone"
+    assert "0" not in st.outbox, "consumed message is gone"
     st.drop_consumed_outbox("bogus")               # malformed seq -> no-op
 
 
-def t3_field_nfset_digest_bounded():
+def t3_shield_nfset_digest_bounded():
+    # on the Stwo pool, the one live spent set (the field pool's was pinned here until G9 slice 5, the legacy pool's until
+    # slice 5c; both digests are constants now)
     st = _st()
-    r_empty = st.state_root()
-    st.field_pool.nullifiers.update(range(1, 500))
+    sp = st.stwo_pool
+    for i in range(1, 500):
+        sp.spend("%064x" % i)
     st._touch()
-    r_full = st.state_root()
-    assert r_full != r_empty, "the digest still BINDS the nullifier set"
+    r_first = st.state_root()
     # the committed projection stays the same SIZE regardless of set size (one digest record, not one per nf)
-    n_records_full = len(ER.records_projection(st))
-    st.field_pool.nullifiers.update(range(500, 1000))
+    n_records_first = len(ER.records_projection(st))
+    for i in range(500, 1000):
+        sp.spend("%064x" % i)
     st._touch()
-    assert len(ER.records_projection(st)) == n_records_full, "record count must not grow with the nullifier set"
-    assert st.state_root() != r_full, "...but the digest changes with the set"
+    assert len(ER.records_projection(st)) == n_records_first, "record count must not grow with the nullifier set"
+    assert st.state_root() != r_first, "...but the digest BINDS the set: it changes with it"
 
 
 def t4_legacy_outbox_shape_refused():
@@ -98,5 +97,5 @@ for name, fn in sorted((n, f) for n, f in list(globals().items())
                        if n.startswith("t") and callable(f) and n[1].isdigit()):
     check(name, fn)
 
-print(f"\n{'ALL EXEC-GC CHECKS PASSED' if not fails else str(fails)+' FAILED'}")
-sys.exit(1 if fails else 0)
+print(f"\n{'ALL EXEC-GC CHECKS PASSED' if not _report.fails else str(_report.fails)+' FAILED'}")
+sys.exit(1 if _report.fails else 0)

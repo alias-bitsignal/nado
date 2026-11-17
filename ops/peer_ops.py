@@ -1,4 +1,5 @@
 import asyncio
+import re
 import glob
 import ipaddress
 import json
@@ -8,9 +9,9 @@ import threading
 
 from compounder import compound_get_list_of, compound_announce_self
 from compounder import compound_get_status_pool
-from config import get_port, get_config, get_timestamp_seconds, update_config, hostport
+from config import get_port, get_config, get_timestamp_seconds, update_config, hostport, test_self_port
 from .data_ops import set_and_sort, get_home
-from .net_ops import read_capped, unpack_zstd_peer, MAX_PEER_BODY
+from .net_ops import read_capped, unpack_zstd_peer, MAX_PEER_BODY, MAX_CONTROL_BODY
 
 import aiohttp
 
@@ -102,8 +103,22 @@ def _migrate_legacy_peers():
 # known numeric/hash field is present but wrong-typed, at the admission boundary — so no downstream
 # consumer ever compares a mistyped value. Absent/None is allowed (a mid-restart peer legitimately omits
 # fields); bool is rejected for numerics (True/False must not masquerade as a weight/height).
-_STATUS_INT_FIELDS = ("latest_block_weight", "finalized_height", "ffg_finalized",
-                      "snapshot_height", "reported_uptime", "protocol")
+# latest_block_height is in the list because core_loop's settle-proof DEPTH GATE reads it: a string height
+# survived `int()` there, so one peer advertising "999999999999" made every remote block "deep" fleet-wide
+# and switched the cryptographic settle verification off (SETTLE_PROOF_DEPTH_GATED trusts the depth signal).
+_STATUS_INT_FIELDS = ("latest_block_weight", "latest_block_height", "finalized_height", "ffg_finalized",
+                      "snapshot_height", "reported_uptime", "protocol", "history_retention")
+# SHAPES, NOT JUST TYPES (review 2026-09-25): this node re-serves every admitted status on /status_pool and the
+# wallet renders several of these fields, so "any string" let one hostile peer put markup into every wallet's Stats
+# tab (history_retention was not checked at all). Honest peers send exactly these shapes — refuse anything else.
+_STATUS_HEX_FIELDS = ("latest_block_hash", "earliest_block_hash", "upcoming_block_hash", "transaction_pool_hash",
+                      "snapshot_hash", "address")
+_STATUS_SHAPES = {
+    "version": re.compile(r"[A-Za-z0-9._+-]{1,64}"),
+    "chain_id": re.compile(r"[A-Za-z0-9._-]{1,48}"),
+    "node_type": re.compile(r"archive|rolling"),
+    "relay_url": re.compile(r"https?://[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?/?"),
+}
 _STATUS_STR_FIELDS = ("latest_block_hash", "earliest_block_hash", "upcoming_block_hash",
                       "transaction_pool_hash", "snapshot_hash", "address", "version", "chain_id")
 
@@ -122,6 +137,14 @@ def status_fields_well_typed(status) -> bool:
         v = status.get(f)
         if v is not None and not isinstance(v, str):
             return False
+    for f in _STATUS_HEX_FIELDS:
+        v = status.get(f)
+        if v is not None and not re.fullmatch(r"[0-9a-f]{0,128}", v):
+            return False
+    for f, rx in _STATUS_SHAPES.items():
+        v = status.get(f)
+        if v is not None and not (isinstance(v, str) and rx.fullmatch(v)):
+            return False
     return True
 
 
@@ -134,11 +157,12 @@ async def get_remote_status(target_peer, logger) -> [dict, bool]:
         url_construct = f"http://{hostport(target_peer, get_port())}/status?compress=zstd"
 
         async with aiohttp.ClientSession(timeout = aiohttp.ClientTimeout(total=5)) as session:
-            async with session.get(url_construct) as response:
+            # allow_redirects=False: a peer's 302 to 127.0.0.1 would be a loopback-authorized GET here (ops/outbound_guard.py)
+            async with session.get(url_construct, allow_redirects=False) as response:
                 if response.status == 200:
                     # anti-OOM: cap the untrusted body like every other peer fetcher (compressed side),
                     # and unpack_zstd_peer caps the decompressed side against a zstd bomb.
-                    status = unpack_zstd_peer(await read_capped(response, MAX_PEER_BODY))
+                    status = unpack_zstd_peer(await read_capped(response, MAX_CONTROL_BODY), cap=MAX_CONTROL_BODY)
                     # reject a malformed-typed status here too (this fetcher feeds the snapshot/reanchor
                     # weight comparisons directly, bypassing the peer_loop admission gate).
                     return status if status_fields_well_typed(status) else False
@@ -194,7 +218,15 @@ def save_peer(ip, port, address, overwrite=False):
 DEFAULT_SEED_PEERS = [
     "38.242.201.206",    # get.nadochain.com — the public bootstrap node
     "208.87.242.141",    # second operator anchor (the Tezos-baker box)
+    "185.100.232.131",   # operator anchor 3
+    "185.184.192.210",   # operator anchor 4
 ]
+# WHY ALL FOUR (betanet-2 launch): with only two seeds, the other operator boxes were ordinary peers, so
+# the staggered restarts of an update wave cooled them into the unreachable list and BENCHED them in fork
+# choice. The node that had already built the chain then became invisible to the rest, which sat at height 0
+# unable to sync it — while the gate below waited for a peer count it could no longer reach. Seed status is
+# exactly the exemption that prevents this (no cooldown, no fork-choice bench), so every operator anchor
+# must be a seed, not just the two public ones.
 
 def seed_peers():
     """Operator seed set: baked-in DEFAULT_SEED_PEERS + any NADO_SEED_PEERS the operator configured
@@ -202,7 +234,56 @@ def seed_peers():
     snapshot from a LONE donor (loops/core_loop.snapshot_bootstrap) — membership in this operator-defined
     set is the anchor; there is no peer-reputation score."""
     extra = [x.strip() for x in (os.environ.get("NADO_SEED_PEERS") or "").split(",") if x.strip()]
+    if os.environ.get("NADO_TESTNET"):
+        # a loopback testnet must NEVER dial the mainnet operator anchors — its children were observed
+        # re-dialing the real bootstrap boxes every peer pass (harmless to consensus, different genesis,
+        # but real traffic at real nodes). The testnet defines its own seeds via NADO_SEED_PEERS or none.
+        return extra
     return list(dict.fromkeys(DEFAULT_SEED_PEERS + extra))
+
+
+def probe_block_hash_signed(peer, height, port=9173, timeout=6, tip_hint=0, self_address=None):
+    """One peer's SIGNED claim of its hash at `height` -> (hash, seats) — the stake-weighted probe
+    behind the fork verdict (doc/finality.md §3a). Falls back to the UNSIGNED probe at weight 0 when the
+    peer predates /hash_attest or the signature does not hold, so the seeds-first headcount keeps
+    working as the liveness anchor — stake hardens the verdict, it never becomes a liveness dependency.
+
+    Seats come from the PROBER'S OWN committed bonded registry (deterministic), so a Sybil peer-set adds
+    zero weight no matter how many IPs it holds. Freshness: the signed as_of (the signer's tip at signing)
+    must sit within 2 epochs of `tip_hint` — a signature captured before the signer itself reorged must
+    not restate a dead view forever."""
+    import json as _json, urllib.request as _rq
+    from protocol import EPOCH_LENGTH
+    try:
+        with _rq.urlopen(f"http://{peer}:{port}/hash_attest?height={int(height)}", timeout=timeout) as r:  # nosec B310 # literal http:// to a peer/loopback host; redirects guarded process-wide (ops/outbound_guard.py)
+            d = _json.loads(r.read(1_000_000))
+        h = d.get("block_hash") if isinstance(d, dict) else None
+        if not (isinstance(h, str) and len(h) == 64):
+            raise ValueError("no usable claim")
+        addr, pk, sig, as_of = d.get("address"), d.get("public_key"), d.get("signature"), int(d.get("as_of", 0))
+        # NEVER COUNT OUR OWN ANSWER (2026-09-13). The IP carve-outs (own_ips, config ip) miss a node whose
+        # public address is not in its config: 185.238.249.208 carried ITSELF in its peer list, answered its
+        # own fork question with its own hash, read agreement, and sat BEHIND on an orphaned branch for hours
+        # — the "probing yourself vetoes your own recovery" trap, reached through a blind spot in the IP
+        # test. The signed claim names its signer; a claim signed by OUR key is us, whatever address it came
+        # from. Not an answer.
+        if self_address and addr == self_address:
+            return None
+        if tip_hint and abs(int(tip_hint) - as_of) > 2 * EPOCH_LENGTH:
+            return h, 0                                   # stale view: count the claim, weigh it nothing
+        from ops.auth_ops import key_authorized
+        from ops.block_ops import hash_attest_message
+        from signatures import verify as _ver
+        if addr and pk and sig and key_authorized(pk, addr) \
+                and _ver(signed=sig, public_key=pk, message=hash_attest_message(int(height), h, as_of)):
+            from ops.account_ops import get_bonded_registry
+            from ops.mining_ops import selection_shares
+            reg = get_bonded_registry()
+            seats = int(selection_shares((reg.get(addr) or {}).get("bonded", 0))) if addr in reg else 0
+            return h, seats
+        return h, 0
+    except Exception:
+        return probe_block_hash(peer, height, port=port, timeout=timeout), 0
 
 
 def probe_block_hash(peer, height, port=9173, timeout=6):
@@ -211,10 +292,119 @@ def probe_block_hash(peer, height, port=9173, timeout=6):
     that independence is the whole point."""
     import json as _json, urllib.request as _rq
     try:
-        with _rq.urlopen(f"http://{peer}:{port}/get_block_number?number={int(height)}", timeout=timeout) as r:
+        with _rq.urlopen(f"http://{peer}:{port}/get_block?number={int(height)}", timeout=timeout) as r:  # nosec B310 # literal http:// to a peer/loopback host; redirects guarded process-wide (ops/outbound_guard.py)
             d = _json.loads(r.read(1_000_000))
         h = d.get("block_hash") if isinstance(d, dict) else None
         return h if isinstance(h, str) and len(h) == 64 else None
+    except Exception:
+        return None
+
+
+def fetch_block_by_hash(peer, block_hash, port=9173, timeout=6):
+    """One peer's block BODY by hash (GET /get_block?hash=), or None — the tie-break's second input: the
+    tx SET of the peer's first divergent block (fork_resolution.tie_winner). Plain blocking GET against the
+    public API, like probe_block_hash, and bounded: a body is at most MAX_PEER_BODY."""
+    import json as _json, urllib.request as _rq
+    try:
+        if not isinstance(block_hash, str) or len(block_hash) != 64:
+            return None
+        with _rq.urlopen(f"http://{hostport(peer, port)}/get_block?hash={block_hash}", timeout=timeout) as r:  # nosec B310 # literal http:// to a peer/loopback host; redirects guarded process-wide (ops/outbound_guard.py)
+            d = _json.loads(r.read(MAX_PEER_BODY))
+        return d if isinstance(d, dict) and d.get("block_hash") == block_hash else None
+    except Exception:
+        return None
+
+
+def peer_tip_weight(peer, port=9173, timeout=6):
+    """A peer's advertised cumulative tip weight from its /status, or None.
+
+    Asked DIRECTLY, like probe_block_hash and for the same reason: the dead-fork escape's whole claim to
+    safety is that it never routes a destructive decision through the status pool, which benching, a
+    collapsed peer set or a stale entry can silently blind (2026-07-20). The escape uses this only as a
+    SYMMETRY BREAKER — never to decide that a fork exists, only which side of an already-proven one yields
+    — and None (unreachable, malformed) must therefore read as "not heavier", i.e. nobody purges."""
+    import json as _json, urllib.request as _rq
+    try:
+        with _rq.urlopen(f"http://{peer}:{port}/status", timeout=timeout) as r:  # nosec B310 # literal http:// to a peer/loopback host; redirects guarded process-wide (ops/outbound_guard.py)
+            d = _json.loads(r.read(1_000_000))
+        w = d.get("latest_block_weight") if isinstance(d, dict) else None
+        return int(w) if isinstance(w, int) and w >= 0 else None
+    except Exception:
+        return None
+
+
+def _peer_heights(peer, port=9173, timeout=6):
+    """A peer's (finalized_height, tip_height) from a single /status read; either element may be None.
+    Used only to pick a comparison height — never as a fork-choice input."""
+    import json as _json, urllib.request as _rq
+    try:
+        with _rq.urlopen(f"http://{peer}:{port}/status", timeout=timeout) as r:  # nosec B310 # literal http:// to a peer/loopback host; redirects guarded process-wide (ops/outbound_guard.py)
+            d = _json.loads(r.read(1_000_000))
+        if not isinstance(d, dict):
+            return None, None
+        def _h(k):
+            v = d.get(k)
+            return int(v) if isinstance(v, int) and v >= 0 else None
+        return _h("finalized_height"), _h("latest_block_height")
+    except Exception:
+        return None, None
+
+
+def probe_height_for(peer_finalized, peer_tip, our_height, margin):
+    """PURE: the highest height at or below `our_height` that the peer can answer AND where a disagreement
+    could still show up. Returns None when no usable height exists. See tests/test_probe_height.py.
+
+    WHY NOT SIMPLY THE PEER'S FINALIZED HEIGHT (the bug this replaces, measured on betanet-15 2026-08-03).
+    A node that has forked correctly REFUSES to self-finalize while the peer-majority tip is off its chain,
+    so its finalized height freezes at the last height it agreed on — which is BELOW the fork point, by
+    construction. Comparing there is therefore vacuous: both chains share all history below the fork, so the
+    probe could only ever return "agree", and that agreement vetoed the dead-fork escape on BOTH sides. The
+    live 2-2 split at h=7143 was invisible to every node for hours while the gap grew past 290 blocks:
+
+        .131 finalized 7107 (frozen), tip 7430, fork at 7143
+        probe at 7107  -> ours 7674b0e9af9bdd00 == theirs   (AGREE - vetoes the escape)
+        probe at 7264  -> ours e698a5192d4c56fd != ba68e6bc (DISAGREE - the fork is plainly visible)
+
+    Agreement at height h only rules out a fork at or below h; it says nothing about a fork above h.
+    DISagreement is conclusive, agreement is not — the old code treated them as symmetric.
+
+    So prefer `tip - margin`: deep enough on the peer's own chain to be settled (margin is FINALITY_DEPTH,
+    and routine reorg churn is bounded by max_rollbacks < FINALITY_DEPTH, so ordinary churn cannot
+    manufacture a false disagreement), but ABOVE a frozen finality floor. For a HEALTHY peer
+    finalized == tip - FINALITY_DEPTH, so this returns exactly what it always did — the behaviour changes
+    only for a peer whose finality has fallen further than `margin` behind its own tip, which is precisely
+    the frozen-finality fork this is meant to see. A fork SHALLOWER than the margin stays invisible here on
+    purpose: that one is the ordinary reorg path's job, not the destructive purge's.
+    """
+    cands = []
+    if peer_finalized is not None:
+        cands.append(int(peer_finalized))
+    if peer_tip is not None:
+        cands.append(int(peer_tip) - int(margin))
+    cands = [c for c in cands if c > 0]
+    if not cands:
+        return None
+    h = min(max(cands), int(our_height))
+    return h if h > 0 else None
+
+
+def _common_probe_height(peer, our_height, port=9173):
+    """(height, their_hash) at the highest height AT OR BELOW `our_height` that this peer can answer and
+    where a disagreement could still be visible — see probe_height_for for why that is NOT its finalized
+    height. Returns (height, None) when it still cannot answer."""
+    from protocol import FINALITY_DEPTH
+    pf, pt = _peer_heights(peer, port=port)
+    h = probe_height_for(pf, pt, our_height, FINALITY_DEPTH)
+    if h is None:
+        return our_height, None
+    return h, probe_block_hash(peer, h, port=port)
+
+
+def _our_hash_at(height):
+    """Our own block hash at `height` (local read), or None."""
+    try:
+        from ops.block_ops import get_block_hash_by_number
+        return get_block_hash_by_number(int(height))
     except Exception:
         return None
 
@@ -243,15 +433,56 @@ def stranded_below_finality(our_hash, height, peers, quorum=2, port=9173):
     for peer in peers:
         theirs = probe_block_hash(peer, height, port=port)
         if theirs is None:
-            unknown.append(peer)
-        elif theirs == our_hash:
+            # THE PEER IS BEHIND US — which is exactly what a node RACING AHEAD ON ITS OWN FORK looks like.
+            # A lone forker mines every slot unopposed, so it outruns the honest majority and nobody has a
+            # block at ITS finalized height; every probe then answered None, `disagree` stayed empty, and
+            # this returned "not stranded" for the one node most in need of rescue (208.87.242.141 was 200
+            # blocks past the majority, 2026-07-28). Retry at a height the peer DOES have: disagreement at
+            # any height that is final on BOTH sides is equally conclusive — one of us is on a dead branch —
+            # and comparing at OUR height only was an accident of framing, not a soundness requirement.
+            probe_h, theirs_lower = _common_probe_height(peer, height, port=port)
+            if theirs_lower is None:
+                unknown.append(peer)
+                continue
+            ours_lower = _our_hash_at(probe_h)
+            if ours_lower is None:
+                unknown.append(peer)
+            elif theirs_lower == ours_lower:
+                agree.append(peer)                    # same chain where we can both see it -> NOT stranded
+            else:
+                disagree.append(peer)
+            continue
+        if theirs == our_hash:
             agree.append(peer)
         else:
             disagree.append(peer)
-    # ANY peer agreeing means our prefix is not provably abandoned — refuse to act. Wiping a node that is
-    # merely poorly connected would be far worse than leaving it wedged for a human to look at.
-    stranded = not agree and len(disagree) >= int(quorum)
-    return stranded, {"height": height, "ours": our_hash, "agree": agree,
+    # A peer agreeing normally means our prefix is not provably abandoned — refuse to act. Wiping a node
+    # that is merely poorly connected would be far worse than leaving it wedged for a human to look at.
+    #
+    # WEIGHT-QUALIFIED AGREEMENT (2026-07-30, the h15076 aftermath). "ANY agreement vetoes" assumed a
+    # stranded node is ALONE — but three nodes re-anchored onto the same minority fork and each then held
+    # a buddy that "agreed" at its finalized height, so all three vetoed each other's escape forever
+    # while the strictly-heavier majority finalized without them. A buddy on the same losing branch is
+    # not evidence of good standing: an agreeing peer only vetoes when its own DIRECTLY-ASKED chain
+    # weight is at least the best disagreeing peer's — i.e. the friend is at least as credible as the
+    # quorum contradicting us. Unknown weights keep the veto (never purge on missing data), a symmetric
+    # equal-weight split keeps the veto on both sides (nobody moves), and a poorly-connected node's
+    # canonical-chain friend always outweighs a lighter fork quorum — every prior safety story survives.
+    # The purge itself additionally stays behind the escape's fork-state + lighter-side/unanimity gates.
+    effective_agree = list(agree)
+    agree_discounted = []
+    if agree and len(disagree) >= int(quorum):
+        dis_weights = [w for w in (peer_tip_weight(p, port=port) for p in disagree) if w is not None]
+        best_dis = max(dis_weights) if dis_weights else None
+        if best_dis is not None:
+            for p in agree:
+                w = peer_tip_weight(p, port=port)
+                if w is not None and w < best_dis:
+                    agree_discounted.append(p)
+            effective_agree = [p for p in agree if p not in agree_discounted]
+    stranded = not effective_agree and len(disagree) >= int(quorum)
+    return stranded, {"height": height, "ours": our_hash, "agree": effective_agree,
+                      "agree_discounted": agree_discounted,
                       "disagree": disagree, "unknown": unknown, "stranded": stranded}
 
 
@@ -262,7 +493,7 @@ def seed_default_peers(logger, my_ip=None):
     whose table got poisoned (e.g. only our own migrated-in IP, which load_ips then excludes) — the old
     'skip if the table is non-empty' left such a node looping 'Loaded 0 reachable peers'."""
     for ip in seed_peers():
-        if not ip or ip == (my_ip or get_config().get("ip")):
+        if not ip or ip == my_ip or ip in own_ips():   # own_ips: this host can be a seed under EITHER family
             continue
         try:
             save_peer(ip=ip, port=get_port(), address="")
@@ -351,12 +582,40 @@ def load_peer(logger, ip, key=None) -> [str, dict]:
     return peer if key is None else peer.get(key)
 
 
+CHECK_SAVE_PEERS_MAX = 50      # new candidate addresses dialled per peer-loop pass (one semaphore batch)
+
+
 def check_save_peers(peers, logger, fails, unreachable):
     """persist newly-reachable peers to the peer table (skipping self, non-routable, and already-known)"""
     # `peers` may be the UNTRUSTED flattened /peers gossip (get_list_of_peers): keep only string IPs so
     # a hostile peer's non-string element (e.g. a dict) can't raise `unhashable type` in set() and abort
     # the whole peer-loop pass. Non-string entries could never be a valid IP anyway.
-    good_peers = {p for p in peers if isinstance(p, str)} - set(fails) - set(unreachable)
+    # Only what could ever be PERSISTED is worth dialling: this function exists to learn the address of a
+    # NEW table entry, so an address already in the table, non-routable (check_ip: loopback/RFC1918/link-
+    # local/metadata — the SSRF class the guard exists for) or our own is skipped before any I/O, not after.
+    # Bounded per pass: the flattened /peers gossip is untrusted, and one peer listing thousands of
+    # blackholed addresses cost 5 s per 50 of them, every second, while statuses and the mempool went stale.
+    my_ip = get_config()["ip"]
+    # p not in own_ips(): never persist any of our own addresses (a saved ghost survives every restart)
+    good_peers = {p for p in peers if isinstance(p, str) and p != my_ip and p not in own_ips() and check_ip(p)} \
+        - set(fails) - set(unreachable)
+    # A TABLE-KNOWN ADDRESS IS A SUCCESS, NOT A SKIP (2026-09-16). The 2026-09-01 bounding pass dropped
+    # already-persisted addresses BEFORE any I/O — right for the cost it targeted, but it also dropped them from
+    # `success`, and `success` is what sniff_buffered_peers ADDS TO THE DIAL SET. /announce_peer saves a validated
+    # peer to the table and THEN buffers it, so every announced peer arrived here already known and was never
+    # linked: the loopback split scenario stopped converging that day (its partition heal is announce-driven), and
+    # on the live fleet an announced peer that is on disk but not in memserver.peers stayed undialled until the next
+    # peerless disk reload. Known addresses cost no probe (they were validated when saved; the dial set benches an
+    # unreachable one on its own) and ride straight into `success`; only NEW addresses are probed and persisted.
+    known_ok = set()
+    if good_peers:
+        with _PEERS_LOCK:
+            _known = _load_peers()
+        known_ok = {p for p in good_peers if p in _known}
+        good_peers = {p for p in good_peers if p not in _known}
+    good_peers = set(sorted(good_peers)[:CHECK_SAVE_PEERS_MAX])
+    if not good_peers:
+        return {"success": sorted(known_ok), "fails": fails}      # SAME SHAPE as below: sniff_buffered_peers indexes it
 
     local_fails = []
     candidates = asyncio.run(compound_get_status_pool(
@@ -366,7 +625,6 @@ def check_save_peers(peers, logger, fails, unreachable):
         logger=logger,
         semaphore=asyncio.Semaphore(50)))
 
-    my_ip = get_config()["ip"]
     with _PEERS_LOCK:
         table = _load_peers()
         changed = False
@@ -390,7 +648,7 @@ def check_save_peers(peers, logger, fails, unreachable):
                 fails.append(entry)
 
 
-    return {"success": candidates.keys(),
+    return {"success": sorted(set(candidates.keys()) | known_ok),
             "fails": fails}
 
 
@@ -463,6 +721,44 @@ def announce_me(targets, port, my_ip, logger, fail_storage) -> None:
 # dozens of file reads + JSON parses per second for a value that effectively never changes.
 # update_local_ip() invalidates on the one code path that rewrites the IP.
 _own_ip_cache = {"v": None}
+_local_ips_cache = {"v": None}
+
+
+def _local_global_ips():
+    """Every globally-scoped address on this host's interfaces (v4 AND v6), read once from `ip -j addr`.
+    This box advertises its v6 (config ip) while peers also list its v4, and every self-filter compared
+    against the ONE configured ip — so the v4 came back as a ghost self-peer after every restart and the
+    relay dialed itself ~9 req/s (2026-09-06). Empty when `ip` is unavailable (the config ip still counts)."""
+    if _local_ips_cache["v"] is None:
+        found = set()
+        try:
+            import subprocess
+            out = subprocess.run(["ip", "-j", "addr"], capture_output=True, text=True, timeout=5).stdout
+            for iface in json.loads(out or "[]"):
+                for a in iface.get("addr_info", []):
+                    if a.get("scope") == "global" and a.get("local"):
+                        found.add(a["local"])
+        except Exception:
+            pass
+        _local_ips_cache["v"] = frozenset(found)
+    return _local_ips_cache["v"]
+
+
+def own_ips():
+    """The set of addresses that are THIS node: the configured ip, the last detected one, and every global
+    interface address. A peer table must never contain any of them.
+
+    RULE: self-identity is a SET, never one address. Any check of the form `peer != my_ip` /
+    `peer == get_config()["ip"]` is a latent ghost-self-peer bug on a dual-stack or multi-homed host
+    (the configured ip is whichever family answered last; peers advertise the other one back to us).
+    Use `ip in own_ips()` — check_ip() already does — and grep for `my_ip` before adding a new comparison."""
+    ips = {_own_ip_cache["v"]} | set(_local_global_ips())
+    try:
+        ips.add(_own_ip_cached())
+        ips.add(get_config().get("ip"))
+    except Exception:
+        pass                                  # no config yet (harness / first boot): interface addresses still count
+    return ips - {None, ""}
 
 def _own_ip_cached():
     """the node's configured public IP, read from the config once and cached (see above)."""
@@ -489,7 +785,7 @@ def check_ip(ip):
     # reject our own IP and any non-globally-routable address (loopback, RFC1918/ULA private, link-local,
     # reserved, multicast, unspecified): accepting these lets a peer seed us with internal targets
     # (eclipse groundwork / limited SSRF probing). is_private covers IPv6 ULA (fc00::/7) too.
-    if ip == _own_ip_cached():
+    if ip in own_ips():
         return False
     # NADO_TESTNET: allow loopback/private peers so a local multi-node testnet can mesh over
     # 127.0.0.x. NEVER set this on mainnet — it disables the SSRF/eclipse IP guard below.
@@ -533,6 +829,16 @@ def subnet_diversity_ok(new_ip: str, current_peers) -> bool:
     return same < MAX_PEERS_PER_SUBNET
 
 
+def usable_self_ip(ip):
+    """Is `ip` worth ADVERTISING as our own address? Parseable and globally routable — rejects the
+    IPv4-CGNAT range (100.64.0.0/10, RFC 6598) a carrier-grade NAT egress reports, RFC1918/ULA, loopback,
+    link-local, reserved. A detector result failing this must be SKIPPED, not stored (#86)."""
+    try:
+        return ipaddress.ip_address(ip).is_global
+    except ValueError:
+        return False
+
+
 async def get_public_ip(logger):
     """detect our own public IP for self-advertisement, PREFERRING IPv4: on a dual-stack host a v6-only
     self would be unreachable to v4-only peers (most of the current mesh) and could partition us. Tries
@@ -547,26 +853,73 @@ async def get_public_ip(logger):
     # PREFER IPv4 for self-advertisement: on a dual-stack host, advertising a v6-only self would make us
     # unreachable to v4-only peers (most of the current mesh) and can partition us. api4/api6 force a family;
     # try v4 first, fall back to v6 (so a v6-ONLY host still gets a usable address), then the generic probe.
+    for ip in await get_public_ips(logger):
+        return ip
+
+
+async def get_public_ips(logger):
+    """Every address the outside world sees us as, best-first (IPv4, then IPv6). PLURAL because a
+    dual-stack host has more than one, and which is right is not decided by family — it is decided by
+    which one can actually be dialled back. See pick_reachable_ip."""
+    if os.environ.get("NADO_TESTNET"):
+        try:
+            return [get_config()["ip"]]
+        except Exception:
+            return ["127.0.0.1"]
     urls = ["https://api4.ipify.org", "https://api6.ipify.org",
             "https://api.ipify.org", "https://ipinfo.io/ip"]
-
+    out = []
     for url_construct in urls:
         try:
-            async with aiohttp.ClientSession(timeout = aiohttp.ClientTimeout(total=5)) as session:
-                async with session.get(url_construct) as response:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+                # allow_redirects=False: a peer's 302 to 127.0.0.1 would be a loopback-authorized GET here (ops/outbound_guard.py)
+                async with session.get(url_construct, allow_redirects=False) as response:
                     ip = (await response.text()).strip()
-                    if ip:
-                        return ip
-
+                    if not ip:
+                        continue
+                    if not usable_self_ip(ip):
+                        logger.info(f"Ignoring non-routable self-IP {ip!r} from {url_construct}")
+                        continue
+                    if ip not in out:
+                        out.append(ip)
         except Exception as e:
             logger.error(f"Unable to fetch IP from {url_construct}: {e}")
+    return out
+
+
+def pick_reachable_ip(candidates, port, logger, current=None):
+    """Of the addresses the world sees us as, pick one that ACTUALLY ANSWERS on our port.
+
+    Routability is not reachability, and that gap is the whole bug. Behind carrier-grade NAT the address
+    api4.ipify reports is a real, globally-routable, PUBLIC IPv4 — the carrier's, shared between its
+    customers — and nothing out there can dial it back to us. It passes every routability test there is.
+    A node in exactly that position (v4 CGNAT + native IPv6, issue #86) kept overwriting its working IPv6
+    with that dead v4 on every heavy refresh, which is why a hand-edited config and a reboot did not stick.
+
+    So the tie-break is the self-probe the node already runs for can_mine: keep the address whose port
+    answers. If none answer, change nothing — an unreachable node should not also churn its identity."""
+    for ip in candidates:
+        if test_self_port(ip, port):
+            return ip
+    if current and test_self_port(current, port):
+        logger.info(f"Keeping {current}: none of {candidates} answered on port {port}")
+        return current
+    return None
+
 
 def update_local_ip(ip, logger):
     """Keep the node's configured public IP current (detected via get_public_ip). We do NOT store our own
     IP as a peer anymore — self is advertised to others via me_to() in /peers, and dialing ourselves just
     fails. (The old code re-saved the new IP as a peer here, which is what created the ghost self-peer and
     the repeated 'Failed to get peers of <own-ip>' self-dial errors.)"""
-    if ip and ip != get_config()["ip"]:
+    cfg = get_config()
+    if cfg.get("auto_ip") is False:
+        # The operator PINNED their address ("auto_ip": false in private/config.json): detection must
+        # never overwrite it. This is the CGNAT/NAT escape hatch — the address that reaches this node can
+        # be one no detector can see from inside (#86), and a manual fix that silently reverts on the
+        # next heavy refresh is worse than no knob at all.
+        return
+    if ip and ip != cfg["ip"]:
         update_config({"ip": ip})
         _own_ip_cache["v"] = ip      # keep check_ip's own-IP cache in step
         logger.info(f"Local IP updated to {ip}")
@@ -597,10 +950,45 @@ def qualifies_to_sync(peer, peer_protocol, memserver_protocol,
     return {"result": True}
 
 
-if __name__ == "__main__":
-    print(load_ips())
-    # save_peer(ip="1.1.1.1", port=0, address="haha")
-    # delete_peers(["1.1.1.1"])
-    # save_peer(ip="1.1.2", port=0, address="haha2")
-    # save_peer(ip="127.0.0.1", port=9173, address="sop3a7f8a5af60b15460181d9b2ff76ad5f5cfc7c5766ab77")
-    # print(asyncio.run(get_remote_peer_address_async('89.176.130.244')))
+def pool_warm_ready(status_pool, hash_pool, elder_s=None):
+    """True when at least one ELDER peer — reported_uptime >= POOL_WARM_ELDER_S — has advertised a pool
+    hash, i.e. this pass either merged its pool or matched it by equality. A young peer's pool proves
+    nothing about the network's: in an update wave it is as empty as ours, and warming from it is what
+    split the fleet at h191043 (2026-09-22). Pure; the 60 s liveness cap stays in core_loop, so a mesh
+    with no elder at all (fresh chain, solo node, everyone restarted) still produces."""
+    from protocol import POOL_WARM_ELDER_S
+    need = POOL_WARM_ELDER_S if elder_s is None else elder_s
+    hashes = hash_pool or {}
+    for ip, st in (status_pool or {}).items():
+        try:
+            if ip in hashes and int((st or {}).get("reported_uptime") or 0) >= need:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def behind_network(status_pool, our_tip, slack=2):
+    """True when some peer advertises a tip more than `slack` blocks above ours: we are still catching up.
+    A system tx built now carries a propagation guard (min_block = our tip + TX_INCLUSION_DELAY) that is
+    already in the past for the rest of the network — h193750, 2026-09-22: a guard built from a tip eight
+    blocks stale was eligible on arrival, the nodes that had it built it in, and five nodes rolled back.
+    Pure. Production is NOT gated on this (a lone node must still mint); only the periodic system txs are.
+
+    THE UPPER MEDIAN, NOT THE MAXIMUM (audit 2026-09-24 #17, confirmed 2026-10-18): one peer advertising any height
+    made every node "behind", so one liar silenced every node's FFG attests, RANDAO reveals, TPM challenges and claims
+    — finality stalled for the price of one fake /status. With the upper median a node is behind when at least half
+    its readable peers are ahead: two peers, one ahead, still counts (as it always did); from three peers a lone
+    liar moves nothing."""
+    hs = []
+    for st in (status_pool or {}).values():
+        try:
+            h = int((st or {}).get("latest_block_height") or 0)
+        except (TypeError, ValueError):
+            continue
+        if h > 0:
+            hs.append(h)
+    if not hs:
+        return False
+    hs.sort()
+    return hs[len(hs) // 2] > int(our_tip) + int(slack)

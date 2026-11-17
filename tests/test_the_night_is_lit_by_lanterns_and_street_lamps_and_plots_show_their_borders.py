@@ -1,0 +1,137 @@
+"""
+Light and borders in Land (operator 2026-11-07: "we could use some more intense sources of light - townhall disappears
+after walking 20 meters at night"; "there should be some kind of a visual cue marking the ownership borders"):
+
+  1. a lantern and a street lamp are made from bare hands (glass, iron, a torch at the anvil), drawn as their models
+     inside their boxes with glowing glass, and known to the world server;
+  2. they light the night farther than a torch — a lantern a yard, a street lamp a street — and the page's few lights go
+     to the sources whose light reaches the player soonest;
+  3. every titled plot around the player is outlined in the colour of whose it is (yours, invited, for sale, someone
+     else's, owner not yet known; wilderness none; photo mode only the plot it photographs); plots of one holder share
+     one outline, plots on sale keep each their own; a border follows the drawn ground and the pieces on it, never a
+     tree; it is on by default and a setting turns it off;
+  4. the new names are in 17 languages.
+
+Run: python3 tests/test_the_night_is_lit_by_lanterns_and_street_lamps_and_plots_show_their_borders.py
+"""
+import os, tempfile  # ISOLATION FIRST (CLAUDE.md rule 4)
+os.environ["HOME"] = tempfile.mkdtemp(prefix="nado-test-land-light-borders-")
+import atexit, shutil; atexit.register(shutil.rmtree, os.environ["HOME"], ignore_errors=True)
+import importlib.util, json, re, subprocess, sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.join(ROOT, "tests"))
+spec = importlib.util.spec_from_file_location("land_server", os.path.join(ROOT, "scripts", "land_server.py"))
+S = importlib.util.module_from_spec(spec); spec.loader.exec_module(S)
+import _harness
+_report = _harness.Report()
+check = _report.check
+R = json.load(open(os.path.join(ROOT, "static", "land-recipes.json")))
+page = open(os.path.join(ROOT, "static", "land.js"), encoding="utf-8").read()
+
+# 1. reachable from bare hands
+have, tools, st = set(), set(), set()
+cls = lambda c: any(t == c or R["tools"][t].get("class") == c for t in tools)
+grew = True
+while grew:
+    grew = False
+    for rr in R["breaking"].values():
+        if not isinstance(rr, dict) or (rr.get("needs") and not cls(rr["needs"])):
+            continue
+        for i, _ in (rr.get("yields") or []) + ([rr["bonus"]] if rr.get("bonus") else []):
+            if i not in have:
+                have.add(i); grew = True
+    for rr in R["recipes"]:
+        if not isinstance(rr, dict) or not all(i in have for i, _ in rr["uses"]) or not all(x in st or cls(x) for x in rr.get("with", [])):
+            continue
+        for i, _ in rr["makes"]:
+            box = tools if i in R["tools"] else st if i in R["stations"] else have
+            if i not in box:
+                box.add(i); grew = True
+check("a lantern and a street lamp are made from bare hands", {"lantern", "lamppost"} <= have)
+js = """
+const W = await import(%s), M = await import(%s), R = %s;
+const out = {};
+for (const k of ["lantern", "lamppost"]) {
+  const u = R.items[k].unit, L = Math.max(u[0], u[1]), S_ = Math.min(u[0], u[1]), parts = M.MODELS[W.B[k]](L, S_, u[2]);
+  out[k] = { inside: parts.every(([l0, l1, s0, s1, y0, y1]) => l0 >= 0 && l1 <= L && s0 >= 0 && s1 <= S_ && y0 >= 0 && y1 <= u[2]),
+             glass: parts.some((p) => p[6] === W.B.lamp), glow: !!W.BLOCKS[W.B[k]].glow };
+}
+out.n = W.BLOCKS.length;
+console.log(JSON.stringify(out));
+""" % (json.dumps(os.path.join(ROOT, "static", "land-world.js")), json.dumps(os.path.join(ROOT, "static", "land-mesher.js")), json.dumps(R))
+r = subprocess.run(["node", "--input-type=module", "-e", js], capture_output=True, text=True, timeout=120)
+J = json.loads(r.stdout.strip().splitlines()[-1]) if r.stdout.strip() else {}
+check("both are drawn as their models inside their boxes, with glowing glass", all(J.get(k, {}).get("inside") and J[k]["glass"] and J[k]["glow"] for k in ("lantern", "lamppost")), (J, r.stderr[-300:]))
+check("the world server knows every block", S.N_BLOCKS == J.get("n"))
+
+# 2. their light
+L = {k: dict(re.findall(r"(\w+): ([\d.]+)", v)) for k, v in re.findall(r"(\w+): \{ (i: [^}]+) \}", page.split("const LIGHTS = ", 1)[1].split(";", 1)[0])}
+check("a street lamp reaches farther and shines brighter than a lantern, a lantern than a torch",
+      float(L["lamppost"]["d"]) > float(L["lantern"]["d"]) > float(L["torch"]["d"]) and float(L["lamppost"]["i"]) > float(L["lantern"]["i"]) > float(L["torch"]["i"]), L)
+check("the page's lights go to the sources whose light reaches the player soonest (distance over reach)",
+      "sort((a, b) => a[0] / LIGHTS[a[2]].d - b[0] / LIGHTS[b[2]].d)" in page and "l.distance = L.d;" in page)
+
+# 3. borders: whose a plot is, as the page decides it (its own borderKind, run here)
+fn = page.split("function borderKind(plot) {", 1)[1].split("\n}\n", 1)[0]
+js = """
+let SHOT = null; const net = { me: "ME" }, dapp = { me: "ME" };
+const titles = new Map([[1, {}], [2, { holder: "X", sale: { seller: "ME" } }], [3, { holder: "M", sale: { seller: "Y" } }],
+                        [4, { holder: "O" }], [5, { holder: "O" }], [6, { holder: "Z" }]]);
+const mine = new Set([5]), builds = new Set([6]);
+const borderKind = (plot) => { %s };
+const a = [0, 1, 2, 3, 4, 5, 6].map(borderKind);
+SHOT = 4; const b = [3, 4].map(borderKind);
+console.log(JSON.stringify({ a, b }));
+""" % fn
+r = subprocess.run(["node", "--input-type=module", "-e", js], capture_output=True, text=True, timeout=60)
+K = json.loads(r.stdout.strip().splitlines()[-1]) if r.stdout.strip() else {}
+check("a plot's border says whose it is: none in the wilderness, owner unknown, yours (and your own listing), for sale, someone else's, invited",
+      K.get("a") == [None, "titled", "mine", "sale", "owned", "mine", "build"], (K, r.stderr[-300:]))
+check("…and photo mode outlines only the plot it photographs", K.get("b") == [None, "shot"], K)
+check("plots of one holder share one outline, plots on sale keep each their own",
+      'return !(SHOT === null && k !== "sale" && holder && n >= 0 && (titles.get(n) || {}).holder === holder && borderKind(n) === k);' in page)
+check("a border follows the drawn ground and the pieces on it, never a tree",
+      "const at = (u, v) => Math.max(earthAt(q.face, u, v), pieceTopAt(p," in page and "const inside = (y) => fieldAt(f, u, v, y) > 0;" in page)
+# THE OUTLINE IS CACHED A PLOT AT A TIME (#150: a 358 ms rebuild at every plot line crossed, measured 2026-11-12): a
+# plot's part is keyed by its pieces, edits, width and which of its edges are drawn, kept in planet metres, and a
+# rebuild only concatenates — the key carries everything the sampling depends on, or a stale outline would stay. Its
+# kind is its colour alone, recoloured on the kept shape (2026-11-16: every plot was sampled twice on arrival;
+# tests/test_a_plot_border_that_only_changes_colour_is_not_sampled_again.mjs runs it)
+check("a plot's outline is built once for its (pieces, edits, width, edges drawn) and kept, recoloured for its kind; a rebuild concatenates",
+      'const key = [nb, ne, wd, drawn.map((d) => (d ? 1 : 0)).join("")].join("|");' in page and "let part = borderCache.get(p);" in page
+      and "col: borderColours(k, part.pos.length)" in page
+      and "if (!part || part.key !== key) {" in page and "for (const p of [...borderCache.keys()]) if (!keep.has(p)) borderCache.delete(p);" in page)
+check("borders are on by default, and a setting turns them off", "borders: 1," in page and "borders: [0, 1]," in page
+      and "const on = SHOT !== null || SET.borders;" in page)
+check("the page asks whose every outlined plot is (its colour), not only the one underfoot",
+      "if (t && SHOT === null && !mine.has(p) && !t.asked) { t.asked = true; holderOf(p)" in page)
+tr = json.load(open(os.path.join(ROOT, "static", "i18n_games", "land.json"), encoding="utf-8"))
+check("the new names are in 17 languages", len(tr) == 17 and all(l.get("land.i.lantern") and l.get("land.i.lamppost") for l in tr.values()))
+# 4. the borders fade with distance (#181 item 2: "visible from the air as a grid"): 6 cm wide, full within 16 m of the eye,
+#    gone by 48 m — a plot photo keeps its own wide outline
+check("a border is 6 cm wide and fades from full within 16 m of the eye to nothing at 48 m; a plot photo keeps 18 cm and full",
+      "const BORDER_W = 0.06, BORDER_NEAR = 16, BORDER_FAR = 48;" in page
+      and "TSL.float(0.85).mul(TSL.float(1).sub(TSL.smoothstep(BORDER_NEAR, BORDER_FAR, TSL.positionView.length())))" in page
+      and "const wd = SHOT !== null ? 0.18 : BORDER_W," in page and "borderMesh = new THREE.Mesh(g, borderMaterial());" in page)
+# 5. a longer day than night and a night one can see in (#181 item 1, approved by the operator 2026-11-14): the sky's
+#    light follows twilight (2 degrees up to 12 under: civil twilight is enough light outdoors), the sun's own light ends
+#    at the horizon, the moon shines from sunset, the night's sky fill is raised; a hand torch from a stick and two
+#    fibre lights the one who holds it
+check("the sky's light follows twilight, from 2 degrees up to 12 under; the sun's own light ends at the horizon",
+      "const TWI_LOW = Math.sin(-12 * Math.PI / 180), TWI_HIGH = Math.sin(2 * Math.PI / 180);" in page
+      and "const day = smooth01(TWI_LOW, TWI_HIGH, elev), sunUp = smooth01(-0.02, 0.22, elev)," in page
+      and "sun.intensity = 2.4 * Math.min(1.6, star.flux) * sunUp;" in page)
+check("a moonlit night: the moon from sunset at 1.3, the sky's fill at full night 1.5 (were 0.9 and 1.1)",
+      "const MOON_I = 1.3, NIGHT_FILL = 1.5;" in page and "moon.intensity = MOON_I * (1 - sunUp);" in page
+      and "hemi.intensity = (NIGHT_FILL + (2.2 - NIGHT_FILL) * day)" in page)
+rules = json.load(open(os.path.join(ROOT, "static", "land-recipes.json")))
+tr = next(r for r in rules["recipes"] if r["id"] == "torch")
+check("a torch is made by hand from a stick and two fibre (no campfire, no charcoal)",
+      tr["uses"] == [["sticks", 1], ["fiber", 2]] and not tr.get("with") and tr["makes"] == [["torch", 1]], tr)
+check("a torch held (the selected hotbar item, on foot) lights the one who holds it, at the hand",
+      'const carryingTorch = () => !flying && hot[slot] === "torch" && (inv.items.torch || 0) > 0;' in page
+      and 'if (carryingTorch()) all.push([0, null, "carried"]);' in page
+      and "const w = w0 || (carryingTorch() ? Wd.posOf(P.face, P.u, P.v, P.h + 1.45) : null);" in page)
+_report.done()

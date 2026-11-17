@@ -1,4 +1,4 @@
-from .data_ops import get_byte_size, sort_list_dict
+from .data_ops import get_byte_size
 
 # Fee-EXEMPT reserved txs. Each is gated so it cannot be spammed — register (sequential PoSW + per-IP cap),
 # heartbeat (must be registered), unbond/withdraw (the sender's OWN stake), commit/reveal/attest/settle
@@ -8,10 +8,18 @@ from .data_ops import get_byte_size, sort_list_dict
 FEE_EXEMPT_RECIPIENTS = frozenset({
     "register", "heartbeat", "unbond", "withdraw", "commit", "reveal", "attest",
     "settle", "bridge_withdraw", "dividend_withdraw",
-    # msgkey (bind ML-KEM messaging pubkey to the account) is fee-exempt + zero-value; it is NOT added to the
-    # empty-account onboarding bypass, so the sender must already have an on-chain account (registered / holds
-    # coins) — that gate replaces register's PoSW as the anti-spam bound, so it is safe from the cull too.
+    # msgkey (bind ML-KEM messaging pubkey to the account) is zero-value. The empty-account check was once named as its
+    # anti-spam bound; it is not one (mempool policy only, and accounts were free to create). The bounds are consensus
+    # — only the FIRST bind is free, a rotation pays MIN_TX_FEE (protocol.py "NO FREE REPEATABLE TRANSACTIONS") — plus the per-sender cap
+    # on pooled fee-exempt txs (memserver._free_pool_admit), which is what keeps protecting it from the cull safe.
     "msgkey",
+    # The four enrolment messages (doc/tpm-attestation-without-a-ca.md) are fee-exempt and zero-value.
+    # Each is bounded: tpm_enrol needs a vendor-signed endorsement chain and only one may be open per
+    # chip, tpm_challenge/tpm_reveal are accepted only from the challengers consensus DREW for that
+    # enrolment, and tpm_commit only from the identity that opened it. Culling them for a fee-bearing
+    # flood would strand an enrolment mid-exchange, and an enrolment that loses one message has to start
+    # over with a new attestation key.
+    "tpm_enrol", "tpm_challenge", "tpm_commit", "tpm_reveal",
 })
 
 
@@ -60,28 +68,6 @@ def cull_buffer(buffer, limit) -> list:
         drop.add(id(tx))
         total -= sizes[id(tx)]
     return [t for t in buffer if id(t) not in drop] if drop else buffer
-
-
-def merge_buffer(from_buffer, to_buffer, block_max, block_min) -> dict:
-    """Promote EVERY tx whose max_block is in (block_min, block_max] from `from_buffer` into `to_buffer`, and
-    keep the rest in `from_buffer`. Single O(N) pass, order-independent.
-
-    The old code re-selected the max-FEE tx each iteration and, when that tx did not match the window, left it
-    in place and re-picked it — spinning on it and STARVING every lower-fee tx, so a due tx (e.g. a fee-0
-    register at target == latest+1) could sit behind an undue higher-fee one and miss its target block. That is
-    the 'accepted but never included' registration bug. Dedup is by txid (O(1)) rather than a deep list scan."""
-    in_to = {tx.get("txid") for tx in to_buffer}
-    kept = []
-    for tx in from_buffer:
-        tid = tx.get("txid")
-        if tid in in_to:
-            continue                                            # already in to_buffer — drop the duplicate
-        if block_min < tx["max_block"] <= block_max:
-            to_buffer.append(tx)
-            in_to.add(tid)
-        else:
-            kept.append(tx)
-    return {"from_buffer": sort_list_dict(kept), "to_buffer": sort_list_dict(to_buffer)}
 
 
 def get_from_pool(pool, source, target):

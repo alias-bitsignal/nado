@@ -53,13 +53,13 @@ tested); the remaining items are documented residuals / future hardening.
   portable proof (`verify_attestation_equivocation_proof`) that burns `SLASH_BOND_PENALTY` of bonded
   stake via the same `slash` path as block-authorship equivocation (`resolve_slash`). The per-epoch
   uniqueness marker still blocks on-chain double-voting; cross-fork double-voting is now punished.
-- **The bonded `MAX_SHARES` cap is per-identity, not aggregate** — sharding capital above `BOND_CAP`
+- **There is no bonded per-identity cap (removed 2026-08-25)** — the old `MAX_SHARES` was per key; sharding capital above it
   across addresses recovers full proportional weight. The bonded lane is therefore capital-proportional
   ("pay-to-win") by design; the cap limits single-address variance, not aggregate stake.
 - **Registration / fee-exempt state growth** — `register` writes an account doc; idle-account GC is now implemented
   (deterministic in-block sweeps, `ops/gc_ops.py`); the registration PoW does not bind `target_block`. Bounded today by
   the lane cap (share), per-IP rate limit, mempool cap, and the in-block one-register-per-sender dedup,
-  but idle-account GC + per-sender mempool occupancy caps are future work.
+  but per-sender mempool occupancy caps are future work.
 - **`FIDELITY_DECAY` is unused** (absent identities keep accumulated fidelity); bounded by the open-lane
   ceiling.
 - **Snapshot bootstrap** trusts an 80%-of-peers quorum with no hardcoded-checkpoint cross-check

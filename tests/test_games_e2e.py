@@ -2,28 +2,42 @@
 End-to-end tests for the ported zkVM games (execnode/games/*). For each game this deploys the real contract
 through the normal blob path on a fresh ExecState, plays a FULL game via `apply_blob` calls (the same path
 the live exec node runs), and asserts: escrow moves correctly, the winner is paid, the banker's accounting
-balances, and the `decode_view` output matches what each game's frontend reads. It also STARK-proves one
-representative method per game (the whole point — a call is provable). Reverts are exercised too.
+balances, and the `decode_view` output matches what each game's frontend reads. Reverts are exercised too. (The
+per-game "one representative method STARK-proves" cases retired in G9 with the Goldilocks exec AIR, vm_circuit.)
 
-Run: python3 tests/test_games_e2e.py        (~2-3 min: several real proofs at reduced query count)
+Run: python3 tests/test_games_e2e.py
 """
 import os, sys, tempfile, traceback
+import atexit, shutil
+
+# INVARIANT: this test never reads or writes the live node's files, because HOME and the exec node's CWD-relative
+# state/DA paths are assigned (never setdefault) to a throwaway directory before any project import.
+os.environ["HOME"] = tempfile.mkdtemp(prefix="nado-games-e2e-")
+atexit.register(shutil.rmtree, os.environ["HOME"], ignore_errors=True)
+os.environ["NADO_EXEC_STATE"] = os.path.join(os.environ["HOME"], "exec_state.json")
+os.environ["NADO_EXEC_DA"] = os.path.join(os.environ["HOME"], "exec_da")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# BLAKE_EXEC_HEIGHT's gen-28 pin retired in G9: generation 28's rules (the v1 VM, field digests) are gone, so this
+# file runs on generation 29's exec layer like the chain does.
 from execnode.state import ExecState
 from execnode import runtimes
-from execnode.stark import vm_circuit as V
 from execnode.games import (coinflip, dice, roulette, tictactoe as ttt, connect4 as c4,
                             slots, mines, reversi as rv, chess, farkle as fk, blackjack as bj, bet as bt,
-                            battleship as bs, pets as ptz, holdem as hd, stormhold as sh, scrapline as sc)
+                            battleship as bs, pets as ptz, holdem as hd, stormhold as sh, scrapline as sc,
+                            pool as pl)
+from execnode.games import _lib as games_lib
 
-fails = 0
-def check(name, fn):
-    global fails
-    try: fn(); print(f"PASS  {name}")
-    except Exception as e:
-        fails += 1; print(f"FAIL  {name}: {e}"); traceback.print_exc()
 
-NQ = 6
+def _tf(mod):
+    """The module holding a banked game's table-field constants (TP, TC). dice keeps none of its own: its table
+    layout IS execnode.games._lib's (it used to re-import TA/TK/TP/TC/TZ from there unused, and this test read them
+    THROUGH dice — removed as unused imports, 2026-09-30). roulette declares its own."""
+    return games_lib if mod is dice else mod
+
+import _harness
+_report = _harness.Report()
+check = _report.run
+
 A = "ndoAAAA" + "A" * 41
 B = "ndoBBBB" + "B" * 41
 
@@ -36,40 +50,31 @@ def _fresh(mod, deployer=A, cursor=100):
     rd = lambda f, k: int((st.contracts[cid]["storage"].get("slots") or {}).get(str(f * (1 << 32) + k), 0))
     return st, code, cid, rd
 
-def _prove(code, method, caller, args, slots, **kw):
-    cf, fa = runtimes.zkvm_statement(caller, args, {})
-    proof, io, ret, ns = V.prove_call(code, method, cf, fa, slots, num_queries=NQ, **kw)
-    vkw = {k: v for k, v in kw.items() if k in ("value", "cursor", "timestamp")}   # verify: context only
-    ok, why = V.verify_call(proof, code, method, cf, fa, io, num_queries=NQ, **vkw)
-    assert ok, f"{method} proof: {why}"
-
-
 # ---- coinflip ----------------------------------------------------------------------------------
 def t_coinflip():
+    # commit-reveal (Release B): each player commits HASH(secret), both reveal, settle pays HASH(s1+s2+g) parity
     st, code, cid, rd = _fresh(coinflip)
+    H = games_lib.vm_hash                              # the gen-29 VM's HASH (zkvm2.hash_words), as the contract hashes
     st.credit_deposit(A, 1_000_000); st.credit_deposit(B, 1_000_000)
-    G = 12345
-    st.apply_blob({"op": "call", "contract": cid, "method": "open", "args": [G], "value": 500}, A, "1")
-    st.apply_blob({"op": "call", "contract": cid, "method": "join", "args": [G], "value": 500}, B, "2")
+    G, s1, s2 = 12345, 0xABC, 0xDEF
+    st.apply_blob({"op": "call", "contract": cid, "method": "open", "args": [G, H([s1])], "value": 500}, A, "1")
+    st.apply_blob({"op": "call", "contract": cid, "method": "join", "args": [G, H([s2])], "value": 500}, B, "2")
     assert rd(coinflip.NN, G) == 2 and st.bridge[cid] == 1000
-    st.block_hashes[102] = 0xABC; st.block_hashes[103] = 0xDEF; st.cursor = 104
+    st.apply_blob({"op": "call", "contract": cid, "method": "reveal", "args": [G, s1]}, A, "r1")
+    st.apply_blob({"op": "call", "contract": cid, "method": "reveal", "args": [G, s2]}, B, "r2")
     st.apply_blob({"op": "call", "contract": cid, "method": "settle", "args": [G]}, A, "3")
     ws = rd(coinflip.WS, G); winner = A if ws == 1 else B
+    assert ws == (H([(s1 + s2 + G) % games_lib.vm_mod()]) & 0xFFFFFFFF) % 2 + 1
     assert rd(coinflip.SD, G) == 1 and st.bridge.get(cid, 0) == 0
     assert st.bridge[winner] == 1_000_000 - 500 + 1000
     v = st.decode_view(st.contracts[cid])
     assert v["p1"][str(G)] == A and v["p2"][str(G)] == B
     # cancel refunds
-    st.apply_blob({"op": "call", "contract": cid, "method": "open", "args": [9], "value": 300}, A, "4")
+    st.apply_blob({"op": "call", "contract": cid, "method": "open", "args": [9, 77], "value": 300}, A, "4")
     st.apply_blob({"op": "call", "contract": cid, "method": "cancel", "args": [9]}, A, "5")
     assert st.bridge.get(cid, 0) == 0
 
-def t_coinflip_prove():
-    code = coinflip.build()
-    S = lambda f, k: f * (1 << 32) + k
-    slots = {S(1, 1): 2, S(2, 1): 500, S(7, 1): 102,
-             S(4, 1): runtimes.zkvm_addr_digest(A), S(5, 1): runtimes.zkvm_addr_digest(B)}
-    _prove(code, "settle", A, [1], slots, cursor=104, block_hashes={102: 1, 103: 2})
+# coinflip_prove retired in G9: the exec AIR (execnode/stark/vm_circuit.py) that proved a call was deleted
 
 
 # ---- dice / roulette (banked) ------------------------------------------------------------------
@@ -78,14 +83,16 @@ def _banked(mod, betargs, winnable):
     st.credit_deposit(A, 100_000_000); st.credit_deposit(B, 2_000_000)
     st.apply_blob({"op": "call", "contract": cid, "method": "open", "args": [3], "value": 50_000_000}, A, "1")
     st.apply_blob({"op": "call", "contract": cid, "method": "bet", "args": betargs, "value": 100_000}, B, "2")
-    assert rd(mod.TC, 3) == winnable and rd(mod.TP, 3) == 50_100_000
-    st.block_hashes[102] = 0x1234; st.block_hashes[103] = 0x5678; st.cursor = 104
+    assert rd(_tf(mod).TC, 3) == winnable and rd(_tf(mod).TP, 3) == 50_100_000
+    # Release B: the bet at cursor 100 binds beacon epoch 100//60 + 2 = 3 (gh = 3*60 - 1 = 179); settle reads BEACON(3)
+    assert rd(mod.GB, 88) == 3 and rd(mod.GH, 88) == 179
+    st.beacons[3] = 0x1234; st.cursor = 180
     st.apply_blob({"op": "call", "contract": cid, "method": "settle", "args": [88]}, B, "3")
-    assert rd(mod.GD, 88) == 1 and rd(mod.TC, 3) == 0
-    assert st.bridge.get(cid, 0) == rd(mod.TP, 3)                      # escrow == withdrawable
+    assert rd(mod.GD, 88) == 1 and rd(_tf(mod).TC, 3) == 0
+    assert st.bridge.get(cid, 0) == rd(_tf(mod).TP, 3)                      # escrow == withdrawable
     b0 = st.bridge.get(A, 0)
     st.apply_blob({"op": "call", "contract": cid, "method": "close", "args": [3]}, A, "4")
-    assert st.bridge.get(A, 0) - b0 == rd(mod.TP, 3) or st.bridge.get(cid, 0) == 0
+    assert st.bridge.get(A, 0) - b0 == rd(_tf(mod).TP, 3) or st.bridge.get(cid, 0) == 0
     v = st.decode_view(st.contracts[cid])
     assert v["ta"]["3"] == A and set(v["gg"]) == {"88"}
 
@@ -102,17 +109,14 @@ def t_dice_overbet_reverts():
     st.credit_deposit(A, 100_000_000)
     st.apply_blob({"op": "call", "contract": cid, "method": "open", "args": [3], "value": 70}, A, "1")
     r = st.apply_blob({"op": "call", "contract": cid, "method": "bet", "args": [88, 3, 25], "value": 20}, A, "2")
-    assert "revert" not in r and rd(dice.TP, 3) == 90 and rd(dice.TC, 3) == 20 * 99 // 25   # full payout 79 reserved
+    assert "revert" not in r and rd(games_lib.TP, 3) == 90 and rd(games_lib.TC, 3) == 20 * 99 // 25   # full payout 79 reserved
     r2 = st.apply_blob({"op": "call", "contract": cid, "method": "bet", "args": [89, 3, 25], "value": 20}, A, "3")
     assert "revert" in r2, "over-bet past the pot must revert"                 # tc 158 > tp 110
-    assert rd(dice.TP, 3) == 90 and rd(dice.TC, 3) == 79                        # state unchanged by the reverted bet
+    assert rd(games_lib.TP, 3) == 90 and rd(games_lib.TC, 3) == 79                        # state unchanged by the reverted bet
     rc = st.apply_blob({"op": "call", "contract": cid, "method": "close", "args": [3]}, A, "4")
     assert "revert" in rc, "close with an open bet (tc>0) must revert"
 
-def t_dice_prove():
-    code = dice.build(); S = lambda f, k: f * (1 << 32) + k
-    slots = {S(1, 3): runtimes.zkvm_addr_digest(A), S(2, 3): 50_000_000, S(3, 3): 50_000_000}
-    _prove(code, "bet", B, [88, 3, 50], slots, value=100_000, cursor=100)
+# dice_prove retired in G9: the exec AIR (execnode/stark/vm_circuit.py) that proved a call was deleted
 
 
 # ---- tictactoe / connect4 (PvP board) ----------------------------------------------------------
@@ -147,13 +151,7 @@ def t_tictactoe_wrongturn_reverts():
     r = st.apply_blob({"op": "call", "contract": cid, "method": "move", "args": [7, 0, 9]}, A, "4")  # wrong ply
     assert "revert" in r
 
-def t_tictactoe_prove():
-    code = ttt.build(); S = lambda f, k: f * (1 << 32) + k
-    B_ = lambda cell, g: (ttt.BD_BASE + cell) * (1 << 32) + g
-    slots = {S(1, 42): 2, S(8, 42): 4, S(3, 42): 200000,
-             S(4, 42): runtimes.zkvm_addr_digest(A), S(5, 42): runtimes.zkvm_addr_digest(B),
-             B_(0, 42): 1, B_(1, 42): 1, B_(3, 42): 2, B_(4, 42): 2}
-    _prove(code, "move", A, [42, 2, 4], slots, cursor=100)
+# tictactoe_prove retired in G9: the exec AIR (execnode/stark/vm_circuit.py) that proved a call was deleted
 
 
 # ---- slots / mines (banked reveal) -------------------------------------------------------------
@@ -163,11 +161,15 @@ def t_slots():
     st.apply_blob({"op": "call", "contract": cid, "method": "open", "args": [5], "value": 5_000_000_000}, A, "1")
     g = 1000
     st.apply_blob({"op": "call", "contract": cid, "method": "spin", "args": [g, 5], "value": 10_000}, B, "2")
-    gh = rd(slots.GH, g); st.block_hashes[gh] = 0x1234567; st.block_hashes[gh + 1] = 0x89abcde; st.cursor = gh + 2
+    # a spin binds to the epoch beacon gb (gh = gb*60 - 1); settle draws from BEACON(gb)
+    gb, gh = rd(slots.GB, g), rd(slots.GH, g)
+    assert gb and gh == gb * 60 - 1, "spin binds the epoch beacon"
+    st.beacons[gb] = 0x1234567 << 100 | 0x89abcde; st.cursor = gh + 2
     pbefore = st.bridge.get(B, 0)
     st.apply_blob({"op": "call", "contract": cid, "method": "settle", "args": [g]}, B, "3")
     gr = rd(slots.GR, g); gw = rd(slots.GW, g)
     stops = [(gr - 1) % 64, ((gr - 1) // 64) % 64, ((gr - 1) // 4096) % 64]
+    assert stops == slots.stops_of(slots.seed_of(gb, gh, beacon=st.beacons[gb]), g), "reels must match reference"
     assert gw == slots.m2_of(stops), "paytable must match reference"
     assert st.bridge.get(B, 0) - pbefore == 10_000 * gw // 2 and rd(slots.GD, g) == 1
 
@@ -179,11 +181,12 @@ def t_mines():
     st.apply_blob({"op": "call", "contract": cid, "method": "bet", "args": [g, 5, 3], "value": 100_000}, B, "2")
     st.apply_blob({"op": "call", "contract": cid, "method": "pick", "args": [g, 2]}, B, "3")
     assert rd(mines.GQ, g) == mines.multiplier(100_000, 0, 3, 2)
-    gh = rd(mines.GH, g); st.block_hashes[gh] = 0xBEEF; st.block_hashes[gh + 1] = 0xCAFE; st.cursor = gh + 2
-    from execnode.stark.field import P
-    q = (0xBEEF % P + 0xCAFE % P + g) % P
+    # a pick binds the round to its beacon epoch gb (gh = gb*60 - 1); resolve draws from BEACON(gb) + g
+    gh, gb = rd(mines.GH, g), rd(mines.GB, g); assert gb and gh == gb * games_lib.EPOCH_LENGTH - 1
+    st.beacons[gb] = 0xBEEFCAFE; st.cursor = gh + 2
+    q = mines.round_seed(g, beacon=0xBEEFCAFE)
     st.apply_blob({"op": "call", "contract": cid, "method": "resolve", "args": [g]}, B, "4")
-    assert rd(mines.GB, g) == mines.resolve_hit(q, 0, 3, 2)
+    assert rd(mines.GX, g) == mines.resolve_hit(q, 0, 3, 2)
 
 # ---- reversi (PvP flip) + chess (record/agree) -------------------------------------------------
 def t_reversi():
@@ -271,10 +274,9 @@ def t_stormhold():
     assert rd(sh.CFG, 790) == 0, "cfg-less open must default to 0 (random kingdom)"
     assert rd(sh.C1, 790) == 0, "commit-less open must default to 0 (open-hand)"
 
-    # HIDDEN HANDS: commits stored at open/join; reveal requires alghash(x) == commit; a wrong x reverts
-    from execnode.stark import alghash
+    # HIDDEN HANDS: commits stored at open/join; reveal requires HASH(x) == commit; a wrong x reverts
     XA, XB = 123456789, 987654321
-    ca, cb = alghash.hashn([XA]), alghash.hashn([XB])
+    ca, cb = games_lib.vm_hash([XA]), games_lib.vm_hash([XB])
     G3 = 79
     st.apply_blob({"op": "call", "contract": cid, "method": "open", "args": [G3, 0, ca], "value": 10_000}, A, "oh")
     assert rd(sh.C1, G3) == ca, "opener commit stored"
@@ -312,11 +314,7 @@ def t_sovereign():
     assert v["lc"]["3"] == 5000 + sv.GAP, "raid pins a future seed height"
 
 
-def t_sovereign_act_proves():
-    from execnode.games import sovereign as sv
-    code = sv.build()
-    S = lambda f, k: f * (1 << 32) + k
-    _prove(code, "act", A, [6, 0, 0], {S(sv.MC, 0): 0}, cursor=100)
+# sovereign_act_proves retired in G9: the exec AIR (execnode/stark/vm_circuit.py) that proved a call was deleted
 
 
 def t_faucet():
@@ -345,16 +343,7 @@ def t_faucet():
     assert "paid=450" in st.apply_blob({"op": "call", "contract": "faucet", "method": "reward", "args": [0, 56, 1, W1, 450]}, OP, "rw4"), "next day pays again"
     assert "revert" in st.apply_blob({"op": "call", "contract": "faucet", "method": "reward", "args": [1, 55, 1, W1, 10 ** 12]}, OP, "rw5"), "underfunded fails closed"
 
-def t_faucet_reward_proves():
-    """The faucet's money path must be PROVABLE, not merely replayable.
-
-    This used to prove `claim`, the self-serve PoW grind — which was ripped out (the faucet is the
-    airdrop-play prize bank, nothing else), leaving the test referencing constants the contract no longer
-    defines. It had been failing on an AttributeError ever since, i.e. proving nothing. `reward` is the
-    method that actually moves money now, so it is the one that has to carry a proof."""
-    from execnode.games import faucet as fc
-    code = fc.build()
-    _prove(code, "reward", fc.OPERATOR, [0, 55, 1, "mldsa44" + "1" * 42, 450], {}, cursor=100_000)
+# faucet_reward_proves retired in G9: the exec AIR (execnode/stark/vm_circuit.py) that proved a call was deleted
 
 
 def t_scrapline():
@@ -397,11 +386,43 @@ def t_scrapline():
                                       "args": [20650, 7, 0, 1, 0, 0, 0, 0, 0, 0, 0]}, A, "px3")    # n = 0
 
 
-def t_stormhold_move_proves():
-    code = sh.build(); S = lambda f, k: f * (1 << 32) + k
-    slots = {S(sh.NN, 77): 2, S(sh.MC, 77): 3, S(sh.P1, 77): runtimes.zkvm_addr_digest(A),
-             S(sh.P2, 77): runtimes.zkvm_addr_digest(B)}
-    _prove(code, "move", B, [77, 12345, 3], slots, cursor=200)
+def t_pool():
+    # the duel contract with the ONE deliberate difference: open() has no `value > 0` require, so a frame
+    # can be played for nothing. Assert the free path escrows/settles exactly like the staked one.
+    st, code, cid, rd = _fresh(pl, deployer=A)
+    st.credit_deposit(A, 1_000_000); st.credit_deposit(B, 1_000_000)
+    G = 5150
+    st.apply_blob({"op": "call", "contract": cid, "method": "open", "args": [G, 0]}, A, "o")   # NO value
+    assert rd(pl.NN, G) == 1 and rd(pl.ST, G) == 0 and rd(pl.PT, G) == 0
+    assert st.bridge.get(cid, 0) == 0 and st.bridge[A] == 1_000_000
+    st.cursor = 300
+    st.apply_blob({"op": "call", "contract": cid, "method": "join", "args": [G]}, B, "j")
+    assert rd(pl.NN, G) == 2 and rd(pl.KH, G) == 300 + pl.GAP
+    # a shot is a 48-bit payload: it must round-trip through storage untouched (JSON-safe, < 2**53)
+    enc = 1 + ((1 << 48) - 1) * 16
+    st.apply_blob({"op": "call", "contract": cid, "method": "move", "args": [G, enc, 0]}, A, "m0")
+    v = st.decode_view(st.contracts[cid])
+    assert v["mv"][str(G * 10000 + 0)] == enc and v["mh"][str(G * 10000 + 0)] % 4 == 1
+    # log cap
+    st.contracts[cid]["storage"]["slots"][str(pl.MC * (1 << 32) + G)] = pl.MAXMOVES
+    assert "revert" in st.apply_blob({"op": "call", "contract": cid, "method": "move",
+                                      "args": [G, 5, pl.MAXMOVES]}, A, "mx")
+    st.contracts[cid]["storage"]["slots"][str(pl.MC * (1 << 32) + G)] = 1
+    # a zero pot still settles cleanly through the shared agree path
+    st.apply_blob({"op": "call", "contract": cid, "method": "agree", "args": [G, 2]}, A, "a1")
+    st.apply_blob({"op": "call", "contract": cid, "method": "agree", "args": [G, 2]}, B, "a2")
+    assert rd(pl.SD, G) == 1 and rd(pl.WR, G) == 2
+    assert st.bridge[A] == 1_000_000 and st.bridge[B] == 1_000_000, "a free frame must move no money"
+    # and the staked path on the same contract still pays the pot
+    G2 = 5151
+    st.apply_blob({"op": "call", "contract": cid, "method": "open", "args": [G2, 0], "value": 40_000}, A, "o2")
+    st.apply_blob({"op": "call", "contract": cid, "method": "join", "args": [G2], "value": 40_000}, B, "j2")
+    ab = st.bridge.get(A, 0)
+    st.apply_blob({"op": "call", "contract": cid, "method": "resign", "args": [G2]}, B, "r2")
+    assert rd(pl.WR, G2) == 1 and st.bridge.get(A, 0) == ab + 80_000
+
+
+# stormhold_move_proves retired in G9: the exec AIR (execnode/stark/vm_circuit.py) that proved a call was deleted
 
 
 def t_farkle():
@@ -437,6 +458,17 @@ def t_farkle():
 
 
 # ---- blackjack (banked, dealer S17, ace-soft) --------------------------------------------------
+def _bj_land(st, rd, g, rnd):
+    """Publish the randomness of hand g's pending step and move the cursor to where it resolves. Returns the
+    (bh0, bh1) pair the reference functions take: (BEACON(gb), 0) for a beacon step, (bh(gh), bh(gh+1)) for a
+    step bound before the beacon rule (gb == 0)."""
+    gb, gh = rd(bj.GB, g), rd(bj.GH, g)
+    if gb:
+        b = rnd(); st.beacons[gb] = b; st.cursor = max(st.cursor, gh + 1)
+        return b, 0
+    h0, h1 = rnd(), rnd(); st.block_hashes[gh] = h0; st.block_hashes[gh + 1] = h1; st.cursor = gh + 2
+    return h0, h1
+
 def t_blackjack():
     import random as _r
     st, code, cid, rd = _fresh(bj, deployer=A)
@@ -446,8 +478,7 @@ def t_blackjack():
     for trial in range(30):
         g = 100 + trial; st.cursor = 200 + trial * 60
         st.apply_blob({"op": "call", "contract": cid, "method": "deal", "args": [g, 5], "value": stake}, B, "d")
-        gh = rd(bj.GH, g); h0 = _r.randint(1, 2**60); h1 = _r.randint(1, 2**60)
-        st.block_hashes[gh] = h0; st.block_hashes[gh + 1] = h1; st.cursor = gh + 2
+        h0, h1 = _bj_land(st, rd, g, lambda: _r.randint(1, 2**60))
         up = bj.card_at(h0, h1, g * 64, 16)
         c0 = bj.card_at(h0, h1, g * 64, 0); c1 = bj.card_at(h0, h1, g * 64, 1)
         ptot, _, _, natural = bj.hand_total([c0, c1])
@@ -459,8 +490,7 @@ def t_blackjack():
             assert rd(bj.GD, g) == 1 and st.bridge.get(B, 0) - pb == stake * 5 // 2, "natural pays 5:2"
             continue
         st.apply_blob({"op": "call", "contract": cid, "method": "stand", "args": [g]}, B, "s")
-        gh2 = rd(bj.GH, g); h2 = _r.randint(1, 2**60); h3 = _r.randint(1, 2**60)
-        st.block_hashes[gh2] = h2; st.block_hashes[gh2 + 1] = h3; st.cursor = gh2 + 2
+        h2, h3 = _bj_land(st, rd, g, lambda: _r.randint(1, 2**60))
         pb = st.bridge.get(B, 0)
         st.apply_blob({"op": "call", "contract": cid, "method": "settle", "args": [g]}, B, "e")
         dtot = bj.dealer_play(h2, h3, g, up)
@@ -481,13 +511,13 @@ def t_blackjack_hit_bust():
     for g in range(900, 990):
         st.cursor = (g + 1) * 100
         st.apply_blob({"op": "call", "contract": cid, "method": "deal", "args": [g, 5], "value": 100_000}, B, "d")
-        gh = rd(bj.GH, g); st.block_hashes[gh] = _r.randint(1, 2**60); st.block_hashes[gh + 1] = _r.randint(1, 2**60); st.cursor = gh + 2
+        _bj_land(st, rd, g, lambda: _r.randint(1, 2**60))
         st.apply_blob({"op": "call", "contract": cid, "method": "reveal", "args": [g]}, B, "r")
         if rd(bj.GD, g):
             continue
         pb = st.bridge.get(B, 0)
         st.apply_blob({"op": "call", "contract": cid, "method": "hit", "args": [g]}, B, "h")
-        gh2 = rd(bj.GH, g); st.block_hashes[gh2] = _r.randint(1, 2**60); st.block_hashes[gh2 + 1] = _r.randint(1, 2**60); st.cursor = gh2 + 2
+        _bj_land(st, rd, g, lambda: _r.randint(1, 2**60))
         st.apply_blob({"op": "call", "contract": cid, "method": "draw", "args": [g]}, B, "w")
         if rd(bj.GD, g) == 1 and rd(bj.GW, g) == 2:
             busted += 1
@@ -496,23 +526,7 @@ def t_blackjack_hit_bust():
             break
     assert busted >= 2, "expected some hit-then-bust hands"
 
-def t_blackjack_prove():
-    import random as _r
-    st, code, cid, rd = _fresh(bj, deployer=A)
-    st.credit_deposit(A, 10_000_000_000); st.credit_deposit(B, 10_000_000)
-    st.apply_blob({"op": "call", "contract": cid, "method": "open", "args": [5], "value": 5_000_000_000}, A, "o")
-    _r.seed(3); g = 100; st.cursor = 500
-    st.apply_blob({"op": "call", "contract": cid, "method": "deal", "args": [g, 5], "value": 100_000}, B, "d")
-    gh = rd(bj.GH, g); st.block_hashes[gh] = _r.randint(1, 2**60); st.block_hashes[gh + 1] = _r.randint(1, 2**60); st.cursor = gh + 2
-    st.apply_blob({"op": "call", "contract": cid, "method": "reveal", "args": [g]}, B, "r")
-    assert not rd(bj.GD, g)
-    st.apply_blob({"op": "call", "contract": cid, "method": "stand", "args": [g]}, B, "s")
-    gh2 = rd(bj.GH, g); st.block_hashes[gh2] = _r.randint(1, 2**60); st.block_hashes[gh2 + 1] = _r.randint(1, 2**60); st.cursor = gh2 + 2
-    slots = {int(k): int(vv) for k, vv in st.contracts[cid]["storage"]["slots"].items()}
-    cf, fa = runtimes.zkvm_statement(B, [g], {})
-    proof, io, ret, ns = V.prove_call(code, "settle", cf, fa, slots, num_queries=NQ, cursor=st.cursor, block_hashes=st.block_hashes)
-    ok, why = V.verify_call(proof, code, "settle", cf, fa, io, num_queries=NQ, cursor=st.cursor)
-    assert ok, f"settle proof: {why}"
+# blackjack_prove retired in G9: the exec AIR (execnode/stark/vm_circuit.py) that proved a call was deleted
 
 
 # ---- bet (parimutuel — the whole pot splits pro-rata among the winning outcome's backers) --------
@@ -648,36 +662,7 @@ def t_bet():
     assert str(M1) in v["mk"] and v["pl"][str(M1 * 8 + 0)] == 800 and v["mcr"][str(M1)] == ADM
 
 
-def t_bet_prove():
-    # prove BOTH new-VM capabilities inside a real contract: create_market's 11 args ride the ARG bus,
-    # claim's pro-rata payout rides DIVMODW.
-    U = bt.UNIT
-    st = ExecState(os.path.join(tempfile.mkdtemp(), "s.json")); st.cursor = 100
-    T0 = 1_000_000; st.block_ts = T0
-    code = bt.build()
-    st.credit_deposit(A, 10_000 * U); st.credit_deposit(B, 10_000 * U)
-    st.apply_blob({"op": "deploy", "runtime": "zkvm", "code": code, "abi": bt.ABI, "nonce": "n"}, A, "d")
-    cid = st.contract_id(A, code, "n")
-    call = lambda m, args, val, who: st.apply_blob(
-        {"op": "call", "contract": cid, "method": m, "args": args, "value": val or 0}, who, m + who)
-    M = 7001
-    cargs = [M, 2, T0 + 100, T0 + 400, "P\nH\nA", "src", "ev", 0, 0, 0, 0]
-    # prove create_market against the PRE state (fresh slots)
-    cf, fa = runtimes.zkvm_statement(A, cargs, {})
-    proof, io, ret, ns = V.prove_call(code, "create_market", cf, fa, {}, num_queries=NQ, timestamp=T0)
-    ok, why = V.verify_call(proof, code, "create_market", cf, fa, io, num_queries=NQ, timestamp=T0)
-    assert ok, f"create_market proof: {why}"
-    # play the market for real, then prove the claim (DIVMODW payout)
-    call("create_market", cargs, None, A)
-    call("bet", [M, 0], 300 * U, B); call("bet", [M, 1], 700 * U, A)
-    st.block_ts = T0 + 120
-    call("resolve", [M, 0], None, A)
-    slots = {int(k): int(vv) for k, vv in st.contracts[cid]["storage"]["slots"].items()}
-    cf, fa = runtimes.zkvm_statement(B, [M], {})
-    proof, io, ret, ns = V.prove_call(code, "claim", cf, fa, slots, num_queries=NQ, timestamp=st.block_ts)
-    assert ret == 300 * 1000 // 300 * U, "pro-rata payout"
-    ok, why = V.verify_call(proof, code, "claim", cf, fa, io, num_queries=NQ, timestamp=st.block_ts)
-    assert ok, f"claim proof: {why}"
+# bet_prove retired in G9: the exec AIR (execnode/stark/vm_circuit.py) that proved a call was deleted
 
 
 # ---- battleship (hidden boards, merkle-sum proofs per shot, reveal-at-claim fleet check) ----------
@@ -752,20 +737,7 @@ def t_battleship_stall_paths():
     assert "ok" in call("forfeit", [G], None, B)
     assert st.bridge.get(B, 0) - b0 == 600
 
-def t_battleship_answer_proves():
-    st, code, cid, shipsA, shipsB, bA, bB, seedA, seedB, sA, sB, rootA, rootB = _bs_setup()
-    call = lambda m, args, val, who: st.apply_blob(
-        {"op": "call", "contract": cid, "method": m, "args": args, "value": val or 0}, who, m + who)
-    G = 42
-    call("open", [G, rootA], 500, A); call("join", [G, rootB], 500, B)
-    cell0 = [c for c in range(100) if bB[c]][0]
-    call("fire", [G, cell0], None, A)
-    isS, salt, flat = bs.make_proof(bB, sB, cell0)
-    slots = {int(k): int(v) for k, v in st.contracts[cid]["storage"]["slots"].items()}
-    cf, fa = runtimes.zkvm_statement(B, [G, isS, salt] + flat, {})
-    proof, io, ret, ns = V.prove_call(code, "answer", cf, fa, slots, num_queries=NQ, cursor=st.cursor)
-    ok, why = V.verify_call(proof, code, "answer", cf, fa, io, num_queries=NQ, cursor=st.cursor)
-    assert ok, f"answer proof (17 ARG args): {why}"
+# battleship_answer_proves retired in G9: the exec AIR (execnode/stark/vm_circuit.py) that proved a call was deleted
 
 
 # ---- pets (tamagotchi NFTs: gene/tier/stats, feeding, training, battles, marketplace) -------------
@@ -790,7 +762,7 @@ def t_pets():
         st.block_hashes[gh] = h0; st.block_hashes[gh + 1] = h1; st.cursor = max(st.cursor, gh + 2)
         assert "ok" in call("hatch", [pid], None, who)
         gene = ptz.ref_gene(h0, h1, pid); sp = ptz.ref_tier(gene)
-        assert rd(ptz.GL, pid) == (gene & 0xFFFFFFFF) and rd(ptz.GH, pid) == (gene >> 32)
+        assert rd(ptz.GL, pid) == (gene & 0xFFFFFFFF) and rd(ptz.GH, pid) == (gene >> 32) & 0xFFFFFFFF   # v2: lo32 of the high word
         assert rd(ptz.SP, pid) == sp and rd(ptz.SI, pid) == ptz.ref_si(gene, sp)
         assert rd(ptz.AP, pid) == ptz.ref_stat(gene, sp, 9) and rd(ptz.PW, pid) == ptz.ref_power(gene, sp)
         genes[pid] = (gene, sp)
@@ -813,7 +785,7 @@ def t_pets():
     # battles: several fights, each turn-engine result differentially checked vs ref_battle_turns
     fights = 0
     for bid in range(100, 108):
-        st.cursor += ptz.EXHAUST + 10
+        st.cursor += ptz.EXHAUST + ptz.REVEAL_WINDOW + 10      # the rest lock covers the reveal window
         alive = lambda p_: rd(ptz.FU, p_) > st.cursor
         mine = {p_: st.zk_addrs.get(str(rd(ptz.OW, p_))) for p_ in (1, 2, 3, 4)}
         a_p = [p_ for p_, o in mine.items() if o == A and alive(p_)]
@@ -822,26 +794,33 @@ def t_pets():
             continue
         pa, pb = a_p[0], b_p[0]
         call("feed", [pa], 5 * 10**9, A); call("feed", [pb], 5 * 10**9, B)
-        if "revert" in call("challenge", [bid, pa, pb], 1000, A):
+        # commit-reveal battle (Release B): each owner commits HASH(secret); both reveal; the duel runs over
+        # HASH(s1 + s2 + bid) in place of the block-hash pair
+        s1, s2 = _r.randint(1, 2**60), _r.randint(1, 2**60)
+        if "revert" in call("challenge", [bid, pa, pb, games_lib.vm_hash([s1])], 1000, A):
             continue
-        if "revert" in call("accept", [bid], 1000, B):
+        if "revert" in call("accept", [bid, games_lib.vm_hash([s2])], 1000, B):
             continue
-        wh = rd(ptz.WH, bid)
-        h0, h1 = _r.randint(1, 2**60), _r.randint(1, 2**60)
-        st.block_hashes[wh] = h0; st.block_hashes[wh + 1] = h1; st.cursor = max(st.cursor, wh + 2)
+        assert "ok" in call("reveal_battle", [bid, s1], None, A) and "ok" in call("reveal_battle", [bid, s2], None, B)
         effA = [ptz.ref_stat(*genes[pa], i) + rd(ptz.TB_BASE + i, pa) for i in range(10)]
         effB = [ptz.ref_stat(*genes[pb], i) + rd(ptz.TB_BASE + i, pb) for i in range(10)]
-        a_wins, dies, _h0, _h1, _log = ptz.ref_battle_turns(h0, h1, bid, effA, effB)
+        a_wins, dies, _h0, _h1, _log = ptz.ref_battle_turns(ptz.ref_battle_seed(s1, s2, bid), 0, bid, effA, effB)
         assert "ok" in call("resolve_battle", [bid], None, B)
         assert rd(ptz.WW, bid) == (pa if a_wins else pb), "battle winner differential"
         loser = pb if a_wins else pa
         assert rd(ptz.WD, bid) == (loser if dies else 0), "death differential"
         assert rd(ptz.OW, loser) == rd(ptz.OW, rd(ptz.WW, bid)), "loser claimed"
-        # gift back so pairings survive (the test drives both keys)
+        # gift back so pairings survive (the test drives both keys). C4 (review 2026-09-23): a pet in a live
+        # battle cannot be transferred until its EX lock lapses, so wait it out — and feed first, since the
+        # wait would otherwise starve it — exactly what a real owner has to do now.
         back = A if loser == pa else B
         wo = st.zk_addrs.get(str(rd(ptz.OW, loser)))
-        if rd(ptz.FU, loser) > st.cursor and wo != back:
-            call("transfer", [loser, back], None, wo)
+        if wo != back:
+            st.cursor = max(st.cursor, rd(ptz.EX, loser))
+            call("feed", [loser], 5 * 10**9, wo)
+            if rd(ptz.FU, loser) > st.cursor:
+                r_ = call("transfer", [loser, back], None, wo)
+                assert "ok" in r_, f"gift back after the lock lapsed: {r_}"
         fights += 1
     assert fights >= 3, f"only {fights} fights"
     # marketplace + naming (fresh pets so they're alive)
@@ -863,25 +842,7 @@ def t_pets():
     assert v["nm"][str(21)] == "Rex" and "tb" in v
     assert not [k for k in st.contracts[cid]["storage"]["slots"] if int(k) >> 32 == ptz.SC], "scratch"
 
-def t_pets_hatch_proves():
-    import random as _r
-    st = ExecState(os.path.join(tempfile.mkdtemp(), "s.json")); st.cursor = 100
-    code = ptz.build()
-    st.credit_deposit(A, 10**12)
-    st.apply_blob({"op": "deploy", "runtime": "zkvm", "code": code, "abi": ptz.ABI, "nonce": "n"}, A, "d")
-    cid = st.contract_id(A, code, "n")
-    rd = lambda f, k: int((st.contracts[cid]["storage"].get("slots") or {}).get(str(f * (1 << 32) + k), 0))
-    st.apply_blob({"op": "call", "contract": cid, "method": "mint", "args": [7], "value": ptz.MINT_FEE}, A, "m")
-    gh = rd(ptz.BH, 7)
-    _r.seed(3)
-    bhs = {gh: _r.randint(1, 2**60), gh + 1: _r.randint(1, 2**60)}
-    st.block_hashes.update(bhs); st.cursor = gh + 2
-    slots = {int(k): int(v) for k, v in st.contracts[cid]["storage"]["slots"].items()}
-    cf, fa = runtimes.zkvm_statement(A, [7], {})
-    proof, io, ret, ns = V.prove_call(code, "hatch", cf, fa, slots, num_queries=NQ, cursor=st.cursor,
-                                      block_hashes=st.block_hashes)
-    ok, why = V.verify_call(proof, code, "hatch", cf, fa, io, num_queries=NQ, cursor=st.cursor)
-    assert ok, f"hatch proof: {why}"
+# pets_hatch_proves retired in G9: the exec AIR (execnode/stark/vm_circuit.py) that proved a call was deleted
 
 
 # ---- hold'em (multiplayer table stakes, side pots, on-chain 7-card showdown) ----------------------
@@ -892,12 +853,12 @@ def t_holdem_eval():
     for _ in range(300):
         cards = [_r.randrange(52) for _ in range(7)]           # multi-deck: duplicates legal
         cf, fa = runtimes.zkvm_statement("fuzz", cards, {})
-        ok, ret, _s, _io = __import__("execnode.zkvm", fromlist=["run"]).run(code, "rank_of", cf, fa, {})
+        ok, ret, _s, _io = __import__("execnode.zkvm2", fromlist=["run"]).run(code, "rank_of", cf, fa, {})
         assert ok and ret == hd.eval7_ref(cards), f"eval7 differential {cards}: {ret} vs {hd.eval7_ref(cards)}"
     for cards in ([0, 13, 26, 39, 1, 2, 3], [8, 9, 10, 11, 12, 20, 33], [0, 2, 4, 6, 8, 10, 12],
                   [12, 0, 1, 2, 3, 30, 40], [0, 0, 13, 13, 26, 26, 39], [5, 5, 5, 5, 18, 31, 44]):
         cf, fa = runtimes.zkvm_statement("fuzz", cards, {})
-        ok, ret, _s, _io = __import__("execnode.zkvm", fromlist=["run"]).run(code, "rank_of", cf, fa, {})
+        ok, ret, _s, _io = __import__("execnode.zkvm2", fromlist=["run"]).run(code, "rank_of", cf, fa, {})
         assert ok and ret == hd.eval7_ref(cards), f"shape {cards}"
 
 def _holdem_settle(seats, ante):
@@ -948,7 +909,6 @@ def t_holdem_sidepots():
 
 def t_holdem_full():
     import random as _r
-    from execnode.stark import alghash
     st = ExecState(os.path.join(tempfile.mkdtemp(), "s.json")); st.cursor = 100
     code = hd.build()
     H, X, Y = "ndoHH" + "H" * 43, "ndoXX" + "X" * 43, "ndoYY" + "Y" * 43
@@ -963,16 +923,17 @@ def t_holdem_full():
     _r.seed(9)
     T, G1, G2, G3 = 500, 501, 502, 503
     xh, xa, xb = _r.randint(1, 2**60), _r.randint(1, 2**60), _r.randint(1, 2**60)
-    assert "ok" in call("open", [T, G1, alghash.hashn([xh]), 1000], 10000, H)
-    assert "ok" in call("join", [T, G2, alghash.hashn([xa])], 5000, X)
-    assert "ok" in call("join", [T, G3, alghash.hashn([xb])], 3000, Y)
-    assert "revert" in call("join", [T, 999, alghash.hashn([1])], 3000, Y), "one seat per address"
+    assert "ok" in call("open", [T, G1, games_lib.vm_hash([xh]), 1000], 10000, H)
+    assert "ok" in call("join", [T, G2, games_lib.vm_hash([xa])], 5000, X)
+    assert "ok" in call("join", [T, G3, games_lib.vm_hash([xb])], 3000, Y)
+    assert "revert" in call("join", [T, 999, games_lib.vm_hash([1])], 3000, Y), "one seat per address"
     assert "ok" in call("start", [T], None, H)
-    d0 = rd(hd.TD, T)
-    h0d, h1d = _r.randint(1, 2**60), _r.randint(1, 2**60)
-    st.block_hashes[d0] = h0d; st.block_hashes[d0 + 1] = h1d
+    d0, tg = rd(hd.TD, T), rd(hd.TG, T)
+    assert tg == 100 // 60 + 2, "the deal pins the beacon epoch two ahead"
+    hbc = _r.randint(1, 2**60)
+    st.beacons[tg] = hbc                                     # hole cards draw from BEACON(tg)
     assert "revert" in call("bet", [G1, 100], None, H), "no betting before the shuffle"
-    st.cursor = d0 + hd.F0 + 1
+    st.cursor = tg * 60 + 1
     assert "ok" in call("bet", [G1, 500], None, H)
     assert "ok" in call("bet", [G2, 500], None, X)
     assert "ok" in call("bet", [G3, 2000], None, Y)          # all-in raise
@@ -980,24 +941,23 @@ def t_holdem_full():
     assert "ok" in call("bet", [G1, 1500], None, H)
     assert "ok" in call("bet", [G2, 1500], None, X)
     assert "ok" in call("close_street", [T], None, H)
-    cs = [rd(hd.SCL_BASE + k, T) for k in range(1, 5)]
+    sc = [rd(hd.SCL_BASE + k, T) for k in range(1, 5)]
     for k in range(1, 4):
-        c = cs[k - 1]
-        st.block_hashes[c] = _r.randint(1, 2**60); st.block_hashes[c + 1] = _r.randint(1, 2**60)
-        st.cursor = c + 1
+        _b0, cs, opens, pins = hd.timeline_ref(d0, tg, sc)
+        st.beacons[pins[k - 1]] = _r.randint(1, 2**60)       # street k+1's cards: BEACON(p_k)
+        st.cursor = opens[k - 1] + 1
         if k == 3:
             assert "ok" in call("bet", [G1, 1000], None, H)
             assert "revert" in call("close_street", [T], None, H), "a pending call blocks the close"
             assert "ok" in call("bet", [G2, 1000], None, X)
         assert "ok" in call("close_street", [T], None, H)
-        cs = [rd(hd.SCL_BASE + kk, T) for kk in range(1, 5)]
-    c4 = cs[3]
-    st.block_hashes[c4] = _r.randint(1, 2**60); st.block_hashes[c4 + 1] = _r.randint(1, 2**60)
-    st.cursor = c4 + 1
-    board = hd.board_ref(st.block_hashes, cs[0], cs[1], cs[2], T)
+        sc = [rd(hd.SCL_BASE + kk, T) for kk in range(1, 5)]
+    _b0, cs, opens, pins = hd.timeline_ref(d0, tg, sc)
+    st.cursor = cs[3] + 1
+    board = hd.board_ref_beacon(st.beacons, pins[0], pins[1], pins[2], T)
     vals = {}
     for g, (who, x) in ((G1, (H, xh)), (G2, (X, xa)), (G3, (Y, xb))):
-        ref = hd.eval7_ref(hd.hole_ref(h0d, h1d, x) + board)
+        ref = hd.eval7_ref(hd.hole_ref_beacon(hbc, x) + board)
         assert "ok" in call("reveal", [g, x], None, who)
         assert rd(hd.GSC, g) == ref, "showdown hand value differential"
         vals[g] = ref
@@ -1024,38 +984,29 @@ def t_holdem_full():
     v = st.decode_view(st.contracts[cid])
     assert v["ta"][str(T)] == H and "cs" in v
 
-def t_holdem_open_proves():
-    # `open` is holdem's representative proof — small + fast. (`reveal` also proves: it fits the 131k gas
-    # ceiling at ~16k rows, but the Python prover takes minutes on that trace, so it's exercised natively
-    # via the 1500-hand rank_of fuzz + full-game differential rather than proven in the suite.)
-    from execnode.stark import alghash
-    code = hd.build()
-    T, G1 = 7, 71
-    args = [T, G1, alghash.hashn([12345]), 1000]
-    cf, fa = runtimes.zkvm_statement(A, args, {})
-    proof, io, ret, ns = V.prove_call(code, "open", cf, fa, {}, num_queries=NQ, value=5000)
-    ok, why = V.verify_call(proof, code, "open", cf, fa, io, num_queries=NQ, value=5000)
-    assert ok, f"open proof: {why}"
+# holdem_open_proves retired in G9: the exec AIR (execnode/stark/vm_circuit.py) that proved a call was deleted
 
 
 # ---- horizon reclaim: a bet/hand/game whose block-hash height ages past ~20000 can never settle (bhash
 # reverts), so each game gets a bhash-free refund gated on pinned_height + 18000 < cursor. Without it the
 # stake is locked forever and tc>0 pins the table open (the "mists" fund-lock class, mirroring slots.claim /
 # mines.reap). Each test: stake, prove reclaim reverts inside the window, age past the horizon, reclaim,
-# assert refund + accounting cleared + close unblocked. ------------------------------------------------
+# assert the outcome + accounting cleared + close unblocked. dice/roulette (Release B): the timed-out stake goes
+# to the BANK (stays in tp), the player is paid nothing. -------------------------------------------------------
 def _banked_reclaim(mod, betargs, reserve, refund_field="reclaim"):
     st, code, cid, rd = _fresh(mod, deployer=A)
     st.credit_deposit(A, 100_000_000); st.credit_deposit(B, 2_000_000)
     st.apply_blob({"op": "call", "contract": cid, "method": "open", "args": [3], "value": 50_000_000}, A, "1")
     st.apply_blob({"op": "call", "contract": cid, "method": "bet", "args": betargs, "value": 100_000}, B, "2")
-    assert rd(mod.TC, 3) == reserve
+    assert rd(_tf(mod).TC, 3) == reserve
     b0 = st.bridge.get(B, 0)
     r = st.apply_blob({"op": "call", "contract": cid, "method": refund_field, "args": [betargs[0]]}, B, "e")
     assert "revert" in str(r).lower(), "reclaim inside the settle window must revert"
-    st.cursor = 102 + 18001                                         # gh was cursor(100)+2; age past horizon
+    st.cursor = rd(mod.GH, betargs[0]) + 18001                       # age gh (the beacon-bound 179) past the window
     st.apply_blob({"op": "call", "contract": cid, "method": refund_field, "args": [betargs[0]]}, B, "r")
-    assert rd(mod.GD, betargs[0]) == 1 and rd(mod.TC, 3) == 0 and rd(mod.TP, 3) == 50_000_000
-    assert st.bridge.get(B, 0) == b0 + 100_000, "stake not refunded"
+    # Release B timeout -> bank: the stake stays in the pot, the reservation is released, the player gets nothing
+    assert rd(mod.GD, betargs[0]) == 1 and rd(_tf(mod).TC, 3) == 0 and rd(_tf(mod).TP, 3) == 50_100_000
+    assert rd(mod.GW, betargs[0]) == 0 and st.bridge.get(B, 0) == b0, "a timed-out bet pays the player nothing"
     st.apply_blob({"op": "call", "contract": cid, "method": "close", "args": [3]}, A, "c")   # tc==0 now unblocks
 
 def t_dice_reclaim():
@@ -1074,16 +1025,21 @@ def t_blackjack_reap():
     assert "revert" in str(r).lower(), "reap inside the window must revert"
     st.cursor = 100 + 18001                                          # age ge past the horizon
     st.apply_blob({"op": "call", "contract": cid, "method": "reap", "args": [88]}, B, "r")
-    assert rd(bj.GD, 88) == 1 and rd(bj.TC, 3) == 0 and rd(bj.TP, 3) == 50_000_000
-    assert st.bridge.get(B, 0) == b0 + 100_000, "stake not refunded"
+    # the timeout resolves to the bank: the stake stays in the pot (tp) and joins the bankroll (tk)
+    assert rd(bj.GD, 88) == 1 and rd(bj.TC, 3) == 0 and rd(bj.TP, 3) == 50_000_000 + 100_000
+    assert rd(bj.TK, 3) == 50_000_000 + 100_000 and st.bridge.get(B, 0) == b0, "a timed-out hand pays the player nothing"
     st.apply_blob({"op": "call", "contract": cid, "method": "close", "args": [3]}, A, "c")
 
 def t_coinflip_reclaim():
     st, code, cid, rd = _fresh(coinflip)
     st.credit_deposit(A, 1_000_000); st.credit_deposit(B, 1_000_000)
     G = 12345
-    st.apply_blob({"op": "call", "contract": cid, "method": "open", "args": [G], "value": 500}, A, "1")
-    st.apply_blob({"op": "call", "contract": cid, "method": "join", "args": [G], "value": 500}, B, "2")
+    # a game the PRE-commit-reveal code opened + joined (md == 0, sh = join cursor + 2): reclaim is its escape
+    sl = st.contracts[cid]["storage"].setdefault("slots", {})
+    S = lambda f: str(f * (1 << 32) + G)
+    sl[S(1)] = 2; sl[S(2)] = 500; sl[S(3)] = 1000; sl[S(7)] = 102
+    sl[S(4)] = runtimes.zkvm_addr_digest(A); sl[S(5)] = runtimes.zkvm_addr_digest(B)
+    st.bridge[A] -= 500; st.bridge[B] -= 500; st.bridge[cid] = st.bridge.get(cid, 0) + 1000
     a0, b0 = st.bridge.get(A, 0), st.bridge.get(B, 0)
     r = st.apply_blob({"op": "call", "contract": cid, "method": "reclaim", "args": [G]}, A, "e")
     assert "revert" in str(r).lower(), "reclaim inside the window must revert"
@@ -1184,13 +1140,11 @@ def t_blackjack_pot_tracks_escrow():
         st.cursor += 3
         r = st.apply_blob({"op": "call", "contract": cid, "method": "deal", "args": [g, 5], "value": 200_000}, B, f"d{g}")
         if "revert" in str(r).lower(): continue
-        for h in (st.cursor + 2, st.cursor + 3): st.block_hashes[h] = 0xABCD * (g + 1) + h
-        st.cursor += 4
+        gb = rd(bj.GB, g); st.beacons[gb] = 0xABCD * (g + 1) + gb; st.cursor = gb * 60
         st.apply_blob({"op": "call", "contract": cid, "method": "reveal", "args": [g]}, B, f"rv{g}")
         if rd(bj.GF, g) == 2:
             st.apply_blob({"op": "call", "contract": cid, "method": "stand", "args": [g]}, B, f"sd{g}")
-            for h in (st.cursor + 2, st.cursor + 3): st.block_hashes[h] = 0x1111 * (g + 2) + h
-            st.cursor += 4
+            gb = rd(bj.GB, g); st.beacons[gb] = 0x1111 * (g + 2) + gb; st.cursor = gb * 60
             st.apply_blob({"op": "call", "contract": cid, "method": "settle", "args": [g]}, B, f"st{g}")
     assert rd(bj.TP, 5) == st.bridge.get(cid, 0), \
         f"pot {rd(bj.TP, 5)} drifted from escrow {st.bridge.get(cid, 0)}"
@@ -1199,19 +1153,20 @@ def t_blackjack_pot_tracks_escrow():
     assert st.bridge.get(cid, 0) == 0, "closing the only table must drain the escrow exactly"
 
 def t_blackjack_reap_forfeits_a_player_stall():
-    """Who gets the stake depends on who stalled.
+    """The timeout resolves to the bank in EVERY phase.
 
-    At gf==2 the hand waits on the PLAYER and the bank has no resolution path at all, so a blanket refund
-    would be a free option: deal, reveal, see both your cards and the up-card, then abandon every bad hand
-    and reap the stake back. That phase forfeits; a hand waiting on a pruned block hash still refunds.
+    At gf==2 the hand waits on the PLAYER and the bank has no resolution path at all, so a refund would be a free
+    option: deal, reveal, see both your cards and the up-card, then abandon every bad hand and reap the stake back.
+    A hand still awaiting its reveal resolves the same way — reveal is permissionless and its beacon outlives the
+    window, so the player had 18000 blocks to land it. (tests/test_blackjack_settles_from_the_beacon_and_times_out_
+    to_the_bank.py covers phases 1-4.)
     """
     st, code, cid, rd = _fresh(bj, deployer=A)
     st.credit_deposit(A, 500_000_000); st.credit_deposit(B, 50_000_000)
     st.apply_blob({"op": "call", "contract": cid, "method": "open", "args": [5], "value": 100_000_000}, A, "o")
     st.cursor += 3
     st.apply_blob({"op": "call", "contract": cid, "method": "deal", "args": [900, 5], "value": 1_000_000}, B, "d")
-    for h in (st.cursor + 2, st.cursor + 3): st.block_hashes[h] = 0x777 * h
-    st.cursor += 4
+    gb = rd(bj.GB, 900); st.beacons[gb] = 0x777 * gb; st.cursor = gb * 60
     st.apply_blob({"op": "call", "contract": cid, "method": "reveal", "args": [900]}, B, "rv")
     assert rd(bj.GF, 900) == 2, "expected the hand to be waiting on the player"
     b0 = st.bridge.get(B, 0)
@@ -1219,13 +1174,14 @@ def t_blackjack_reap_forfeits_a_player_stall():
     st.apply_blob({"op": "call", "contract": cid, "method": "reap", "args": [900]}, B, "rp")
     assert st.bridge.get(B, 0) == b0, "a player who abandoned their own turn must forfeit, not be refunded"
     assert rd(bj.TC, 5) == 0 and rd(bj.GD, 900) == 1, "the cover must still be released and the hand closed"
-    # but a hand stranded on a pruned hash (still awaiting reveal) is nobody's fault — refund
+    # a hand nobody revealed resolves to the bank too
     st.cursor += 3
     st.apply_blob({"op": "call", "contract": cid, "method": "deal", "args": [901, 5], "value": 1_000_000}, B, "d2")
     b1 = st.bridge.get(B, 0)
     st.cursor = rd(bj.GE, 901) + 18001
     st.apply_blob({"op": "call", "contract": cid, "method": "reap", "args": [901]}, B, "rp2")
-    assert st.bridge.get(B, 0) == b1 + 1_000_000, "a hash-stranded hand must refund the stake"
+    assert st.bridge.get(B, 0) == b1 and rd(bj.GD, 901) == 1, "an unrevealed hand times out to the bank"
+    assert rd(bj.TP, 5) == st.bridge.get(cid, 0), "the pot still equals the escrow"
 
 def t_farkle_reclaim():
     st, code, cid, rd = _fresh(fk)
@@ -1248,50 +1204,40 @@ def t_farkle_reclaim():
 
 if __name__ == "__main__":
     check("coinflip: open/join/settle/cancel + escrow + view", t_coinflip)
-    check("coinflip: settle proves", t_coinflip_prove)
     check("dice: open/bet/settle/close banker accounting + view", t_dice)
     check("roulette: masked bet/settle/close + view", t_roulette)
-    check("dice: bet proves (divmod + bankroll)", t_dice_prove)
     check("dice: over-max bet + unsafe close revert (solvency)", t_dice_overbet_reverts)
     check("tictactoe: full game, p1 wins, pot paid + view", t_tictactoe)
     check("connect4: vertical win, pot paid + view", t_connect4)
     check("tictactoe: wrong turn / wrong ply revert", t_tictactoe_wrongturn_reverts)
-    check("tictactoe: winning move proves", t_tictactoe_prove)
     check("slots: spin/settle paytable matches reference", t_slots)
     check("mines: bet/pick/resolve multiplier + mine-hit vs reference", t_mines)
     check("reversi: flip board matches reference", t_reversi)
     check("chess: move record + agree settlement", t_chess)
     check("stormhold: free-actor move log + seed heights + agree/resign", t_stormhold)
-    check("stormhold: move proves (seed-height record)", t_stormhold_move_proves)
     check("scrapline: duel contract reuse + move-log cap", t_scrapline)
+    check("pool: stake-optional open + free-frame settle", t_pool)
     check("sovereign: persistent nation world — global log, ply binding, address resolution", t_sovereign)
-    check("sovereign: act proves", t_sovereign_act_proves)
     check("faucet: fixed-name deploy, PoW claims, budgets, pause, solvency", t_faucet)
-    check("faucet: reward proves", t_faucet_reward_proves)
     check("farkle: roll/hold scoring + banking vs reference", t_farkle)
     check("blackjack: deal/reveal/stand/settle vs dealer S17 + payouts + view", t_blackjack)
     check("blackjack: hit-then-bust loses immediately", t_blackjack_hit_bust)
-    check("blackjack: settle proves (dealer loop trace)", t_blackjack_prove)
     check("bet: parimutuel markets, resolver panels, voids, pro-rata claims", t_bet)
-    check("bet: create (ARG bus) + claim (DIVMODW) prove", t_bet_prove)
     check("battleship: full hidden-board game, lie/overlap rejected, pot paid", t_battleship)
     check("battleship: timeout + forfeit stall paths", t_battleship_stall_paths)
-    check("battleship: answer proves (17-arg merkle proof on the ARG bus)", t_battleship_answer_proves)
     check("pets: gene/tier/stat/feed/train/battle differentials + marketplace", t_pets)
-    check("pets: hatch proves (12-hash gene derivation)", t_pets_hatch_proves)
     check("holdem: 7-card evaluator differential (300 hands + shapes)", t_holdem_eval)
     check("holdem: layered side pots, ties, uncalled bets, fold refunds", t_holdem_sidepots)
     check("holdem: full table-stakes hand, showdown differential, settle", t_holdem_full)
-    check("holdem: open proves (representative call)", t_holdem_open_proves)
-    check("dice: horizon reclaim voids a stale bet, refunds, unblocks close", t_dice_reclaim)
-    check("roulette: horizon reclaim voids a stale bet, refunds, unblocks close", t_roulette_reclaim)
-    check("blackjack: horizon reap voids a stale hand, refunds, releases cover", t_blackjack_reap)
+    check("dice: a bet unsettled past its window goes to the bank and unblocks close", t_dice_reclaim)
+    check("roulette: a bet unsettled past its window goes to the bank and unblocks close", t_roulette_reclaim)
+    check("blackjack: horizon reap closes a stale hand for the bank, releases cover", t_blackjack_reap)
     check("coinflip: horizon reclaim refunds both stakes on a stranded flip", t_coinflip_reclaim)
     check("farkle: horizon reclaim refunds each seat's ante on an abandoned table", t_farkle_reclaim)
     check("farkle: settle pays the WINNER, not seat #1's owner (nez clobber)", t_farkle_settle_pays_the_winner)
     check("farkle: a reclaimed seat id is consumed, never recycled with its score", t_farkle_reclaim_consumes_the_seat)
     check("farkle: reclaim spares an active seat; a decided table takes no antes", t_farkle_reclaim_spares_an_active_seat)
     check("blackjack: the pot never drifts above escrow (close stays solvent)", t_blackjack_pot_tracks_escrow)
-    check("blackjack: reap forfeits a player's own stall, refunds a hash strand", t_blackjack_reap_forfeits_a_player_stall)
-    print("ALL PASS" if fails == 0 else f"{fails} FAILURES")
-    sys.exit(1 if fails else 0)
+    check("blackjack: reap resolves to the bank in every phase", t_blackjack_reap_forfeits_a_player_stall)
+    print("ALL PASS" if _report.fails == 0 else f"{_report.fails} FAILURES")
+    sys.exit(1 if _report.fails else 0)

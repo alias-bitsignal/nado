@@ -11,6 +11,7 @@ Run: python3 tests/test_idle_gc.py
 """
 import os, sys, tempfile, traceback, logging
 os.environ["HOME"] = tempfile.mkdtemp(prefix="nado_idlegc_")
+import atexit, shutil; atexit.register(shutil.rmtree, os.environ["HOME"], ignore_errors=True)   # leave no /tmp home behind (9,600 leaked by 2026-09-22)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 for d in ("index", "blocks", "logs", "peers"):
     os.makedirs(f"{os.environ['HOME']}/nado/{d}", exist_ok=True)
@@ -19,21 +20,18 @@ logger = logging.getLogger("idlegc"); logger.addHandler(logging.NullHandler())
 from genesis import create_indexers
 create_indexers()
 
-from protocol import (EPOCH_LENGTH, GC_IDLE_EPOCHS, RECERT_HISTORY_EPOCHS, POSW_LEASE_EPOCHS,
-                      SATURATION_LOOKBACK_EPOCHS, FIDELITY_CAP)
+from protocol import (EPOCH_LENGTH, GC_IDLE_EPOCHS, POSW_LEASE_EPOCHS, SATURATION_LOOKBACK_EPOCHS, FIDELITY_CAP)
+# the retention in force at every epoch since gen 26 (the per-class leases; gen 25's LEASE_V2_EPOCH gate is deleted)
+from protocol import RECERT_HISTORY_EPOCHS_V2 as RECERT_HISTORY_EPOCHS
 from ops import kv_ops
 from ops.gc_ops import apply_idle_gc, revert_idle_gc
 from ops.account_ops import create_account
 from ops.dividend_ops import fidelity_at_epoch
 from ops.mining_ops import open_shares
 
-fails = 0
-def check(name, fn):
-    """Run fn; print PASS/FAIL and count failures."""
-    global fails
-    try: fn(); print(f"PASS  {name}")
-    except Exception as e:
-        fails += 1; print(f"FAIL  {name}: {e}"); traceback.print_exc()
+import _harness
+_report = _harness.Report()
+check = _report.run
 
 # --- scenario ---------------------------------------------------------------------------------
 # Boundary at epoch CUR: account horizon = CUR - GC_IDLE_EPOCHS, row horizon = CUR - RECERT_HISTORY.
@@ -160,5 +158,5 @@ for name, fn in sorted((n, f) for n, f in list(globals().items())
                        if n.startswith("t") and callable(f) and n[1].isdigit()):
     check(name, fn)
 
-print(f"\n{'ALL IDLE-GC CHECKS PASSED' if not fails else str(fails)+' FAILED'}")
-sys.exit(1 if fails else 0)
+print(f"\n{'ALL IDLE-GC CHECKS PASSED' if not _report.fails else str(_report.fails)+' FAILED'}")
+sys.exit(1 if _report.fails else 0)

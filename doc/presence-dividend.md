@@ -2,8 +2,8 @@
 
 > **Status: IMPLEMENTED** (variant (b)). Open-lane block **production** stays decentralized; the open-lane block
 > **reward** is split into a small producer tip plus a redistributed **presence dividend**, accrued off-L1 on the
-> execution node and collected on demand against the settled root. Presence = the PoSW lease (there is no separate
-> heartbeat), so a miner accrues while its lease is valid and stops when it lapses. Live end-to-end.
+> execution node and collected on demand against the settled root. Presence = the attested-device lease (there is no
+> separate heartbeat; PoSW was retired at gen 25), so a miner accrues while its lease is valid and stops when it lapses. Live end-to-end.
 
 ## 1. The problem
 
@@ -31,9 +31,9 @@ Any redistribution design MUST respect both, or it is dead on arrival:
 1. **No `O(P)` L1 writes per block.** Crediting a million micro-balances every ~8 s bloats state without bound
    and stalls the node. The **L1 stays `O(1)` per block**; all per-capita accounting happens **off-L1**.
 2. **No flat-per-identity payout.** A dividend that pays each present identity equally *pays by headcount* —
-   exactly what the 20% cap, the PoSW lease, and fidelity exist to neutralize. Flat-per-identity is a **Sybil
+   exactly what the 30% lane cap, the device lease, and fidelity exist to neutralize. Flat-per-identity is a **Sybil
    faucet** (a million masks each collect dust = the farm collects a lot). The dividend **must** be weighted by
-   a Sybil-costly metric. We use **fidelity** (continuous presence), which already costs PoSW recurrence to fake.
+   a Sybil-costly metric. We use **fidelity** (continuous presence), which costs a real device re-attesting every lease to fake.
 
 ## 4. Design (variant b)
 
@@ -53,8 +53,8 @@ dividend  = R − treasury − tip                (the rest — goes to the pres
 - **`dividend`** is credited on L1 to a single reserved recipient — the **dividend pool** (add `"dividend"` to
   `RESERVED_RECIPIENTS`). One account, so still `O(1)` on L1. The pool simply accrues the redistributed emission.
 
-Bonded-lane blocks now ALSO contribute a modest `BONDED_DIVIDEND_BPS` (20%) slice to the same pool — the
-passive-capital lane sharing with the active, capital-free open miners (producer keeps 70%, treasury 10%).
+Bonded-lane blocks ALSO contribute a `BONDED_DIVIDEND_BPS` slice to the same pool — 40% since the betanet-5 (gen 23) reroll, 20% before — the
+passive-capital lane sharing with the active, capital-free open miners (producer keeps 50%, treasury 10%).
 It is kept small so staking stays clearly the more profitable use of capital (the security budget is
 preserved). So the dividend pool is fed by BOTH lanes; it is still redistributed to the OPEN-lane present set.
 
@@ -64,6 +64,10 @@ L1 by bonded quorum (Phase 2). It becomes the **dividend accountant**:
 
 - Each epoch it knows the present open registry and every present miner's **fidelity weight** `w_i`
   (`OPEN_BASE_FLOOR..OPEN_BASE_FLOOR+OPEN_FID_BONUS`, i.e. 2..10) — the same weight the lane draw already uses.
+  The dividend has its own weight, `protocol.dividend_weight` = `min(fidelity, DIVIDEND_WEIGHT_CAP_V2)` with the cap
+  at 15 — a straight line (the convex 1..25 curve of betanet-5 is gone, see the note at the end). A lapse halves
+  fidelity instead of resetting it (`protocol.fidelity_step`), and bonded blocks send 40 % of themselves to the pool
+  (`BONDED_DIVIDEND_BPS`). See the rules block in `protocol.py` and `doc/progressive-levy.md`.
 - It distributes that epoch's pooled `dividend` **pro-rata by `w_i`** into each miner's **off-L1** dividend
   balance.
 
@@ -98,14 +102,14 @@ withdrawal + a nullifier so each accrual epoch is claimed once). So:
 ## 5. Why this doesn't reopen the Sybil hole
 
 - The dividend is **fidelity-weighted**, and fidelity is continuous-presence — a fresh mask starts at the floor
-  (`w=1`) and only ramps with real elapsed epochs of presence, each of which now costs a **PoSW recert** to
+  (`w=1`) and only ramps with real elapsed epochs of presence, each of which costs a **device lease renewal** to
   sustain (see [ip-spoofing-and-sybil.md](ip-spoofing-and-sybil.md)). So a flood of new masks splits a floor-weighted
   sliver, not an equal cut.
 - The dividend is drawn **only from the open lane's `OPEN_BPS` (30%)** emission. The [reward-capture theorem](reward-capture-theorem.md)
-  still holds: a free/Sybil actor cannot pull more than ~20% of emission, redistributed or not. Redistribution
+  still holds: a free/Sybil actor cannot pull more than the open lane's ~30% of emission, redistributed or not. Redistribution
   changes *who inside the 30% gets paid and how smoothly* — it does **not** enlarge the 30%.
 - Net: the dividend inherits the exact Sybil bound the architecture already proves. It is **not** "outside" the
-  security architecture — it is deliberately *coupled* to it (fidelity + the 20% cap), which is the only way a
+  security architecture — it is deliberately *coupled* to it (fidelity + the 30% cap), which is the only way a
   per-capita payout can be safe.
 
 ## 6. The one incentive to tune: the producer tip
@@ -125,7 +129,7 @@ constant** rather than a fraction, so it's predictable regardless of `R`.
 | `TREASURY_BPS` | `1000` (unchanged) | treasury cut of every block |
 | `OPEN_TIP_BPS` | `2000` | open producer's cut of an open-lane block (the rest, minus treasury, is the dividend) |
 | `DIVIDEND` recipient | `"dividend"` | reserved L1 pool address the dividend accrues to (`O(1)` on L1) |
-| dividend weight | `fidelity` (`w=2..10`) | per-miner pro-rata weight (Sybil-costly); **not** flat-per-identity |
+| dividend weight | `protocol.dividend_weight(fidelity, epoch)` — linear `min(f, 15)` (`DIVIDEND_WEIGHT_CAP_V2`); fidelity 1 pays 1 — no probation since gen 25 (was convex `1..25` on betanet-5) | per-miner pro-rata weight (Sybil-costly); **not** flat-per-identity. Separate from selection since 2026-08-25: selection keeps a liveness floor, the dividend's floor is economic |
 | min withdraw | e.g. `≥ 100× MIN_TX_FEE` | client-side floor so a withdrawal is always worth its fee |
 
 ## 8. Trade-offs & open questions
@@ -158,3 +162,31 @@ Pre-mainnet alpha — a reward-split + reserved-recipient change is a clean cons
 
 Nothing here weakens the two-lane security model — it only changes how the open lane's *already-capped* 30% is
 paid out: from a per-block jackpot to a fidelity-weighted, off-L1, withdraw-when-worthwhile stream.
+
+
+> **Probation (2026-09-01, gen-23-keyed at epoch 1440):** an identity earns no dividend until its first timely
+> renewal — it is *absent* from the epoch's weight set rather than weighted 0, because the accrual floors listed
+> weights to 1. See doc/ip-spoofing-and-sybil.md §"Probation and the burst-proof baseline".
+
+> **Linear since betanet-6 (2026-09-01):** `dividend_weight = min(fidelity, 30)`, 0 while on probation — since then
+> capped at 15 (`DIVIDEND_WEIGHT_CAP_V2`) and with probation retired at gen 25, so today it is `min(fidelity, 15)`. The convex
+> curve back-loaded the pool onto month-long streaks and made one lapse cost 72 % of weight; both shapes are linear
+> in identity count, so the change costs nothing against farms and pays presence proportionally.
+
+## 10. Carried identities and the betanet-8 dividend gap (`DIVIDEND_CARRY_EPOCH` = 340, 2026-09-27)
+
+**What went wrong (our reroll commit 302215f2).**
+- The betanet-8 carry leased every carried identity with a recert at epoch 0 (`genesis.py`).
+- The dividend rule excludes exactly that marker, to keep never-attested genesis seeds out. So every carried identity was present and produced blocks, but earned **no dividend** until it re-registered.
+- The replay that builds the committed weights (`dividend_ops.fidelity_at_epoch`) rebuilt fidelity from gen-27 recerts only. So a carried veteran who did renew weighed like a newcomer. The live account field and `/get_open_weights` showed the right value, so the discrepancy was invisible.
+- **Measured on 2026-09-27:** the 23 carried identities that had not re-registered were in no committed weight set. A handful of fresh identities took nearly all of the inflow; one alone took it all for epochs 40–94.
+
+**From epoch 340:**
+- An identity the carry named as present (`genesis_carry.dat` "present") counts as attested.
+- Its replayed fidelity starts from its carried value (`genesis_alloc.dat`), which is exactly where the live apply continued from.
+- The files are read once, the same way `genesis.py` resolves them (`dividend_ops.carried_identities`).
+- Committed epochs before 340 stay as they were; making the underpaid identities whole is a separate decision for the operator.
+- Test: `tests/test_dividend_carried_identities.py`.
+- Since gen 28 (betanet-9) the gate is deleted and the rule holds from epoch 0.
+
+**For every future reroll:** a carried identity must not be marked like an unattested seed. The carry names the present set, and both the dividend rule and the fidelity replay must read it.

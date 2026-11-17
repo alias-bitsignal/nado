@@ -1,0 +1,102 @@
+"""The 2026-08-25 dividend rules (protocol.py), unconditional since the betanet-5 (gen 23) reroll: the
+dividend weight (LINEAR over EVERY level since gen 25 — gen 24 skipped fidelity 1 as probation while identities were
+free to farm; replaced the convex 1..25 curve on 2026-09-01; capped at DIVIDEND_WEIGHT_CAP_V2 = 15 at every epoch since
+gen 26, the gentler gradient of 2026-09-08 whose epoch gate was deleted after the betanet-8 reroll),
+the halving lapse, and the 40% bonded levy. Also pins that NO
+activation gate exists for them any more — they rode gen 22 behind a generation-keyed gate that the reroll
+retired; a bare height sneaking back in would outlive its chain."""
+import os, sys, re, tempfile, traceback
+os.environ["HOME"] = tempfile.mkdtemp()
+import atexit, shutil; atexit.register(shutil.rmtree, os.environ["HOME"], ignore_errors=True)   # leave no /tmp home behind (9,600 leaked by 2026-09-22)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import protocol as P
+
+import _harness
+_report = _harness.Report()
+check = _report.run
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def t_no_gate_survives():
+    src = open(os.path.join(ROOT, "protocol.py")).read()
+    for name in ("DIVIDEND_RULES_HEIGHT", "DIVIDEND_RULES_EPOCH", "_GEN22_RULES_ACTIVATION", "bonded_dividend_bps", "BONDED_DIVIDEND_BPS_V2"):
+        assert not re.search(r"^\s*(def\s+)?%s\b" % name, src, re.M), f"{name} is back — the gen-22 gate was retired at gen 23"
+    assert P.CHAIN_GENERATION >= 23
+
+
+def t_bonded_levy():
+    assert P.BONDED_DIVIDEND_BPS == 4000
+    for R in (1, 7, 10**9, 10**9 + 3):
+        pc, dv, tr = P.split_bonded_block_reward(R)
+        assert pc + dv + tr == R, "the split must sum exactly (apply == rollback integers)"
+        assert dv == R * 4000 // P.BPS_DENOM and tr == R * P.TREASURY_BPS // P.BPS_DENOM
+    assert P.split_bonded_block_reward(10**9) == (5 * 10**8, 4 * 10**8, 10**8)     # 50 / 40 / 10
+
+
+def t_dividend_curve():
+    got = [P.dividend_weight(f, 0) for f in (0, 1, 2, 5, 10, 15, 20, 25, 30, 99, None, -3)]
+    # ONE clean line over every level — fidelity 1 (the first lease) pays 1; no skipped level, no probation — capped at
+    # the gentler gradient's 15 from epoch 0 (gen 25 ran the flat 30 until its epoch 110)
+    assert got == [0, 1, 2, 5, 10, 15, 15, 15, 15, 15, 0, 0], got
+    assert [P.dividend_weight(f, 0) for f in range(1, 16)] == list(range(1, 16)), "every fidelity level 1..15 is on the line"
+    assert P.dividend_weight(30, 0) == P.dividend_weight(30, 10 ** 6) == P.DIVIDEND_WEIGHT_CAP_V2 == 15, "one cap at every epoch"
+    assert all(P.dividend_weight(f, 0) <= P.dividend_weight(f + 1, 0) for f in range(0, 35)), "monotonic"
+    assert P.dividend_weight(1, 0) == P.dividend_weight(1, 999_999) == 1, "no epoch ever gates the first lease"
+    assert P.on_probation(1, 0) is False and P.on_probation(0, 5) is False, "probation retired: the name always answers False"
+    assert P.DIVIDEND_WEIGHT_MAX == P.FIDELITY_CAP == 30, "the ramp itself still saturates at 30 (fidelity)"
+    from ops.mining_ops import open_shares
+    assert open_shares(0) == 2 and open_shares(30) == 10, "selection weight keeps its liveness floor"
+
+
+def t_fidelity_step():
+    G, MIN = P.FIDELITY_GAIN, P.FIDELITY_MIN_GAP_EPOCHS
+    assert P.fidelity_step(7, True, MIN) == 7 + G and P.fidelity_step(7, True, MIN + 5) == 7 + G
+    assert P.fidelity_step(7, True, MIN - 1) == 7 and P.fidelity_step(7, True, 1) == 7     # anti-farm spacing
+    assert P.fidelity_step(20, False, 999) == 10                                            # lapse halves
+    assert P.fidelity_step(3, False, 999) == max(G, 1)
+    assert P.fidelity_step(0, False, 999) == G and P.fidelity_step(1, False, 999) == G     # never below GAIN
+
+
+def t_live_apply_and_replay_share_the_step():
+    """apply_register and fidelity_at_epoch must both call protocol.fidelity_step — not mirror it."""
+    a = open(os.path.join(ROOT, "ops", "account_ops.py")).read()
+    d = open(os.path.join(ROOT, "ops", "dividend_ops.py")).read()
+    assert "fidelity_step(" in a.split("def apply_register")[1].split("\ndef ")[0]
+    assert "fidelity_step(" in d.split("def fidelity_at_epoch")[1].split("\ndef ")[0]
+    assert "dividend_weight(" in d.split("def weights_at_epoch")[1]
+
+
+def t_dividends_require_attestation():
+    """DIVIDENDS REQUIRE ATTESTATION (gen 25's DIVIDEND_ATTESTED_EPOCH, 0 from gen 26 and deleted): a genesis-seeded
+    identity (recert only at epoch 0) is PRESENT (it produces) but takes no dividend; an attested identity (recert >= 1)
+    earns."""
+    import tempfile, os
+    os.environ["HOME"] = tempfile.mkdtemp(prefix="nado-divatt-")
+    from ops import kv_ops
+    kv_ops.close_all(); kv_ops.init_env()
+    from ops.dividend_ops import weights_at_epoch, present_at_epoch
+    assert not hasattr(P, "DIVIDEND_ATTESTED_EPOCH"), "the epoch gate stays deleted"
+    G = 1                                          # the first epoch an attested (recert >= 1) identity can be present in
+    seed, real = "5" * 46, "6" * 46
+    kv_ops.recert_put(seed, 0)                     # genesis_open.dat seed
+    kv_ops.recert_put(real, 1)                     # attested register at epoch 1
+    assert seed in present_at_epoch(G) and real in present_at_epoch(G), "both hold a lease (the seed still produces)"
+    w = weights_at_epoch(G)
+    assert seed not in w and w.get(real, 0) >= 1, w
+    w0 = weights_at_epoch(0)
+    assert seed not in w0, "at epoch 0 too: the rule has no gate left"
+    kv_ops.recert_put(seed, G)                     # the seed attests (a real register) -> earns like anyone
+    assert seed in weights_at_epoch(G + 1)
+    kv_ops.close_all()
+
+
+if __name__ == "__main__":
+    check("no activation gate survives the reroll", t_no_gate_survives)
+    check("bonded levy 40%; splits sum exactly", t_bonded_levy)
+    check("dividend weight: linear min(fidelity, 30), 0 on probation, selection weight untouched", t_dividend_curve)
+    check("fidelity step: spacing kept, lapse halves", t_fidelity_step)
+    check("live apply and fraud-proof replay share protocol.fidelity_step", t_live_apply_and_replay_share_the_step)
+    check("dividends require attestation: genesis seeds produce but do not earn, at every epoch", t_dividends_require_attestation)
+    print("ALL PASS" if _report.fails == 0 else f"{_report.fails} FAILURES")
+    sys.exit(1 if _report.fails else 0)

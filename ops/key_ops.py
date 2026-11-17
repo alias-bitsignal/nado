@@ -22,7 +22,7 @@ def load_keys(file=f"{get_home()}/private/keys.dat"):
     """{"private_key": "", "public_key": "", "address": ""}
 
     The address is ALWAYS re-derived from the public key under the CURRENT ADDRESS_PREFIX rather than
-    trusted from the file. A keyfile written before an address-format change (the alphanet-7 debrand:
+    trusted from the file. A keyfile written before an address-format change (the betanet-7 debrand:
     ndo… → mldsa44…) caches the OLD string, and every consumer — the node's own mining identity in
     /mining_status and the producer registries, contract deploys, operator scripts — would then act as
     an address that owns nothing. make_address is deterministic, so this is a no-op for a current keyfile.
@@ -42,9 +42,18 @@ def load_keys(file=f"{get_home()}/private/keys.dat"):
     try:
         from ops.address_ops import make_address
         if keydict.get("public_key"):
-            keydict["address"] = make_address(keydict["public_key"])
+            # a key of another signature scheme carries "alg", and its address commits to it (protocol.py
+            # "USER-SELECTABLE SIGNATURE SCHEMES") — re-derived under that scheme, never as an ML-DSA-44 key
+            keydict["address"] = make_address(keydict["public_key"], alg=keydict.get("alg"))
     except Exception:
         pass          # never make key loading fail on a derivation problem — fall back to the stored value
+    # ACCOUNT AUTHENTICATION (doc/key-rotation.md): after a key rotation the node's signing key no longer
+    # derives its account address. A keyfile written by scripts/auth_cli.py carries `account` — the address
+    # this key AUTHORIZES — and that is the node's identity (sender of every tx it mints, its registry entry).
+    # Absent = legacy: the derived address, exactly as before.
+    acct = keydict.get("account")
+    if isinstance(acct, str) and acct:
+        keydict["address"] = acct
     return keydict
 
 
@@ -60,14 +69,43 @@ def uniqueness(value):
     """number of distinct characters — the address-entropy heuristic used by generate_keys"""
     return len(set(value))
 
+# Minimum distinct characters in a fresh address — a cheap sanity filter against visually degenerate,
+# repetitive-looking addresses. It MUST be satisfiable by the current address alphabet, and that is the
+# whole story of this constant:
+#
+# it was 18, which was fine while addresses carried the mldsa44 name prefix. betanet-14 removed the
+# prefix (4ed77695), leaving a bare 46-char LOWERCASE HEX address — an alphabet of exactly 16 symbols. A
+# demand for 18 distinct characters then became UNSATISFIABLE, and `while ... < 18: redraw` turned into an
+# infinite loop burning a core.
+#
+# What made that expensive is where it fires: nado.py runs `if not keyfile_found(): save_keys(generate_keys())`,
+# so it is unreachable on any node that already has a keyfile and hit EVERY BRAND-NEW node on first boot.
+# The network could not take on a new node at all, and no existing node would ever show the symptom.
+#
+# 13 measured over 3000 draws: accepts 99.67%, rejects only the genuinely degenerate 11-12 tail, so the
+# original "redraws are rare" property holds. Max attainable is 16 (see MAX_UNIQUENESS in
+# tests/test_address_filter_satisfiable.py, which pins this against the live address format).
+MIN_ADDRESS_UNIQUENESS = 13
+_MAX_KEYGEN_DRAWS = 1000
+
+
 def generate_keys():
-    """Generate a fresh keydict, redrawing until the address has >= 18 distinct characters — a cheap
-    sanity filter against visually degenerate / repetitive-looking addresses (redraws are rare and
-    the keys stay uniformly random)."""
-    keydict = None
-    while not keydict or uniqueness(keydict["address"]) < 18:
+    """Generate a fresh keydict, redrawing until the address has >= MIN_ADDRESS_UNIQUENESS distinct
+    characters.
+
+    BOUNDED on purpose. The filter is a cosmetic nicety; being unable to satisfy it is a CONFIGURATION
+    BUG (the threshold outran the address alphabet), and the correct response to that is to say so, not to
+    spin forever. An unbounded loop here cost the network every new node it could have gained between
+    betanet-14 and now, silently, because a hang reports nothing.
+    """
+    for _ in range(_MAX_KEYGEN_DRAWS):
         keydict = generate_keydict()
-    return keydict
+        if uniqueness(keydict["address"]) >= MIN_ADDRESS_UNIQUENESS:
+            return keydict
+    raise RuntimeError(
+        f"could not generate an address with >= {MIN_ADDRESS_UNIQUENESS} distinct characters in "
+        f"{_MAX_KEYGEN_DRAWS} draws — MIN_ADDRESS_UNIQUENESS exceeds what the current address alphabet "
+        f"can produce. Lower it to match the format (see ops/key_ops.py).")
 
 
 if __name__ == "__main__":

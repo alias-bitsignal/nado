@@ -1,5 +1,7 @@
 # ZK execution proofs for contracts — feasibility (issue #85)
 
+> **HISTORICAL (G9, 2026-10-28):** Kept for its design reasoning and measurements; no file below is in the tree. The Stwo execution AIR that replaced `vm_circuit.py` is `native/stwo_settle/src/blake/vm_air.rs`. The Goldilocks stack it describes (`execnode/stark/`, the field VM `execnode/zkvm.py`, `native/starkprove`, `native/starkcompose`, `native/alghash2`, `wasm/goldilocks`) was retired at the generation-29 reroll and deleted in G9. Live now: the contract VM `execnode/zkvm2.py` (256-bit word wrapping mod 2^256, BLAKE2s `hash`), the BLAKE2s exec root (`execnode/exec_root_b2.py`, `execnode/csmt.py`), and Stwo proofs (Circle STARK over M31): the shielded pool via `native/stwo_js`, settlement via `execnode/settle_b2.py` + `native/stwo_settle` (dormant behind `STWO_SETTLE_HEIGHT`). See doc/stwo-migration.md.
+
 **Status: BUILT (first cut live, 2026-07-14).** The proving stack from §4's build order is implemented and
 tested end-to-end:
 
@@ -9,7 +11,7 @@ tested end-to-end:
 | zkVM — field-native provable register VM + assembler | `execnode/zkvm.py`, `execnode/zkvmasm.py` | ✅ (`tests/test_zkvm.py`) |
 | zkVM execution AIR (101 columns, 94 constraints, 5 LogUp buses) | `execnode/stark/vm_circuit.py` | ✅ (`tests/test_zkvm_circuit.py` — adversarial suite) |
 | exec-layer runtime `"zkvm"` + digest registry + slot storage | `execnode/runtimes.py`, `state.py` | ✅ (`tests/test_zkvm_runtime.py` — 3-way differential) |
-| proven-execution endpoints | `/exec/prove_call`, `/exec/verify_call` | ✅ |
+| proven-execution endpoints | `/exec/verify_call` (`/exec/prove_call` unrouted and deleted, review 2026-09-23 Z7) | ✅ |
 | **epoch settlement proof** — binds `pre_root → post_root`, installs into the settlement seam | `execnode/settlement_proofs.py` | ✅ (`tests/test_settlement_proof.py` — incl. real `ops.settlement_ops` seam) |
 
 Measured (this host, Python + native Goldilocks): a real contract call (blockhash randomness → LO32 →
@@ -23,10 +25,10 @@ calls, emits one per-call proof each, and binds the pre/post **zkVM state roots*
 to the `["kv", cid, "slots", …]` leaves `execnode/state.py` already commits in `state_root`, so `post_root`
 *is* the settled root's zkVM projection. `verify_epoch` checks the whole batch with **no re-execution**
 (verify each proof → replay each authenticated log → recompute the root), and
-`settlement_proofs.settlement_verifier(...)` plugs straight into `ops.settlement_ops.set_settlement_verifier`
+a verified settle-with-proof records the `kv_ops.settlement_proven` marker that `ops.settlement_ops.settlement_justified` honours
 — the Phase-2b seam — so L1 can justify a root by proof instead of by bonded quorum.
 
-**Reboot + game migration (2026-07-14, post-v1.0.0-alpha.9; the chain has since rerolled to alphanet-6).** Deleting stackvm made the zkVM the
+**Reboot + game migration (2026-07-14, post-v1.0.0-alpha.9; the chain has since rerolled to betanet-6).** Deleting stackvm made the zkVM the
 only runtime, so the chain was rebooted with every holder's balance + bonded stake carried
 forward (`tools/alphanet5_carryforward.py`; exec-side balances + dividends folded into L1, contract pots
 refunded to players, supply conserved exactly). Games return only as zkVM ports (`execnode/games/`):
@@ -41,7 +43,10 @@ refunded to players, supply conserved exactly). Games return only as zkVM ports 
   metadata stored as digests, per-user positions via read-only view methods); **battleship** (alghash
   merkle-sum board, per-shot proofs on the `ARG` bus); **pets** (tamagotchi NFTs — gene/stat/train +
   12-turn battle, differentially verified); **holdem** (multiplayer table stakes, layered side pots, an
-  on-chain 7-card hand evaluator differentially verified EXACT on 1500+ random hands). Each is verified
+  on-chain 7-card hand evaluator differentially verified EXACT on 1500+ random hands); **pool** (8-ball
+  — the duel escrow with the `value > 0` require dropped from `open`, so a frame can be played for NO
+  stake at all; the rules are a fixed-point INTEGER physics simulation in the browser, no floating point
+  anywhere, so two clients replaying the shot log agree ball for ball). Each is verified
   sound (escrow + payouts) and STARK-provable, with a full-game E2E in `tests/test_games_e2e.py`.
 - **Shared lean primitives (so re-ports stay cheap):** the banked-table skeleton (`open`/`fund`/`close` +
   index-append + table view-maps) lives once in `execnode/games/_lib.py` — five banked games that used to
@@ -88,7 +93,9 @@ authenticated public I/O log, the epoch transition needs **no second in-circuit 
    cryptography — each segment is an ordinary sound aggregated epoch proof, and verification checks each
    segment AND the chain (a tampered boundary root is rejected). So execution over an unbounded epoch is
    fully covered.
-2. **O(1) verification — RECURSION, the remaining milestone.** After segmentation L1 still verifies K
+2. **O(1) verification — RECURSION. Done since this was written:** the wide-sponge `alghash2`, the in-circuit
+   FRI/STARK verifier and the K→1 fold exist and are on the consensus path (`SETTLE_PROOF_RECURSIVE = True`,
+   doc/zk-recursion.md). The original gap analysis follows. After segmentation L1 still verifies K
    segment proofs (each sub-second); folding them into ONE constant-size proof needs **in-VM STARK
    verification** — running a FRI/Merkle/transcript verifier as a zkVM program and proving it. That is
    genuinely gated on new cryptography, not a quick patch: the current alghash sponge is width-2 (~64-bit

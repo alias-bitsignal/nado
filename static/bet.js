@@ -14,10 +14,10 @@
 // -> every stake refunds 1:1; an unbacked winner auto-voids. Payouts are pull-based (each bettor calls
 // claim). Outcomes are integers 0..nout-1 everywhere. Per-user positions are read through the contract's
 // /exec/view methods (claimable_of etc.) — see the myCache notes below.
-import { Book } from "./bookgame.js?v=650810e4";
-import { NadoDapp, rawToNado, nadoToRaw, randId, _m, $, base, gate, canPay, wireWallet, stickyInputs, renderWallet, resolveAliases, disp, alertBar, notify, confirmingLabel, loadQR, share, shareInvite, esc } from "./nadodapp.js?v=db1a59d7";
+import { Book } from "./bookgame.js";
+import { NadoDapp, rawToNado, nadoToRaw, randId, _m, $, base, gate, canPay, wireWallet, stickyInputs, renderWallet, resolveAliases, disp, alertBar, notify, confirmingLabel, loadQR, share, shareInvite, esc } from "./nadodapp.js";
 
-const CID = "233a89ff483f1792941201b3b28025c6";   // execnode/games/bet.py (zkVM), deployed by the node key (nonce "a5")
+const CID = "dc4849b08430c6c9c27061f02d2bef71";   // execnode/games/bet.py (zkVM), deployed by the node key (nonce "a5")
 const dapp = new NadoDapp({ cid: CID, app: "Bet" });
 // the fixed-odds BOOK (bank vs punters) — model, solvency maths, actions and settle predicates all
 // live in the shared scaffold, so this game and hamster cannot drift on the part that moves money
@@ -33,7 +33,7 @@ const fmtLeft = (s) => { s = Math.max(0, Math.round(s)); const d = Math.floor(s 
 let lastSto = null, activeMarket = null, selOutcome = null;
 // Matches list scales to thousands: filter (settled markets accumulate forever, so hide them by default) +
 // text search + a DOM cap so we never inject thousands of cards at once. shownN grows via "show more".
-const PAGE_SIZE = 60;
+const PAGE_SIZE = 12;   // a screenful; "Show more" fetches the rest — 60 cards was a 12,000px page
 let searchQ = "", mktFilter = "live", shownN = PAGE_SIZE;
 const isSettled = (m) => m.status === "resolved" || m.status === "void";
 function visibleMarkets(mkts) {
@@ -74,7 +74,7 @@ function actionLanded(f) {
 // Pools/totals live on-chain in UNITs of 10^4 raw NADO (the contract's DIVMODW-sound money model); the
 // pl board is keyed m*8+i. Metadata (ds/so/ev) are stored as field digests that decode_view resolves back
 // to the original strings, so mk.title/labels read exactly as before. PER-USER positions (stake/claimable/
-// claimed/vote/resolver) live in alghash-keyed slots the storage view can't enumerate — we read them via
+// claimed/vote/resolver) live in hash-keyed slots the storage view can't enumerate — we read them via
 // the contract's read-only views (dapp.view → GET /exec/view) into `myCache`, refreshed for the selected
 // market every poll plus a slow round-robin sweep over the rest (so auto-collect finds old wins from any
 // device without hammering the node).
@@ -405,7 +405,9 @@ function marketCard(mk) {
   const oddsRow = mk.outsHTML;
   const meta = [];
   if (mk.myTotal > 0) meta.push('<span class="b ok" style="margin-left:0">' + window.t("bet.yourBet", "your bet {amt}", { amt: rawToNado(mk.myTotal) }) + "</span>");
-  meta.push(statusText(mk));
+  // statusText is PLAIN text carrying a market's outcome label, which its creator chose (audit 2026-09-25: a label of
+  // <img onerror=…> ran script on a page that shares its origin with a plaintext wallet key). Escape at every HTML sink.
+  meta.push(esc(statusText(mk)));
   return '<div class="mkt' + (mk.id === activeMarket ? " sel" : "") + '" data-m="' + mk.id + '">' +
     '<div class="top"><span class="ttl">' + esc(mk.title) + "</span>" + statusTag(mk.status) + "</div>" +
     '<div class="meta">' + meta.join(" · ") + "</div>" + oddsRow + "</div>";
@@ -493,7 +495,7 @@ function render() {
   gate({ mybets: signedIn && mine.length > 0 });
   if (mine.length) $("myBetsList").innerHTML = mine.map((mk) => {
     const c = claimable(mk);
-    let tag = statusText(mk);
+    let tag = esc(statusText(mk));            // plain text into innerHTML: escaped (see marketCard)
     if (c > 0) tag = '<span class="b ok">' + window.t("bet.toCollect", "💰 {amt} to collect", { amt: rawToNado(c) }) + "</span>";
     else if (mk.claimed) tag = '<span class="b dimb">' + window.t("bet.collectedTag", "collected ✓") + "</span>";
     return '<div class="pos" data-m="' + mk.id + '" style="cursor:pointer"><span>' + esc(mk.title) +

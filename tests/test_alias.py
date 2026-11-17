@@ -7,6 +7,7 @@ Run: python3 tests/test_alias.py
 """
 import os, sys, tempfile, traceback, logging
 os.environ["HOME"] = tempfile.mkdtemp(prefix="nado_alias_")
+import atexit, shutil; atexit.register(shutil.rmtree, os.environ["HOME"], ignore_errors=True)   # leave no /tmp home behind (9,600 leaked by 2026-09-22)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 for d in ("index", "blocks", "logs", "peers"):
     os.makedirs(f"{os.environ['HOME']}/nado/{d}", exist_ok=True)
@@ -23,13 +24,9 @@ from ops.key_ops import generate_keys
 from config import get_timestamp_seconds
 from signatures import sign, unhex
 
-fails = 0
-def check(name, fn):
-    """Run fn; print PASS/FAIL and count failures."""
-    global fails
-    try: fn(); print(f"PASS  {name}")
-    except Exception as e:
-        fails += 1; print(f"FAIL  {name}: {e}"); traceback.print_exc()
+import _harness
+_report = _harness.Report()
+check = _report.run
 
 def raises(fn):
     """True if fn raises."""
@@ -112,10 +109,12 @@ def t6_unregister_frees_name():
 
 def t7_name_validation():
     """Prove valid_alias_name rejects short/cased/reserved/malformed names and accepts good ones."""
-    # The address-shaped case is DERIVED from the live prefix, never spelled out: this assertion used to
-    # read "ndofoo" and silently stopped testing anything the moment the prefix was rebranded (see
-    # doc/debrand.md — a pinned address literal is the recurring bug in this repo, not a one-off).
-    for bad in ("ab", "Alice", "bond", "alias", ADDRESS_PREFIX + "foo", MSIG_PREFIX + "foo",
+    # The address-shaped case is a REAL derived address, never a prefix concatenation: ADDRESS_PREFIX went
+    # empty at the debrand, so "ADDRESS_PREFIX + 'foo'" degraded to plain "foo" — a perfectly valid alias —
+    # and the assertion failed. valid_alias_name itself moved to is_address() (checksum) for the same
+    # reason; the test now derives its address the same way and can never rot with the prefix again.
+    from ops.address_ops import make_address
+    for bad in ("ab", "Alice", "bond", "alias", make_address("ab" * 60), MSIG_PREFIX + "foo",
                 "has space", "1abc", "a" * 33, "", 123):
         assert not alias_ops.valid_alias_name(bad), f"{bad!r} should be invalid"
     for good in ("alice", "shop_1", "my-name", "abc"):
@@ -167,5 +166,5 @@ for name, fn in list(globals().items()):
     if name.startswith("t") and callable(fn) and name[1].isdigit():
         check(name, fn)
 
-print(f"\n{'ALL PASSED' if not fails else str(fails)+' FAILED'}")
-sys.exit(1 if fails else 0)
+print(f"\n{'ALL PASSED' if not _report.fails else str(_report.fails)+' FAILED'}")
+sys.exit(1 if _report.fails else 0)

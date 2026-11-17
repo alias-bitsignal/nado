@@ -1,6 +1,6 @@
 import asyncio
 import functools
-import hashlib
+import json
 import os
 import queue
 import re
@@ -10,6 +10,7 @@ import sys
 
 from ops import codec
 from ops.gossip import should_gossip, gossip_targets
+from ops.stwo_relay import StwoRelay, make_handlers as _stwo_relay_handlers, STWO_RELAY_MAX_BODY
 import zstandard as _zstd
 from aiohttp import web
 
@@ -26,21 +27,22 @@ def _zstd_wire():
 
 import versioner
 import time
-from config import get_protocol, get_config, get_timestamp_seconds, hostport
+from config import get_protocol, get_config, get_timestamp_seconds, hostport, migrate_config, get_public_relay_url, get_port
 from ops import self_update
+from ops import identity_log            # gen 25: every register tx seen at /submit leaves a node-local line
 from genesis import make_genesis, make_folders
 from loops.consensus_loop import ConsensusClient
 from loops.core_loop import CoreClient
 from loops.message_loop import MessageClient
 from loops.peer_loop import PeerClient
 from memserver import MemServer
-from ops.account_ops import get_account, fetch_totals, get_bonded_registry
-from ops.address_ops import proof_sender
+from ops.account_ops import get_account, fetch_totals, get_bonded_registry, get_hard_finality as _ghf, get_finalized_height
+from ops.address_ops import is_address
 from signatures import (verify as _mldsa_verify, unhex as _mldsa_unhex,
                         backend_name as _pq_backend_name,
                         backend_degraded_reason as _pq_backend_reason)
 from ops.mining_ops import total_shares
-from ops.block_ops import get_block, recommended_fee, get_block_number, SYNC_BATCH_MAX, SYNC_BATCH_BYTES
+from ops.block_ops import get_block, recommended_fee, get_block_number, get_block_hash_by_number, SYNC_BATCH_MAX, SYNC_BATCH_BYTES
 from ops.data_ops import get_home, allow_async, get_byte_size
 from ops.key_ops import keyfile_found, generate_keys, save_keys
 from ops.log_ops import get_logger
@@ -48,8 +50,9 @@ from ops.peer_ops import save_peer, get_remote_status, check_ip, me_to, known_pe
 from ops.transaction_ops import get_transaction, get_transactions_of_account, to_readable_amount
 from ops import snapshot_ops
 from ops import mining_history
+import protocol as _proto
 from protocol import (GENESIS_ADDRESS, TREASURY_ADDRESS, TREASURY_GENESIS, GENESIS_TIMESTAMP, CHAIN_ID,
-                      ADDRESS_PREFIX, FINALITY_DEPTH, EPOCH_LENGTH)
+                      FINALITY_DEPTH, EPOCH_LENGTH)
 
 import gc  # replaces pympler/muppy — the full-heap walk fatally trips CPython GC under asyncio load
 
@@ -68,6 +71,10 @@ def handler(signum, frame):
     message pool to disk, then exit 0. Block/state integrity needs no flush here (atomic writes + replay)."""
     logger.info(f"Terminating: {signum}: {frame}")
     memserver.terminate = True
+    try:
+        logger.info(f"Mempool persisted ({memserver.save_pool(force=True)} transactions)")
+    except Exception as e:
+        logger.error(f"mempool persist on shutdown failed: {e}")
     # Persist the off-chain message pool so a restart/redeploy doesn't drop undelivered DMs + prekeys.
     try:
         n = memserver.message_pool.stats().get("messages", 0)
@@ -101,6 +108,12 @@ def serialize(output, name=None, compress=None):
 # pushed to a worker thread via asyncio.to_thread so the event loop stays responsive.
 # --------------------------------------------------------------------------------------------------
 from ops.net_ops import client_ip_from, unpack_tx
+from ops.outbound_guard import install_redirect_guard
+# NO urlopen IN THIS PROCESS FOLLOWS A REDIRECT TO A NON-PUBLIC ADDRESS (bandit B310 triage, 2026-09-30): a peer
+# answering 302 -> http://127.0.0.1:9173/terminate made the node GET its own loopback-authorized endpoint. Installed
+# before any loop starts; ops/outbound_guard.py has the whole story. Never remove this line.
+install_redirect_guard()
+from protocol import POSW_LEASE_EPOCHS, FIDELITY_MIN_GAP_EPOCHS, LEASE_EPOCHS_BY_CLASS, LEASE_ASSERT_CLASSES
 
 try:
     _TRUSTED_PROXIES = frozenset(get_config().get("trusted_proxies") or [])
@@ -113,6 +126,69 @@ def _ip(request):
     is a configured trusted reverse proxy (config 'trusted_proxies'), so the per-IP rate limits + anti-Sybil
     registration cap cannot be header-spoofed on a directly-exposed node."""
     return client_ip_from(request.remote or "unknown", request.headers.get("X-Forwarded-For", ""), _TRUSTED_PROXIES)
+
+
+def _is_local_request(resolved_ip, headers) -> bool:
+    """Is this request GENUINELY from the box? True only when the resolved client IP is loopback AND no
+    forwarding header is present. Pure, for tests.
+
+    WHY (relay patch 0002, 2026-09-01): /terminate, /log, /force_sync, /health and the submit rate-limit
+    exemption authorize on client_ip == 127.0.0.1. Behind a reverse proxy the socket peer IS 127.0.0.1, so on
+    a node whose operator followed the relay recipe without `trusted_proxies`, every proxied request resolved
+    to loopback and a stranger could shut the node down with a bare GET /terminate. A proxy always adds
+    X-Forwarded-For / X-Real-IP; a real local caller (curl localhost:9173) never does — so their presence is
+    the tell. With trusted_proxies configured the resolved IP is already the remote one and this changes
+    nothing; without it, the shortcut now fails closed. The server key still works from anywhere."""
+    if resolved_ip not in ("127.0.0.1", "::1"):
+        return False
+    h = headers or {}
+    if h.get("X-Forwarded-For") or h.get("X-Real-IP") or h.get("Forwarded"):
+        return False
+    # ...AND THE REQUEST MUST NAME THE LOOPBACK HOST (review 2026-09-25, reproduced from the public internet). The
+    # header test above assumed every proxy adds X-Forwarded-For; the 24 game vhosts on the seed box proxy with
+    # `proxy_set_header Host $host` and NO forwarding header, so a client connecting straight to the origin's 443
+    # (no firewall, Cloudflare bypassed) with SNI dice.nadochain.com reached /terminate, /log and /force_sync as
+    # "local". A proxy always sends the PUBLIC name it was reached by; a genuine local caller (curl localhost:9173,
+    # the exec node on 127.0.0.1:9173) sends the loopback name. Fail closed on anything else.
+    host = str(h.get("Host") or "").strip().lower()
+    if host.startswith("["):                                   # [::1]:9173
+        host = host[1:].split("]", 1)[0]
+    elif host.count(":") == 1:                                 # name:port
+        host = host.split(":", 1)[0]
+    return host in ("localhost", "127.0.0.1", "::1")
+
+
+def _is_local(request) -> bool:
+    return _is_local_request(_ip(request), request.headers)
+
+
+# ENCODED-BODY CACHES (2026-09-06). /get_latest_block (~8 req/s) and /get_account (~23 req/s: three calls per
+# wallet tick until every wallet has reloaded onto /wallet_view) JSON-encoded their answer on the EVENT LOOP
+# for every call; the answer only changes when a block commits. Keyed on kv_ops.write_generation() (plus the
+# address / readable flag for accounts) and served as pre-encoded bytes. Bounded; cleared on a generation
+# change so the dict never holds two generations of accounts.
+_ENC_CACHE = {"gen": None, "bodies": {}}
+_ENC_CACHE_MAX = 8192
+
+
+def _enc_cached(key, build):
+    """bytes body for `key` at the current write generation; `build()` -> JSON-able object on a miss"""
+    from ops import kv_ops as _kv
+    gen = _kv.write_generation()
+    c = _ENC_CACHE
+    if c["gen"] != gen:
+        c["gen"], c["bodies"] = gen, {}
+    body = c["bodies"].get(key)
+    if body is None:
+        body = json.dumps(build(), separators=(",", ":")).encode("utf-8")
+        if len(c["bodies"]) < _ENC_CACHE_MAX:
+            c["bodies"][key] = body
+    return body
+
+
+def _json_body_resp(body, status=200):
+    return web.Response(body=body, status=status, content_type="application/json",
+                        headers={"Access-Control-Allow-Origin": "*"})
 
 
 def _resp(output, status=200, headers=None):
@@ -166,13 +242,22 @@ def _qint(request, key, default):
 
 
 # --- pool / field dump handlers (the repetitive read-only ones) ----------------------------------
-def _dump_handler(name, getter):
+def _dump_handler(name, getter, rate=None, heavy=False):
     """Factory for the repetitive read-only dump endpoints (/peers, /transaction_pool, ...): a GET
-    handler returning `getter()` serialized under `name`. Runs inline on the event loop — only use
-    for cheap in-memory reads. Honors ?compress=msgpack|zstd."""
+    handler returning `getter()` serialized under `name`. Honors ?compress=zstd.
+
+    `heavy=True` runs the serialize in a worker thread (NOT on the event loop) and `rate` sets a per-IP
+    limit — both REQUIRED for dumps that can be large: the tx pool budget is ~196 MiB (raised for inline
+    settle proofs), so an unauth /transaction_pool would otherwise JSON-encode ~100+ MiB ON the event loop,
+    freezing all I/O/consensus/gossip. Cheap in-memory dumps (/peers) keep the inline path."""
     async def _h(request):
         """Dump getter()'s live value serialized under `name`."""
-        return _resp(serialize(name=name, output=getter(), compress=_q(request, "compress", "none")))
+        if rate is not None and _rate_limited(request, rate):
+            return _RL()
+        comp = _q(request, "compress", "none")
+        if heavy:
+            return _resp(await asyncio.to_thread(lambda: serialize(name=name, output=getter(), compress=comp)))
+        return _resp(serialize(name=name, output=getter(), compress=comp))
     return _h
 
 
@@ -187,6 +272,147 @@ async def legacy_static_redirect(request):
     # The page/assets were renamed miner.* -> interface.* (it's a full interface now, not just a miner).
     # Redirect the old paths so saved links / bookmarks to /static/miner.html keep working.
     raise web.HTTPFound("/static/interface." + request.match_info["ext"])
+
+
+def _protocol_auth_active():
+    """Whether account authentication (doc/key-rotation.md) is live on this chain generation — advertised on
+    /status so wallets show the Account keys panel only where an `auth` tx can land."""
+    import protocol as _p
+    return _p.AUTH_ACTIVE
+
+
+def _genesis_hash_cached():
+    """Block 0's hash for /status — the shared per-process memo in ops.block_ops."""
+    from ops.block_ops import genesis_hash_cached
+    return genesis_hash_cached()
+
+
+_PUBLIC_RELAY_URL = [None]
+
+
+def _public_relay_url():
+    """config.get_public_relay_url(), read once (it is a file read) — an operator changing it restarts anyway."""
+    if _PUBLIC_RELAY_URL[0] is None:
+        try:
+            _PUBLIC_RELAY_URL[0] = get_public_relay_url()
+        except Exception:
+            _PUBLIC_RELAY_URL[0] = ""
+    return _PUBLIC_RELAY_URL[0]
+
+
+_RELAYS_LEAD_MAX = 30   # the wallet's RELAY_LEAD_MAX: how far ahead of us a peer's reported height is believed
+
+
+async def relays(request):
+    """GET /relays: every RPC endpoint on THIS chain a wallet could use instead of us — ourselves plus each
+    peer in status_pool (already gated to our genesis by peer_loop's admission checks), with the peer's
+    live height so the wallet can prefer a node at the tip.
+
+    Two addresses per entry: `url` is the TLS origin the operator advertises (config public_relay_url,
+    gossiped as /status relay_url) — the only kind a wallet served over HTTPS can use, mixed content
+    being blocked; `api` is the bare http://ip:port every node exposes, usable from a wallet loaded over
+    plain HTTP (a miner pointing a browser at their own node). Null `url` means the operator has not
+    published one. Nothing here is trusted: the wallet re-probes a candidate's /status and refuses a
+    different chain_id or a tip that trails the best known one before it switches (static/interface.js,
+    relay pool). Rate-limited 60/min: the wallet refreshes its pool every 5 minutes."""
+    if _rate_limited(request, 60):
+        return _RL()
+
+    def _work():
+        port = get_port()
+        lb = memserver.latest_block if isinstance(memserver.latest_block, dict) else {}
+        out = [{
+            "self": True, "ip": memserver.ip, "url": _public_relay_url() or None,
+            "api": f"http://{hostport(memserver.ip, port)}", "address": memserver.address,
+            "chain_id": CHAIN_ID, "height": lb.get("block_number"), "finalized": memserver.finalized_height,
+            "version": memserver.version,
+            "node_type": "archive" if getattr(memserver, "archive", False) else "rolling",
+        }]
+        own_h = lb.get("block_number") if isinstance(lb.get("block_number"), int) else None
+        for ip, st in list(consensus.status_pool.items()):
+            if not isinstance(st, dict) or ip == memserver.ip:
+                continue
+            # A PEER'S HEIGHT IS ITS OWN CLAIM (audit 2026-09-25): passed through verbatim, one peer reporting 10^9 was
+            # every wallet's "network tip". Clamped to our tip + _RELAYS_LEAD_MAX (a peer honestly ahead by a few blocks
+            # still ranks first); anything that is not an int is reported as unknown.
+            _h = st.get("latest_block_height")
+            _h = _h if isinstance(_h, int) and not isinstance(_h, bool) and _h >= 0 else None
+            if _h is not None and own_h is not None:
+                _h = min(_h, own_h + _RELAYS_LEAD_MAX)
+            url = st.get("relay_url")
+            if not (isinstance(url, str) and url.lower().startswith(("http://", "https://"))):
+                url = None
+            out.append({
+                "self": False, "ip": ip, "url": url, "api": f"http://{hostport(ip, port)}",
+                "address": st.get("address"), "chain_id": st.get("chain_id"),
+                "height": _h, "finalized": st.get("finalized_height"),
+                "version": st.get("version"), "node_type": st.get("node_type"),
+            })
+        return {"chain_id": CHAIN_ID, "relays": out}
+    return _resp(await asyncio.to_thread(_work))
+
+
+_ATTEST_KERNEL_OK = [None]
+
+
+_TPM_STATE = [None]
+
+
+def _tpm_state() -> str:
+    """What this machine can do on the vendor-endorsed path (doc/tpm-attestation-without-a-ca.md):
+    "none" (no TPM device), "uncertified" (a chip holding no endorsement certificate — a virtual TPM,
+    typically), or "ready".
+
+    ADVERTISED SO THE ANSWER IS VISIBLE FROM OUTSIDE, for the same reason `attest_kernel` is. The
+    question "which of our nodes can attest themselves" was otherwise answerable only by logging into
+    each box, and the honest answer on a rented-server fleet is usually "none of them": a VPS exposes no
+    TPM, or exposes a virtual one whose endorsement key no silicon vendor ever signed. That is not a
+    defect to fix — a virtual TPM's attestation is worth nothing, because whoever runs the hypervisor can
+    mint as many as they like — but it should be a fact anyone can read off /status rather than a
+    surprise. Probed ONCE: a TPM does not appear at runtime, and NV reads are not free.
+    """
+    if _TPM_STATE[0] is not None:
+        return _TPM_STATE[0]
+    try:
+        from ops.tpm_linux import LinuxTpm
+        if not LinuxTpm.present():
+            _TPM_STATE[0] = "none"
+        else:
+            with LinuxTpm() as t:
+                _TPM_STATE[0] = "ready" if t.ek_certificate() else "uncertified"
+    except Exception:
+        _TPM_STATE[0] = "none"
+    return _TPM_STATE[0]
+
+
+def _attest_kernel_ok() -> bool:
+    """Whether ops.attest_native can load the native verifier (memoised; re-checked after a failure so a
+    rebuild shows up without a restart)."""
+    if _ATTEST_KERNEL_OK[0]:
+        return True
+    try:
+        from ops import attest_native
+        attest_native._load()
+        _ATTEST_KERNEL_OK[0] = True
+    except Exception:
+        _ATTEST_KERNEL_OK[0] = False
+    return _ATTEST_KERNEL_OK[0]
+
+
+def _undo_shadow_status() -> dict:
+    """The generic undo log's shadow verdicts (ops/kv_ops UNDO LOG): blocks recorded, rollbacks checked, keys whose
+    hand-written revert disagreed with the recorded prior value. Mismatch > 0 is a revert bug to investigate."""
+    from ops import kv_ops as _kv
+    return dict(_kv.UNDO_SHADOW)
+
+
+def _jobs_report():
+    """The cached job report (ops/jobs.py) — refreshed by _node_jobs_loop, never computed in the handler."""
+    try:
+        from ops import jobs
+        return jobs.report()
+    except Exception:
+        return None
 
 
 async def status(request):
@@ -214,9 +440,36 @@ async def status(request):
             # problem. Old peers without this field fall back to finalized_height in the UI.
             "latest_block_height": lb.get("block_number"),
             "latest_block_weight": lb.get("cumulative_weight", 0),
+            # GENERATION IDENTITY (2026-08-20, the betanet-4 cutover): CHAIN_ID is a code label two
+            # generations can momentarily share (un-purged reroll stragglers run the new code over the
+            # old chain), but block 0's hash is unforgeable chain identity. Peers refuse status
+            # admission on a mismatch (peer_loop) — one filter that starves every consensus pool of
+            # foreign-generation weight/verdict claims at once.
+            "auth_active": bool(_protocol_auth_active()),
+            "genesis_hash": _genesis_hash_cached(),
             "earliest_block_hash": eb.get("block_hash"),
+            # BODY HORIZON — the oldest height this node can actually serve a BODY for, which is the
+            # question every caller of node_type is really asking. node_type is a POLICY flag ("do I
+            # prune?"), and it was being read as a capability claim. Those are not the same thing, and on
+            # a snapshot-booted node they are barely related: snapshot_bootstrap backfills only
+            # REWARD_WINDOW + 2*EPOCH_LENGTH + FINALITY_DEPTH = 265 bodies behind its anchor and nothing
+            # older, ever. Such a node with archive=true advertises "archive" while holding 265 blocks of
+            # history — it archives everything from its snapshot FORWARD and nothing before it. Publish
+            # the horizon so a peer picking a donor, or an explorer deciding what it can render, reads a
+            # measured fact instead of a promise the flag cannot keep.
+            "earliest_block_height": eb.get("block_number"),
             "finalized_height": memserver.finalized_height,
             "ffg_finalized": memserver.ffg_finalized,
+            # the UN-CROSSABLE floor (two-floor model, protocol.FINALITY_HARD_BACKSTOP): quorum checkpoint
+            # folded with the wide liveness backstop — what rollback refuses and re-anchors floor at
+            "hard_finality": _ghf(),
+            # the recovery state machine's current step (verdicts, adoption phases, last swallowed
+            # exception) — remote diagnosis for nodes with no shell access; see core_loop._rec
+            "recovery": getattr(memserver, "recovery_debug", None),
+            "recovery_fail": getattr(memserver, "recovery_fail", None),
+            "last_block_reject": getattr(memserver, "last_block_reject", None),
+            "last_fork_diff": getattr(memserver, "last_fork_diff", None),
+            "recent_tx_rejects": getattr(memserver, "recent_tx_rejects", []),
             "protocol": memserver.protocol,
             # CONSENSUS CONSTANTS THE BROWSER MUST MATCH. static/interface.js hardcodes these and its own
             # comments say "MUST match protocol.py" — they drifted anyway (FINALITY_DEPTH sat at 12 vs 45,
@@ -225,6 +478,15 @@ async def status(request):
             # pair cannot silently diverge again.
             "finality_depth": FINALITY_DEPTH,
             "epoch_length": EPOCH_LENGTH,
+            # the presence-lease constants the wallet mirrors for its countdown / renewal timing — adopted
+            # from here (like finality_depth) so a change never strands the browser on a stale literal
+            "posw_lease_epochs": POSW_LEASE_EPOCHS,          # the historical / default grant (an identity with no class yet)
+            "lease_epochs_by_class": dict(LEASE_EPOCHS_BY_CLASS),   # per-class leases: the wallet reads its class's own lease
+            # the per-class lease rules hold from epoch 0 (gen 25's LEASE_V2_EPOCH, 0 from gen 26, is deleted); the field
+            # stays at that value because the wallet still reads it
+            "lease_v2_epoch": 0,
+            "lease_assert_classes": sorted(LEASE_ASSERT_CLASSES),
+            "fidelity_min_gap_epochs": FIDELITY_MIN_GAP_EPOCHS,
             # DEGRADATION VISIBILITY, same purpose as update_capable: without the native ML-DSA lib
             # every verify is ~84x slower (0.154 ms -> 12.98 ms measured) and serialised behind one
             # global lock, so the node silently stops keeping up. The fallback warns once to stderr at
@@ -238,14 +500,41 @@ async def status(request):
             # has SEEN (cached by the last /update or daily check — never fetched inline here), and
             # whether it is running behind it. Lets anyone spot a lagging node from /status alone.
             "running_commit": self_update.running_head(),
+            # WHERE THIS NODE'S EXEC NODE ANSWERS (2026-10-26): the wallet assumed :9273 on the relay's host, so a node run
+            # with another NADO_EXEC_PORT served a wallet that read some OTHER exec node on 9273 — on a box that also runs
+            # the fleet's exec node, the live one (found by the gen-29 rehearsal's loopback walk). The port the node itself
+            # uses to reach its exec node (_EXEC_PORT); static/interface.js execBase reads it.
+            "exec_port": _EXEC_PORT,
+            # NATIVE LIBRARIES (2026-09-25): per crate, whether the library the loader opens is present, current
+            # against its Rust sources, and newer than this process (rebuilt but not yet loaded). A peer's rebuild
+            # after a .rs commit was otherwise unverifiable without a shell on the box.
+            "native": self_update.native_report(),
             "latest_main": self_update.latest_known(),
+            # JOBS (2026-09-26, ops/jobs.py): every job this machine should run (deploy/units/manifest.json) with its
+            # systemd state, the in-node samplers' last success, and `problems` — so a job that stops is seen from
+            # /status and from every peer's status_pool instead of failing silently for days.
+            "jobs": _jobs_report(),
+            "undo_shadow": _undo_shadow_status(),
+            # PROOF RULE GATES (2026-09-23): a proof is judged by the rules of the block it lands in, and the
+            # wallet's on-device prover must produce that format, so the heights are published here rather
+            # than hard-coded in a page that would go stale (see static/interface.js _onDeviceProve2). Every one of
+            # these rules is live from block 1 since gen 26 — their gen-25 gates (PROOF_BIND_HEIGHT,
+            # PROOF_BLOCK_SELECTOR_HEIGHT, REVIEW_R2_HEIGHT, SHIELD_WIDE_HEIGHT, PROOF_TRACE_LDT_HEIGHT,
+            # PROOF_QUERY_FULL_HEIGHT) are deleted — and the wallet still reads the heights, so each is served as 1.
+            "proof_rules": {"bind": 1, "block_selector": 1, "round2": 1, "shield_wide": 1, "trace_ldt": 1,
+                            "full_query": 1},
+            # THE CHAIN CLOCK VS THE WALL (2026-09-23): what TIME reads at the tip and how far behind (or ahead
+            # of) real time it is — the number the next reroll's cadence is set from, visible without a script.
+            "chain_clock": {"cadence_ds": _proto.CHAIN_CLOCK_CADENCE_DS,
+                            "at_tip": _proto.chain_clock(int(lb.get("block_number", 0) or 0)) if lb else None,
+                            "lag_s": (int(time.time()) - _proto.chain_clock(int(lb.get("block_number", 0) or 0))) if lb else None},
             # NODE TYPE (non-consensus, doc/rolling-mode-and-da.md): "archive" keeps every block body
             # forever; "rolling" drops bodies past its retention window (state + number<->hash indexes are
             # always kept, so it still validates and serves the beacon/FFG). Advertised so the network
             # panel can show WHAT each peer is, not just which commit it runs — the two answer different
             # questions when you are working out who can serve history.
-            "node_type": "archive" if getattr(memserver, "archive", True) else "rolling",
-            "history_retention": (0 if getattr(memserver, "archive", True)
+            "node_type": "archive" if getattr(memserver, "archive", False) else "rolling",
+            "history_retention": (0 if getattr(memserver, "archive", False)
                                   else int(getattr(memserver, "history_retention_blocks", 0) or 0)),
             "update_available": bool(self_update.latest_known() and self_update.running_head()
                                      and self_update.latest_known() != self_update.running_head()),
@@ -255,10 +544,46 @@ async def status(request):
             # Advertised so the condition is visible from the OUTSIDE (network panel, a sweep of peers),
             # not only to whoever happens to call /update. False here is a node that WILL diverge.
             "update_capable": (memserver.updatability or {}).get("capable"),
+            # DEVICE ATTESTATION kernel (native/attest): False here is a node that cannot validate register txs
+            # once DEVICE_ATTEST_HEIGHT is active — audit the fleet on this field BEFORE the reroll.
+            "attest_kernel": _attest_kernel_ok(),
+            # CAN THIS MACHINE ATTEST ITSELF? "none" / "uncertified" / "ready" — see _tpm_state. On a
+            # rented-server fleet this reads "none" almost everywhere, which is the expected answer and
+            # not a fault: self-enrolment is for physical machines, and a VPS has no vendor-certified chip.
+            "tpm": _tpm_state(),
+            # What the challenger duty last did. It swallows its own exceptions so a failure cannot stop
+            # block production, which also means the reason never leaves that machine's log — and the
+            # machines that matter are operated by other people.
+            "tpm_duty": getattr(memserver, "tpm_duty", None),
+            # WHY it cannot update, and WHY a forked node is not healing itself — both visible from OUTSIDE.
+            # `capable` is a bare boolean covering only LOCAL defects, and /log is authenticated, so a remote
+            # operator had no way to tell which precondition was vetoing. That guessing is what stretched the
+            # .141 incident; these are diagnostics only, nothing reads them back.
+            "update_blocking": (memserver.updatability or {}).get("blocking") or [],
+            # THE WARNING BAND IS THE PART THAT PREVENTS ANYTHING. `blocking` only fires once the node is
+            # ALREADY unable to update — by then the disk is full and, measured, not even `git gc` can run
+            # (it writes the new pack before dropping the old objects, so it needs roughly the pack size
+            # free). The low-disk warning fires with ~1 GiB of headroom, i.e. days of notice, and without
+            # it here that notice existed only in this node's own journal — invisible to exactly the
+            # fleet-wide sweep that would act on it. Four nodes wedged on betanet-3 while every remote
+            # check said they were fine.
+            "update_warnings": (memserver.updatability or {}).get("warnings") or [],
+            "update_free_disk_mb": ((memserver.updatability or {}).get("checks") or {}).get("free_disk_mb"),
+            "update_remote_reachable": ((memserver.updatability or {}).get("checks") or {}).get("remote_reachable"),
+            "dead_fork_probe": getattr(memserver, "dead_fork_probe", None),
             # NETWORK PARTITION KEY: peers gate admission on this (peer_loop) so nodes on a different
-            # chain (e.g. a pre-relaunch alphanet) never enter the status/consensus pools — a foreign
+            # chain (e.g. a pre-relaunch betanet) never enter the status/consensus pools — a foreign
             # chain's advertised weight would otherwise stall production via the caught-up gate.
             "chain_id": CHAIN_ID,
+            # which address formula this chain uses: clients that derive addresses outside the served JS — the TPM helper
+            # binary — read it here before deriving any key's address, and a helper that finds NO field falls back to
+            # format 1 (apps/nado-tpm-attest/src/tx.rs set_address_format). Format 2 has been unconditional since the
+            # betanet-9 gate cleanup (protocol.ADDRESS_FORMAT deleted); KEEP SERVING 2 while any published helper reads it.
+            "address_format": 2,
+            # WALLET-GRADE ORIGIN (config.get_public_relay_url): where a BROWSER can reach this node's API over
+            # TLS, or null. Peers collect it through status_pool and serve it from /relays, which is how a web
+            # wallet learns where else it can go when its own relay stops answering. Opt-in per operator.
+            "relay_url": _public_relay_url() or None,
         }
         try:
             _ch = snapshot_ops.latest_final_checkpoint_height(memserver.finalized_height)
@@ -304,10 +629,16 @@ async def _mining_history_maintainer():
     pays for the index at all. Once caught up it only folds in the handful of blocks since the last pass."""
     while True:
         try:
+            # Index up to the FINALIZED floor, never the live tip: a rollback then never touches an indexed
+            # height, so the index is built once and kept, instead of dropped and rescanned from genesis
+            # after every emergency rollback. The chart lags the tip by finality depth (~5 min), which is
+            # nothing for a per-day series. 1 s of scanning per 1 s of sleep while building: the scan holds
+            # the GIL in whole-body JSON decodes, and this node is also the public relay.
+            floor = await asyncio.to_thread(get_finalized_height)
             info = await asyncio.to_thread(mining_history.catch_up,
-                                           memserver.latest_block["block_number"],
-                                           memserver.block_time, mining_history.KEEP_DAYS, 3.0)
-            await asyncio.sleep(0.5 if info["building"] else 10.0)
+                                           min(memserver.latest_block["block_number"], floor),
+                                           memserver.block_time, mining_history.KEEP_DAYS, 1.0)
+            await asyncio.sleep(1.0 if info["building"] else 10.0)
         except Exception:
             await asyncio.sleep(30)   # a torn read / restarting store — retry, never kill the maintainer
 
@@ -390,6 +721,23 @@ async def get_recommended_fee(request):
     return _resp({"fee": recommended_fee(memserver.latest_block) + 1})
 
 
+async def next_block_txids(request):
+    """GET /next_block_txids: {tip, height, txids} — the EXACT tx set this node would assemble into the next
+    block on its current tip (memserver.get_next_block_txids: the mature, target-height, blob-capped subset,
+    i.e. what upcoming_block_hash hashes). Read by peers' PRE-ASSEMBLY RECONCILE right before they build
+    (memserver.reconcile_next_block_set) so every assembler holds the union of the mesh's next-block sets
+    instead of racing on the differences. ~64 B per tx; served from the upcoming-hash cache. Rate-limited
+    120/min per IP; peers are exempt (they ask once per block)."""
+    ip = _ip(request)
+    if ip not in memserver.peers and _rate_limited(request, 120):
+        return _RL()
+
+    def _work():
+        tip, height, txids = memserver.get_next_block_txids()
+        return {"tip": tip, "height": height, "txids": txids}
+    return _resp(await asyncio.to_thread(_work))
+
+
 async def transactions_by_id(request):
     """POST /transactions_by_id?compress=: body = codec list of txids (bounded); returns the named
     transactions from OUR pool — the expensive half of mempool set reconciliation, proportional to
@@ -409,7 +757,7 @@ async def transactions_by_id(request):
         if not isinstance(ids, list) or len(ids) > 1000:
             return "Error: too many ids", 400
         wanted = {i for i in ids if isinstance(i, str) and len(i) <= 64}
-        txs = [t for t in memserver.transaction_pool if t.get("txid") in wanted]
+        txs = [t for t in memserver.live_pool() if t.get("txid") in wanted]   # never a tx that cannot land
         return serialize(name="transactions", output=txs, compress=_q(request, "compress", "none")), 200
 
     out, code = await asyncio.to_thread(_work, body)
@@ -421,62 +769,88 @@ async def submit_transaction(request):
     oversized/malformed payload can't balloon memory) and merge it into the pool. Serves BOTH user
     submissions and peer PUSH-GOSSIP (a peer relaying a tx it just accepted). On a first-sight accept
     the tx is re-pushed to our other peers, so one submit floods the mesh in ~one hop per edge; a dup
-    returns "Already present" and never re-floods, which terminates the epidemic. `register` txs also
-    pass the per-source-IP anti-Sybil budget. 200 on accept, 403 on reject, 429 over the rate limit."""
+    returns "Already present" and never re-floods, which terminates the epidemic (the per-source-IP register
+    budget was retired at gen 25). 200 on accept, 403 on reject, 429 over the rate limit."""
     ip = _ip(request)
-    # A LINKED PEER relaying gossip bypasses the 30/min per-IP user limit — otherwise a busy relay
-    # would 429 the very floods that keep mempools converged. It stays bounded: a dup is a cheap
-    # "Already present" that is not re-gossiped, and an abusive peer is benched/purged by peer_loop.
-    if ip not in memserver.peers and _rate_limited(request, 30):
+    # RATE LIMIT. A large (proof-carrying) submit is expensive to admit, so it is strict-limited for
+    # EVERYONE — a linked peer must NOT be able to amplify the 192 MiB body-cap DoS by relaying oversized
+    # bodies. Otherwise a linked peer relaying gossip gets a higher-but-FINITE bucket (the old code gave
+    # peers an UNCONDITIONAL bypass, and becoming a peer is cheap/permissionless, so that was an
+    # unlimited-flood lever); an ordinary user keeps 30/min. A dup is a cheap non-re-gossiped "Already
+    # present", and an abusive peer is still benched/purged by peer_loop.
+    # LARGE (proof-carrying) submits are strict-limited for EVERYONE — that is the actual DoS lever, and a
+    # linked peer must not be able to amplify it. SMALL submits from a LINKED PEER stay unlimited: that is
+    # relayed gossip, and throttling it drops transactions the fleet is trying to converge on (an
+    # exact-landing tx like `register` has exactly ONE block it can be included in, so a single throttled
+    # relay loses it outright). Ordinary users keep the 30/min cap.
+    # LOCALHOST is the operator's own tooling (contract deploys, scripts) and is already trusted elsewhere
+    # (/terminate, /force_sync). It is not a DoS vector — it is on the box — and throttling it broke a real
+    # deploy: a 25-contract redeploy submits in bursts and five of them came back 429, silently leaving
+    # contracts undeployed. Exempt it from BOTH buckets.
+    _local = _is_local(request)
+    # A BODY WITHOUT A LENGTH IS A LARGE BODY (audit 2026-09-25). Chunked transfer sends no Content-Length, so
+    # `content_length or 0` read it as small: it skipped the strict bucket, and from a linked peer skipped every
+    # bucket, while still delivering up to the 192 MiB cap. Honest senders — the wallet's fetch, peers' gossip —
+    # always send a length, so an unknown one is judged as the worst case it can be.
+    _large = request.content_length is None or request.content_length > 2 * 1024 * 1024
+    if _large:
+        if not _local and _rate_limited(request, 6):
+            return _RL()
+    elif not _local and ip not in memserver.peers and _rate_limited(request, 30):
         return _RL()
-
-    def _work(body, ip):
-        """Decode, anti-Sybil check, pool-merge, and (on a first-sight accept) queue push-gossip."""
+    # ...AND AT MOST _LARGE_SUBMIT_MAX LARGE BODIES IN FLIGHT AT ONCE, node-wide: the per-IP bucket bounds one
+    # source, not many, and each large body is held in memory whole while it is read and decoded.
+    if _large and not _local:
+        global _large_inflight
+        if _large_inflight >= _LARGE_SUBMIT_MAX:
+            return _RL()
+        _large_inflight += 1
         try:
-            transaction = unpack_tx(body)   # size-bounded JSON-codec decode (ops/net_ops.py)
-            rej = _ip_registration_rejection(ip, transaction)
-            if rej:
-                return rej, 429
-            output = memserver.merge_transaction(transaction, user_origin=True)
-            if should_gossip(output):       # newly accepted -> fan out to peers, minus the sender
-                memserver.enqueue_gossip(transaction, exclude_ip=ip)
-            return output, (200 if output.get("result") else 403)
-        except Exception as e:
-            return f"Error: {e}", 403
+            body = await request.read()
+            out, code = await asyncio.to_thread(_work_submit, body, ip)
+        finally:
+            _large_inflight -= 1
+        return _resp(out, status=code)
     body = await request.read()
-    out, code = await asyncio.to_thread(_work, body, ip)
+    out, code = await asyncio.to_thread(_work_submit, body, ip)
     return _resp(out, status=code)
 
 
-def _ip_registration_rejection(ip, transaction):
-    """IP-DIVERSITY cap (non-consensus relay admission control): for a `register` tx, enforce the
-    per-source-IP progressive registration budget so one device/range can't script thousands of
-    identities. Returns a rejection dict if over budget, else None. Never raises into tx submission."""
+_LARGE_SUBMIT_MAX = 2
+_large_inflight = 0
+
+
+def _work_submit(body, ip):
+    """Decode, pool-merge, and (on a first-sight accept) queue push-gossip."""
     try:
-        if not isinstance(transaction, dict) or transaction.get("recipient") != "register":
-            return None
-        from ops.ratelimit import allow_registration
-        cap = getattr(memserver, "max_registrations_per_ip", 64)
-        window = getattr(memserver, "max_registrations_window", 7200.0)
-        if not allow_registration(ip, str(transaction.get("sender", "")), cap, window):
-            return {"result": False,
-                    "message": "Too many registrations from this IP/range — one device can onboard only a "
-                               "limited number of mining addresses (anti-Sybil). Use fewer addresses."}
-    except Exception:
-        return None
-    return None
+        transaction = unpack_tx(body)   # size-bounded JSON-codec decode (ops/net_ops.py)
+        output = memserver.merge_transaction(transaction, user_origin=True)
+        if should_gossip(output):       # newly accepted -> fan out to peers, minus the sender
+            memserver.enqueue_gossip(transaction, exclude_ip=ip)
+        # IDENTITY LOG (gen 25): the per-IP enforcement is gone, the OBSERVATION stays — every register tx
+        # leaves one node-local line (ip, sender, entry/renewal, device class, AAGUID, certificate hashes) so
+        # "are these identities really individual?" is answered from data: tools/identity_audit.py.
+        # only USER ingress: a peer re-pushing the same tx (push gossip lands here too, answered "Already
+        # present") would log every relay as "N senders behind one IP" — the farm signature the log exists for
+        if ip not in memserver.peers and output.get("message") != "Already present":
+            identity_log.record(ip, transaction, output.get("result"), output.get("message"))
+        return output, (200 if output.get("result") else 403)
+    except Exception as e:
+        return f"Error: {e}", 403
 
 
 async def health(request):
     """GET /health?key=&compress=: CPython GC counters/stats for memory-leak triage. Requires the node's
     server key unless called from 127.0.0.1 (heap introspection is not for the public)."""
     server_key = _q(request, "key", "none")
-    if server_key != memserver.server_key and _ip(request) != "127.0.0.1":
+    if server_key != memserver.server_key and not _is_local(request):
         return _resp("Unauthorized", status=403)
     compress = _q(request, "compress", "none")
-    data = {"gc_counts": list(gc.get_count()),
-            "gc_objects_tracked": len(gc.get_objects()),
-            "gc_stats": gc.get_stats()}
+    def _work():
+        return {"gc_counts": list(gc.get_count()),
+                "gc_objects_tracked": len(gc.get_objects()),      # materialises a list of EVERY object
+                "gc_stats": gc.get_stats()}
+    data = await asyncio.to_thread(_work)
     return _resp(serialize(name="health", output=data, compress=compress))
 
 
@@ -484,7 +858,7 @@ async def log(request):
     """GET /log?key=: the last 500 node log lines as <br>-joined HTML. Server-key or localhost only
     (logs leak peer IPs and operational detail)."""
     server_key = _q(request, "key", "none")
-    if server_key != memserver.server_key and _ip(request) != "127.0.0.1":
+    if server_key != memserver.server_key and not _is_local(request):
         return _resp("Unauthorized", status=403)
 
     def _read():
@@ -505,17 +879,17 @@ async def force_sync(request):
             forced_ip = _q(request, "ip")
             server_key = _q(request, "key", "none")
             client_ip = _ip(request)
-            if server_key == memserver.server_key or client_ip == "127.0.0.1":
+            if server_key == memserver.server_key or _is_local(request):
                 # validate the TARGET too (not just the caller): reject a non-routable/internal forced_ip so
                 # an authenticated force-sync can't be pointed at loopback/RFC1918/metadata (SSRF hardening).
                 if not (forced_ip and check_ip(forced_ip)):
                     return f"Invalid or non-routable target IP for force-sync: {forced_ip}", 400
-                if client_ip == "127.0.0.1" or check_ip(client_ip):
+                if _is_local(request) or check_ip(client_ip):
                     memserver.force_sync_ip = forced_ip
                     memserver.peers = [forced_ip]
                     return f"Synchronization is now forced only from {forced_ip} until majority consensus is reached", 200
-                return f"Failed to force to sync from {forced_ip}", 200
-            return f"Wrong server key {server_key}", 200
+                return f"Failed to force to sync from {forced_ip}", 400
+            return "Wrong or missing server key", 403
         except Exception as e:
             return f"Error: {e}", 403
     out, code = await asyncio.to_thread(_work)
@@ -523,7 +897,7 @@ async def force_sync(request):
 
 
 async def whats_my_ip(request):
-    """GET /whats_my_ip: the caller's IP as this node sees it (trusted-proxy aware). ?compress=msgpack."""
+    """GET /whats_my_ip: the caller's IP as this node sees it (trusted-proxy aware). Plain text."""
     client_ip = _ip(request)
     return _resp(client_ip)
 
@@ -532,12 +906,11 @@ async def terminate(request):
     """GET /terminate?key=: shut the node down (terminate flag, then hard os._exit 0.2s later so the
     response still flushes). Localhost or server-key only."""
     server_key = _q(request, "key", "none")
-    client_ip = _ip(request)
-    if client_ip == "127.0.0.1" or server_key == memserver.server_key:
+    if _is_local(request) or server_key == memserver.server_key:
         memserver.terminate = True
         asyncio.get_event_loop().call_later(0.2, functools.partial(os._exit, 0))
         return _resp("Termination signal sent, node is shutting down...")
-    return _resp("Wrong or missing key for a remote node")
+    return _resp("Wrong or missing key for a remote node", status=403)
 
 
 async def transaction(request):
@@ -568,7 +941,7 @@ async def account_transactions(request):
         """Blocking DUPSORT index scan + block reads (worker thread)."""
         try:
             address = _q(request, "address", memserver.address)
-            min_block = int(_q(request, "min_block", "0"))
+            min_block = _qint(request, "min_block", 0)     # malformed -> 0, not a 403 with the parser's text
             data = get_transactions_of_account(account=address, min_block=min_block)
             code = 200
             if not data:
@@ -580,36 +953,78 @@ async def account_transactions(request):
     return _resp(out, status=code)
 
 
-async def block_by_hash(request):
-    """GET /get_block?hash=&compress=: one block by hash; 404 when unknown or pruned."""
+async def block_lookup(request):
+    """GET /get_block?hash=&compress= OR /get_block?number=&compress=[&hash_only=1]: ONE endpoint, one
+    block, addressed either way. With number + hash_only=1 the number->hash INDEX answers even where the
+    body is gone (pruned, or below an archive gap): {"block_number", "block_hash"} — what the exec
+    node's finality-revert probe needs at heights whose body L1 no longer serves.
+    (The /get_block_number alias was REMOVED 2026-08-19 after every in-repo caller — peer probes, the
+    exec tail, the wallet, scripts, tests — moved here; /get_block?number= was already served by every
+    deployed build, so updated callers stayed compatible through the update wave.)"""
     def _work():
         """Blocking block read (worker thread)."""
         try:
-            data = get_block(_q(request, "hash"))
-            code = 200
-            if not data:
-                data, code = "Not found", 404
-            return serialize(name="block_hash", output=data, compress=_q(request, "compress", "none")), code
-        except Exception as e:
-            return f"Error: {e}", 403
-    out, code = await asyncio.to_thread(_work)
-    return _resp(out, status=code)
-
-
-async def block_by_number(request):
-    """GET /get_block_number?number=&compress=: one block by height; 404 when unknown or pruned."""
-    def _work():
-        """Blocking block read (worker thread)."""
-        try:
-            data = get_block_number(_q(request, "number"))
+            num = _q(request, "number")
+            if num is not None and num != "":
+                data = get_block_number(num)
+                if not data and _q(request, "hash_only", "") == "1":
+                    n = _qint(request, "number", None)
+                    if n is None:
+                        return "Bad number", 400
+                    bh = get_block_hash_by_number(n)
+                    if bh:
+                        data = {"block_number": n, "block_hash": bh}
+                name = "block_number"
+            else:
+                data = get_block(_q(request, "hash"))
+                name = "block_hash"
             code = 200
             if not data:
                 data, code = "Not found", 404   # 404, not 403: a missing/pruned record isn't "forbidden"
-            return serialize(name="block_number", output=data, compress=_q(request, "compress", "none")), code
+            return serialize(name=name, output=data, compress=_q(request, "compress", "none")), code
         except Exception as e:
             return f"Error: {e}", 403
     out, code = await asyncio.to_thread(_work)
     return _resp(out, status=code)
+
+
+_HASH_ATTEST_CACHE = {}    # height -> (as_of, response) — bounds the free-signing oracle (~one sign/height/tip)
+
+async def hash_attest(request):
+    """GET /hash_attest?height= : this node's SIGNED claim of its canonical hash at `height` — the
+    stake-weighted half of the fork-verdict probes (doc/finality.md §3a). The reply binds
+    (chain_id, height, hash, as_of=our tip) under the node's ML-DSA key; the PROBER weighs it by the
+    signer's bonded seats in the prober's OWN committed registry, so a Sybil peer-set adds zero weight
+    while the seeds keep working as the unsigned liveness fallback. Signing is cached per (height, tip)
+    — a flood re-serves the cached signature instead of grinding ML-DSA. That cache only helps for a
+    REPEATED height: a client cycling heights forces one signature per request, so non-peers are
+    rate-limited (peers probe once per verdict and are exempt, the next_block_txids pattern)."""
+    if _ip(request) not in memserver.peers and _rate_limited(request, 60):
+        return _RL()
+    def _work():
+        try:
+            h = int(_q(request, "height"))
+        except (TypeError, ValueError):
+            return "Bad height", 400
+        bh = get_block_hash_by_number(h)
+        if not bh:
+            return "Not found", 404
+        as_of = int(memserver.latest_block.get("block_number", 0))
+        cached = _HASH_ATTEST_CACHE.get(h)
+        if cached and cached[0] == as_of:
+            return cached[1], 200
+        from ops.block_ops import hash_attest_message
+        from signatures import sign as _sig
+        resp = {"height": h, "block_hash": bh, "as_of": as_of, "address": memserver.address,
+                "public_key": memserver.keydict["public_key"],
+                "signature": _sig(memserver.private_key, hash_attest_message(h, bh, as_of))}
+        while len(_HASH_ATTEST_CACHE) >= 512:          # evict the OLDEST entry, not the whole cache
+            _HASH_ATTEST_CACHE.pop(next(iter(_HASH_ATTEST_CACHE)))
+        _HASH_ATTEST_CACHE[h] = (as_of, resp)
+        return resp, 200
+    out, code = await asyncio.to_thread(_work)
+    return _resp(serialize(name="hash_attest", output=out, compress="none") if code == 200 else out,
+                 status=code)
 
 
 def _collect_block_chain(start_hash, count, link_field):
@@ -692,8 +1107,49 @@ async def get_supply(request):
 
 
 async def latest_block(request):
-    """GET /get_latest_block?compress=: the in-memory latest block (no disk read)."""
-    return _resp(serialize(name="latest_block", output=memserver.latest_block, compress=_q(request, "compress", "none")))
+    """GET /get_latest_block?compress=: the in-memory latest block (no disk read). The plain-JSON form is
+    served from the per-generation encoded cache (_enc_cached)."""
+    comp = _q(request, "compress", "none")
+    if comp == "none":
+        lb = memserver.latest_block
+        try:
+            return _json_body_resp(_enc_cached(("latest_block", lb.get("block_hash")), lambda: lb))
+        except Exception:
+            pass                                   # fall through to the plain path on anything odd
+    return _resp(serialize(name="latest_block", output=lb if comp == "none" else memserver.latest_block, compress=comp))
+
+
+def _enrich_account(addr, data):
+    """Add the derived fields a wallet needs onto an account doc, IN PLACE: `reg_epoch` (the latest recert
+    epoch — the presence lease) and `devbind` (binding mode/class/handle + the per-class lease fields).
+
+    ONE IMPLEMENTATION, BOTH ENDPOINTS (2026-09-17). /get_account enriched and /wallet_view — the bundled
+    read the wallet actually polls — added only `reg_epoch`. getAccount() in the wallet prefers the bundle
+    while it is fresh, so `acc.devbind` was undefined on most reads: bindIsPermanent() answered FALSE for a
+    permanently-bound identity, the register path fell past the statement-free branch, and the owner of a
+    helper-enrolled chip got a Windows Hello prompt that chip cannot answer. It "worked on the second try"
+    whenever the bundle happened to be stale and the direct /get_account ran. Same cause made
+    leaseEpochsOf() fall back to the 36 h default for 7-day classes, so the countdown and the 80 % renewal
+    trigger were wrong too. A second enrichment site is how that happened; there is now only one."""
+    from ops import kv_ops as _kv
+    from ops.node_attest import bind_info as _bi
+    from protocol import lease_epochs_for as _lef, EPOCH_LENGTH as _EL
+    data["reg_epoch"] = _kv.recert_latest(addr)      # latest recert epoch (presence lease)
+    # BINDING MODE (doc/device-attestation.md §"Binding modes"): the wallet reads `devbind.mode` to know whether
+    # this identity renews without a statement ("perm", live) or needs one every lease ("lease")
+    _b = _bi(addr, data)
+    _tip = int((memserver.latest_block or {}).get("block_number") or 0)
+    _ep = _tip // _EL
+    _reg = int(data["reg_epoch"]) if isinstance(data.get("reg_epoch"), int) else -1
+    # PER-CLASS LEASES: the lease THIS identity's latest recert granted (its countdown), the lease
+    # its class grants now, and whether it may renew by credential signature (assert-class + a credential on chain)
+    data["devbind"] = {"mode": _b["bind_mode"], "cls": _b["bind_cls"], "handle": _b.get("bind_handle"),
+                       "live": _b["bind_live"], "epoch": _b["bind_epoch"],
+                       "lease_epochs": _kv.lease_of(addr, _reg) if _reg >= 0 else _lef(_b["bind_cls"], _ep),
+                       "lease_epochs_next": _lef(_b["bind_cls"], _ep),
+                       "assert_ok": bool(_b["bind_cls"] in LEASE_ASSERT_CLASSES
+                                         and isinstance(data.get("devcred"), str) and data.get("devcred"))}
+    return data
 
 
 async def account(request):
@@ -708,8 +1164,7 @@ async def account(request):
             data = get_account(addr, create_on_error=False)
             code = 200
             if data:
-                from ops import kv_ops
-                data["reg_epoch"] = kv_ops.recert_latest(addr)   # latest PoSW recert epoch (presence lease)
+                _enrich_account(addr, data)          # reg_epoch + devbind — the SAME fields /wallet_view returns
                 if readable == "true":
                     data.update({"balance": to_readable_amount(data["balance"])})
                     data.update({"produced": to_readable_amount(data["produced"])})
@@ -719,8 +1174,91 @@ async def account(request):
             return serialize(name="address", output=data, compress=_q(request, "compress", "none")), code
         except Exception as e:
             return f"Error: {e}", 403
+    comp = _q(request, "compress", "none")
+    if comp == "none":
+        from ops import kv_ops as _kv
+        key = ("account", _q(request, "address", memserver.address), _q(request, "readable", "none"))
+        gen = _kv.write_generation()
+        c = _ENC_CACHE
+        if c["gen"] == gen and key in c["bodies"]:
+            return _json_body_resp(c["bodies"][key])
+        out, code = await asyncio.to_thread(_work)
+        if code == 200 and isinstance(out, (dict, list)) and _kv.write_generation() == gen:
+            body = json.dumps(out, separators=(",", ":")).encode("utf-8")
+            if c["gen"] != gen:
+                c["gen"], c["bodies"] = gen, {}
+            if len(c["bodies"]) < _ENC_CACHE_MAX:
+                c["bodies"][key] = body
+            return _json_body_resp(body)
+        return _resp(out, status=code)
     out, code = await asyncio.to_thread(_work)
     return _resp(out, status=code)
+
+
+def _account_mempool_summary(addr):
+    """The address's pending (mempool) activity summary — shared by /get_account_mempool and /wallet_view.
+    Pure in-memory pool scan + at most a few alias lookups; expired leftovers are skipped."""
+    lb = memserver.latest_block if isinstance(memserver.latest_block, dict) else {}
+    height = int(lb.get("block_number") or 0)
+    from ops import alias_ops
+    free_in = free_out = exec_in = exec_out = 0
+    # HALT-CLASS belt (audit 2026-07): read UNVALIDATED payload numbers through a safe coercion. A
+    # non-int data field used to make this O(mempool) scan's bare int() raise, and the one outer
+    # except returned 403 for EVERY address while the poison sat in the pool. Admission now rejects
+    # such a blob so it cannot be pooled; this keeps the endpoint up even if one somehow were.
+    def _si(x):
+        return int(x) if isinstance(x, int) and not isinstance(x, bool) else 0
+    txs = []
+    for tx in list(memserver.transaction_pool):
+        if not isinstance(tx, dict):
+            continue
+        if int(tx.get("max_block") or 0) <= height:
+            continue    # expired leftover — can never enter a block, so it isn't "confirming"
+        sender, recipient = tx.get("sender"), tx.get("recipient")
+        amount, fee = int(tx.get("amount") or 0), int(tx.get("fee") or 0)
+        data = tx.get("data") if isinstance(tx.get("data"), dict) else {}
+        fi = fo = ei = eo = 0
+        # exits proven straight to data["addr"] (bridge/shield claims), whoever submitted them
+        if recipient in ("bridge_withdraw", "unshield") and data.get("addr") == addr:
+            fi += _si(data.get("amount"))
+        if sender == addr:
+            if recipient == "withdraw":            # matured unbond claim: bonded -> spendable
+                fi += _si(data.get("amount"))
+            elif recipient == "bridge":            # L1 -> exec (playable) deposit
+                fo += amount + fee
+                ei += amount
+            elif recipient == "blob":              # exec call: the fee leaves L1; a value escrows from playable
+                fo += fee
+                op = data.get("op")
+                if op == "call":
+                    eo += _si(data.get("value"))
+                elif op == "bridge_withdraw":      # playable -> L1 (lands via a later bridge_withdraw claim)
+                    eo += _si(data.get("amount"))
+            elif recipient in ("bridge_withdraw", "unshield", "unbond", "register", "heartbeat",
+                               "msgkey", "attest", "commit", "reveal", "settle", "slash",
+                               "xmsg", "htlc_claim", "invite_claim", "invite_refund"):
+                pass                               # fee-exempt / no spendable movement (exit credits handled above)
+            else:                                  # plain send, bond, shield, alias, htlc_lock, ...
+                fo += amount + fee
+                if recipient == addr:
+                    fi += amount                   # self-send: only the fee actually leaves
+        else:
+            # incoming: direct address match, or a send addressed to one of the address's aliases
+            to = recipient
+            if to and not is_address(to):
+                to = alias_ops.resolve_alias(recipient) or recipient
+            if to == addr:
+                fi += amount
+        if fi or fo or ei or eo:
+            free_in += fi; free_out += fo; exec_in += ei; exec_out += eo
+            if len(txs) < 50:
+                txs.append({"txid": tx.get("txid"), "sender": sender, "recipient": recipient,
+                            "amount": amount, "fee": fee, "op": data.get("op") if data else None,
+                            "free_in": fi, "free_out": fo, "exec_in": ei, "exec_out": eo})
+    out = {"address": addr, "height": height,
+           "free_in": free_in, "free_out": free_out, "exec_in": exec_in, "exec_out": exec_out,
+           "txs": txs}
+    return out
 
 
 async def account_mempool(request):
@@ -735,71 +1273,767 @@ async def account_mempool(request):
         """Blocking pool scan (worker thread — alias resolution reads LMDB)."""
         try:
             addr = _q(request, "address", memserver.address)
-            lb = memserver.latest_block if isinstance(memserver.latest_block, dict) else {}
-            height = int(lb.get("block_number") or 0)
-            from ops import alias_ops
-            free_in = free_out = exec_in = exec_out = 0
-            # HALT-CLASS belt (audit 2026-07): read UNVALIDATED payload numbers through a safe coercion. A
-            # non-int data field used to make this O(mempool) scan's bare int() raise, and the one outer
-            # except returned 403 for EVERY address while the poison sat in the pool. Admission now rejects
-            # such a blob so it cannot be pooled; this keeps the endpoint up even if one somehow were.
-            def _si(x):
-                return int(x) if isinstance(x, int) and not isinstance(x, bool) else 0
-            txs = []
-            for tx in list(memserver.transaction_pool):
-                if not isinstance(tx, dict):
-                    continue
-                if int(tx.get("max_block") or 0) <= height:
-                    continue    # expired leftover — can never enter a block, so it isn't "confirming"
-                sender, recipient = tx.get("sender"), tx.get("recipient")
-                amount, fee = int(tx.get("amount") or 0), int(tx.get("fee") or 0)
-                data = tx.get("data") if isinstance(tx.get("data"), dict) else {}
-                fi = fo = ei = eo = 0
-                # exits proven straight to data["addr"] (bridge/shield claims), whoever submitted them
-                if recipient in ("bridge_withdraw", "unshield") and data.get("addr") == addr:
-                    fi += _si(data.get("amount"))
-                if sender == addr:
-                    if recipient == "withdraw":            # matured unbond claim: bonded -> spendable
-                        fi += _si(data.get("amount"))
-                    elif recipient == "bridge":            # L1 -> exec (playable) deposit
-                        fo += amount + fee
-                        ei += amount
-                    elif recipient == "blob":              # exec call: the fee leaves L1; a value escrows from playable
-                        fo += fee
-                        op = data.get("op")
-                        if op == "call":
-                            eo += _si(data.get("value"))
-                        elif op == "bridge_withdraw":      # playable -> L1 (lands via a later bridge_withdraw claim)
-                            eo += _si(data.get("amount"))
-                    elif recipient in ("bridge_withdraw", "unshield", "unbond", "register", "heartbeat",
-                                       "msgkey", "attest", "commit", "reveal", "settle", "slash",
-                                       "xmsg", "htlc_claim"):
-                        pass                               # fee-exempt / no spendable movement (exit credits handled above)
-                    else:                                  # plain send, bond, shield, alias, htlc_lock, ...
-                        fo += amount + fee
-                        if recipient == addr:
-                            fi += amount                   # self-send: only the fee actually leaves
-                else:
-                    # incoming: direct address match, or a send addressed to one of the address's aliases
-                    to = recipient
-                    if to and not to.startswith(ADDRESS_PREFIX):
-                        to = alias_ops.resolve_alias(recipient) or recipient
-                    if to == addr:
-                        fi += amount
-                if fi or fo or ei or eo:
-                    free_in += fi; free_out += fo; exec_in += ei; exec_out += eo
-                    if len(txs) < 50:
-                        txs.append({"txid": tx.get("txid"), "sender": sender, "recipient": recipient,
-                                    "amount": amount, "fee": fee, "op": data.get("op") if data else None,
-                                    "free_in": fi, "free_out": fo, "exec_in": ei, "exec_out": eo})
-            out = {"address": addr, "height": height,
-                   "free_in": free_in, "free_out": free_out, "exec_in": exec_in, "exec_out": exec_out,
-                   "txs": txs}
+            out = _account_mempool_summary(addr)
             return serialize(name="account_mempool", output=out, compress=_q(request, "compress", "none")), 200
         except Exception as e:
             return f"Error: {e}", 403
     out, code = await asyncio.to_thread(_work)
     return _resp(out, status=code)
+
+
+async def device_attest_probe(request):
+    """POST /device_attest_probe {att, cdj, cid}: phase 0 of doc/device-attestation.md — parse a phone's
+    WebAuthn attestation statement, KEEP the sample for the phase-1 kernel's test vectors, and answer with a
+    summary (format, chain shape, AAGUID, whether the chain's root is one of the pinned vendor roots by
+    fingerprint). Not a verdict, not consensus: the chain and signatures are verified by the native kernel
+    in phase 1. Rate-limited 10/min per IP."""
+    if _rate_limited(request, 10):
+        return _RL()
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("body must be an object")
+        att, cdj = str(body.get("att") or ""), str(body.get("cdj") or "")
+        if not att or not cdj or len(att) > 200_000 or len(cdj) > 8_000:
+            raise ValueError("att/cdj missing or too large")
+        from ops import device_attest as _da
+        import protocol as _p
+        summary = await asyncio.to_thread(_da.parse_attestation, att, cdj)
+        # "root_pinned" means: the LAST certificate in x5c is a pinned root. That is only meaningful for chains that
+        # carry their root; a TPM chain (AIK → vendor intermediate) is issued BY the pinned Microsoft root and never
+        # contains it, so the answer is unknown here (None) and only the kernel's chain walk at submit decides.
+        summary["root_pinned"] = (None if summary.get("fmt") in ("tpm", "trezor", "ledger")   # roots are keys / not in x5c
+                                  else summary.get("root_sha256") in _p.DEVICE_ATTEST_ROOT_FINGERPRINTS)
+        summary["format_accepted"] = summary.get("fmt") in _p.DEVICE_ATTEST_FORMATS
+        name = await asyncio.to_thread(_da.store_sample, summary, {"att": att, "cdj": cdj, "cid": str(body.get("cid") or "")}, _ip(request))
+        logger.warning(f"device attest probe: fmt={summary.get('fmt')} aaguid={(summary.get('auth_data') or {}).get('aaguid')} "
+                       f"x5c={summary.get('x5c_count')} root_pinned={summary['root_pinned']} sample={name}")
+        return _resp({"ok": True, "summary": summary})
+    except Exception as e:
+        return _resp({"ok": False, "error": str(e)[:200]}, status=400)
+
+
+async def devbind_lookup(request):
+    """POST /devbind_lookup {att}: what the device behind a statement currently vouches for, BEFORE the wallet submits a
+    hardware registration (doc/device-attestation.md §"Binding modes" — rebinding a Ledger/Trezor to another account
+    is allowed after one lease, and the wallet must say "this device vouches for another account, rebind it here?"
+    before the tap is spent). Answers {key_cls, bound_to, bound_epoch, mode, movable_at_epoch, permanent_class}; no
+    verdict, no consensus. Rate-limited 20/min per IP."""
+    if _rate_limited(request, 20):
+        return _RL()
+    try:
+        body = await request.json()
+        att = str((body or {}).get("att") or "")
+        if not att or len(att) > 200_000:
+            raise ValueError("att missing or too large")
+        import protocol as _p
+        from ops import kv_ops as _kv
+        from ops.device_attest import device_binding_key as _dbk
+        def _work():
+            key = _dbk({"att": att}, _p.DEVICE_BIND_MAX_CERT_SECS, strict=True)
+            cls = key.split(":", 1)[0]
+            row = _kv.devbind_get(key)
+            out = {"ok": True, "key_cls": cls, "permanent_class": cls in _p.DEVICE_BIND_PERMANENT_CLASSES,
+                   "bound_to": None, "bound_epoch": -1, "mode": None, "movable_at_epoch": None}
+            if row:
+                tip = int(memserver.latest_block["block_number"])
+                out.update({"bound_to": row[0], "bound_epoch": int(row[1]), "mode": row[2],
+                            # instant moves (every block from 1; gen 25's DEVICE_REBIND_INSTANT_HEIGHT is deleted):
+                            # movable now, the other identity is evicted in the same block
+                            "movable_at_epoch": tip // _p.EPOCH_LENGTH,
+                            "evicts": True})
+            return out
+        return _resp(await asyncio.to_thread(_work))
+    except Exception as e:
+        return _resp({"ok": False, "error": str(e)[:200]}, status=400)
+
+
+# --- TPM ENROLMENT (doc/tpm-attestation-without-a-ca.md) ------------------------------------------------
+#
+# A chip whose vendor certified it, but whom Microsoft will not issue an AIK certificate, proves itself here
+# instead: we seal a secret to its endorsement key bound to its attestation key's Name, and only a TPM holding
+# both can give it back. 26.8% of this chain's attestation attempts are machines in exactly that position.
+#
+# NOTHING IS SIGNED. The reveal is what makes the result checkable by everyone afterwards - MakeCredential's
+# blob is deterministic in (seed, name, secret), so any node can replay the challenge from public data. There
+# is no CA key here to steal, rotate or guard, which is the entire point of the construction.
+#
+async def tpm_proof_drop(request):
+    """POST {address, id, device, max_block} — the enrolment helper leaves a finished device proof for
+    the wallet that owns `address`.
+
+    THE WALLET HAS TO SIGN THE REGISTRATION ITSELF, because a registration is signed by the identity it
+    registers; the helper cannot do it and should not be able to. So the helper does the half that
+    needs the chip and stops there."""
+    if _rate_limited(request, 10, 60):       # a person enrols one chip; ten a minute is generous and bounds the rest
+        return _RL()
+    try:
+        body = await request.json()
+        addr = str(body.get("address") or "")
+        if not (12 <= len(addr) <= 64 and all(c in "0123456789abcdef" for c in addr)):
+            return _resp({"ok": False, "reason": "malformed address"}, status=400)
+        dev = body.get("device")
+        if not isinstance(dev, dict) or not dev.get("certinfo") or not dev.get("sig"):
+            return _resp({"ok": False, "reason": "no device proof"}, status=400)
+
+        # INTO THE ONE STORE THE WALLET POLLS (node_attest; /node_attest_pickup). This endpoint once had its own private
+        # dict and its own /tpm_proof_pickup, and nothing in the wallet read either (both deleted 2026-10-10) — so the
+        # first proof ever produced on real silicon sat there until its max_block passed, with no button anywhere that
+        # could collect it. The wallet
+        # has polled /node_attest_pickup for "attest from another device" all along, and this is the same
+        # situation by a different road: a machine that holds the hardware cannot sign for the identity it
+        # vouches for, so the finished proof waits for that wallet to collect it. One store, one pickup.
+        try:
+            from ops import node_attest as _na
+            _mb = int(body.get("max_block") or 0)
+            _mirror = _na.drop(addr, _mb, dev, int(memserver.latest_block["block_number"]))
+            # A REFUSED MIRROR IS NOT A SUCCESSFUL DROP. drop() REPORTS failure, it does not raise, so the
+            # except below never saw it and this endpoint answered {"ok": true} while the wallet-facing
+            # store stayed empty — the same silent-success that hid the KeyError, one layer up. Two test
+            # drops were reported as landed and stored nowhere before this line existed.
+            if not _mirror.get("ok"):
+                logger.error(f"tpm_proof_drop: mirror refused for {addr[:12]}: {_mirror.get('reason')}")
+                return _resp({"ok": False, "reason": f"proof not accepted: {_mirror.get('reason')}"},
+                             status=400)
+            # AND FAN IT OUT, because a wallet does not stay on one relay. This called node_attest.drop()
+            # in-process, which stores locally and skips the one-hop forward that /node_attest_drop does
+            # for exactly this reason — so the proof existed on precisely ONE node. A wallet load-balances
+            # across the relay pool and fails over on its own mid-session (observed: get.nadochain.com ->
+            # psychz.nadochain.com), so a proof reachable from one relay is a proof most users cannot
+            # collect. Same one-hop rule as the wallet path: forwarded drops carry hop=1 and are never
+            # forwarded again.
+            asyncio.get_event_loop().create_task(_forward_drop(
+                {"sender": addr, "max_block": _mb, "device": dev, "hop": 1}))
+        except Exception as _e:
+            # NEVER FAIL THE DROP over the mirror — but never swallow it silently either. A bare `pass`
+            # here hid a KeyError in node_attest.drop that left the wallet-facing store empty while this
+            # endpoint reported success, and the only way anyone found out was a person looking for a
+            # button that was never going to appear.
+            logger.error(f"tpm_proof_drop: mirror into node_attest failed: {type(_e).__name__}: {_e}")
+            return _resp({"ok": False, "reason": "proof not stored"}, status=500)
+        return _resp({"ok": True})
+    except Exception as e:
+        return _resp({"ok": False, "reason": str(e)[:200]}, status=400)
+
+
+async def download_enrol(request):
+    """GET /download_enrol?address=<addr>&os=win|linux — the enrolment helper, with the caller's address
+    BAKED INTO THE FILENAME.
+
+    A downloaded binary cannot be told anything at launch: it has no arguments, because a person
+    double-clicks it. But it can read its own filename, and a browser saves the name the server sends.
+    So the wallet — which already knows the address — hands it over through the one channel that
+    survives the round trip, and the user pastes nothing.
+
+    THE ADDRESS IS NOT A SECRET AND NOT A CREDENTIAL. It only tells the helper which identity the chip
+    should vouch for; the registration that follows is still signed by whoever owns that address, which
+    is why naming someone else's address here achieves nothing."""
+    addr = str(request.query.get("address", "")).strip()
+    want = "linux" if str(request.query.get("os", "win")).lower().startswith("lin") else "win"
+    name = "nado-tpm-enrol.exe" if want == "win" else "nado-tpm-enrol-linux"
+    path = os.path.join(_STATIC_DIR, name)
+    if not os.path.isfile(path):
+        return _resp({"error": "the enrolment helper is not published on this node"}, status=404)
+    if addr:
+        if not (12 <= len(addr) <= 64 and all(c in "0123456789abcdef" for c in addr)):
+            return _resp({"error": "malformed address"}, status=400)
+        stem = f"nado-tpm-enrol-{addr}"
+    else:
+        stem = "nado-tpm-enrol"
+    filename = stem + (".exe" if want == "win" else "")
+    return web.FileResponse(path, headers={
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Cache-Control": "no-cache",
+    })
+
+
+# REFUSED ENDORSEMENT CHAINS ARE KEPT, because the chain is the only way to learn which vendor root we are
+# missing. A refusal used to end at a 400: the owner saw "endorsement certificate rejected" and the one
+# artefact that could have fixed it — the chain itself, which the relay was already holding — was dropped on
+# the floor. Pinning a vendor needs the real certificates (the issuer names say who to ask, and the top of
+# the chain is the root to go and verify), so they are written down here and pinned later, deliberately,
+# after the usual checks. A new Intel laptop was refused tonight for a root Intel publishes openly.
+#
+# NOT CONSENSUS, purely operational: a directory of files this node writes for its operator. It grants
+# nothing, and nothing reads it back into validation — pinning a root stays a gated protocol commit.
+_REFUSED_EK_MAX = 200
+
+
+def _keep_refused_ek(chain, verdict):
+    """Write a refused endorsement chain to $HOME/nado/refused_ek/<leaf sha256>/ for later inspection."""
+    try:
+        import hashlib as _h
+        from ops.data_ops import get_home as _home
+        if not chain:
+            return
+        base = os.path.join(_home(), "refused_ek")
+        os.makedirs(base, exist_ok=True)
+        # BOUNDED: anyone can post a chain, so this must not become an unbounded write primitive. Once the
+        # directory is full we stop rather than evict — the EARLIEST refusals are the ones worth keeping,
+        # and a flood must not push them out.
+        try:
+            if len(os.listdir(base)) >= _REFUSED_EK_MAX:
+                return
+        except OSError:
+            return
+        leaf = _h.sha256(chain[0]).hexdigest()
+        d = os.path.join(base, leaf)
+        if os.path.isdir(d):
+            return                                    # same chip again: keep the first copy, write nothing
+        os.makedirs(d, exist_ok=True)
+        for i, der in enumerate(chain):
+            with open(os.path.join(d, f"{i}.der"), "wb") as f:
+                f.write(bytes(der))
+        meta = {"reason": verdict.get("reason"), "root_reached": verdict.get("root_sha256") or "",
+                "chain_len": len(chain), "sha256": [_h.sha256(bytes(c)).hexdigest() for c in chain],
+                "at": int(time.time())}
+        with open(os.path.join(d, "verdict.json"), "w") as f:
+            json.dump(meta, f, indent=1, sort_keys=True)
+        logger.warning(f"kept the refused endorsement chain at {d} — inspect it with "
+                       f"`openssl x509 -inform DER -in {d}/0.der -noout -issuer`")
+    except Exception as e:
+        logger.error(f"could not keep a refused endorsement chain: {type(e).__name__}: {e}")
+
+
+# COMPLETING A CHAIN THE CALLER COULD NOT. A machine hands over what its platform holds, which is often a
+# leaf and little else: the endorsement certificate's issuers live on the vendor's PKI and are reachable
+# only by following the authority-information-access extension of each certificate in turn. A client
+# behind a filtered network, or one that simply does not speak the scheme the vendor chose, then presents
+# an incomplete path and is refused for something that has nothing to do with its hardware.
+#
+# The relay has the network the client may lack, and the URLs are printed inside the certificates, so it
+# finishes the walk and hands the completed chain back. The client puts THAT into its transaction, so
+# consensus still verifies a complete chain entirely offline — this adds no network read to validation,
+# which would be a determinism break (see CLAUDE.md). It also cannot widen what is accepted: the
+# completed chain must still reach a PINNED root, and fetching an unknown root does not pin it.
+_AIA_MAX_FETCH = 12
+_AIA_MAX_BYTES = 64_000
+_AIA_TIMEOUT = 6
+
+
+def _split_der_certs(buf: bytes):
+    """Split concatenated DER certificates. One "certificate" a caller hands over is frequently several.
+
+    THIS IS THE WHOLE OF A BUG THAT LOOKED LIKE MISSING HARDWARE. Intel's ODCA stores the ROM, Kernel and
+    PTT intermediates in the TPM's EK certificate chain NV range CONCATENATED, with nothing between them.
+    Every layer treated the blob as one certificate: the verifier saw a leaf and an object whose subject
+    was the first of the three, decided the second was not the leaf's issuer, and refused a genuine
+    Intel-signed chip whose actual issuer was inside the same blob. Eighteen guesses at vendor URLs went
+    looking for a certificate the machine had already sent us.
+
+    Splitting here rather than only in the client fixes it for callers we will never update. Each
+    certificate is SEQUENCE with a long-form length, so the length says where the next one starts; the
+    walk stops at anything that does not parse rather than guessing."""
+    out, o = [], 0
+    while o + 4 <= len(buf):
+        if buf[o] != 0x30 or not (buf[o + 1] & 0x80):
+            break
+        n = buf[o + 1] & 0x7F
+        if n == 0 or n > 4 or o + 2 + n > len(buf):
+            break
+        ln = int.from_bytes(buf[o + 2:o + 2 + n], "big")
+        end = o + 2 + n + ln
+        if ln == 0 or end > len(buf):
+            break
+        out.append(buf[o:end])
+        o = end
+    return out or [buf]
+
+
+def _tbs_name(der: bytes, which: int) -> bytes:
+    """The raw DER of a certificate's issuer (which=0) or subject (which=1) Name, by walking the
+    structure rather than decoding it. Compared as BYTES so no string normalisation can make two
+    different names look equal."""
+    def hdr(b, o):
+        if o + 1 >= len(b):
+            return None
+        f = b[o + 1]
+        if f < 0x80:
+            return (o + 2, f)
+        n = f & 0x7F
+        if n == 0 or n > 4 or o + 2 + n > len(b):
+            return None
+        return (o + 2 + n, int.from_bytes(b[o + 2:o + 2 + n], "big"))
+    h = hdr(der, 0)
+    if not h:
+        return b""
+    h2 = hdr(der, h[0])
+    if not h2:
+        return b""
+    o, seen = h2[0], 0
+    if o < len(der) and der[o] == 0xA0:                       # optional explicit version
+        v = hdr(der, o)
+        if not v:
+            return b""
+        o = v[0] + v[1]
+    while o < len(der):
+        v = hdr(der, o)
+        if not v:
+            return b""
+        end = v[0] + v[1]
+        if end > len(der):
+            return b""
+        if der[o] == 0x30:
+            seen += 1
+            if (which == 0 and seen == 2) or (which == 1 and seen == 4):
+                return der[o:end]
+        o = end
+    return b""
+
+
+def _order_chain(certs):
+    """Order a bag of certificates into a path: leaf first, then whatever issued the one before it.
+
+    A SET IS NOT A PATH. Splitting a concatenated blob yields the right certificates in whatever order the
+    platform stored them — Intel's NV range holds ROM, then Kernel, then the PTT certificate that actually
+    issued the leaf — so verification still fails on "x5c[0] does not verify against its issuer" unless
+    they are put in order. The leaf is the certificate that issued nothing else in the bag, which needs no
+    name parsing and no assumption about storage order. Anything that cannot be placed is appended rather
+    than dropped: a certificate we cannot position is not evidence of a bad chip."""
+    certs = [bytes(c) for c in certs]
+    if len(certs) < 2:
+        return certs
+    subj = [_tbs_name(c, 1) for c in certs]
+    issu = [_tbs_name(c, 0) for c in certs]
+    leaf = next((i for i in range(len(certs))
+                 if subj[i] and not any(j != i and issu[j] == subj[i] for j in range(len(certs)))), 0)
+    used, out, cur = [False] * len(certs), [], leaf
+    while True:
+        used[cur] = True
+        out.append(certs[cur])
+        if not issu[cur] or issu[cur] == subj[cur]:
+            break
+        nxt = next((j for j in range(len(certs)) if not used[j] and subj[j] and subj[j] == issu[cur]), None)
+        if nxt is None:
+            break
+        cur = nxt
+    out.extend(c for i, c in enumerate(certs) if not used[i])
+    return out
+
+
+def _aia_urls(der: bytes):
+    """Every http/https URL a certificate points at, read by the DER length rather than by scanning to a
+    delimiter — the bytes after a URL are frequently printable, and a scan appends them and 404s."""
+    out, i = [], 0
+    for scheme in (b"https://", b"http://"):
+        i = 0
+        while True:
+            j = der.find(scheme, i)
+            if j < 0:
+                break
+            i = j + 1
+            url = None
+            if j >= 2 and der[j - 2] == 0x86:                      # GeneralName uniformResourceIdentifier
+                ln = der[j - 1]
+                if len(scheme) <= ln <= len(der) - j:
+                    try:
+                        url = der[j:j + ln].decode("ascii")
+                    except Exception:
+                        url = None
+            if url is None:
+                k = j
+                while k < len(der) and 0x21 <= der[k] <= 0x7E and der[k] not in b',()<>"':
+                    k += 1
+                try:
+                    url = der[j:k].decode("ascii").rstrip(".,;")
+                except Exception:
+                    url = None
+            if url and url not in out:
+                out.append(url)
+    return out
+
+
+def _fetch_der(url: str):
+    """One certificate over plain HTTP. TLS buys nothing here: the object is verified by signature to a
+    pinned root, so a substituted response fails exactly as a corrupt one does, and the certificate is
+    public by construction. Refuses anything that is not a plausible DER certificate."""
+    try:
+        if url.startswith("https://"):
+            url = "http://" + url[len("https://"):]
+        if not url.startswith("http://"):
+            return None
+        # A CRL IS ALSO A DER SEQUENCE. Certificates and revocation lists sit in the same extension and
+        # begin with the same two bytes, so "looks like DER" accepts a CRL and splices it into the chain
+        # as though it were the issuer — which then fails to verify and hides the fact that the real
+        # issuer was fetched successfully alongside it. Skip the obvious ones by path, and confirm what
+        # comes back actually parses as a certificate before using it.
+        low = url.lower()
+        if low.endswith(".crl") or "/crls/" in low:
+            return None
+        # SSRF GUARD: this URL comes from a caller-supplied certificate, so it must never be a way to make
+        # this node probe its own network. Only public hosts, and only what parses as a certificate.
+        # CHECKED ON EVERY HOP, AT CONNECT TIME (bandit B310 triage, 2026-09-30). The guard used to resolve the
+        # host once here and then call urlopen, which (a) FOLLOWED REDIRECTS unchecked — a public AIA host
+        # answering `302 http://127.0.0.1:9173/terminate` made this node GET its own loopback-authorized
+        # /terminate, because a loopback socket with a loopback Host header is what _is_local_request trusts —
+        # and (b) resolved the name a second time to connect (DNS rebinding). public_only_opener() dials only the
+        # address it checked, on the first hop and on every redirect. Never go back to a pre-flight check
+        # followed by a bare urlopen here (tests/test_outbound_never_follows_redirect_to_loopback.py).
+        from ops.outbound_guard import public_only_opener
+        with public_only_opener().open(url, timeout=_AIA_TIMEOUT) as r:
+            b = r.read(_AIA_MAX_BYTES + 1)
+        if 256 < len(b) <= _AIA_MAX_BYTES and b[0] == 0x30 and b[1] == 0x82 and _tbs_name(b, 1):
+            return b
+    except Exception:
+        return None
+    return None
+
+
+def _complete_ek_chain(chain):
+    """`chain` plus every issuer reachable from it. Breadth-first over everything already fetched, because
+    a certificate may publish several locations and the one that closes to a pinned root may not be the
+    first that answers. Bounded in both directions: a certificate that points at itself walks forever."""
+    out = [bytes(c) for c in chain]
+    seen = {bytes(c) for c in out}
+    frontier, fetched = list(out), 0
+    for _depth in range(6):
+        nxt = []
+        for cert in frontier:
+            for url in _aia_urls(cert):
+                if fetched >= _AIA_MAX_FETCH:
+                    break
+                fetched += 1
+                der = _fetch_der(url)
+                if der and der not in seen:
+                    seen.add(der)
+                    out.append(der)
+                    nxt.append(der)
+        if not nxt or fetched >= _AIA_MAX_FETCH:
+            break
+        frontier = nxt
+    return out, fetched
+
+
+async def tpm_enrol_id(request):
+    """POST {"ek": [<hex DER>...], "pub": <hex>} -> {"id": <32 hex>}.
+
+    The enrolment id is DERIVED from public content, so the client could compute it itself — it asks
+    instead so there is ONE implementation of that derivation rather than two that must be kept in
+    step. This verifies nothing and grants nothing: it is a hash of values the caller already holds.
+    """
+    from ops import tpm_enrol as _te
+    from protocol import CHAIN_ID as _cid
+    from ops import attest_native as _an
+    try:
+        body = await request.json()
+        # SPLIT EVERY ELEMENT: a caller may hand over one "certificate" that is several concatenated.
+        chain = []
+        for x in (body.get("ek") or []):
+            chain.extend(_split_der_certs(bytes.fromhex(x)))
+        # DROP WHAT IS NOT A CERTIFICATE. A caller hands over what its platform gave it, and platforms
+        # store revocation lists beside certificates — both are DER SEQUENCEs, so one arriving in the
+        # bag would otherwise reach the parser and fail the whole chain for a machine that supplied
+        # everything correctly. Judged by structure (a certificate has a subject Name where a CRL does
+        # not), never by where it came from.
+        chain = [c for c in chain if _tbs_name(c, 1)]
+        # DEDUPLICATE. A store can hand back the same certificate twice, and a duplicate is not harmless:
+        # the path walk can step into the copy instead of the issuer, and the leaf test ("issued nothing
+        # else here") is confused by a second copy of the leaf. Order-preserving so the result stays a
+        # pure function of the input.
+        _seen, _uniq = set(), []
+        for c in chain:
+            if c not in _seen:
+                _seen.add(c)
+                _uniq.append(c)
+        chain = _order_chain(_uniq)
+        pub = bytes.fromhex(str(body.get("pub") or ""))
+        if not chain or not pub:
+            return _resp({"error": "need ek chain and pub"}, status=400)
+        now = int((memserver.latest_block or {}).get("block_timestamp") or time.time())
+        ek = _an.verify_ek(chain, now)
+        if not ek.get("ok"):
+            # BEFORE REFUSING, FINISH THE WALK THE CLIENT COULD NOT. The URLs are inside the certificates
+            # the caller already sent; an Intel laptop was refused for nothing but a missing intermediate
+            # its own platform does not store and its client could not fetch.
+            completed, n = await asyncio.to_thread(_complete_ek_chain, chain)
+            completed = _order_chain(completed)
+            if n and len(completed) > len(chain):
+                ek2 = _an.verify_ek(completed, now)
+                if ek2.get("ok"):
+                    logger.info("completed a partial endorsement chain from %d to %d certificate(s) "
+                                "by following AIA" % (len(chain), len(completed)))
+                    chain, ek = completed, ek2
+        if not ek.get("ok"):
+            # LOG THE REFUSAL WITH ENOUGH TO DIAGNOSE IT WITHOUT THE OWNER'S CONSOLE. This returned a 400
+            # and recorded nothing, so the only trace of a refused machine was a line on a screen in
+            # someone else's house — "relay returned 400", with the reason in a part of the message that
+            # did not get quoted. The root REACHED is the diagnostic that matters: a chip whose chain
+            # completes to an unpinned vendor is a pinning decision, while one that fails to complete is
+            # a broken or truncated AIA walk, and those need opposite fixes.
+            logger.warning(
+                "tpm_enrol_id refused an endorsement chain: reason=%s root_reached=%s chain_len=%d "
+                "leaf_bytes=%d" % (ek.get("reason"), ek.get("root_sha256") or "(none)", len(chain),
+                                   len(chain[0]) if chain else 0))
+            _keep_refused_ek(chain, ek)
+            return _resp({"error": f"endorsement certificate rejected: {ek.get('reason')}",
+                          "root_reached": ek.get("root_sha256") or ""}, status=400)
+        identity = ek.get("identity") or ek.get("ek_identity")
+        if not identity:
+            return _resp({"error": "the kernel accepted the chain but reported no endorsement identity",
+                          "verdict_fields": sorted(ek)}, status=500)
+        # HAND BACK THE CHAIN WE VERIFIED, not just the id. If we completed it above, the caller's own
+        # copy is still short and the enrolment transaction it builds from that copy would be refused by
+        # consensus for exactly the reason we just fixed. Returning the verified chain lets the client put
+        # the complete one on chain, which keeps validation a purely offline check of a self-contained
+        # proof. A client that already had a complete chain gets back what it sent.
+        return _resp({"id": _te.enrol_id(_cid, str(identity), _te.aik_name_hex(pub)),
+                      "ek": identity, "manufacturer": ek.get("manufacturer"),
+                      "chain": [bytes(c).hex() for c in chain]})
+    except KeyError as e:
+        # A BARE KeyError REPR IS A FOUR-CHARACTER ERROR MESSAGE. str(KeyError('identity')) is
+        # "'identity'", which tells a caller nothing about which payload was missing it, and cost a
+        # round trip with a remote tester to identify. Name the field and say where it was expected.
+        return _resp({"error": f"missing field {e} in the request payload"}, status=400)
+    except Exception as e:
+        return _resp({"error": f"{type(e).__name__}: {str(e)[:200]}"}, status=400)
+
+
+async def register_challenge(request):
+    """POST {"sender": <address>, "max_block": <int>} -> {"challenge": <64 hex>, "anchor": <hash>}.
+
+    The 32 bytes a device must attest over. Derived from the chain, the sender, the anchor block and
+    the landing height, so an attestation can never be replayed for another identity or another lease.
+    Served so a client does not have to reproduce the chain's hash of those four things; the value is
+    public and computing it grants nothing, since producing an attestation OVER it still needs the chip.
+    """
+    from ops.transaction_ops import register_device_challenge
+    from ops.block_ops import get_block_hash_by_number
+    from protocol import POSW_ANCHOR_OFFSET as _off
+    try:
+        body = await request.json()
+        sender = str(body.get("sender") or "")
+        max_block = int(body.get("max_block") or 0)
+        if not sender or max_block <= 0:
+            return _resp({"error": "need sender and max_block"}, status=400)
+        anchor = get_block_hash_by_number(max(0, max_block - _off))
+        if not anchor:
+            return _resp({"error": "anchor block unavailable on this node"}, status=503)
+        return _resp({"challenge": register_device_challenge(sender, anchor, max_block).hex(),
+                      "anchor": anchor})
+    except Exception as e:
+        return _resp({"error": str(e)[:200]}, status=400)
+
+
+async def tpm_enrolment(request):
+    """GET /tpm_enrolment?id=<32 hex> — the on-chain enrolment record, or {"found": false}.
+
+    The client half of doc/tpm-attestation-without-a-ca.md needs exactly this: a machine that published
+    an enrolment has to see when its drawn challengers have answered (so it can activate them in its
+    chip) and when the reveals have landed (so it can register). It derives the id itself from its own
+    chip, so nothing here is a lookup by identity — a caller can only read a record it can already name.
+
+    PUBLIC AND READ-ONLY. Every field is consensus state that any node can serve; the secrets in it were
+    published by their own challengers, and the whole point of the construction is that a verifier
+    re-derives the proof from public values."""
+    from ops import kv_ops as _kv
+    from ops.transaction_ops import tpm_challengers_view
+    eid = str(request.query.get("id", ""))
+    if len(eid) != 32 or any(c not in "0123456789abcdef" for c in eid):
+        return _resp({"found": False, "error": "malformed enrolment id"}, status=400)
+    rec = _kv.tpm_enrol_get(eid)
+    if not rec:
+        return _resp({"found": False})
+    # WHETHER THIS RECORD IS STILL USABLE, computed here so a client does not have to know the window or
+    # carry a second copy of the rule. An expired, unproven record is dead weight: its challenger set was
+    # drawn under whatever rule applied then, and a client that keeps waiting on it waits forever. The
+    # client re-publishes instead, which supersedes it with a fresh draw.
+    from ops.tpm_enrol import enrol_window as _win
+    tip = int((memserver.latest_block or {}).get("block_number") or 0)
+    expires_at = int(rec.get("h") or 0) + _win(int(rec.get("h") or 0))
+    expired = rec.get("state") != "proven" and tip >= expires_at
+    out = {"found": True, "id": eid, "expires_at": expires_at, "expired": expired, "tip": tip, **rec}
+    # A DELAYED DRAW (ops/tpm_enrol "COMMIT, THEN DRAW") is stored with no challengers until its first challenge;
+    # the view serves the set the chain will enforce, or k placeholders before its draw epoch — never an empty list,
+    # which the shipped helper would read as "every challenger answered" (transaction_ops.tpm_challengers_view).
+    out.update(tpm_challengers_view(rec, tip))
+    # TPM POOL v2 (protocol.py "TPM CHALLENGER POOL v2"): a v2 record already serves its stored "pool" / "k" / "missed" through
+    # **rec; "k" and "v2" are stated for EVERY record so a client reads how many challengers to wait for instead of
+    # assuming 3 (a legacy record answers k = 3, v2 = false).
+    from ops.tpm_enrol import is_v2 as _is_v2, record_k as _record_k
+    out["k"], out["v2"] = _record_k(rec), _is_v2(rec)
+    # RETRY SPACING (ops/tpm_enrol.retry_ready_at): the first block this chip may open a new enrolment at, computed by
+    # the function validation enforces (tpm_enrol.retry_ready_at over the chip's stored count), so the helper can name
+    # the exact block instead of a lower bound. "client_failed" says whether the spacing applies to this record.
+    from ops.transaction_ops import tpm_retry_view
+    out.update(tpm_retry_view(rec, tip))
+    return _resp(out)
+
+
+_tpm_duty_cache = {"tip": None, "index": {}}
+
+
+async def tpm_duty(request):
+    """GET /tpm_duty?address=<addr> -> {"tip": n, "duties": [{"id", "action", "ekpub", "name", "min_block",
+    "max_block"}, ...]} — every live TPM enrolment where `address` is a DRAWN challenger that still owes a message:
+    "challenge" while the record is open and the address has published none, "reveal" while it is in commit and the
+    address has a challenge on chain and no reveal.
+
+    WHY A WALLET NEEDS THIS. The v2 challenger pool is online stake (protocol.py "TPM CHALLENGER POOL v2"), and a wallet that
+    bonds and lands its duties holds that stake — so a wallet can be drawn, and a drawn party that does not answer is
+    excluded from the pool for a day. A node finds its duties in its own loop (core_loop.maybe_tpm_challenge); a wallet
+    asks here. min_block / max_block are the node loop's own (transaction_ops.tpm_duty_bounds) and a duty whose window
+    cannot fit is omitted. The wallet keeps its own secret and seed; nothing here is a secret.
+
+    PUBLIC, READ-ONLY, CHEAP: one index of every drawn address is built per tip and served from memory until the tip
+    moves (transaction_ops.tpm_pending_duties)."""
+    if _rate_limited(request, 120):
+        return _RL()
+    address = str(request.query.get("address", ""))
+    if not (0 < len(address) <= 128 and address.isalnum()):
+        return _resp({"error": "malformed address"}, status=400)
+    tip = int((memserver.latest_block or {}).get("block_number") or 0)
+    if _tpm_duty_cache["tip"] != tip:
+        from ops import kv_ops as _kv
+        from ops.transaction_ops import tpm_pending_duties
+        try:
+            index = tpm_pending_duties(tip, _kv.tpm_enrols_live(limit=256, tip=tip))
+        except Exception as e:
+            return _resp({"error": f"duties unavailable: {str(e)[:160]}"}, status=503)
+        _tpm_duty_cache.update(tip=tip, index=index)
+    return _resp({"tip": tip, "duties": list(_tpm_duty_cache["index"].get(address, []))})
+
+
+async def node_attest_drop(request):
+    """POST /node_attest_drop {sender, max_block, device:{att,cdj,rp}, hop?}: a wallet drops a device attestation
+    for a NODE's address (ops/node_attest — the phone cannot reach a TLS-less node, so the statement travels
+    through any relay). Kept in memory until max_block passes; forwarded ONE hop to this relay's peers so the
+    node finds it wherever it polls. Shape-checked only — the kernel verdict happens in the node's own merge.
+    Rate-limited 10/min per IP like the probe — except linked peers, whose one-hop forwards carry every wallet's drop."""
+    if _ip(request) not in memserver.peers and _rate_limited(request, 10):
+        return _RL()
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("body must be an object")
+        from ops import node_attest as _na
+        tip = int(memserver.latest_block["block_number"])
+        out = _na.drop(str(body.get("sender") or ""), body.get("max_block"), body.get("device"), tip)
+        if not out.get("ok"):
+            return _resp(out, status=400)
+        if not body.get("hop"):                       # one hop only: a forwarded drop is never forwarded again
+            fwd = {"sender": body["sender"], "max_block": int(body["max_block"]), "device": body["device"], "hop": 1}
+            asyncio.get_event_loop().create_task(_forward_drop(fwd))
+        out["drops"] = _na.count()
+        return _resp(out)
+    except Exception as e:
+        return _resp({"ok": False, "reason": str(e)[:200]}, status=400)
+
+
+async def _forward_drop(fwd: dict):
+    """Best-effort one-hop fan-out of a node attestation drop to every linked peer (aiohttp, 4 s each)."""
+    try:
+        import aiohttp
+        from config import hostport
+        body = json.dumps(fwd)
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=4)) as s:
+            for peer in list(memserver.peers)[:32]:
+                try:
+                    # allow_redirects=False: a peer's 302 to 127.0.0.1 would be a loopback-authorized GET here (ops/outbound_guard.py)
+                    await s.post(f"http://{hostport(peer, memserver.port)}/node_attest_drop", data=body,
+                                 headers={"Content-Type": "application/json"}, allow_redirects=False)
+                except Exception:
+                    continue
+    except Exception as e:
+        logger.debug(f"node attest forward: {e}")
+
+
+async def node_attest_pickup(request):
+    """GET /node_attest_pickup?sender=: the drop held for `sender`, {"drop": {...}} or {"drop": null}. Any node may
+    ask for any sender — the blob is useless without the sender's signing key. Rate 60/min."""
+    if _rate_limited(request, 60):
+        return _RL()
+    from ops import node_attest as _na
+    # ACCEPT `address=` AS WELL AS `sender=`. Every other endpoint on this node takes address=
+    # (/get_account, /download_enrol), and this one silently returned an empty list
+    # for it rather than complaining — which cost a debugging cycle on the night the first real proof
+    # was produced. An empty result that means "wrong parameter name" is indistinguishable from one that
+    # means "nothing waiting", so accept both spellings instead of making callers guess.
+    sender = _q(request, "sender", "") or _q(request, "address", "")
+    try:
+        tip = int(memserver.latest_block["block_number"])
+    except Exception:
+        tip = 0
+    drops = _na.pickup_all(str(sender), tip) if sender else []
+    return _resp({"drop": (drops[-1] if drops else None), "drops": drops, "tip": tip})
+
+
+async def node_attest_status(request):
+    """GET /node_attest_status: THIS node's open-lane lease state and what an operator's tap would do —
+    {address, registered, fidelity, last_recert_epoch, epoch, renewable, wants, drop_waiting}. The wallet's
+    "Attest a node" card reads it to say "needs a tap" / "renews in N epochs" / "attested"."""
+    if _rate_limited(request, 60):
+        return _RL()
+    from ops import node_attest as _na
+    try:
+        tip = int(memserver.latest_block["block_number"])
+    except Exception:
+        tip = 0
+    st = await asyncio.to_thread(_na.lease_state, memserver.address, tip)
+    st["drop_waiting"] = _na.pickup(memserver.address, tip) is not None
+    st["last_attempt"] = _na.last_attempt()     # what this node last did with a statement, and why it failed if it did
+    st["tip"] = tip
+    return _resp(st)
+
+
+async def wallet_view(request):
+    """GET /wallet_view?address=&since=: everything the wallet polls per tick, in ONE round trip —
+    {"latest": <get_latest_block>, "account": <get_account or null>, "mining_status": <mining_status>,
+     "unbond": <get_unbond>, "mempool": <get_account_mempool>, "tags": <tags?since=>}.
+
+    WHY (2026-09-06): ~100 open wallets each made six relay calls per 8 s tick (get_latest_block,
+    get_account twice, mining_status, get_unbond, get_account_mempool) — ~110 req/s, and the per-request
+    aiohttp + thread-hop overhead was the single largest slice of relay CPU once the real hot spots were
+    gone. The reads themselves are cheap and all in-process; the round trips were the cost. The wallet
+    falls back to the individual endpoints on a relay without this route (404), so nothing here is
+    load-bearing for correctness. Same rate limit as mining_status."""
+    if _rate_limited(request, 120):
+        return _RL()
+    address = _q(request, "address", memserver.address)
+    try:
+        since = int(_q(request, "since", "0") or 0)
+    except Exception:
+        since = 0
+    def _work():
+        from ops import kv_ops as _kv
+        from ops.block_ops import mining_status as _ms
+        lb = memserver.latest_block if isinstance(memserver.latest_block, dict) else {}
+        tip = int(lb.get("block_number") or 0)
+        out = {"latest": lb, "height": tip}
+        try:
+            acc = get_account(address, create_on_error=False)
+            if acc:
+                # the bundle is what the wallet actually polls: it must carry EXACTLY what /get_account carries,
+                # or a field only that endpoint adds is invisible for as long as the bundle stays fresh
+                _enrich_account(address, acc)
+            out["account"] = acc or None
+        except Exception as e:
+            out["account"] = None; out["account_error"] = str(e)[:120]
+        try:
+            out["mining_status"] = _ms(address, tip, memserver.block_time)
+        except Exception as e:
+            out["mining_status"] = None; out["mining_status_error"] = str(e)[:120]
+        try:
+            pending = _kv.unbond_get(address)
+            if pending:
+                rb = int(pending.get("release_block", 0))
+                out["unbond"] = {"address": address, "pending": {"amount": int(pending.get("amount", 0)),
+                                 "release_block": rb}, "matured": tip >= rb,
+                                 "blocks_left": max(0, rb - tip), "height": tip}
+            else:
+                out["unbond"] = {"address": address, "pending": None, "matured": False, "height": tip}
+        except Exception as e:
+            out["unbond"] = None; out["unbond_error"] = str(e)[:120]
+        try:
+            out["mempool"] = _account_mempool_summary(address)
+        except Exception as e:
+            out["mempool"] = None; out["mempool_error"] = str(e)[:120]
+        try:
+            mp = memserver.message_pool
+            out["tags"] = {"tags": mp.list_tags(since_seq=since), "cursor": mp.cursor()}
+        except Exception as e:
+            out["tags"] = None; out["tags_error"] = str(e)[:120]
+        return serialize(name="wallet_view", output=out, compress=_q(request, "compress", "none"))
+    return _resp(await asyncio.to_thread(_work))
 
 
 async def announce_peer(request):
@@ -885,51 +2119,58 @@ async def snapshot_chunk(request):
                         headers={"Access-Control-Allow-Origin": "*"})
 
 
-_richest_cache = {"height": -1, "value": 0, "address": None}
-# STAMPEDE LOCKS. All three caches below are keyed on the block height, which moves every ~6 s, so at
+# STAMPEDE LOCKS. Both caches below are keyed on the block height, which moves every ~6 s, so at
 # every block boundary every concurrent request missed at once and each ran its OWN full iter_accounts()
 # scan. The to_thread pool is min(32, cpu+4) wide, so 32 simultaneous /wealth_stats at a boundary meant
 # 32 full scans of GIL-held Python (~90 ms each at 11k accounts = ~2.9 s, half a block slot) from one
 # unauthenticated client. Holding the lock across the scan means exactly one runs and the rest return
 # its result. Paired with a rate limit on each endpoint below — these are page-load reads, not polls.
-_scan_locks = {k: _threading.Lock() for k in ("richest", "wealth", "rich_list")}
-
-
-async def get_richest(request):
-    """GET /get_richest: the single largest account by balance+bonded (wallet "coin pile" visual).
-    O(accounts) scan, but cached per block height so it costs at most one scan per block."""
-    if _rate_limited(request, 30):
-        return _RL()
-    # The largest account by total holdings (balance + bonded) — powers the wallet's relative "coin
-    # pile" visual. O(accounts) scan, cached per block height so it runs at most once per block.
-    def _work():
-        """Cached-per-height O(accounts) max scan (worker thread)."""
-        from ops import kv_ops
-        try:
-            h = memserver.latest_block["block_number"]
-        except Exception:
-            h = 0
-        if _richest_cache["height"] == h and _richest_cache["address"] is not None:
-            return {"richest": _richest_cache["value"], "address": _richest_cache["address"], "block_number": h}
-        with _scan_locks["richest"]:                       # one scan per height, not one per requester
-            if _richest_cache["height"] == h and _richest_cache["address"] is not None:
-                return {"richest": _richest_cache["value"], "address": _richest_cache["address"],
-                        "block_number": h}
-            return _richest_scan(h)
-
-    def _richest_scan(h):
-        from ops import kv_ops
-        best_v, best_a = 0, None
-        for addr, acc in kv_ops.iter_accounts():
-            tot = int(acc.get("balance", 0)) + int(acc.get("bonded", 0))
-            if tot > best_v:
-                best_v, best_a = tot, addr
-        _richest_cache.update(height=h, value=best_v, address=best_a)
-        return {"richest": best_v, "address": best_a, "block_number": h}
-    return _resp(await asyncio.to_thread(_work))
+_scan_locks = {k: _threading.Lock() for k in ("wealth", "rich_list")}
 
 
 _wealth_cache = {"height": -1, "data": None}
+_wealth_body = {"height": -1, "body": None}      # encoded JSON of _wealth_cache["data"], same height key
+
+
+WEALTH_RANKS_MAX = 4096       # /wealth_stats `ranks` entries: complete below (~57 KB at the cap), sampled above
+
+
+import threading as _threading                 # nado.py has no module-level threading import; scoped here
+
+_device_stats_cache = {"height": -1, "data": None}
+_device_stats_lock = _threading.Lock()
+
+
+async def device_stats(request):
+    """GET /device_stats: what the network's collectors run on — device bindings by class, with how many
+    are LIVE (still vouching for a present collector) and how many the chain has ever recorded.
+
+    "/stats should display types of mining devices and their representation" (operator 2026-09-13). The
+    account rows cannot answer this — the account->device reverse index is stamped only for permanent
+    classes — so it is read from the devbind table itself, whose keys carry the class consensus binds on.
+    One cursor walk plus the open registry, in a worker thread, cached per height and single-flighted so a
+    burst of Stats tabs costs one scan. Rate-limited like the other stats reads."""
+    if _rate_limited(request, 30):
+        return _RL()
+
+    def _work():
+        from ops import kv_ops
+        from ops.account_ops import get_open_registry
+        from ops.mining_ops import epoch_of
+        from ops.node_attest import device_histogram
+        h = int(memserver.latest_block["block_number"])
+        if _device_stats_cache["height"] == h and _device_stats_cache["data"] is not None:
+            return _device_stats_cache["data"]
+        with _device_stats_lock:
+            if _device_stats_cache["height"] == h and _device_stats_cache["data"] is not None:
+                return _device_stats_cache["data"]
+            epoch = epoch_of(h + 1)
+            present = set(get_open_registry(epoch))
+            data = device_histogram(kv_ops.devbind_rows(), epoch, present)
+            data.update({"height": h, "epoch": epoch, "present_total": len(present)})
+            _device_stats_cache.update(height=h, data=data)
+            return data
+    return _resp(await asyncio.to_thread(_work))
 
 
 async def get_wealth_stats(request):
@@ -966,7 +2207,7 @@ async def get_wealth_stats(request):
     def _wealth_scan(h, heapq, math, kv_ops, DENOMINATION):
         n, s, s2, richest = 0, 0.0, 0.0, 0
         buckets = [0] * 10
-        top, gsum = [], 0
+        top, gsum, alltot = [], 0, []
         for _addr, acc in kv_ops.iter_accounts():
             tot = int(acc.get("balance", 0)) + int(acc.get("bonded", 0))
             if tot > richest:
@@ -975,6 +2216,7 @@ async def get_wealth_stats(request):
                 lt = math.log(tot)
                 n += 1; s += lt; s2 += lt * lt
                 gsum += tot
+                alltot.append(tot)
                 nado = tot / DENOMINATION
                 buckets[0 if nado < 0.01 else min(9, int(math.floor(math.log10(nado))) + 3)] += 1
                 heapq.heappush(top, tot)
@@ -983,17 +2225,43 @@ async def get_wealth_stats(request):
         mean = (s / n) if n else 0.0
         std = math.sqrt(max(0.0, s2 / n - mean * mean)) if n else 0.0
         tops = sorted(top, reverse=True)
+        # EXACT RANKING (2026-09-02): the log-normal fit is a poor model of this chain — 676 of 906 wallets
+        # sit in one tiny bucket, so anything above ~20 NADO scored "richer than 99%" and every active
+        # wallet read the same caption. `ranks` is the DESCENDING list of non-zero totals (raw, as strings),
+        # complete when count <= WEALTH_RANKS_MAX, else sampled at WEALTH_RANKS_MAX evenly spaced ranks
+        # (first and last always present) — the wallet binary-searches its own total for an exact rank
+        # or a 1/WEALTH_RANKS_MAX-resolution percentile. ~14 bytes per entry; bounded.
+        alltot.sort(reverse=True)
+        if len(alltot) > WEALTH_RANKS_MAX:
+            step = (len(alltot) - 1) / (WEALTH_RANKS_MAX - 1)
+            ranks = [alltot[round(i * step)] for i in range(WEALTH_RANKS_MAX)]
+        else:
+            ranks = alltot
         data = {"count": n, "richest": richest, "log_mean": mean, "log_std": std, "block_number": h,
                 "buckets": buckets, "sum_total": str(gsum),
-                "top10": str(sum(tops[:10])), "top100": str(sum(tops))}
+                "top10": str(sum(tops[:10])), "top100": str(sum(tops)),
+                "ranks": [str(t) for t in ranks]}
         _wealth_cache.update(height=h, data=data)
         return data
-    return _resp(await asyncio.to_thread(_work))
+    data = await asyncio.to_thread(_work)
+    # PRE-ENCODED BODY per height (2026-09-06): the ranks payload is ~57 KB and was JSON-encoded on the
+    # event loop for every one of ~4.5 req/s (7.6 % of event-loop CPU); encode once per height.
+    h = data.get("block_number") if isinstance(data, dict) else None
+    body = _wealth_body.get("body") if h is not None and _wealth_body.get("height") == h else None
+    if body is None:
+        body = json.dumps(data, separators=(",", ":")).encode("utf-8")
+        if h is not None:
+            _wealth_body.update(height=h, body=body)
+    return web.Response(body=body, content_type="application/json", headers={"Access-Control-Allow-Origin": "*"})
 
 
 # ------------------------------------------------ peer geolocation (interface stats world map) ----
 GEO_API = "http://ip-api.com/batch"   # free tier: http-only, 100 IPs/batch — fine: server-side + TTL-cached
 GEO_TTL = 6 * 3600                    # re-geolocate peers at most every 6 hours (IPs rarely move)
+GEO_MIN_REFRESH = 300                 # ...but a CONNECTED peer the cache has never located earns a refresh
+                                      # after 5 min: the cache file sits under index/ (wiped by every purge)
+                                      # and a node that geolocated with 0 peers (crash loop / just booted)
+                                      # otherwise served an EMPTY map for the whole 6 h TTL (2026-09-02)
 _geo_state = {"cache": None, "computing": False}
 
 
@@ -1034,7 +2302,7 @@ def _geo_fetch(ips):
         try:
             req = urllib.request.Request(GEO_API, data=body, method="POST",
                                          headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=15) as r:
+            with urllib.request.urlopen(req, timeout=15) as r:  # nosec B310 # constant http URL; redirects guarded process-wide (ops/outbound_guard.py)
                 arr = _json.loads(r.read().decode("utf-8"))
             for rec in arr:
                 if rec.get("status") == "success" and rec.get("query"):
@@ -1095,12 +2363,14 @@ async def geo_peers(request):
                 _geo_state["cache"] = cache
             except Exception:
                 cache = None
-        if cache is None or int(_time.time()) - int(cache.get("ts", 0)) >= GEO_TTL:
-            _geo_compute()      # refresh in the background; serve stale meanwhile if we have it
-        if cache is None:
-            return {"status": "computing", "points": [], "countries": []}
-        geo = cache.get("geo", {}) or {}
         status_map = _geo_peer_status()
+        geo = (cache.get("geo", {}) or {}) if cache else {}
+        age = int(_time.time()) - int(cache.get("ts", 0)) if cache else GEO_TTL
+        unlocated = [ip for ip, st in status_map.items() if st == "connected" and ip not in geo]
+        if cache is None or age >= GEO_TTL or (unlocated and age >= GEO_MIN_REFRESH):
+            _geo_compute()      # refresh in the background; serve stale meanwhile if we have it
+        if cache is None or (not geo and _geo_state["computing"]):
+            return {"status": "computing", "points": [], "countries": []}
         points, by_country = [], {}
         counts = {"connected": 0, "known": 0, "unreachable": 0}
         for ip, g in geo.items():
@@ -1128,6 +2398,18 @@ async def get_treasury_status(request):
     # schedule, and every proposal with its LIVE tally (approving activated-stake vs the 2/3 quorum bar) + status.
     if _rate_limited(request, 60):
         return _RL()
+    # `?address=` adds a per-proposal `voted` flag for that address. The tally already loads each proposal's
+    # voter set to sum its shares, so this costs nothing extra — it was simply never returned, and without it
+    # a client cannot tell "nobody voted" from "I already voted". A wallet that votes on a schedule needs
+    # GROUND TRUTH for that, not local bookkeeping: localStorage is per-browser, so a second device (or a
+    # cleared cache) would re-submit a fee-bearing vote on every refresh. Voter sets are on-chain and this
+    # endpoint is public, so exposing membership leaks nothing.
+    #
+    # `voted` means "has cast a vote", YES OR NO — a 'no' stores weight 0 but stays in the voter set. That is
+    # deliberately the right question for an auto-voter: it must never flip a vote the user deliberately cast
+    # against a spend. It is NOT "approves".
+    _who = (request.query.get("address") or "").strip().lower()
+
     def _work():
         """Tally every live proposal against the activated bonded registry (worker thread)."""
         from ops import kv_ops
@@ -1153,13 +2435,29 @@ async def get_treasury_status(request):
             if not executed and h > expiry:
                 continue                                    # expired + never executed -> dead; skip (scales the list)
             voters = kv_ops.treasury_voters(pid)
-            approving = sum(selection_shares(reg[v]["bonded"]) for v in voters if v in reg and _vote_activated(reg[v], epoch))
+            # TALLY EXACTLY AS CONSENSUS DOES (settlement_ops.treasury_justified): sum the weight SNAPSHOTTED
+            # when each vote was cast, for voters still in the bonded registry.
+            #
+            # This used to recompute selection_shares from LIVE bonded stake, which diverged from consensus in
+            # two ways at once. A 'no'/withdrawn vote stores weight 0 but STAYS in the voter set (see
+            # account_ops: `eff = w if choice == "yes" else 0`), so opposing a proposal still showed up as
+            # approving it — the bar could read "passed" for a spend everyone had voted down. And topping up
+            # bonded stake after voting inflated the displayed approval, which treasury_justified deliberately
+            # prevents by snapshotting. The Quorum tab is what people read before voting, and it was showing a
+            # different election from the one being run.
+            #
+            # VERIFIED ON CHAIN (betanet-16, proposal c0078b53, 1 NADO -> faucet): with one activated voter
+            # holding 100 shares, casting 'no' moved approving_shares 100 -> 0 while `voters` stayed at 2.
+            # The old expression returns 100 for that same state, because the voter is still in the set and
+            # still activated — it never looked at the choice at all.
+            approving = sum(kv_ops.treasury_vote_weight(pid, v) for v in voters if v in reg)
             status = "executed" if executed else ("passed" if treasury_justified(pid, reg, epoch) else "open")
             amt = int(spend.get("amount", 0))
             props.append({"pid": pid, "recipient": spend.get("recipient"), "amount": amt,
                           "memo": spend.get("memo", ""), "nonce": spend.get("nonce"), "expiry": expiry,
                           "expires_in": max(0, expiry - h), "approving_shares": approving, "voters": len(voters),
-                          "status": status, "within_cap": amt <= max_spend})
+                          "status": status, "within_cap": amt <= max_spend,
+                          **({"voted": any(v.lower() == _who for v in voters)} if _who else {})})
         props.sort(key=lambda p: (p["status"] != "open", -p["approving_shares"]))
         props = props[:50]                                  # cap the returned list (open/active first)
         return {"block_number": h, "epoch": epoch, "treasury": bal,
@@ -1174,32 +2472,13 @@ async def get_treasury_status(request):
 
 
 async def get_posw_difficulty(request):
-    """GET /posw_difficulty: the CONSENSUS registration-PoSW difficulty at the current finalized anchor
-    epoch — multiplier, base/required sequential steps, and recent registration count in the window.
-    Wallets read it to prove at the right difficulty and show the expected wait."""
-    # Current registration PoSW difficulty (doc/ip-spoofing-and-sybil.md): the CONSENSUS multiplier + required
-    # sequential-step count for a registration anchored at the current finalized anchor epoch. The wallet reads
-    # this to (a) prove at the right difficulty and (b) show the user the expected wait ("×N due to a spike").
-    def _work():
-        """Compute the difficulty a prover should use RIGHT NOW (worker thread) — the strict v2
-        chain-derived requirement; there is no other mode."""
-        from ops.reg_difficulty import difficulty_multiplier, _window_count
-        from ops.mining_ops import epoch_of
-        from protocol import POSW_T, POSW_ANCHOR_OFFSET, POSW_DIFF_WINDOW
-        try:
-            h = memserver.latest_block["block_number"]
-        except Exception:
-            h = 0
-        max_block = h + 6                      # the CLI/wallet target a registration a few blocks out
-        anchor_epoch = epoch_of(max(0, max_block - POSW_ANCHOR_OFFSET))
-        mult = difficulty_multiplier(anchor_epoch)
-        recent = _window_count(anchor_epoch - POSW_DIFF_WINDOW, anchor_epoch - 1)
-        return {"block_number": h, "anchor_epoch": anchor_epoch, "multiplier": mult,
-                "base_t": POSW_T, "required_t": POSW_T * mult,
-                "recent_registrations": recent, "window_epochs": POSW_DIFF_WINDOW}
-    return _resp(await asyncio.to_thread(_work))
+    """RETIRED at gen 25: registration no longer carries a sequential-work proof. Answers required_t 0 so an
+    old client learns there is nothing to compute; new wallets never call it."""
+    return _resp({"required_t": 0, "retired": True, "reason": "device attestation replaced PoSW at gen 25"})
 
 
+# per-height memo of the top-100 scan below. (Lost once while the PoSW endpoint above was stubbed for gen 25 —
+# tests/test_no_undefined_names.py caught it; that check runs on the FINAL tree before every push.)
 _rich_list_cache = {"height": -1, "list": None}
 
 
@@ -1212,7 +2491,6 @@ async def get_rich_list(request):
     # O(accounts) scan, cached per block height (top 100 kept, sliced to n) so it runs at most once/block.
     def _work():
         """Cached-per-height O(accounts) top-100 scan (worker thread)."""
-        from ops import kv_ops
         try:
             h = memserver.latest_block["block_number"]
         except Exception:
@@ -1253,31 +2531,55 @@ async def get_open_weights(request):
     q_epoch = request.query.get("epoch")
     def _work():
         """Read the open-lane weights (worker thread)."""
-        from ops.mining_ops import open_shares, epoch_of
+        from ops.mining_ops import epoch_of
         if q_epoch is not None:
             from ops.dividend_ops import weights_at_epoch
             try:
                 e = int(q_epoch)
             except (TypeError, ValueError):
                 return {"error": "bad epoch"}
+            # COMMITTED-FIRST (EPOCH_WEIGHTS_COMMIT_ACTIVATION): from the activation boundary every
+            # completed epoch's weights are FROZEN into L1 state at commit time — immune to the
+            # reconstruction drift that every fidelity/pool code change inflicts on weights_at_epoch
+            # (measured 2026-08-19: replaying a 6-hour-old epoch under the day's build no longer
+            # reproduced what the fleet computed live). Serve the immutable row whenever one exists;
+            # reconstruction remains only for pre-activation history.
+            from ops import kv_ops as _kv
+            _committed = _kv.epoch_weights_get(e)
+            if _committed is not None:
+                return {"epoch": e, "weights": _committed, "committed": True}
             # WEIGHT SAFETY (idle-GC, ops/gc_ops.py): weights_at_epoch(E) replays recert rows down
             # to E - SATURATION_LOOKBACK_EPOCHS; rows below the gc_rows_below watermark are GONE.
             # Refuse (410-style error) rather than serve a silently-truncated reconstruction — a
             # cold exec node must bootstrap from a SETTLED checkpoint instead of ancient replay.
-            from protocol import SATURATION_LOOKBACK_EPOCHS
+            from protocol import saturation_lookback_at
             from ops import kv_ops as _kv
             # the reconstruction needs rows from max(0, E - lookback); refuse iff pruning has
             # crossed that floor (with nothing pruned yet — watermark 0 — every epoch serves).
-            if max(0, e - SATURATION_LOOKBACK_EPOCHS) < _kv.meta_get_int("gc_rows_below", 0):
+            # The lookback is a function of E (protocol.saturation_lookback_at): it grows towards the 7-day bound
+            # instead of refusing every epoch the day the leases lengthen.
+            if max(0, e - saturation_lookback_at(e)) < _kv.meta_get_int("gc_rows_below", 0):
                 return {"error": "epoch too old: recert history pruned (bootstrap the exec node "
                                  "from a settled checkpoint)", "epoch": e}
             return {"epoch": e, "weights": weights_at_epoch(e)}
         from ops.account_ops import get_open_registry
         epoch = epoch_of(memserver.latest_block["block_number"])
         reg = get_open_registry(epoch)
-        weights = {addr: open_shares(info.get("fidelity", 0)) for addr, info in reg.items()}
-        return {"epoch": epoch, "weights": weights}
-    return _resp(await asyncio.to_thread(_work))
+        from protocol import dividend_weight
+        weights = {}
+        for addr, info in reg.items():
+            w = dividend_weight(info.get("fidelity", 0), epoch)
+            if w > 0:                                   # probation = absent (protocol.dividend_weight)
+                weights[addr] = w
+        # the referral slice and scale (protocol.py "REFERRALS"), through the SAME function the committed weights use,
+        # so the live numbers a wallet shows are cut the way the epoch will be paid
+        from ops.dividend_ops import referral_split
+        return {"epoch": epoch, "weights": referral_split(weights, epoch)}
+    out = await asyncio.to_thread(_work)
+    # error dicts were answered 200 (the comment above says "410-style" and meant it): 400 on a bad
+    # epoch, 410 when the recert history behind it is gone
+    _err = out.get("error") if isinstance(out, dict) else None
+    return _resp(out, status=(410 if _err and "too old" in _err else 400) if _err else 200)
 
 
 async def duty_committee(request):
@@ -1307,7 +2609,8 @@ async def duty_committee(request):
             out["in_committee"] = addr in seats
             out["seats_of"] = seats.get(addr, 0)
         return out
-    return _resp(await asyncio.to_thread(_work))
+    out = await asyncio.to_thread(_work)
+    return _resp(out, status=400 if isinstance(out, dict) and out.get("error") else 200)
 
 
 async def get_dividend_inflow(request):
@@ -1326,6 +2629,29 @@ async def get_dividend_inflow(request):
     return _resp(await asyncio.to_thread(_work))
 
 
+async def settle_chain_inputs(request):
+    """GET /settle_chain_inputs?sc=S&cursor=C: every L1 chain input a Stwo settlement of the span (S, C] is judged with
+    (ops/settle_chain.l1_inputs_doc: the reveals behind every readable beacon, the accrual inputs, the block hashes of
+    every BHASH window, and `refused` below EXEC_CARRY_ROOT_HEIGHT; the dividend carry is no L1 input — `div_carry` is
+    always null — it is the span's pre-root record). READ-ONLY: the G8 shadow run (tools/settle_b2_shadow.py) derives the
+    Chain from it and compares it with the exec node's own bookkeeping, without opening this node's database. The span is
+    bounded (4 * SETTLE_PROOF_MAX_SPAN) and the reply is ~65 bytes per held block hash. Rate-limited 20/min per IP."""
+    if _rate_limited(request, 20):
+        return _RL()
+    from protocol import SETTLE_PROOF_MAX_SPAN
+    try:
+        sc, cur = int(request.query.get("sc", "")), int(request.query.get("cursor", ""))
+    except (TypeError, ValueError):
+        return _resp({"error": "bad sc/cursor"}, status=400)
+    if not (0 <= sc < cur <= sc + 4 * SETTLE_PROOF_MAX_SPAN):
+        return _resp({"error": f"need 0 <= sc < cursor <= sc + {4 * SETTLE_PROOF_MAX_SPAN}"}, status=400)
+
+    def _work():
+        from ops.settle_chain import l1_inputs_doc
+        return l1_inputs_doc(sc, cur)
+    return _resp(await asyncio.to_thread(_work))
+
+
 async def get_settled(request):
     """GET /get_settled[?ns=]: the canonical SETTLED execution-layer checkpoint {ns, exec_cursor, state_root}
     for namespace `ns` (default DEFAULT_NS) — the state the bonded quorum has attested; what exec nodes and
@@ -1340,6 +2666,20 @@ async def get_settled(request):
         cursor, root = latest_settled(ns)
         return {"ns": ns, "exec_cursor": cursor, "state_root": root}
     return _resp(await asyncio.to_thread(_work))
+
+
+async def unshield_claimed(request):
+    """GET /unshield_claimed?addr=&nonces=1,2,3: which of the address's unshield exits L1 has already released (the burned
+    (addr, nonce) nullifier, kv_ops.shield_nullifier_exists). The exec node lists every exit it ever recorded — it never
+    learns that L1 released one — so a wallet that claimed from that list alone re-sent a refused claim for every past
+    exit on every render and then told its user "still settling" (loopback walk 2026-10-12). At most 500 nonces."""
+    addr = _q(request, "addr", "") or ""
+    nonces = [n for n in (_q(request, "nonces", "") or "").split(",") if n][:500]
+    if not addr or not all(n.isdigit() and len(n) <= 20 for n in nonces):
+        return _resp({"error": "addr and nonces (decimal, comma-separated) are required"}, status=400)
+    from ops import kv_ops
+    claimed = await asyncio.to_thread(lambda: [n for n in nonces if kv_ops.shield_nullifier_exists(addr, n)])
+    return _resp({"addr": addr, "claimed": claimed})
 
 
 async def resolve_alias(request):
@@ -1398,148 +2738,196 @@ async def htlcs(request):
     return _resp({"htlcs": allh})
 
 
-# HTML pages are served with their /static/<asset> references stamped ?v=<file mtime>. The stamped URL
-# changes whenever the file on disk changes, so the assets themselves can be cached as immutable (by the
-# browser AND the CDN edge) while an edit still propagates on the next page load — the interface pulls
-# ~1.5 MB of JS (i18n.js alone is ~1 MiB), which under the old blanket no-store re-downloaded every visit.
-_STATIC_REF_RE = re.compile(rb'((?:src|href)=")(/static/[A-Za-z0-9_./-]+)(")')
-# ES-module import specifiers inside a served .js:  from "./x.js"  ·  import("./x.js")  ·  import "./x.js"
-_JS_IMPORT_RE = re.compile(rb'(\bfrom\s*["\']|import\s*\(\s*["\']|import\s*["\'])(\.{1,2}/[A-Za-z0-9_./-]+\.js)(["\'])')
+async def get_invite(request):
+    """GET /invite?id=: one funded invite (protocol.py "FUNDED INVITE LINKS") — {id, invite: {sender, amount, expiry,
+    status, claimant} | null, tip}. The newcomer's wallet reads it to say who invited them and what is waiting."""
+    from ops import kv_ops
+    iid = _q(request, "id", "")
+    rec = await asyncio.to_thread(kv_ops.invite_get, iid) if iid else None
+    doc = None if rec is None else dict(zip(("sender", "amount", "expiry", "status", "claimant"), rec))
+    return _resp({"id": iid, "invite": doc, "tip": memserver.latest_block["block_number"]})
 
 
-_JS_EPOCH_TTL = 2.0        # seconds; a deploy is picked up within this, a request storm walks static/ once
-_js_epoch_cache = [0.0, 0]  # [computed_at_monotonic, value]
-_static_body_cache = {}     # abs path -> (mtime_ns, size, js_epoch, body_bytes, etag_or_None)
-_STATIC_CACHE_MAX_BYTES = 48 * 1024 * 1024
-_static_cache_bytes = [0]
-_static_cache_lock = _threading.Lock()
+async def invites(request):
+    """GET /invites?address=: the invites `address` funded (its "your invites" list, and the refunds its wallet owes
+    itself after expiry). Full-set read — rate-limited 60/min per IP."""
+    if _rate_limited(request, 60):
+        return _RL()
+    from ops import kv_ops
+    addr = _q(request, "address")
+    allv = await asyncio.to_thread(kv_ops.invite_all)
+    out = {i: dict(zip(("sender", "amount", "expiry", "status", "claimant"), r)) for i, r in allv.items()
+           if not addr or r[0] == addr}
+    return _resp({"invites": out, "tip": memserver.latest_block["block_number"]})
 
 
-def _js_epoch():
-    """A single version number = the NEWEST mtime across ALL static .js files. Every .js reference (HTML
-    <script> AND in-file ES imports) is stamped with THIS, so editing ANY module bumps the version of the
-    WHOLE graph at once. That guarantees coherency: a browser/CDN can never load a fresh game.js against a
-    stale cached nadodapp.js (the bug that made 'sign in do nothing' after an SDK export was added) — the
-    stamped URLs all change together, so a cache miss on one is a cache miss on all its dependencies.
-
-    CACHED for _JS_EPOCH_TTL. This is a full os.walk + os.stat over ~130 .js files (2.5 ms measured) and
-    it ran on EVERY html and EVERY .js request, on the event loop. The value only moves when someone
-    deploys, so a couple of seconds of staleness costs nothing and a page load stops paying it ~15x."""
-    now = time.monotonic()
-    if now - _js_epoch_cache[0] < _JS_EPOCH_TTL:
-        return _js_epoch_cache[1]
-    newest = 0
-    try:
-        for root, _dirs, names in os.walk(_STATIC_DIR):
-            for name in names:
-                if name.endswith(".js"):
-                    newest = max(newest, int(os.stat(os.path.join(root, name)).st_mtime))
-    except OSError:
-        pass
-    _js_epoch_cache[0], _js_epoch_cache[1] = now, newest
-    return newest
-
-
-def _static_cached(full, build):
-    """Memoise a stamped static body on (path, mtime_ns, size, js_epoch), calling build(raw_bytes) on miss.
-
-    Stamping is a pure function of the file bytes and the JS epoch, but it was redone on every request
-    ON THE EVENT LOOP: a cold GET /static/i18n.js measured 220 ms (8 ms read + 162 ms of regex
-    substitution), during which this process served nothing else AND the block loop could not run,
-    because re.sub does not release the GIL. A page load pulls i18n.js + interface.js + a dozen modules
-    — ~300 ms of blocked loop per fresh visitor, and ten at once is a dropped block. Keyed on mtime, so
-    a redeploy invalidates immediately rather than serving stale JS off a timer."""
-    try:
-        st = os.stat(full)
-    except OSError:
-        return None
-    key = (st.st_mtime_ns, st.st_size, _js_epoch())
-    hit = _static_body_cache.get(full)
-    if hit is not None and hit[0] == key:
-        return hit[1]
-    with open(full, "rb") as f:
-        raw = f.read()
-    built = build(raw)
-    with _static_cache_lock:
-        prev = _static_body_cache.get(full)
-        if prev is not None:
-            _static_cache_bytes[0] -= len(prev[1][0])
-        if _static_cache_bytes[0] > _STATIC_CACHE_MAX_BYTES:
-            _static_body_cache.clear()       # whole static/ is ~16 MB, so this should never fire
-            _static_cache_bytes[0] = 0
-        _static_body_cache[full] = (key, built)
-        _static_cache_bytes[0] += len(built[0])
-    return built
+async def referrals(request):
+    """GET /referrals?address=: who `address` named as its referrer ({address, since_height} or null) and the
+    identities that named it — each with its window (until_epoch) and whether it is inside it and present now, which
+    is when the referrer earns REFERRAL_SHARE / REFERRAL_SCALE of its dividend weight (protocol.py "REFERRALS").
+    Rate-limited 30/min per IP (it reads the open registry)."""
+    if _rate_limited(request, 30):
+        return _RL()
+    addr = _q(request, "address")
+    if not addr:
+        return _resp({"error": "address required"}, status=400)
+    def _work():
+        from ops import kv_ops
+        from ops.mining_ops import epoch_of
+        from ops.account_ops import get_open_registry
+        from protocol import REFERRAL_EPOCHS, REFERRAL_SCALE, REFERRAL_SHARE, EPOCH_LENGTH
+        tip = memserver.latest_block["block_number"]
+        epoch = epoch_of(tip)
+        mine = kv_ops.referral_get(addr)
+        rows = kv_ops.referrals_by(addr)
+        present = set(get_open_registry(epoch))
+        referred = []
+        for who, h in rows:
+            start = int(h) // EPOCH_LENGTH
+            referred.append({"address": who, "since_height": int(h), "until_epoch": start + REFERRAL_EPOCHS,
+                             "in_window": start <= epoch < start + REFERRAL_EPOCHS, "present": who in present})
+        return {"address": addr, "referrer": None if mine is None else {"address": mine[0], "since_height": mine[1]},
+                "referred": referred, "share": [REFERRAL_SHARE, REFERRAL_SCALE], "window_epochs": REFERRAL_EPOCHS,
+                # active_from: REFERRAL_HEIGHT (gen 28's gate, 1 from gen 29, inlined in G9). The wallet offers invite
+                # creation only while tip >= active_from, so it stays 1 — the chain refuses an invite at height 0.
+                "active_from": 1, "tip": tip, "epoch": epoch, "self_present": addr in present}
+    return _resp(await asyncio.to_thread(_work))
 
 
-def _stamp_static_refs(html):
-    """Rewrite src/href="/static/<asset>" references in `html` (bytes) to .../<asset>?v=<version>. A .js
-    asset is stamped with the global JS epoch (so all modules bust together); other assets use their own
-    mtime. References whose file doesn't exist are left untouched."""
-    jsep = _js_epoch()
-    def sub(m):
-        rel = m.group(2)[len(b"/static/"):].decode()
-        try:
-            v = jsep if rel.endswith(".js") else int(os.stat(os.path.join(_STATIC_DIR, rel)).st_mtime)
-        except (OSError, UnicodeDecodeError):
-            return m.group(0)
-        return m.group(1) + m.group(2) + b"?v=%d" % v + m.group(3)
-    return _STATIC_REF_RE.sub(sub, html)
+# ONE cache-busting scheme (2026-10-10, ops/static_versions.py): every /static reference in a served page or module is
+# rewritten to ?v=<the referenced file's content hash, including its own rewritten imports>, and a URL is immutable only
+# while its v names the current bytes. It replaced four overlapping schemes — a JS-wide mtime epoch stamped here,
+# md5 literals written into sources by merge_games.py, hand labels (?v=mlkem / ?v=ratchet2 / ?v=1) and interface.js's
+# HW_STAMP — under which vendor/nado-crypto.js loaded under TWO URLs (two module instances) and noble-secp256k1.js?v=1
+# was served immutable for a year. Never hand-write a ?v= in static/: the server swallows it, and
+# tests/test_static_versions.py refuses it in source.
+from ops.static_versions import StaticVersions as _StaticVersions, cache_control as _static_cache_control
+# INVARIANT: a served module's version covers the /protocol.js stamp it carries, because the stamp is applied to the
+# module's bytes BEFORE they are versioned — so an importer's URL moves when the constants do.
+_static_versions = _StaticVersions(_STATIC_DIR, js_transform=lambda raw: _stamp_protocol_import(raw))
 
 
-def _stamp_js_imports(js_bytes):
-    """Rewrite a served .js file's relative ES-module imports (from './x.js') to '.../x.js?v=<js epoch>',
-    so the shared modules (nadodapp.js, nadotx.js, …) are fetched at the SAME coherent version as the
-    importing file — never a stale CDN-cached copy that's missing a newly-added export."""
-    v = b"?v=%d" % _js_epoch()
-    return _JS_IMPORT_RE.sub(lambda m: m.group(1) + m.group(2) + v + m.group(3), js_bytes)
+def _etag_matches(request, etag):
+    return etag in (t.strip() for t in request.headers.get("If-None-Match", "").split(","))
+
+
+_CSP_BY_VER = {}                 # page version -> its Content-Security-Policy (page_csp)
 
 
 async def _html_response(request, full):
-    """Serve an HTML file with stamped asset references, a strong ETag over the stamped body, and
-    revalidation caching (no-cache = store + ask; a 304 answers the ask in one small round trip).
-    The stamp+hash runs in a worker thread on a cache miss so a cold page never blocks the event loop."""
-    cached = await asyncio.to_thread(_static_cached, full, lambda raw: (
-        (lambda b: (b, '"' + hashlib.blake2b(b, digest_size=16).hexdigest() + '"'))(_stamp_static_refs(raw))))
-    if cached is None:
+    """Serve an HTML file with version-stamped asset references, a strong ETag (its version — a hash of the stamped
+    body) and revalidation caching (no-cache = store + ask; a 304 answers the ask in one small round trip). The
+    versioning runs in a worker thread so a cold page never blocks the event loop."""
+    got = await asyncio.to_thread(_static_versions.get, full)
+    if got is None or got[0] is None:
         return web.Response(status=404, text="Not found")
-    body, etag = cached
+    body, ver = got
+    etag = '"' + ver + '"'
     # X-Frame-Options/frame-ancestors: the wallet must NEVER be framed — the exec_sign / forum-login confirm is
     # the only human gate, and a header-delivered frame denial defeats clickjacking of it (a <meta> CSP cannot).
+    # script-src: only this page's own inline code (sha256 of the stamped body) + same-origin + WASM (static_versions
+    # page_csp, audit #22). Memoised per version: the version IS a hash of the body, so it names the policy exactly.
+    csp = _CSP_BY_VER.get(ver)
+    if csp is None:
+        from ops.static_versions import page_csp
+        csp = _CSP_BY_VER[ver] = page_csp(body)
+        if len(_CSP_BY_VER) > 512:
+            _CSP_BY_VER.pop(next(iter(_CSP_BY_VER)))
     headers = {"Cache-Control": "no-cache", "ETag": etag, "Access-Control-Allow-Origin": "*",
-               "X-Frame-Options": "DENY", "Content-Security-Policy": "frame-ancestors 'none'"}
-    inm = request.headers.get("If-None-Match", "")
-    if etag in (t.strip() for t in inm.split(",")):
+               "X-Frame-Options": "DENY", "Content-Security-Policy": csp}
+    if _etag_matches(request, etag):
         return web.Response(status=304, headers=headers)
     return web.Response(body=body, content_type="text/html", charset="utf-8", headers=headers)
 
 
+_STATIC_SECRET_NAMES = re.compile(r"^(keys\.dat|nado-identity.*\.json|.*\.(key|pem|p12|pfx))$", re.I)
+
+
+def _static_secret(full):
+    """True for a file under static/ that must never be served, whatever its path. FOUND LIVE 2026-09-27: the TPM
+    enrolment helper writes its signing identity (a private key) as nado-identity.json BESIDE ITSELF, and a run from
+    static/ left one there on 2026-09-11 — served to the internet with HTTP 200 for 16 days. Three rules, any one
+    refuses: a dotfile; a key-material name; and a file its owner made unreadable to others (mode without o+r) —
+    which is how a program writes a secret, and which no file meant for download has (the helpers are 0755)."""
+    base = os.path.basename(full)
+    if base.startswith(".") or _STATIC_SECRET_NAMES.match(base):
+        return True
+    try:
+        return not (os.stat(full).st_mode & 0o004)
+    except OSError:
+        return True
+
+
 async def static_handler(request):
-    """GET /static/{path}: serve a file from static/ with open CORS. HTML goes through _html_response
-    (asset-stamped + ETag revalidation). An asset requested with a numeric ?v= is content-addressed by
-    construction (the stamp is its mtime), so it's served immutable for a year — cacheable by browsers
-    and the CDN edge. Everything else is no-cache: stored but revalidated (ETag/Last-Modified -> 304),
-    so wallet/explorer edits are picked up immediately without re-downloading unchanged bytes.
+    """GET /static/{path}: serve a file from static/ with open CORS. HTML goes through _html_response. A .js module is
+    served with its references rewritten to their content versions (ops/static_versions.py); everything else streams
+    as is. Cache rule: ?v= equal to the file's CURRENT version -> immutable for a year (browser and CDN edge); any other
+    ?v= or none -> no-cache with the version as ETag, so a stale or hand-written URL can never pin old bytes.
     Path-traversal contained: the normpath'd target must stay under _STATIC_DIR or it 404s."""
     rel = request.match_info.get("path", "")
     full = os.path.normpath(os.path.join(_STATIC_DIR, rel))
     if not (full == _STATIC_DIR or full.startswith(_STATIC_DIR + os.sep)) or not os.path.isfile(full):
         return web.Response(status=404, text="Not found")
+    if _static_secret(full):                 # 404, not 403: never confirm that a secret is there
+        return web.Response(status=404, text="Not found")
     if full.endswith(".html"):
         return await _html_response(request, full)
-    immutable = request.query.get("v", "").isdigit()
-    headers = {"Cache-Control": "public, max-age=31536000, immutable" if immutable else "no-cache",
+    got = await asyncio.to_thread(_static_versions.get, full)
+    if got is None:
+        return web.Response(status=404, text="Not found")
+    body, ver = got
+    etag = '"' + ver + '"'
+    headers = {"Cache-Control": _static_cache_control(request.query.get("v", ""), ver), "ETag": etag,
                "Access-Control-Allow-Origin": "*"}
-    # A .js module's relative imports are rewritten to the coherent global JS version so the CDN can never
-    # pair a fresh importer with a stale imported module (missing-export -> dead page). Read + rewrite in
-    # process (JS files are small); everything else streams via FileResponse.
-    if full.endswith(".js"):
-        cached = await asyncio.to_thread(_static_cached, full, lambda raw: (_stamp_js_imports(raw), None))
-        if cached is None:
-            return web.Response(status=404, text="Not found")
-        return web.Response(body=cached[0], content_type="application/javascript", charset="utf-8",
-                            headers=headers)
+    if _etag_matches(request, etag):
+        return web.Response(status=304, headers=headers)
+    if body is not None:                     # a module whose references were rewritten (or that has none)
+        return web.Response(body=body, content_type="application/javascript", charset="utf-8", headers=headers)
     return web.FileResponse(full, headers=headers)
+
+
+# GET /protocol.js and /protocol.json (2026-10-10, ops/client_protocol.py): protocol.CLIENT_EXPORTS rendered from the
+# module THIS process runs, so a browser client imports the constants instead of carrying hand-made copies that drifted
+# (FINALITY_DEPTH 12 vs 45, TX_INCLUSION_DELAY 2 vs 8, auto-bond default 80 vs 99). Rendered in memory, never written
+# into the tree (a tracked build product at its generated path once bricked the fleet fast-forward). No new trust: the
+# wallet and the games are served by this same relay, which already supplies their code, balances and fee targets.
+# CACHING: every served .js that imports "/protocol.js" is rewritten to "/protocol.js?v=<hash of the rendered body>"
+# (_stamp_protocol_import below, applied by the static versioner before it hashes the module), and a request carrying the CURRENT hash is immutable for a year — the URL changes
+# exactly when the values do, i.e. after a protocol.py commit restarts the node. An unstamped or stale-stamped request
+# (the website's cross-origin import, an old cached importer) gets no-cache + a strong ETag, so it revalidates in one
+# small round trip and can never pin an old value. CORS is open: nadochain.com's /emission imports it cross-origin.
+_PROTOCOL_IMPORT_RE = re.compile(rb'((?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s*)["\'])/protocol\.js(?:\?v=[A-Za-z0-9_.-]*)?(["\'])')
+
+
+def _stamp_protocol_import(js_bytes):
+    """Rewrite `from "/protocol.js"` (and import("/protocol.js")) in a served .js to the content-hash stamped URL. The
+    static body cache needs no extra key: the hash is fixed for the life of the process."""
+    from ops.client_protocol import rendered
+    v = rendered()[2].encode()
+    return _PROTOCOL_IMPORT_RE.sub(lambda m: m.group(1) + b"/protocol.js?v=" + v + m.group(2), js_bytes)
+
+
+def _protocol_response(request, body, content_type):
+    from ops.client_protocol import rendered
+    ver = rendered()[2]
+    etag = '"' + ver + '"'
+    headers = {"Cache-Control": "public, max-age=31536000, immutable" if request.query.get("v") == ver else "no-cache",
+               "ETag": etag, "Access-Control-Allow-Origin": "*"}
+    if etag in (t.strip() for t in request.headers.get("If-None-Match", "").split(",")):
+        return web.Response(status=304, headers=headers)
+    return web.Response(body=body, content_type=content_type, charset="utf-8", headers=headers)
+
+
+async def protocol_js(request):
+    """GET /protocol.js: protocol.CLIENT_EXPORTS as an ES module (`export const NAME = value;`)."""
+    from ops.client_protocol import rendered
+    return _protocol_response(request, rendered()[0], "application/javascript")
+
+
+async def protocol_json(request):
+    """GET /protocol.json: the same names and values as JSON (integers above 2^53 - 1 as decimal strings)."""
+    from ops.client_protocol import rendered
+    return _protocol_response(request, rendered()[1], "application/json")
 
 
 async def favicon(request):
@@ -1574,7 +2962,8 @@ def _msg_verify_sig(public_key, sender, env):
     signing digest (every envelope field except `sig`). Same verify() the tx path uses."""
     from ops.message_pool import signing_digest
     try:
-        if not public_key or not proof_sender(sender=sender, public_key=public_key):
+        from ops.auth_ops import key_authorized
+        if not public_key or not key_authorized(public_key, sender):
             return False
         return _mldsa_verify(signed=env.get("sig", ""), public_key=public_key,
                              message=_mldsa_unhex(signing_digest(env)))
@@ -1587,7 +2976,8 @@ def _prekey_verify_sig(public_key, address, bundle):
     must verify over the bundle's signing digest. False (never raises) on any failure."""
     from ops.message_pool import prekey_signing_digest
     try:
-        if not public_key or not proof_sender(sender=address, public_key=public_key):
+        from ops.auth_ops import key_authorized
+        if not public_key or not key_authorized(public_key, address):
             return False
         return _mldsa_verify(signed=bundle.get("sig", ""), public_key=public_key,
                              message=_mldsa_unhex(prekey_signing_digest(bundle)))
@@ -1612,6 +3002,8 @@ async def post_message(request):
         except Exception as e:
             return f"Error: {e}", 403
     body = await request.read()
+    if len(body) > 262144:                      # 256 KiB: the pool caps a message at 16 KiB; reject
+        return _resp("message too large", status=413)   # oversized bodies BEFORE the json.loads blow-up
     out, code = await asyncio.to_thread(_work, body)
     return _resp(out, status=code)
 
@@ -1656,6 +3048,8 @@ async def post_msg_key(request):
         except Exception as e:
             return f"Error: {e}", 403
     body = await request.read()
+    if len(body) > 262144:                      # 256 KiB: the pool caps a prekey at 32 KiB; reject
+        return _resp("prekey too large", status=413)     # oversized bodies BEFORE the json.loads blow-up
     out, code = await asyncio.to_thread(_work, body)
     return _resp(out, status=code)
 
@@ -1724,7 +3118,7 @@ async def state_health(request):
     PER-SUB-DB root breakdown {db: [root, rows]} (snapshot_ops.per_db_roots) at the current tip, with the L2
     settled (exec_cursor, exec_root) and tip/finalized heights. Pure DIAGNOSTIC, no consensus effect: an
     external watcher polls this on several peers and, when two disagree at the same height, sees WHICH sub-DB
-    diverged in one shot instead of inferring a fork from block hashes (the alphanet-8 wedge took a replay
+    diverged in one shot instead of inferring a fork from block hashes (the betanet-8 wedge took a replay
     harness to localize to the meta DB — this endpoint is that harness, live). Rate-limited like other reads."""
     if _rate_limited(request, 6):        # two full-state walks are expensive; this is a diagnostic, not a poll target
         return _RL()
@@ -1742,6 +3136,22 @@ async def state_health(request):
                 "per_db": {n: [r, c] for n, (r, c) in per_db.items()},
                 "exec_cursor": cur, "exec_root": exec_root}
     return _resp(await asyncio.to_thread(_snap))
+
+
+async def treasury_history_report(request):
+    """GET /treasury_history?limit=: the DURABLE governance archive — every treasury payout that actually
+    executed on this chain, newest first, plus per-recipient totals (who received how much, how often).
+
+    Derived from `treasury_execute` TRANSACTIONS in blocks, which are permanent, rather than from the
+    `treasury_proposals` display index the Quorum tab reads: that index drops expired proposals, caps at
+    50, and is excluded from the state root, so it can differ between nodes and is not a record of
+    anything. `start_height` says where THIS node's view begins — a snapshot-synced node has no blocks
+    below its checkpoint, so it archives forward from there. Rate-limited 60/min per IP."""
+    if _rate_limited(request, 60):
+        return _RL()
+    from ops import treasury_history
+    limit = _qint(request, "limit", 200)
+    return _resp(await asyncio.to_thread(treasury_history.report, limit))
 
 
 async def daily_stats_report(request):
@@ -1788,6 +3198,9 @@ async def update_node(request):
         return _resp({"status": "disabled", "reason": "auto_update=false in config — /update is disabled"},
                      status=403)
     result = await asyncio.to_thread(self_update.check_and_update, "remote")
+    # busy / rate_limited: the kick is remembered, not dropped (self_update.queue_recheck)
+    if self_update.queue_recheck(result):
+        result = dict(result, queued_recheck=True)
     if result.get("status") == "updated" and request.query.get("wave", "1") != "0":
         peer_list = list(memserver.peers)
 
@@ -1797,7 +3210,8 @@ async def update_node(request):
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3)) as s:
                     async def _one(p):
                         try:
-                            async with s.get(f"http://{hostport(p, get_config()['port'])}/update?wave=1"):
+                            # allow_redirects=False: a peer's 302 to 127.0.0.1 would be a loopback-authorized GET here (ops/outbound_guard.py)
+                            async with s.get(f"http://{hostport(p, get_config()['port'])}/update?wave=1", allow_redirects=False):
                                 pass
                         except Exception:
                             pass
@@ -1823,10 +3237,100 @@ async def update_peer(request):
     try:
         import aiohttp
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
-            async with s.get(f"http://{hostport(target, get_config()['port'])}/update?wave=0") as r:
+            # allow_redirects=False: a peer's 302 to 127.0.0.1 would be a loopback-authorized GET here (ops/outbound_guard.py)
+            async with s.get(f"http://{hostport(target, get_config()['port'])}/update?wave=0", allow_redirects=False) as r:
                 return _resp(await r.json())
     except Exception as e:
         return _resp({"status": "unreachable", "error": str(e)[:120]}, status=502)
+
+
+_DA_PROXY_PATHS = ("meta", "have", "shard", "get")
+_EXEC_PORT = int(os.environ.get("NADO_EXEC_PORT", "9273"))
+
+
+def _exec_local_get(path, timeout=5):
+    """GET a JSON view from THIS host's exec node, or None (no exec node here is a normal configuration)."""
+    import urllib.request as _rq
+    try:
+        with _rq.urlopen(f"http://127.0.0.1:{_EXEC_PORT}{path}", timeout=timeout) as r:  # nosec B310 # literal http:// to loopback; redirects guarded process-wide (ops/outbound_guard.py)
+            return json.loads(r.read(4_000_000))
+    except Exception:
+        return None
+
+
+def _exec_local_da_publish(data: bytes):
+    """POST bytes to THIS host's exec node /da/publish -> the commitment (raises when there is none)."""
+    import urllib.request as _rq
+    req = _rq.Request(f"http://127.0.0.1:{_EXEC_PORT}/da/publish", data=data, method="POST",
+                      headers={"Content-Type": "application/octet-stream"})
+    with _rq.urlopen(req, timeout=120) as r:  # nosec B310 # literal http:// to loopback; redirects guarded process-wide (ops/outbound_guard.py)
+        return json.loads(r.read(1_000_000)).get("commitment")
+
+
+def _stwo_relay_submit(tx):
+    """The node's own field_transfer blob, merged and gossiped exactly as a user's /submit_transaction is."""
+    output = memserver.merge_transaction(tx, user_origin=True)
+    if should_gossip(output):
+        memserver.enqueue_gossip(tx)
+    return output
+
+
+# THE STWO SPEND RELAY (ops/stwo_relay.py): ON BY DEFAULT ON EVERY NODE — the default is in the CODE
+# (.get("stwo_relay", True)), because get_config() returns private/config.json verbatim and a key added to the template
+# reaches only new installs (CLAUDE.md rule 9). "stwo_relay": false opts a node out. It signs with the node's own key.
+_stwo_relay = StwoRelay(
+    keydict_fn=lambda: memserver.keydict,
+    tip_fn=lambda: memserver.latest_block["block_number"],
+    exec_get=_exec_local_get,
+    da_publish=_exec_local_da_publish,
+    submit=_stwo_relay_submit,
+    enabled_fn=lambda: get_config().get("stwo_relay", True) is not False,
+    healthy_fn=lambda: not getattr(memserver, "emergency_mode", False),
+    balance_fn=lambda: (get_account(memserver.address, create_on_error=False) or {}).get("balance"))
+stwo_relay_info, stwo_relay_post = _stwo_relay_handlers(_stwo_relay, _ip)
+
+
+async def da_proxy(request):
+    """GET /da/{meta,have,shard,get} — forward to THIS host's exec node, which owns the DA store.
+
+    WHY L1 SERVES THIS AT ALL. Data availability is fully implemented on the exec node (DaStore, /da/meta,
+    /da/have, /da/shard, /da/get, da_announce, da_fetch), every node that runs nado-exec has a store, and a
+    settle whose proof is too large to inline is supposed to publish the proof to DA and carry only a
+    commitment. It has never worked across this fleet for one reason: execnode._da_sources asks peers on the
+    EXEC port, and that port is not exposed between nodes — measured 2026-08-08, every peer's :9273 refused
+    while :9173 answered. So DA could not deliver a shard and the code fell back to riding ~69 MiB of proof
+    inline inside the transaction, which every node then re-parses on every candidate build.
+
+    Proxying the four READ endpoints through the port peers can already reach fixes that without asking
+    anyone to open a firewall. The target is hardcoded to loopback and the path to a fixed allowlist, so this
+    is not a general proxy and cannot be pointed at another host (no SSRF).
+
+    Streamed, not buffered: a shard is blob/k — tens of MiB — and reading it into L1 only to write it out
+    again would put that allocation on the event loop, which is the exact cost DA exists to remove.
+    """
+    if _rate_limited(request, 60):     # was unlimited, unlike every sibling DA endpoint; holds a 120s
+        return _RL()                   # streaming connection + pokes exec da.reconstruct, so cap it
+    what = request.match_info.get("what", "")
+    if what not in _DA_PROXY_PATHS:
+        return _resp({"error": "unknown da endpoint"}, status=404)
+    url = f"http://127.0.0.1:{_EXEC_PORT}/da/{what}"
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as s:
+            # allow_redirects=False: a peer's 302 to 127.0.0.1 would be a loopback-authorized GET here (ops/outbound_guard.py)
+            async with s.get(url, params=dict(request.query), allow_redirects=False) as r:
+                out = web.StreamResponse(status=r.status,
+                                         headers={"Content-Type": r.headers.get("Content-Type",
+                                                                                "application/octet-stream")})
+                await out.prepare(request)
+                async for chunk in r.content.iter_chunked(1 << 16):
+                    await out.write(chunk)
+                await out.write_eof()
+                return out
+    except Exception as e:
+        # An exec node that is down or still starting is a NORMAL state, not an error worth 500-ing over:
+        # da_fetch treats a non-200 as "this source has nothing" and moves to the next peer.
+        return _resp({"error": "exec node unreachable", "detail": str(e)[:120]}, status=503)
 
 
 async def make_app(port):
@@ -1834,7 +3338,67 @@ async def make_app(port):
     0.0.0.0 plus a best-effort SEPARATE IPV6_V6ONLY socket (so v4 clients keep plain v4 addresses for
     rate-limit keys); NADO_TESTNET binds only the node's own configured IP so several nodes can share
     the port on distinct 127.0.0.x addresses. Never returns."""
-    app = web.Application()
+    # BODY CAP. aiohttp defaults client_max_size to 1 MiB, and a SETTLE-WITH-PROOF transaction is bigger
+    # than that: the epoch proof is ~1263 KB (measured, and constant in the call count — see ROADMAP).
+    # So every proof-carrying settle was answered "HTTP 413 Maximum request body size 1048576 exceeded"
+    # and the validity-proof path could not be used AT ALL, on any generation, no matter which consensus
+    # flags were on. It presented as an unparseable submit reply in the exec node, never as a size error,
+    # which is why enabling the prover produced bare quorum attestations and no explanation.
+    #
+    # 8 MiB matches the peer-body budget memserver already assumes (transaction_pool_max_bytes is 4 MiB
+    # "<< 8 MiB peer body"), leaves headroom for a fold bundle, and is still far below anything that would
+    # make a submit a memory-exhaustion lever — the pool cap, per-tx validation and the rate limiter all
+    # still apply behind it.
+    # RAISED AGAIN, for the same reason one size up. 8 MiB was sized for a ~1263 KB epoch proof; a real
+    # settle proof at protocol strength measures ~120 MiB, which is why it was pushed to DA — and DA
+    # cannot deliver it on this fleet, because only one node runs a DA store, so a peer cannot pull it
+    # inside _fetch_da_proof's 8 s budget and NO proof has ever landed. Carrying it inline over the gossip
+    # the fleet already runs removes the fetch entirely. See protocol.MAX_INLINE_TX_BYTES.
+    from protocol import MAX_INLINE_TX_BYTES as _MAX_INLINE_TX
+    # PER-PATH BODY CAP. The 192 MiB client_max_size exists for ONE route — /submit_transaction carrying an
+    # inline settle proof. Applied app-wide it let an unauthenticated request to a KB-sized endpoint
+    # (/message, /msg_key, …) buffer 192 MiB and then expand it via json.loads into a multi-GiB object graph
+    # → RSS/OOM + to_thread-pool starvation. This middleware rejects, by Content-Length, any oversized body
+    # to a non-large route BEFORE the handler reads it; the two message handlers also raw-length-guard the
+    # chunked (no-Content-Length) case before decode.
+    _DEFAULT_MAX_BODY = 2 * 1024 * 1024              # 2 MiB — generous for any normal tx/message/prekey
+    _LARGE_BODY_PATHS = {"/submit_transaction"}      # the only route that carries an inline settle proof
+    # a Stwo spend's proof bundle (~6 MB of JSON) to the spend relay: its own cap, between the two
+    _PATH_BODY_CAPS = {"/stwo/relay": STWO_RELAY_MAX_BODY}
+
+    @web.middleware
+    async def _body_cap_mw(request, handler):
+        limit = _MAX_INLINE_TX if request.path in _LARGE_BODY_PATHS else _PATH_BODY_CAPS.get(request.path, _DEFAULT_MAX_BODY)
+        cl = request.content_length
+        if cl is not None and cl > limit:
+            return _resp(f"body {cl} exceeds {limit} for {request.path}", status=413)
+        # CHUNKED uploads carry no Content-Length, so the check above passes them, and the handlers'
+        # own `len(body) > cap` guards run only AFTER `request.read()` has buffered the whole body —
+        # up to the APP-WIDE client_max_size (the 192 MiB settle-proof allowance) on EVERY path. Bind
+        # the per-path cap to the request itself so read() raises 413 at `limit` instead.
+        if cl is None and limit < _MAX_INLINE_TX:
+            request = request.clone(client_max_size=limit)
+        # A CLIENT THAT HANGS UP MID-BODY IS NOT AN ERROR (2026-09-27): during every update wave a peer restarts while
+        # its gossip POST to /submit_transaction is still being read, and read() raises ConnectionResetError. Nothing
+        # is lost — the peer re-gossips after its restart — but aiohttp logged a full traceback per drop, which the
+        # health watch counts as an anomaly on every push. The peer is gone, so the status is for the log only.
+        try:
+            resp = await handler(request)
+        except ConnectionResetError:
+            return web.Response(status=499, text="client closed the connection")
+        # CORS for the READ API: every GET here is public, unauthenticated chain data (the same bytes any
+        # peer or wallet reads), so any origin may read it — nadochain.com's live "next block, as every
+        # node computes it" widget and any explorer/dashboard. No credentials are ever involved; the
+        # authenticated surfaces (/log, /update) key on a token/IP, not on cookies, so a wildcard changes
+        # nothing about what a foreign page can do. Mirrors the header _RL() already sends.
+        if request.method in ("GET", "HEAD", "OPTIONS"):
+            try:
+                resp.headers.setdefault("Access-Control-Allow-Origin", "*")
+            except Exception:
+                pass
+        return resp
+
+    app = web.Application(client_max_size=_MAX_INLINE_TX, middlewares=[_body_cap_mw])
     app.add_routes([
         web.get("/", home),
         *[web.get("/" + _t, interface_page) for _t in _TAB_PATHS],
@@ -1849,22 +3413,44 @@ async def make_app(port):
         web.get("/get_transaction", transaction),
         web.get("/get_blocks_after", blocks_after),
         web.get("/get_blocks_before", blocks_before),
-        web.get("/get_block_number", block_by_number),
-        web.get("/get_block", block_by_hash),
+        web.get("/hash_attest", hash_attest),
+        web.get("/get_block", block_lookup),
         web.get("/get_account", account),
         web.get("/get_account_mempool", account_mempool),
-        web.get("/transaction_pool", _dump_handler("transaction_pool", lambda: memserver.transaction_pool)),
+        web.get("/wallet_view", wallet_view),
+        web.post("/device_attest_probe", device_attest_probe),
+        web.get("/download_enrol", download_enrol),
+        web.post("/tpm_proof_drop", tpm_proof_drop),
+        web.get("/tpm_enrolment", tpm_enrolment),
+        web.get("/tpm_duty", tpm_duty),
+        web.post("/tpm_enrol_id", tpm_enrol_id),
+        web.post("/register_challenge", register_challenge),
+        web.post("/devbind_lookup", devbind_lookup),
+        web.post("/node_attest_drop", node_attest_drop),
+        web.get("/node_attest_pickup", node_attest_pickup),
+        web.get("/node_attest_status", node_attest_status),
+        web.get("/transaction_pool", _dump_handler("transaction_pool", lambda: memserver.live_pool(),
+                                                    rate=30, heavy=True)),
         web.get("/invariants", invariants_report),
         web.get("/rollback_stats", rollback_stats_report),
         web.get("/daily_stats", daily_stats_report),
+        web.get("/treasury_history", treasury_history_report),
         web.get("/state_health", state_health),
         web.get("/update", update_node),
         web.get("/update_peer", update_peer),
+        # DA reads, forwarded to this host's exec node — see da_proxy for why L1 carries them.
+        web.get("/da/{what}", da_proxy),
+        # the Stwo spend relay (ops/stwo_relay.py): a wallet's private spend published under THIS node's account
+        web.get("/stwo/relay_info", stwo_relay_info),
+        web.post("/stwo/relay", stwo_relay_post),
+        web.options("/stwo/relay", stwo_relay_post),
         # mempool SET RECONCILIATION wire (memserver.merge_remote_transactions): the cheap id list +
         # the bounded fetch-by-id — divergent peers no longer re-download each other's whole pools.
         web.get("/transaction_ids", _dump_handler("transaction_ids",
-                                                  lambda: [t.get("txid") for t in memserver.transaction_pool])),
+                                                  lambda: [t.get("txid") for t in memserver.live_pool()],
+                                                  heavy=True)),
         web.post("/transactions_by_id", transactions_by_id),
+        web.get("/next_block_txids", next_block_txids),
         web.get("/transaction_hash_pool", _dump_handler("transactions_hash_pool", lambda: {
             "transactions_hash_pool": consensus.transaction_hash_pool,
             "majority_transactions_hash_pool": consensus.majority_transaction_pool_hash})),
@@ -1876,6 +3462,7 @@ async def make_app(port):
         web.get("/mining_history", mining_history_handler),
         web.get("/get_unbond", get_unbond),
         web.get("/status", status),
+        web.get("/relays", relays),
         web.get("/peers", _dump_handler("peers", lambda: me_to(list(memserver.peers)))),
         web.get("/geo_peers", geo_peers),
         web.get("/peer_buffer", _dump_handler("peer_buffer", lambda: list(memserver.peer_buffer))),
@@ -1884,19 +3471,24 @@ async def make_app(port):
             "block_opinions": consensus.block_hash_pool,
             "majority_block_opinion": consensus.majority_block_hash})),
         web.get("/get_recommended_fee", get_recommended_fee),
-        web.get("/get_richest", get_richest),
         web.get("/wealth_stats", get_wealth_stats),
+        web.get("/device_stats", device_stats),
         web.get("/treasury_status", get_treasury_status),
         web.get("/posw_difficulty", get_posw_difficulty),
         web.get("/get_rich_list", get_rich_list),
         web.get("/get_open_weights", get_open_weights),
         web.get("/duty_committee", duty_committee),
         web.get("/get_dividend_inflow", get_dividend_inflow),
+        web.get("/settle_chain_inputs", settle_chain_inputs),
         web.get("/get_settled", get_settled),
+        web.get("/unshield_claimed", unshield_claimed),
         web.get("/resolve_alias", resolve_alias),
         web.get("/msig_address", msig_address),
         web.get("/get_htlc", get_htlc),
         web.get("/htlcs", htlcs),
+        web.get("/invite", get_invite),
+        web.get("/invites", invites),
+        web.get("/referrals", referrals),
         web.get("/get_aliases_of", aliases_of),
         web.get("/terminate", terminate),
         web.get("/health", health),
@@ -1906,6 +3498,8 @@ async def make_app(port):
         web.get("/force_sync", force_sync),
         web.get("/favicon.ico", favicon),
         web.get("/robots.txt", robots_txt),
+        web.get("/protocol.js", protocol_js),
+        web.get("/protocol.json", protocol_json),
         web.get("/static/miner.{ext:html|js|css}", legacy_static_redirect),   # old name -> interface.*
         web.get("/static/{path:.*}", static_handler),
     ])
@@ -1920,7 +3514,28 @@ async def make_app(port):
         # them separate (rather than one dual-stack "::" socket) means v4 clients arrive as plain 1.2.3.4
         # on the v4 socket instead of ::ffff:1.2.3.4 — so client_ip_from / rate-limiting see real v4 keys.
         # The v6 listener is best-effort: a host with no IPv6 just skips it (v4 keeps working).
-        await web.TCPSite(runner, host="0.0.0.0", port=port).start()
+        await web.TCPSite(runner, host="0.0.0.0", port=port).start()  # nosec B104 # the node IS the public P2P/API endpoint: it must listen on every interface
+        # ALSO SERVE ON PORT 80, because the node's own port is the one that gets blocked. A prover on a
+        # filtered home or office network — or behind a host firewall deciding what an unsigned download
+        # may do — reaches 80 and not 9173, and an enrolment needs a relay it can actually talk to. The
+        # same application, the same handlers; only the port differs.
+        #
+        # BEST EFFORT AND NEVER FATAL: an unprivileged node cannot bind 80 without CAP_NET_BIND_SERVICE,
+        # and a host already running a web server has it taken. Both are ordinary, so they are logged at
+        # info and the node carries on — a node that refuses to start because port 80 was busy would be a
+        # far worse failure than one that is simply not reachable on it.
+        # DEFAULT IN THE CODE, NOT ONLY IN THE TEMPLATE. get_config() returns the file verbatim and does
+        # NOT merge new defaults, so a key added to config.py reaches only nodes installed after it — and
+        # every node already running would have skipped this silently. `or 0` made "absent" mean
+        # "disabled", which is the opposite of what a new default is for. An explicit 0 still disables it.
+        _relay_port = int(get_config().get("relay_port", 80) or 0)
+        if _relay_port and _relay_port != port:
+            try:
+                await web.TCPSite(runner, host="0.0.0.0", port=_relay_port).start()  # nosec B104 # the node IS the public P2P/API endpoint: it must listen on every interface
+                logger.info(f"Also listening on 0.0.0.0:{_relay_port} (reachable where {port} is filtered)")
+            except Exception as e:
+                logger.info(f"Not listening on {_relay_port} ({type(e).__name__}) — "
+                            f"provers on networks that filter {port} will use another relay")
         try:
             s6 = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
             s6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
@@ -1937,6 +3552,18 @@ async def make_app(port):
 """warning, no intensive operations or locks should be invoked from API interface"""
 logger = get_logger(logger_name="main_logger")
 
+# DEVICE ATTESTATION KERNEL — REFUSE TO START without it once the rule is active. A node that updated the Python
+# code but did not build native/attest (no cargo, a failed build) would otherwise reject every register tx and
+# fork off silently; failing loudly here is the same policy as the ML-DSA backend. The updater builds the crate
+# (ops.self_update._CRATES); on a hand-installed node: cd native/attest && cargo build --release.
+try:
+    import protocol as _p_attest
+    if int(getattr(_p_attest, "DEVICE_ATTEST_HEIGHT", 0) or 0) > 0:
+        from ops import attest_native as _attest_native
+        _attest_native._load()
+except Exception as _e_attest:
+    raise SystemExit(f"device attestation kernel unavailable: {_e_attest} — build native/attest (cargo build --release). REFUSING TO START.")
+
 allow_async()
 
 updated_version = versioner.update_version()
@@ -1950,6 +3577,57 @@ from ops.data_ops import chain_purge_due, purge_chain_data, stamp_chain_generati
 if chain_purge_due():
     logger.warning("CHAIN_GENERATION bumped — a genesis reroll shipped with this update; wiping chain data for regenesis")
     purge_chain_data(logger)
+
+# GENESIS-IDENTITY BACKSTOP (2026-08-20, the betanet-4 cutover). The marker above is a HINT that can
+# miss: three hand-installed nodes kept extending the OLD chain through the reroll because their
+# generation marker was absent (split/non-systemd layouts), and a missing marker deliberately stamps
+# instead of purging — which then PERMANENTLY exempts the stale data. The CHAIN ITSELF is the truth:
+# block 0's hash is blake2b_hash_link(GENESIS_TIMESTAMP, []) by construction, so on-disk data whose
+# block 0 hashes differently belongs to another genesis, full stop — purge it regardless of markers.
+# Read via a STANDALONE read-only LMDB open (never kv_ops.init_env: purging directories underneath
+# the process-wide cached env would leave later writes going to deleted inodes).
+try:
+    if os.path.exists(f"{get_home()}/index/block_ends.dat"):
+        import lmdb as _lmdb
+        from hashing import blake2b_hash_link as _bhl
+        _e = _lmdb.open(f"{get_home()}/index/state", readonly=True, lock=False, max_dbs=64)
+        try:
+            _db = _e.open_db(b"block_by_num", create=False)
+            with _e.begin(db=_db) as _txn:
+                _g0 = _txn.get((0).to_bytes(8, "big"))
+        finally:
+            _e.close()
+        if _g0 is not None and _g0.decode() != _bhl(link_from=GENESIS_TIMESTAMP, link_to=[]):
+            logger.warning("On-disk block 0 does not match protocol GENESIS_TIMESTAMP — "
+                           "foreign-generation chain data; wiping for regenesis")
+            purge_chain_data(logger)
+        else:
+            # HEIGHT-vs-WALLCLOCK BOUND (the rolling-node identity, 2026-08-20). A snapshot-booted /
+            # rolling node holds NO block 0 to compare (_g0 is None above, so the hash check is mute) —
+            # which is exactly how purged nodes were RE-INFECTED at the betanet-4 cutover: they rebooted
+            # into an old-chain majority, snapshot bootstrap adopted the heavier quorum snapshot with no
+            # genesis-descent proof, and 7 of 10 nodes ended back on the dead chain within minutes. But
+            # height is bound to wallclock by construction: production paces at BLOCK_TIME, so a chain
+            # whose max height exceeds ~2x the blocks the CURRENT genesis could have produced since
+            # GENESIS_TIMESTAMP (plus slack) cannot be this generation's chain, pruned or not. Pure
+            # arithmetic — no probe, no block 0, no marker.
+            import time as _time
+            from protocol import BLOCK_TIME as _BT   # NOT in nado.py's top import list — the missing
+            # import made the whole backstop a named no-op on every node ("skipped (NameError)")
+            _bound = int((_time.time() - GENESIS_TIMESTAMP) / _BT) * 2 + 600
+            with _lmdb.open(f"{get_home()}/index/state", readonly=True, lock=False,
+                            max_dbs=64) as _e2:
+                _db2 = _e2.open_db(b"block_by_num", create=False)
+                with _e2.begin(db=_db2) as _txn2:
+                    _cur2 = _txn2.cursor()
+                    _maxh = int.from_bytes(_cur2.key(), "big") if _cur2.last() else 0
+            if _maxh > _bound:
+                logger.warning(f"On-disk chain reaches height {_maxh} but this genesis could have "
+                               f"produced at most ~{_bound} blocks since GENESIS_TIMESTAMP — "
+                               f"foreign-generation chain data; wiping for regenesis")
+                purge_chain_data(logger)
+except Exception as _ge:
+    logger.warning(f"genesis-identity check skipped ({type(_ge).__name__}: {_ge})")
 stamp_chain_generation()
 
 # GENESIS SENTINEL: key off block_ends.dat (written LAST by make_genesis), NOT the blocks/ dir (created FIRST
@@ -1967,13 +3645,15 @@ if not os.path.exists(f"{get_home()}/index/block_ends.dat"):
         logger=logger,
     )
 
-# BLOCK-STORE migration (idempotent, one-time): fold any legacy per-file bodies (flat or sharded
-# *.block) into the append-only segment store, and repair a torn segment tail from a crash mid-append.
+# BLOCK-STORE open (idempotent, every boot): discover the active segment and repair a torn segment tail
+# from a crash mid-append. The legacy per-file *.block sweep that used to run here was deleted: nothing
+# has written a *.block body since the segment store (ae3c319d, 2026-07-12), and every reroll since has
+# purged chain data, so no node can still hold one.
 try:
-    from ops.block_ops import migrate_block_store
-    migrate_block_store(logger)
+    from ops import segment_store as _segment_store
+    _segment_store.init()
 except Exception as _e:
-    logger.error(f"block-store segment migration failed: {_e}")
+    logger.error(f"block-store segment open failed: {_e}")
     raise SystemExit(1)   # a half-migrated store must not silently run — fix disk/permissions and restart
 
 # CHECKPOINT SWEEP (idempotent, boot-time): drop any persisted checkpoint that does not anchor to THIS
@@ -2018,9 +3698,50 @@ assert not is_port_in_use(get_config()["port"], _port_check_host), "Port already
 signal.signal(signal.SIGINT, handler)
 signal.signal(signal.SIGTERM, handler)
 
+# ONE-TIME CONFIG MIGRATION, before MemServer reads a single knob. create_config is create-only and writes
+# every default at install time, so a changed default otherwise reaches new installs and nothing else — the
+# value the old installer wrote looks exactly like a value the operator chose. Narrow and idempotent: it
+# only touches keys still holding the old default, and stamps config_version so it never runs twice.
+try:
+    _mig = migrate_config(logger=logger)
+    if _mig.get("changed"):
+        logger.warning(f"config migrated: {_mig['changed']}")
+except Exception as e:
+    logger.warning(f"config migration skipped: {type(e).__name__}: {e}")
+
 memserver = MemServer(logger=logger)
 
 logger.info(f"NADO version {memserver.version} started")
+try:
+    memserver.load_pool()          # the previous process's mempool, re-validated tx by tx
+except Exception as _e:
+    logger.error(f"mempool restore failed: {_e}")
+
+# AN ARCHIVE NODE THAT SNAP-SYNCED IS NOT AN ARCHIVE. snapshot_bootstrap backfills only
+# REWARD_WINDOW + 2*EPOCH_LENGTH + FINALITY_DEPTH bodies behind its anchor and nothing older, EVER — so a
+# node that boots that way with archive=true keeps everything from its snapshot forward and has nothing
+# before it, while advertising itself as the peer that can serve history.
+#
+# We do NOT refuse snapshot sync to fix that, and the reason matters: rolling is the default now, so within
+# one retention window no peer will hold deep bodies to serve. Forcing a from-genesis replay would not
+# produce a full archive, it would produce a node that can never sync at all. The honest move is to say
+# what this node actually is, once, loudly, at boot — an operator who wants a TRUE archive has to sync
+# from genesis while some peer still serves it, or copy an existing archive's data directory.
+try:
+    if getattr(memserver, "archive", False):
+        _eb = memserver.earliest_block if isinstance(memserver.earliest_block, dict) else {}
+        _from = int(_eb.get("block_number") or 0)
+        if _from > 1:
+            logger.warning("=" * 78)
+            logger.warning(f"ARCHIVE MODE, BUT THIS NODE'S HISTORY STARTS AT BLOCK {_from}.")
+            logger.warning("  It was bootstrapped from a snapshot, so the bodies below that height were")
+            logger.warning("  never downloaded and never will be. It archives everything from here FORWARD;")
+            logger.warning("  it cannot serve the chain before it. Peers reading node_type=archive will")
+            logger.warning("  expect otherwise. For a true archive: sync from genesis while a peer still")
+            logger.warning("  serves those bodies, or copy an existing archive node's data directory.")
+            logger.warning("=" * 78)
+except Exception:
+    pass                                    # a diagnostic must never keep the node from starting
 logger.info(f"Your address: {memserver.address}")
 logger.info(f"Your IP: {memserver.ip}")
 
@@ -2145,12 +3866,53 @@ def _daily_stats_loop():
                     floors = {"up_agree": max(0, min(100, round(consensus.upcoming_block_hash_pool_percentage))),
                               "tip_agree": max(0, min(100, round(consensus.block_hash_pool_percentage)))}
                 daily_stats.sample(tip, _load_block, gauges, floors)
+                # Governance archive: walk the same freshly-incorporated blocks for treasury payouts.
+                # Pull-only and failure-isolated — a bad pass must never take down telemetry sampling.
+                try:
+                    from ops import treasury_history as _th
+                    _th.scan(tip, _load_block)
+                except Exception:
+                    pass
         except Exception as e:
             logger.info(f"daily-stats sample failed (retrying next pass): {e}")
         time.sleep(daily_stats.SAMPLE_INTERVAL)
 
 
 _threading.Thread(target=_daily_stats_loop, daemon=True, name="daily_stats").start()
+
+
+def _node_jobs_loop():
+    """In-node jobs + the job report (ops/jobs.py, deploy/units/manifest.json, doc/jobs.md).
+    DEX PRICES (ops/dex_prices.py): sampled here, not by a separate process — the old detached script died at a
+    reboot and the shared chart froze for two days unseen. Runs on every node; only a node with an exec node has
+    prices to read (the others fail the read quietly and write nothing). JOB REPORT: every declared unit's systemd
+    state, refreshed each pass for /status `jobs`. Pull-only and failure-isolated; nothing here touches consensus."""
+    from ops import dex_prices, jobs
+    jobs.inner["dex_prices"] = {"role": "exec", "since": time.time(), "last_ok": None}
+    time.sleep(20)
+    while True:
+        try:
+            n = dex_prices.sample_once(_proto.CHAIN_ID)
+            if n is not None:
+                jobs.inner["dex_prices"].update(last_ok=int(time.time()), series=n)
+        except Exception as e:
+            logger.info(f"dex price sample failed (retrying next pass): {e}")
+        try:
+            # EXEC SUPERVISOR (ops/exec_supervisor.py, 2026-09-27): an update restart can leave nado-exec stopped on a
+            # machine whose root side cannot bring it back (185.100.232.5, 185.238.249.208); the node runs it itself
+            # until the service returns. Before the report, so the report reads what it decided.
+            from ops import exec_supervisor
+            jobs.supervisor = exec_supervisor.supervise(log=logger.warning)
+        except Exception as e:
+            logger.info(f"exec supervisor pass failed: {e}")
+        try:
+            jobs.refresh(get_config())
+        except Exception as e:
+            logger.info(f"job report refresh failed: {e}")
+        time.sleep(dex_prices.EVERY)
+
+
+_threading.Thread(target=_node_jobs_loop, daemon=True, name="node_jobs").start()
 
 
 def _gossip_worker():

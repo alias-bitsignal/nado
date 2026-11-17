@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title data-i18n="land.title">NADO Land — one planet, built block by block on land you own</title>
+<meta name="description" content="Land: a permanent planet in your browser. Own a plot as an NFT, build on it block by block with others in real time, and anchor your build on the NADO chain. Post-quantum secure, no install.">
+<meta name="robots" content="index, follow, max-image-preview:large">
+<link rel="canonical" href="https://land.nadochain.com/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="NADO">
+<meta property="og:url" content="https://land.nadochain.com/">
+<meta property="og:title" content="NADO Land — one planet, built block by block on land you own">
+<meta property="og:description" content="Own a plot as an NFT, build on it in real time, anchor your build on chain.">
+<meta property="og:image" content="https://nadochain.com/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:site" content="@nadochain">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%2048%2048%22%3E%3Ccircle%20cx%3D%2224%22%20cy%3D%2224%22%20r%3D%2219%22%20fill%3D%22%232f6fb0%22/%3E%3Cpath%20d%3D%22M9%2026c6-3%209%203%2015-1s9-6%2015-2v6c-6%208-24%209-30-3z%22%20fill%3D%22%235f9e3a%22/%3E%3C/svg%3E">
+<meta name="theme-color" content="#0b0f14">
+<script src="/static/i18n.js"></script>
+<style>
+  :root{--bg:#0b0f14;--elev:#131a23;--border:#243140;--txt:#e6edf3;--dim:#93a1b0;--accent:#00ad93;--accent2:#00c9a7;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;--sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  *{box-sizing:border-box}
+  /* overscroll-behavior: a sideways look-drag that began on a panel swiped the phone's browser BACK, out of the game
+     (found walking the live page as a phone, 2026-11-08) */
+  html,body{margin:0;height:100%;overflow:hidden;overscroll-behavior:none;background:var(--bg);color:var(--txt);font-family:var(--sans)}
+  #world{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none}
+  header{position:fixed;top:0;left:0;right:0;display:flex;align-items:center;gap:10px;padding:10px 14px;
+    background:linear-gradient(rgba(11,15,20,.72),rgba(11,15,20,0));pointer-events:none;z-index:5}
+  header>*{pointer-events:auto}
+  header h1{font-size:17px;margin:0;font-weight:800;text-shadow:0 1px 3px #000}header h1 .a{color:var(--accent2)}
+  header .hub{margin-left:auto;font-size:12px;font-weight:700;color:var(--dim);text-decoration:none;border:1px solid var(--border);border-radius:999px;padding:6px 12px;background:var(--elev)}
+  #hudPos{white-space:pre-line}   /* flying with a nav unit, its line under the flight line (#173) */
+  #hudInfo{position:fixed;top:52px;left:14px;font-size:12.5px;line-height:1.55;z-index:4;text-shadow:0 1px 2px #000;max-width:min(560px,calc(100vw - 28px))}
+  #hudInfo .dim{color:#c9d4de}
+  /* HEALTH (#162): hearts in the HUD; a red flash when struck; the death card */
+  #hudHp{color:#ff6b6b;font-weight:800;letter-spacing:1px}
+  #hurtFlash{position:fixed;inset:0;pointer-events:none;z-index:6;opacity:0;transition:opacity .45s;box-shadow:inset 0 0 120px 40px rgba(220,0,0,.75)}
+  #hurtFlash.on{opacity:1;transition:none}
+  #hitDir{position:fixed;left:50%;top:50%;width:0;height:0;pointer-events:none;z-index:6;opacity:0;transition:opacity .5s}
+  #hitDir.on{opacity:1;transition:none}
+  #hitDir i{position:absolute;left:-110px;top:-190px;width:220px;height:70px;box-sizing:border-box;border-top:12px solid rgba(235,30,30,.92);border-radius:50%/100% 100% 0 0}
+  #hitDir.warn i{border-top-color:rgba(255,176,0,.95)}
+  #deathCard{position:fixed;inset:0;z-index:40;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;background:rgba(60,0,0,.72);color:#fff;text-align:center;padding:16px}
+  #deathCard.hidden{display:none}
+  #deathCard h2{margin:0;font-size:22px}
+  #deathCard button{font:inherit;font-weight:800;border:0;border-radius:12px;padding:12px 22px;cursor:pointer;background:linear-gradient(135deg,var(--accent),var(--accent-2));color:var(--bg)}
+  /* the plot line as a wrapping row with even gaps: inline, a long translation wrapped its button onto a line jammed
+     against the text above (Czech, 2026-11-06) */
+  #hudPlot{display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;margin-top:4px}
+  .pill{display:inline-block;font-size:11px;font-weight:800;border-radius:999px;padding:3px 9px;background:rgba(19,26,35,.85);border:1px solid var(--border)}
+  .pill.ok{border-color:var(--accent2);color:var(--accent2)}
+  .btn,button.ghost{font:inherit;font-size:12px;font-weight:700;color:var(--txt);background:rgba(19,26,35,.88);border:1px solid var(--border);border-radius:8px;padding:5px 10px;cursor:pointer;text-decoration:none}
+  .btn:hover,button.ghost:hover{border-color:var(--accent2)}
+  #hudGpu{position:fixed;right:12px;bottom:10px;font:11px var(--mono);color:var(--dim);z-index:4;cursor:pointer}
+  #cross{position:fixed;left:50%;top:50%;width:18px;height:18px;margin:-9px 0 0 -9px;z-index:3;pointer-events:none}
+  #aimLine{position:fixed;left:50%;top:calc(50% + 16px);transform:translateX(-50%);font-size:12px;color:#fff;text-shadow:0 1px 2px #000;z-index:3;pointer-events:none;white-space:nowrap;max-width:80vw;overflow:hidden;text-overflow:ellipsis}
+  #cross:before,#cross:after{content:"";position:absolute;background:rgba(255,255,255,.85);box-shadow:0 0 2px #000}
+  #cross:before{left:8px;top:0;width:2px;height:18px}#cross:after{top:8px;left:0;height:2px;width:18px}
+  #hotwrap{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);z-index:4;text-align:center}
+  #goal{font-size:12px;color:#ffe9a8;text-shadow:0 1px 2px #000;margin:0 auto 4px;min-height:14px;max-width:min(60vw,520px)}   /* (wraps clear of a phone's touch buttons) */
+  #hotName{font-size:12px;font-weight:700;text-shadow:0 1px 2px #000;margin-bottom:4px;min-height:16px}
+  #pieceInfo{font-size:11px;color:#dfe7ee;text-shadow:0 1px 2px #000;margin-bottom:4px;min-height:14px}
+  #hotbar{display:flex;gap:4px;padding:4px;background:rgba(11,15,20,.6);border:1px solid var(--border);border-radius:10px}
+  .hs{position:relative;width:44px;height:44px;border:2px solid transparent;border-radius:7px;display:grid;place-items:center;cursor:pointer}
+  .hs.on{border-color:#fff}.hs canvas{width:32px;height:32px;image-rendering:pixelated}
+  .hs span{position:absolute;left:3px;top:1px;font-size:10px;font-weight:800;text-shadow:0 1px 2px #000}
+  .hs b{position:absolute;right:3px;bottom:1px;font-size:11px;font-weight:800;text-shadow:0 1px 2px #000}
+  .hs.none{opacity:.4}.hs.empty{width:auto;padding:0 12px;font-size:12px;color:var(--dim);cursor:default}
+  #breakBar{position:fixed;left:50%;top:calc(50% + 18px);width:60px;height:5px;margin-left:-30px;background:rgba(0,0,0,.5);border-radius:3px;z-index:3;overflow:hidden}
+  #breakBar i{display:block;height:100%;width:0;background:#fff}
+  /* the games' slider (mines, dice, blackjack carry the same three rules) for the wallet's buy-in and cash-out sliders,
+     which drew as the OS default on this page ("the OS default slider is terrible", operator 2026-11-06) */
+  input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:10px;padding:0;border:0;margin:12px 0;background:linear-gradient(90deg,var(--accent) 0,var(--accent2) 100%);border-radius:999px;cursor:pointer}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:26px;height:26px;border-radius:50%;background:#fff;border:3px solid var(--accent);box-shadow:0 2px 8px rgba(0,0,0,.4);cursor:grab}
+  input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;background:#fff;border:3px solid var(--accent);cursor:grab}
+  /* what a gather gave, beside the crosshair (it used to show only in the bag: "it gives, but it is only visible in the bag!!!") */
+  #pickup{position:fixed;left:calc(50% + 22px);top:calc(50% - 10px);z-index:3;pointer-events:none;display:flex;flex-direction:column;gap:2px;font:600 13px system-ui,sans-serif;color:#fff;text-shadow:0 1px 3px #000}
+  #pickup div{transition:opacity .6s,transform .6s}
+  #pickup div.go{opacity:0;transform:translateY(-10px)}
+  [dir=rtl] #pickup{left:auto;right:calc(50% + 22px)}
+  #palGrid h3{font-size:13px;margin:14px 0 6px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em}
+  .chips{display:flex;flex-wrap:wrap;gap:6px}
+  .chip{font:inherit;font-size:12px;color:var(--txt);background:#0b0f14;border:1px solid var(--border);border-radius:999px;padding:4px 10px}
+  .chip.pl{cursor:pointer}.chip.pl:hover{border-color:var(--accent2)}.chip.tool{border-color:var(--accent2);color:var(--accent2)}
+  .rcp{display:flex;align-items:center;gap:10px;justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--border);font-size:13px}
+  .rcp.off{opacity:.55}.rcp .dim{font-size:11.5px;color:var(--dim)}
+  .tradeform{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:8px;font-size:12.5px}
+  .tradeform input,.tradeform select{font:inherit;font-size:12.5px;color:var(--txt);background:#0b0f14;border:1px solid var(--border);border-radius:7px;padding:4px 6px}
+  .tradeform input[type=number]{width:62px}.tradeform #gvTo{flex:1;min-width:160px}
+  button:disabled{opacity:.45;cursor:default}
+  #console{position:fixed;left:14px;bottom:96px;z-index:7;width:min(560px,calc(100vw - 28px));pointer-events:none}
+  #conLog{font:500 13px var(--mono);color:#fff;text-shadow:0 1px 2px #000;display:none;flex-direction:column;gap:2px}
+  #conLog.show{display:flex}
+  /* no scroller (a scrolling layer drew blank in the headless check): the last 16 lines open, the last 6 while playing */
+  #conLog div:not(:nth-last-child(-n+16)){display:none}#console:not(.open) #conLog div:not(:nth-last-child(-n+6)){display:none}
+  #conLog div{background:rgba(11,15,20,.55);padding:2px 8px;border-radius:6px;align-self:flex-start;max-width:100%;overflow-wrap:anywhere}
+  #conLog .me{color:var(--dim)}#conLog .err{color:#ff9b8a}
+  #conIn{display:none;width:100%;margin-top:6px;font:500 14px var(--mono);color:var(--txt);background:rgba(11,15,20,.92);border:1px solid var(--border);border-radius:8px;padding:8px 10px;pointer-events:auto}
+  #console.open #conIn{display:block}#console.open #conLog{pointer-events:auto}
+  body.touch #console{bottom:150px}
+  /* a phone, typing: at the TOP, the input first and the newest line under it (playtest 2026-11-15: open at the bottom it
+     lay across the Chat, Run and Turn buttons — Chat, which closes it, half under the box — and a phone's own keyboard
+     covers the bottom half while one types) */
+  body.touch #console.open{top:52px;bottom:auto;display:flex;flex-direction:column-reverse}
+  body.touch #console.open #conLog.show{flex-direction:column-reverse}
+  body.touch #console.open #conIn{margin:0 0 6px}
+  #help{position:fixed;inset:0;display:grid;place-items:center;z-index:6;pointer-events:none}
+  body.shot > :not(#world){display:none!important}   /* PHOTO MODE (?shot=): the world, nothing of the page */
+  #help .card{pointer-events:auto;max-width:420px;margin:16px;background:rgba(19,26,35,.94);border:1px solid var(--border);border-radius:14px;padding:18px 20px;font-size:13.5px;line-height:1.6}
+  #help h2{margin:0 0 8px;font-size:17px}#help kbd{font:11px var(--mono);border:1px solid var(--border);border-radius:5px;padding:1px 5px;background:#0b0f14}
+  #help .go{margin-top:12px;font:inherit;font-weight:800;color:#0b0f14;background:var(--accent2);border:0;border-radius:10px;padding:8px 22px;cursor:pointer}
+  #palette{position:fixed;inset:0;z-index:8;display:grid;place-items:center;background:rgba(0,0,0,.45)}
+  #palette .card{max-width:min(620px,calc(100vw - 32px));max-height:80vh;overflow:auto;background:var(--elev);border:1px solid var(--border);border-radius:14px;padding:16px}
+  #palette h2{margin:0 0 10px;font-size:16px;display:flex;align-items:center}#palette h2 button:first-of-type{margin-left:auto}#palette h2{gap:6px}
+  #palGrid{font-size:13px}
+  #chestPanel,#machPanel,#npcPanel{position:fixed;inset:0;z-index:8;display:grid;place-items:center;background:rgba(0,0,0,.45)}
+  #machPanel .card,#chestPanel .card,#npcPanel .card{max-width:min(560px,calc(100vw - 32px));max-height:80vh;overflow:auto;background:var(--elev);border:1px solid var(--border);border-radius:14px;padding:16px;font-size:13px}
+  #chestPanel h2,#machPanel h2,#npcPanel h2{margin:0 0 10px;font-size:16px;display:flex;align-items:center}#chestPanel h2 button,#machPanel h2 button,#npcPanel h2 button{margin-left:auto}
+  .mrow{display:flex;gap:8px;align-items:center;justify-content:space-between;padding:6px 0;border-top:1px solid var(--border)}.mrow.on b{color:var(--accent2)}
+  #setPanel{position:fixed;inset:0;z-index:8;display:grid;place-items:center;background:rgba(0,0,0,.45)}
+  #setPanel .card{width:min(460px,calc(100vw - 32px));max-height:80vh;overflow:auto;background:var(--elev);border:1px solid var(--border);border-radius:14px;padding:16px;font-size:13px}
+  #setPanel h2{margin:0 0 10px;font-size:16px;display:flex;align-items:center}#setPanel h2 button{margin-left:auto}
+  .srow{display:flex;gap:10px;align-items:center;justify-content:space-between;padding:7px 0;border-top:1px solid var(--border)}
+  .srow select{font:inherit;color:var(--txt);background:#0b0f14;border:1px solid var(--border);border-radius:8px;padding:6px 8px;max-width:58%}
+  .presets{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 8px}.presets button.on{border-color:var(--accent2);color:var(--accent2)}
+  #wardPanel{position:fixed;inset:0;z-index:8;display:grid;place-items:center;background:rgba(0,0,0,.45)}
+  #mapPanel{position:fixed;inset:0;z-index:8;display:grid;place-items:center;background:rgba(0,0,0,.45)}
+  #padPanel{position:fixed;inset:0;z-index:8;display:grid;place-items:center;background:rgba(0,0,0,.45)}
+  #planetPanel{position:fixed;inset:0;z-index:8;display:grid;place-items:center;background:rgba(0,0,0,.45)}
+  #planetPanel .card{width:min(480px,calc(100vw - 32px));max-height:88vh;overflow:auto;background:var(--elev);border:1px solid var(--border);border-radius:14px;padding:16px;font-size:13px;line-height:1.7}
+  #planetPanel h2{margin:0 0 10px;font-size:16px;display:flex;align-items:center}#planetPanel h2 button{margin-left:auto}
+  #planetPanel .note{opacity:.7;font-size:12px}
+  #padPanel .card{width:min(460px,calc(100vw - 32px));max-height:88vh;overflow:auto;background:var(--elev);border:1px solid var(--border);border-radius:14px;padding:16px;font-size:13px;line-height:1.6}
+  #padPanel h2{margin:0 0 10px;font-size:16px;display:flex;align-items:center}#padPanel h2 button{margin-left:auto}
+  #mapPanel .card{width:min(520px,calc(100vw - 32px));max-height:92vh;overflow:auto;background:var(--elev);border:1px solid var(--border);border-radius:14px;padding:16px;font-size:13px}
+  #mapPanel h2{margin:0 0 10px;font-size:16px;display:flex;align-items:center}#mapPanel h2 button{margin-left:auto}
+  #mapCanvas{width:min(100%,calc(92vh - 150px));height:auto;aspect-ratio:1;display:block;margin:0 auto;border-radius:8px;background:#1b2430}   /* a short phone screen: the whole map in view, not cut off below (#173) */
+  #mapLegend{margin-top:8px;line-height:1.6}#mapLegend b{display:inline-block;width:10px;height:10px;margin:0 4px 0 10px;border-radius:2px;vertical-align:-1px}
+  #mapBtn{pointer-events:auto;margin-top:6px;padding:4px 12px;border-radius:999px;border:1px solid var(--border);background:var(--elev);color:inherit;font:inherit;cursor:pointer}
+  #wardPanel .card{max-width:min(560px,calc(100vw - 32px));max-height:80vh;overflow:auto;background:var(--elev);border:1px solid var(--border);border-radius:14px;padding:16px;font-size:13px}
+  #wardPanel h2{margin:0 0 10px;font-size:16px;display:flex;align-items:center;gap:6px}#wardPanel h2 button:first-of-type{margin-left:auto}
+  #wardPanel h3{margin:10px 0 6px;font-size:12px;color:var(--dim)}
+  .ward{display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap}.fig{position:relative;width:120px;height:196px;flex:none}.fig i{position:absolute;border-radius:3px}
+  .sws{display:flex;gap:6px;flex-wrap:wrap}.sw{width:26px;height:26px;border-radius:50%;border:2px solid var(--border);cursor:pointer;padding:0}.sw.on{border-color:var(--accent2)}.sw.face{width:38px;height:38px;border-radius:10px}
+  .wslot{margin:6px 0;display:flex;gap:6px;align-items:center;flex-wrap:wrap}.wslot b{min-width:52px}
+  #chestPanel h3{margin:10px 0 6px;font-size:12px;color:var(--dim)}.chestRow{display:flex;flex-wrap:wrap;gap:6px}.crow{display:inline-flex;gap:2px}.chestRow .pb{padding:6px 9px;display:block}
+  .pb{font:inherit;font-size:11px;color:var(--txt);background:#0b0f14;border:1px solid var(--border);border-radius:9px;padding:8px 4px;cursor:pointer;display:grid;justify-items:center;gap:5px}
+  .pb:hover{border-color:var(--accent2)}.pb canvas{width:40px;height:40px;image-rendering:pixelated}
+  #loading{position:fixed;inset:0;display:grid;place-items:center;z-index:9;background:var(--bg);font-size:15px;color:var(--dim);padding:24px;text-align:center}
+  .hidden{display:none!important}
+  /* the profiler (` or /prof): where each frame's time goes */
+  #prof{position:fixed;top:120px;right:12px;z-index:7;margin:0;padding:8px 10px;max-width:min(560px,calc(100vw - 24px));white-space:pre;overflow:hidden;
+    font:500 11px/1.35 var(--mono);color:#e8f0f8;background:rgba(8,12,18,.78);border:1px solid var(--border);border-radius:10px;pointer-events:none}
+  #touchUi{display:none}
+  body.touch #touchUi{display:block}
+  body.touch #help .keys{display:none}
+  #touchUi button{position:fixed;z-index:5;width:58px;height:58px;border-radius:50%;font:inherit;font-size:12px;font-weight:800;color:var(--txt);
+    background:rgba(19,26,35,.7);border:1px solid var(--border);touch-action:none;word-break:keep-all}   /* (keep-all: Japanese チャット broke as チャッ/ト — no spaces, the browser broke anywhere; fitTouchLabels shrinks a whole word instead) */
+  #touchUi button.on{border-color:var(--accent2);color:var(--accent2)}   /* a toggle that is on: Fly while flying */
+  #tJump{right:18px;bottom:96px}#tDown{right:84px;bottom:96px}#tFly{right:18px;bottom:162px}
+  #tBreak{right:150px;bottom:96px}#tPlace{right:84px;bottom:162px}#tPal{right:150px;bottom:162px}
+  /* Use (Q on a keyboard): a door, a chest, a pilot seat — and leaving a craft. A phone had no way to open a door at all */
+  #tUse{right:216px;bottom:96px}
+  /* the goal line between the two button clusters (playtest 2026-11-15: at 800 px its 60 % ran under Use) — the left cluster
+     ends 208 px in, the right one 274 px in, so a centred line keeps clear of both within 100vw − 2 × 280 px */
+  body.touch #goal{max-width:max(150px,calc(100vw - 560px));font-size:11px}
+  /* a portrait phone: the clusters span the whole width at the bottom, so the line rides above the top row (Fire, Wear,
+     Level: bottom 228 + 58 px) — a tall screen has the room */
+  /* AN UPRIGHT PHONE (narrower than 600 px): the left cluster goes up a row, off the right cluster's rows — at 412 px wide
+     the third columns met (Turn's right edge 208, Bag's left 204: Bag lay over Turn in every language, measured live
+     2026-11-16, and at 360 px by 52 px); the goal line rises with it. Measured after: nothing overlaps at 412, 390, 360. */
+  @media (max-width:600px){body.touch #goal{position:fixed;left:50%;transform:translateX(-50%);bottom:362px;max-width:calc(100vw - 32px);margin:0}
+    body.touch #tChat,body.touch #tRun,body.touch #tTurn{bottom:228px}body.touch #tFire,body.touch #tWard,body.touch #tLevel{bottom:294px}}
+  /* the left cluster (#139, playtest 2026-11-11: a phone had no chat or console — so no /tp, /help — no run, no piece
+     turn, no fire, no wardrobe): the thumb that walks reaches them beside the stick */
+  #tChat{left:18px;bottom:162px}#tRun{left:84px;bottom:162px}#tTurn{left:150px;bottom:162px}#tFire{left:18px;bottom:228px}#tWard{left:84px;bottom:228px}
+  /* Level (L on a keyboard, #139): a phone could level ground only by typing /level in the console */
+  #tLevel{left:150px;bottom:228px}
+  body.touch #hotwrap{bottom:8px}
+  /* the HUD text took the top third of a 480-px phone (#139): smaller, tighter, and the plot card's explanations
+     (the wilderness sentence, the NADO sentence) folded away — the pill and the buttons stay */
+  body.touch #hudInfo{font-size:11px;line-height:1.3;max-width:min(380px,calc(100vw - 130px))}
+  body.touch #hudPlot .dim{display:none}
+  /* a phone whose HUD would reach the buttons below it (German, signed out: 1 px over Fire, playtest 2026-11-16) takes the
+     tighter type — set by land.js fitHud, only when needed */
+  body.touch #hudInfo.tight{font-size:10px;line-height:1.2}body.touch #hudInfo.tight #hudPlot{gap:3px 6px;margin-top:2px}
+  body.touch #hudInfo.tight .btn,body.touch #hudInfo.tight button,body.touch #hudInfo.tight .pill{padding-top:3px;padding-bottom:3px}
+  @media (max-width:620px){header h1{font-size:15px}.hs{width:34px;height:34px}.hs canvas{width:24px;height:24px}}
+</style>
+</head>
+<body>
+<canvas id="world"></canvas>
+<header>
+  <h1>NADO <span class="a" data-i18n="land.name">Land</span></h1>
+  <a class="hub" href="https://nadochain.com/apps.html" data-i18n="land.hub">All apps</a>
+</header>
+<div id="hudInfo"><div id="hudPos"></div><div id="hudPlot"></div><div id="hudHp" class="hidden"></div><button id="mapBtn" class="hidden" data-i18n="land.tMap">Map</button><button id="setBtn" data-i18n="land.setBtn">Settings</button></div>
+<div id="hurtFlash"></div>
+<div id="hitDir"><i></i></div>
+<div id="deathCard" class="hidden" role="dialog"><h2 id="deathBy"></h2><p id="deathWhere" class="dim"></p><button id="deathGo" data-i18n="land.respawn">Wake up</button></div>
+<div id="cross"></div><div id="aimLine"></div>
+<div id="breakBar" class="hidden"><i></i></div>
+<div id="pickup" aria-live="polite"></div>
+<div id="hotwrap"><div id="goal"></div><div id="hotName"></div><div id="pieceInfo"></div><div id="hotbar"></div></div>
+<div id="hudGpu"></div>
+<div id="console"><div id="conLog" aria-live="polite"></div><input id="conIn" maxlength="200" autocomplete="off" spellcheck="false" aria-label="Command or chat" data-i18n-ph="land.cPlaceholder" placeholder="/help — or say something"></div>
+<div id="help"><div class="card">
+  <h2 data-i18n="land.helpTitle">Welcome to the planet</h2>
+  <div data-i18n="land.helpBody2">Gather from the wilderness with your hands, make tools, and with them gather what your hands could not. Every plot is a title you can own: build on yours, and trade what you gather.</div>
+  <div class="keys">
+    <div><kbd>W A S D</kbd> <span data-i18n="land.kMove">walk</span> · <kbd>Space</kbd> <span data-i18n="land.kJump">jump</span> · <kbd>Shift</kbd> <span data-i18n="land.kRun">run</span> · <kbd>F</kbd> <span data-i18n="land.kFly">fly</span></div>
+    <div><kbd>X</kbd> <span data-i18n="land.kFire">make fire</span> · <kbd>V</kbd> <span data-i18n="land.kWard">wardrobe</span> · <kbd>/</kbd> <span data-i18n="land.kConsole">console</span> · <kbd>Enter</kbd> <span data-i18n="land.kChat">chat</span></div>
+    <div><kbd>R</kbd> <span data-i18n="land.kSize">piece size</span> · <kbd>T</kbd> <span data-i18n="land.kTurn">turn it</span> · <kbd>[ ]</kbd> <span data-i18n="land.kSnap">snap</span> · <kbd>Q</kbd> <span data-i18n="land.kDoor">talk to a person, open or close a door</span> · <kbd>G</kbd> <span data-i18n="land.kShape">box, slope or stairs</span> · <kbd>L</kbd> <span data-i18n="land.kLevel">flatten the ground (shovel)</span></div>
+    <div><kbd data-i18n="land.kLeft">left click</kbd> <span data-i18n="land.kGather">hold to gather</span> · <kbd data-i18n="land.kRight">right click</kbd> <span data-i18n="land.kPlace">place</span> · <kbd>1–9</kbd> <span data-i18n="land.kPick">pick a block</span> · <kbd>E</kbd> <span data-i18n="land.kBag">bag: make and trade</span></div>
+  </div>
+  <button id="helpPlay" class="go" data-i18n="land.play">Play</button>
+</div></div>
+<div id="palette" class="hidden"><div class="card">
+  <h2><span data-i18n="land.bagTitle">Bag</span><button id="wardOpen" class="ghost" data-i18n="land.wardTitle">Wardrobe</button><button id="setOpen" class="ghost" data-i18n="land.setBtn">Settings</button><button id="palClose" class="ghost" data-i18n="land.close">Close</button></h2>
+  <div id="palGrid"></div>
+</div></div>
+<div id="chestPanel" class="hidden"><div class="card">
+  <h2><span data-i18n="land.i.chest">Chest</span><button id="chestClose" class="ghost" data-i18n="land.close">Close</button></h2>
+  <div id="chestGrid"></div>
+</div></div>
+<pre id="prof" class="hidden"></pre>
+<div id="machPanel" class="hidden"><div class="card">
+  <h2><span id="machTitle"></span><button id="machClose" class="ghost" data-i18n="land.close">Close</button></h2>
+  <div id="machGrid"></div>
+</div></div>
+<div id="npcPanel" class="hidden"><div class="card">
+  <h2><span id="npcTitle"></span><button id="npcClose" class="ghost" data-i18n="land.close">Close</button></h2>
+  <div id="npcGrid"></div>
+</div></div>
+<div id="setPanel" class="hidden"><div class="card">
+  <h2><span data-i18n="land.setTitle">Graphics</span><button id="setClose" class="ghost" data-i18n="land.close">Close</button></h2>
+  <div id="setGrid"></div>
+</div></div>
+<div id="planetPanel" class="hidden"><div class="card">
+  <h2><span data-i18n="land.plTitle">The planet</span><button id="planetClose" class="ghost" data-i18n="land.close">Close</button></h2>
+  <div id="planetGrid"></div>
+</div></div>
+<div id="padPanel" class="hidden"><div class="card">
+  <h2><span data-i18n="land.padTitle">Launch pad</span><button id="padClose" class="ghost" data-i18n="land.close">Close</button></h2>
+  <div id="padGrid"></div>
+</div></div>
+<div id="mapPanel" class="hidden"><div class="card">
+  <h2><span data-i18n="land.mapTitle">Map</span><button id="mapPlanet" class="ghost" data-i18n="land.plTitle">The planet</button><button id="mapClose" class="ghost" data-i18n="land.close">Close</button></h2>
+  <canvas id="mapCanvas" width="480" height="480"></canvas>
+  <div id="mapLegend"></div>
+</div></div>
+<div id="wardPanel" class="hidden"><div class="card">
+  <h2><span data-i18n="land.wardTitle">Wardrobe</span><button id="wardClose" class="ghost" data-i18n="land.close">Close</button></h2>
+  <div id="wardGrid"></div>
+</div></div>
+<div id="touchUi">
+  <button id="tJump" data-i18n="land.tJump">Jump</button><button id="tDown" data-i18n="land.tDown">Down</button>
+  <button id="tFly" data-i18n="land.tFly">Fly</button><button id="tBreak" data-i18n="land.tBreak">Break</button>
+  <button id="tPlace" data-i18n="land.tPlace">Place</button><button id="tPal" data-i18n="land.tBag">Bag</button>
+  <button id="tUse" data-i18n="land.tUse">Use</button>
+  <button id="tChat" data-i18n="land.tChat">Chat</button><button id="tRun" data-i18n="land.tRun">Run</button><button id="tTurn" data-i18n="land.tTurn">Turn</button>
+  <button id="tFire" data-i18n="land.tFire">Fire</button><button id="tWard" data-i18n="land.tWard">Wear</button><button id="tLevel" data-i18n="land.tLevel">Flatten</button>
+</div>
+<div id="loading" data-i18n="land.loading">Approaching the planet…</div>
+<script type="importmap">{"imports":{"three":"/static/land-three-webgpu.js","three/webgpu":"/static/land-three-webgpu.js","three/tsl":"/static/land-three-tsl.js","three/addons/":"/static/vendor/three/addons/"}}</script>
+<script type="module" src="/static/land.js"></script>
+</body>
+</html>

@@ -8,31 +8,40 @@ was moved into the flexibly-landing class (proof-gated, at-most-once, no landing
 
 (Run: python3 tests/test_tx_landing_window.py — pure logic, no node, fast.)
 """
+import os as _os, tempfile as _tempfile  # ISOLATION FIRST (CLAUDE.md rule 4): never the live node's HOME or exec files
+_os.environ["HOME"] = _tempfile.mkdtemp(prefix="nado-test-")
+_os.environ["NADO_EXEC_STATE"] = _os.path.join(_os.environ["HOME"], "exec_state.json")
+_os.environ["NADO_EXEC_DA"] = _os.path.join(_os.environ["HOME"], "exec_da")
 import os, sys, traceback
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from protocol import TX_TARGET_MARGIN, TX_LANDING_WINDOW, ADDRESS_PREFIX
+from protocol import TX_TARGET_MARGIN, TX_LANDING_WINDOW
+from signatures import generate_keydict
 from ops.block_ops import _lands_flexibly, check_target_match, match_transactions_target
 import logging
 _LOG = logging.getLogger("t"); _LOG.addHandler(logging.NullHandler())
 
-fails = 0
-def check(name, fn):
-    global fails
-    try: fn(); print(f"PASS  {name}")
-    except Exception as e:
-        fails += 1; print(f"FAIL  {name}: {e}"); traceback.print_exc()
+import _harness
+_report = _harness.Report()
+check = _report.run
 
 
 def _tx(recipient, max_block, min_block=0, txid=None):
-    return {"recipient": recipient, "max_block": max_block, "min_block": min_block,
-            "txid": txid or f"{recipient}:{max_block}:{min_block}"}
+    # a LEGACY tx carries no min_block key at all — a windowed duty is recognised by the key's PRESENCE
+    # (block_ops._lands_flexibly), so min_block=0 must mean "absent", not "present and zero"
+    tx = {"recipient": recipient, "max_block": max_block, "txid": txid or f"{recipient}:{max_block}:{min_block}"}
+    if min_block:
+        tx["min_block"] = min_block
+    return tx
 
 
-# A plain-transfer recipient must carry the LIVE prefix: _lands_flexibly() routes on
-# `recipient.startswith(ADDRESS_PREFIX)`, so a pinned "ndo…" literal stopped selecting the flexible path
-# the moment the prefix was rebranded — and this list is the test's whole definition of "flexible".
-PAYEE = ADDRESS_PREFIX + "abc123"
-FLEX = [PAYEE, "blob", "bridge", "bridge_withdraw", "dividend_withdraw"]
+# A plain-transfer recipient must be a REAL address. _lands_flexibly() no longer routes on a prefix
+# check — it calls is_address(), which validates the CHECKSUM — so a made-up literal like "abc123" is
+# classified as neither a reserved recipient nor an address and takes the exact-landing branch, exactly
+# as a typo'd address would. Derive one instead of pinning a string.
+# gen-28 rehearsal, ADDRESS FORMAT 2: make_address(<42-hex body>) now HASHES the body into an address nobody holds,
+# so the payee is a GENERATED KEY's address — valid on whatever format is live.
+PAYEE = generate_keydict()["address"]
+FLEX = [PAYEE, "blob", "bridge", "bridge_withdraw", "dividend_withdraw", "faucet", "auth"]
 EXACT = ["bond", "unbond", "withdraw", "register", "msgkey", "attest", "commit", "reveal", "duty",
          "settle", "alias", "htlc_lock"]
 
@@ -91,5 +100,5 @@ if __name__ == "__main__":
     check("flexibly-landing tx includable at EVERY height in [min,max]", t_flex_lands_anywhere_in_window)
     check("timing-critical tx lands only at exactly max_block", t_exact_lands_only_at_max_block)
     check("margin is generous and fits under the landing window", t_window_is_generous)
-    print("ALL PASS" if fails == 0 else f"{fails} FAILURES")
-    sys.exit(1 if fails else 0)
+    print("ALL PASS" if _report.fails == 0 else f"{_report.fails} FAILURES")
+    sys.exit(1 if _report.fails else 0)

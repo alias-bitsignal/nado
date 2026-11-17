@@ -1,0 +1,86 @@
+"""The pre-push hook refuses a code change that ships without a test (scripts/git-hooks/pre-push; CLAUDE.md rule 11).
+
+Every push to the fleet leaves from this checkout, so the hook is where "every change ships with its test" is enforced
+instead of remembered (8 code commits of the 2026-09-26 session had none). Pins, in a throwaway clone: a commit that
+changes code and no test is refused before anything runs; the same commit with "[no-test: <reason>]" in its message
+passes that check and reaches the core guards; a doc-only commit needs no test.
+
+Run: python3 tests/test_pre_push_hook_requires_tests.py
+"""
+import os, tempfile
+os.environ["HOME"] = tempfile.mkdtemp(prefix="nado-test-hook-")
+import atexit, shutil; atexit.register(shutil.rmtree, os.environ["HOME"], ignore_errors=True)
+import subprocess, sys
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HOOK = os.path.join(ROOT, "scripts", "git-hooks", "pre-push")
+import _harness
+_report = _harness.Report()
+check = _report.check
+
+
+def git(repo, *a):
+    return subprocess.run(["git", "-C", repo, *a], capture_output=True, text=True, check=True).stdout.strip()
+
+
+repo = os.path.join(os.environ["HOME"], "r")
+os.makedirs(os.path.join(repo, "ops")); os.makedirs(os.path.join(repo, "doc")); os.makedirs(os.path.join(repo, "tests"))
+env_git = ["-c", "user.name=t", "-c", "user.email=t@t"]
+subprocess.run(["git", "init", "-q", repo], check=True)
+open(os.path.join(repo, "ops", "x.py"), "w").write("X = 1\n")
+git(repo, "add", "-A"); git(repo, *env_git, "commit", "-qm", "base")
+base = git(repo, "rev-parse", "HEAD")
+git(repo, "update-ref", "refs/remotes/origin/main", base)
+
+
+def push_check(msg, path, text):
+    open(os.path.join(repo, path), "w").write(text)
+    git(repo, "add", "-A"); git(repo, *env_git, "commit", "-qm", msg)
+    head = git(repo, "rev-parse", "HEAD")
+    r = subprocess.run(["bash", HOOK], input=f"refs/heads/main {head} refs/heads/main {base}\n", cwd=repo,
+                       capture_output=True, text=True, env={**os.environ, "PY": sys.executable})
+    git(repo, "reset", "-q", "--hard", base)
+    return r
+
+
+r = push_check("change code, no test", "ops/x.py", "X = 2\n")
+check("a code change without a test is refused", r.returncode != 0 and "without a test" in r.stdout, r.stdout[-300:])
+check("... before any guard runs", "core guards" not in r.stdout)
+r = push_check("change code\n\n[no-test: a constant nothing reads yet]", "ops/x.py", "X = 3\n")
+check("with [no-test: <reason>] it passes the test check and reaches the core guards",
+      "without a test" not in r.stdout and "core guards" in r.stdout, r.stdout[-300:])
+r = push_check("docs", "doc/a.md", "words\n")
+check("a doc-only change needs no test", "without a test" not in r.stdout and "core guards" in r.stdout, r.stdout[-300:])
+
+# A conflicted merge of two tested branches: its combined diff lists ops/x.py and no test file. It must not be refused
+# (each parent commit carries its test and is judged itself); a code commit without a test in the same range still is.
+def commit(msg, files):
+    for p_, t_ in files.items():
+        os.makedirs(os.path.dirname(os.path.join(repo, p_)), exist_ok=True)
+        open(os.path.join(repo, p_), "w").write(t_)
+    git(repo, "add", "-A"); git(repo, *env_git, "commit", "-qm", msg)
+git(repo, "checkout", "-qb", "side", base)
+commit("side change", {"ops/x.py": "X = 10\n", "tests/test_side.py": "pass\n"})
+git(repo, "checkout", "-q", "-")
+commit("main change", {"ops/x.py": "X = 20\n", "tests/test_main.py": "pass\n"})
+subprocess.run(["git", "-C", repo, *env_git, "merge", "-q", "side"], capture_output=True)
+commit("merge side", {"ops/x.py": "X = 30\n"})
+merged = git(repo, "rev-parse", "HEAD")
+check("the merge's own combined diff names code and no test (the case being pinned)",
+      git(repo, "show", "--name-only", "--format=", merged).split() == ["ops/x.py"])
+r = subprocess.run(["bash", HOOK], input=f"refs/heads/main {merged} refs/heads/main {base}\n", cwd=repo,
+                   capture_output=True, text=True, env={**os.environ, "PY": sys.executable})
+check("a merge of tested commits is not refused as code without a test", "without a test" not in r.stdout, r.stdout[-300:])
+commit("untested change after the merge", {"ops/x.py": "X = 40\n"})
+head = git(repo, "rev-parse", "HEAD")
+r = subprocess.run(["bash", HOOK], input=f"refs/heads/main {head} refs/heads/main {base}\n", cwd=repo,
+                   capture_output=True, text=True, env={**os.environ, "PY": sys.executable})
+check("... while an untested commit in the same range still is",
+      "untested change after the merge" in r.stdout and "merge side" not in r.stdout, r.stdout[-300:])
+# The stamper's test is one of the core guards (#186): it stayed red for five days because no push ran it.
+import re
+_guards = re.search(r'for g in (.*?); do', open(HOOK).read(), re.S).group(1).replace("\\", " ").split()
+check("the core guards are test files that exist", len(_guards) >= 5 and all(os.path.isfile(os.path.join(ROOT, g)) for g in _guards), _guards)
+check("...and the static stamper's test is one of them", "tests/test_static_versions.py" in _guards, _guards)
+
+print("ALL PASS" if not _report.fails else f"{_report.fails} FAILURES")
+sys.exit(1 if _report.fails else 0)

@@ -14,16 +14,13 @@ Run: python3 tests/test_rollback_stats.py
 import os, sys, tempfile, time, traceback
 
 os.environ["HOME"] = tempfile.mkdtemp(prefix="nado_rbstats_")
+import atexit, shutil; atexit.register(shutil.rmtree, os.environ["HOME"], ignore_errors=True)   # leave no /tmp home behind (9,600 leaked by 2026-09-22)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ops import rollback_stats as RS
 
-fails = 0
-def check(name, fn):
-    """Run fn; print PASS/FAIL and count failures."""
-    global fails
-    try: fn(); print(f"PASS  {name}")
-    except Exception as e:
-        fails += 1; print(f"FAIL  {name}: {e}"); traceback.print_exc()
+import _harness
+_report = _harness.Report()
+check = _report.run
 
 
 def t_record_accumulates_and_persists():
@@ -51,7 +48,7 @@ def t_legacy_bare_count_loads_with_null_depth():
     import json
     day = "2019-06-15"
     with open(RS._stats_path(), "w") as f:
-        json.dump({day: 4}, f)
+        json.dump({day: 4, "__chain__": RS._chain_stamp()}, f)   # stamped: an unstamped file is a foreign lineage
     loaded = RS._load()
     assert loaded == {day: {"c": 4, "d": None, "r": None, "e": None}}, loaded
 
@@ -81,6 +78,7 @@ def t_retention_prunes_oldest_only():
     import json
     old = {f"2001-01-{d:02d}": 9 for d in range(1, 11)}
     with open(RS._stats_path(), "w") as f:
+        old["__chain__"] = RS._chain_stamp()
         json.dump(old, f)
     real, RS._RETENTION_DAYS = RS._RETENTION_DAYS, 3
     try:
@@ -102,5 +100,5 @@ for name, fn in [
 ]:
     check(name, fn)
 
-print("ALL PASSED" if not fails else f"{fails} FAILED")
-sys.exit(1 if fails else 0)
+print("ALL PASSED" if not _report.fails else f"{_report.fails} FAILED")
+sys.exit(1 if _report.fails else 0)

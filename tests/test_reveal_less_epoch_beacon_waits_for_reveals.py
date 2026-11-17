@@ -1,0 +1,96 @@
+"""The exec BEACON of an epoch with no RANDAO reveals is computed from the next revealed epoch's reveals
+(execnode/state.ExecState.exec_beacon_at; BEACON_EXTEND_HEIGHT, gen 28's gate, 1 from gen 29, inlined in G9).
+
+  * epoch 0 keeps exec_beacon_int(0, its own reveals) even when reveal-less (the gate's `< 1` at height 0);
+  * from epoch 1 a reveal-less epoch is None (not final) until a later epoch with reveals is final, then takes its
+    reveals; past BEACON_EXTEND_MAX empty epochs the plain value stands;
+  * an epoch WITH reveals keeps its own reveals;
+  * advance_beacons stops at an unresolved epoch and fills it (and everything after) once it resolves — the beacon
+    map stays a gap-free range;
+  * the L1 settle-proof check, the exec node and the client all read the same definitions.
+
+Run: python3 tests/test_reveal_less_epoch_beacon_waits_for_reveals.py
+"""
+import os
+import re
+import sys
+import tempfile
+
+os.environ["HOME"] = tempfile.mkdtemp(prefix="nado-beacon-extend-")   # never the live database (assign, not setdefault)
+import atexit, shutil; atexit.register(shutil.rmtree, os.environ["HOME"], ignore_errors=True)
+os.environ["NADO_EXEC_STATE"] = os.path.join(os.environ["HOME"], "exec_state.json")
+os.environ["NADO_EXEC_DA"] = os.path.join(os.environ["HOME"], "exec_da")
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
+import protocol as P                                                   # noqa: E402
+from execnode.state import ExecState                                   # noqa: E402
+
+FAILED = []
+L = P.EPOCH_LENGTH
+GATE_E = 1000                          # just an epoch number now: the rule holds from epoch 1
+
+
+def check(name, cond, detail=""):
+    print(("PASS  " if cond else "FAIL  ") + name + ("" if cond else f"   {detail}"))
+    if not cond:
+        FAILED.append(name)
+
+
+REV = {}
+
+
+def rv(e):
+    return REV.get(e, set())
+
+
+at = ExecState.exec_beacon_at
+plain = ExecState.exec_beacon_int
+
+# the pre-gate half (a reveal-less epoch below BEACON_EXTEND_HEIGHT kept its plain value) is retired in G9: generation
+# 28's rules. Epoch 0 is the one epoch that still does — the inlined gate's `e0 < 1`.
+check("epoch 0 keeps its plain value when reveal-less", at(0, rv, 0) == plain(0, []) and at(0, rv, 5) == plain(0, []))
+check("epoch 1 reveal-less is not final while later epochs are empty", at(1, rv, 1) is None)
+check("a future epoch is not final", at(GATE_E + 1, rv, GATE_E) is None)
+
+E = GATE_E + 5
+REV[E + 2] = {"s1", "s2"}
+check("a reveal-less epoch is not final while later epochs are empty", at(E, rv, E + 1) is None)
+check("it takes the first revealed later epoch's reveals once that epoch is final",
+      at(E, rv, E + 2) == plain(E, ["s1", "s2"]) and at(E, rv, E + 2) != plain(E, []))
+check("the epoch number stays in the value (two empty epochs extending to one reveal set differ)",
+      at(E + 1, rv, E + 2) == plain(E + 1, ["s1", "s2"]) and at(E + 1, rv, E + 2) != at(E, rv, E + 2))
+check("an epoch with reveals keeps its own reveals", at(E + 2, rv, E + 2) == plain(E + 2, ["s1", "s2"]))
+E2 = GATE_E + 100
+check("past BEACON_EXTEND_MAX empty epochs the plain value stands",
+      at(E2, rv, E2 + P.BEACON_EXTEND_MAX + 3) == plain(E2, []))
+check("... and not before they are all final", at(E2, rv, E2 + P.BEACON_EXTEND_MAX - 1) is None)
+
+# advance_beacons
+st = ExecState(os.path.join(os.environ["HOME"], "s.json"))
+st.beacon_floor = E - 1
+st.beacons = {}
+st.randao_reveals = {E - 1: {"a"}, E + 2: {"s1", "s2"}}
+st.advance_beacons((E + 1) * L + 3)
+check("advance_beacons stops at the unresolved epoch", sorted(st.beacons) == [E - 1], sorted(st.beacons))
+st.advance_beacons((E + 2) * L)
+check("and fills it and every later epoch once it resolves", sorted(st.beacons) == [E - 1, E, E + 1, E + 2]
+      and st.beacons[E] == plain(E, ["s1", "s2"]), sorted(st.beacons))
+
+# one definition everywhere
+src = open(os.path.join(ROOT, "ops", "transaction_ops.py")).read()
+# (the L1 settle-proof BEACON check that read exec_beacon_at was deleted with that verifier in G9; the Stwo settlement's
+# chain reads go through the same ExecState.exec_beacon_at in execnode/settle_b2.py)
+check("no L1 code reads BEACON through a second definition", "_ExecState.exec_beacon_int(_key" not in src)
+ex = open(os.path.join(ROOT, "execnode", "execnode.py")).read()
+check("/exec/beacon is routed", 'web.get("/exec/beacon", h_beacon)' in ex)
+js = open(os.path.join(ROOT, "static", "nadodapp.js")).read()
+# the SDK imports EPOCH_LENGTH from the relay's /protocol.js (rendered from protocol.py, values pinned by
+# tests/test_constant_mirrors.py) and re-exports it to the games; a literal copy here is what could drift
+m = re.search(r'import \{([^}]*)\} from "/protocol\.js"', js)
+check("the client's EPOCH_LENGTH is protocol.EPOCH_LENGTH",
+      bool(m) and re.search(r"\bEPOCH_LENGTH\b", m.group(1)) is not None and L == P.EPOCH_LENGTH
+      and re.search(r"export \{[^}]*\bEPOCH_LENGTH\b", js) is not None, m and m.group(1))
+
+print("ALL PASS" if not FAILED else f"{len(FAILED)} FAILURES")
+sys.exit(1 if FAILED else 0)

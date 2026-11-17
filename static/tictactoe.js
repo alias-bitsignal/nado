@@ -3,13 +3,13 @@
 // pot instantly, and a full board auto-refunds both stakes. Ply-bound moves (the chess retry-race
 // lesson), resign/abort escapes, and a short ~30-min move clock. Built on the shared PvP board-game
 // scaffold (pvpgame.js) — this file is ONLY the tic-tac-toe board: its decode, its render, its move.
-import { NadoDapp, rawToNado, _m, $, disp, gate, hoist } from "./nadodapp.js?v=db1a59d7";
-import { PvpGame } from "./pvpgame.js?v=05a0dca3";
-import { BoardDaily, gameModes } from "./board-daily-ui.js?v=aafea378";   // shared free Daily Challenge + mode picker
-import * as RULES from "./tictactoe-rules.js?v=5cd8baec";
-import { Practice } from "./practice.js?v=69d3a659";   // free in-browser practice vs the computer
+import { NadoDapp, rawToNado, _m, $, disp, gate, hoist } from "./nadodapp.js";
+import { PvpGame } from "./pvpgame.js";
+import { BoardDaily, gameModes } from "./board-daily-ui.js";   // shared free Daily Challenge + mode picker
+import * as RULES from "./tictactoe-rules.js";
+import { Practice } from "./practice.js";   // free in-browser practice vs the computer
 
-const CID = "abbcc4340b05a77482f0cb07a5d915c5";
+const CID = "532ca2459a8685d614e9a2af5754bb7f";
 const dapp = new NadoDapp({ cid: CID, app: "TicTacToe" });
 const LINES = [[0, 1, 2], [3, 4, 5], [6, 7, 8], [0, 3, 6], [1, 4, 7], [2, 5, 8], [0, 4, 8], [2, 4, 6]];
 

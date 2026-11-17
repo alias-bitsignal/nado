@@ -16,6 +16,7 @@ Run: python3 tests/test_settle_trustless_flag.py
 import os, sys, tempfile, logging
 
 os.environ["HOME"] = tempfile.mkdtemp(prefix="nado_trustless_")
+import atexit, shutil; atexit.register(shutil.rmtree, os.environ["HOME"], ignore_errors=True)   # leave no /tmp home behind (9,600 leaked by 2026-09-22)
 os.environ.setdefault("NADO_TESTNET", "1")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 for d in ("index", "blocks", "logs", "peers"):
@@ -44,7 +45,9 @@ _saved = protocol.SETTLE_PROOF_TRUSTLESS
 try:
     # baseline: nobody has attested (CURSOR, ROOT) and there is no proof marker
     protocol.SETTLE_PROOF_TRUSTLESS = False
-    check("flag defaults OFF in source", _saved is False)
+    # The flag was ACTIVATED at the alphanet-11 trustless-settlement reroll (commit 95ecf25); it is ON in
+    # source now. This test still forces it False/True locally below to prove BOTH gated behaviours.
+    check("flag is ON in source (activated at the alphanet-11 reroll)", _saved is True)
     check("no marker, flag OFF, empty registry -> NOT justified",
           settlement_ops.settlement_justified(NS, CURSOR, ROOT, EMPTY_REG) is False)
 

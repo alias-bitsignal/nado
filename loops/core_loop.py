@@ -7,7 +7,7 @@ import time
 import traceback
 
 from config import get_timestamp_seconds, get_config
-from ops.account_ops import get_totals, index_totals, get_bonded_registry, get_open_registry, set_finalized_height, get_finalized_height, get_account
+from ops.account_ops import get_totals, index_totals, get_bonded_registry, set_finalized_height, get_finalized_height, get_hard_finality, set_hard_finality, get_account
 from ops.block_ops import (
     knows_block,
     get_blocks_after,
@@ -18,8 +18,6 @@ from ops.block_ops import (
     set_earliest_block_info,
     get_block,
     construct_block,
-    get_block_reward,
-    epoch_beacon,
     check_target_match,
     valid_block_timestamp,
     block_already_indexed,
@@ -29,32 +27,68 @@ from ops.block_ops import (
     verify_block_signature,
     get_block_hash_by_number,
     prune_block_bodies,
-    randao_eligible_bonded,
+    prune_tx_history_window,
 )
-from ops.mining_ops import select_producer_two_lane, epoch_of, block_fork_weight
+from ops.mining_ops import epoch_of
 from ops import kv_ops
 from ops import fork_resolution
-from protocol import CHAIN_ID, BASE_SUBSIDY, MIN_TX_FEE, BOND_CAP, AUTO_BOND_MIN_RAW, AUTO_COLLECT_MIN_RAW, \
-    TX_INCLUSION_DELAY, TX_TARGET_MARGIN
+from protocol import CHAIN_ID, BASE_SUBSIDY, MIN_TX_FEE, AUTO_BOND_MIN_RAW, AUTO_COLLECT_MIN_RAW, \
+    AUTO_MIN_FEE_MULTIPLE, \
+    TX_INCLUSION_DELAY, TX_TARGET_MARGIN, RESERVED_TX_MARGIN, FLEX_TX_MIN_MARGIN
 from ops.data_ops import shuffle_dict, sort_list_dict, get_byte_size, get_home
-from ops.peer_ops import check_ip, qualifies_to_sync, get_remote_status
+from ops.peer_ops import check_ip, qualifies_to_sync, get_remote_status, own_ips, behind_network
 from ops import snapshot_ops
 from ops.pool_ops import cull_buffer
 from ops.transaction_ops import remove_outdated_transactions
 from ops.transaction_ops import (
     to_readable_amount,
     validate_transaction,
-    validate_all_spending, index_transactions, assert_unique_reserved, assert_block_blob_cap, SpendingLedger
-)
+    validate_all_spending, index_transactions, assert_unique_reserved, assert_block_blob_cap, assert_block_budget, SpendingLedger, ProofUnavailable, WindowUnavailable)
 import secrets as _secrets
 from rollback import rollback_one_block, MissingParentError, FinalityViolation
 from ops.reward_ops import credit_block_reward, apply_treasury_burn
 from ops.transaction_ops import (construct_duty_tx,
                                  construct_bond_tx, construct_blob_tx, construct_register_tx,
-                                 construct_dividend_withdraw_tx)
+                                 construct_dividend_withdraw_tx, construct_unshield_tx)
 from ops.attestation_ops import ffg_finalized_checkpoint
 from ops.mining_ops import beacon_commitment
-from protocol import EPOCH_LENGTH, FINALITY_DEPTH, REWARD_WINDOW
+from protocol import EPOCH_LENGTH, FINALITY_DEPTH, FINALITY_HARD_BACKSTOP, REWARD_WINDOW
+from protocol import TX_LANDING_WINDOW
+from ops.tpm_enrol import enrol_window as _te_window
+
+# How long one direct seed-genesis probe answers for (_seeds_answering); the healthy path pays nothing.
+SEED_PROBE_MEMO_S = 30
+# How many of our own tip blocks _heal_state_divergence may revert at one height before handing the
+# problem to the re-anchor ladder. LOCAL pacing, not consensus — it decides how long we try a cheap
+# repair, never whether a block is valid. Small on purpose: one block is the overwhelmingly common case
+# (the divergence entered applying our tip), and a deeper corruption wants the state replaced wholesale,
+# not walked down to the finality floor one rollback at a time while calling that a repair.
+TX_REINDEX_BATCH = 200        # blocks per reindex write txn (one fsync per batch; see _start_tx_reindex)
+STATE_HEAL_MAX_DEPTH = 3
+# How often a node that CANNOT evaluate the rules at its tip re-asks whether it can now. LOCAL pacing:
+# the positive answer is memoised for the epoch, this only bounds how long a finished refill waits to lift
+# the production gate. A minute is nothing against the minutes a fill takes and the hours a split costs.
+RULES_EVAL_RECHECK_S = 60
+# Consecutive failures to APPLY the measured majority's branch at one tip before adoption stops arguing
+# and hands the node to the re-anchor ladder. LOCAL pacing: one refusal may be a bad donor, three at the
+# same tip is our own state refusing the chain everyone else holds. Reset the moment the tip moves.
+ADOPT_FAIL_ESCALATE_AFTER = 3
+
+# CATCH-UP HOLD for the soft depth floor (see _depth_floor_corroborated): while the mesh's median advertised
+# height is more than this many blocks above ours, the floor waits instead of probing peers per block.
+SYNC_FLOOR_HOLD_GAP = 2 * FINALITY_DEPTH + EPOCH_LENGTH
+# While fast-forwarding (emergency mode) BELOW the hold gap, the corroboration verdict is reused for this
+# many seconds instead of re-probed per applied block: _extends_us memoizes per (peer, OUR height), and our
+# height moves every block during a catch-up, so every block paid up to four blocking 3 s probes — 61 %
+# of the core loop's wall time, ~4 s/block against a 6.8 s cadence, a 25-block gap that never closed
+# (2026-09-06 py-spy --idle on the relay). The depth floor is the soft floor; a 20 s old "yes" advances it
+# by at most a few blocks of the donor chain we are applying anyway, and a 20 s old "no" only holds it.
+SYNC_CORROB_TTL_S = 20
+
+# ARCHIVE SELF-REPAIR cadence (seconds): how often an archive node whose history does not reach genesis
+# looks for a peer that reaches deeper and starts a background fill (_maybe_refill_archive). Only while a
+# gap exists; a whole archive costs nothing here.
+ARCHIVE_REFILL_EVERY = 600
 
 # How often (seconds) emergency mode logs "Could not find a syncable peer". The loop still retries every
 # ~1s, but a lone/bootstrap node with no reachable donor would otherwise flood the log once/sec.
@@ -62,6 +96,12 @@ NO_SYNCABLE_LOG_INTERVAL = 30
 # Seconds a strictly-better-but-unheld tip must PERSIST before we call it a fork and enter emergency
 # mode. Below this it is ordinary propagation lag (see minority_block_consensus). ~half a block.
 MINORITY_GRACE_S = 5
+# TREADMILL GUARD (emergency exit hysteresis): a clean-prefix BEHIND verdict within this many blocks
+# of the heaviest ADVERTISED tip exits the emergency loop instead of racing gossip forever — that
+# residue is propagation lag, and the loop's own pass overhead (knows_block RTT + fetch + verify)
+# regenerates it every pass. See the exit in emergency_mode(). Advertised tips among healthy peers
+# straggle by 1-2 blocks; 2 keeps genuine multi-block deficits inside the loop.
+EMERGENCY_EXIT_LAG = 2
 
 # How often (seconds) to log + telemetry-count an emergency-mode entry. emergency_mode() is re-entered
 # ~1/s while behind; without this throttle "Entering/Looping emergency mode" spammed the journal and a
@@ -76,17 +116,59 @@ _DIVERGENCE_LOG_EVERY = 20
 # its snapshot/finality floor) re-imports a seed's snapshot to recover; bound the retry so a persistently
 # failing import can't hammer the seed every pass.
 REANCHOR_COOLDOWN = 30
+# Consecutive DEAD_FORK verdicts before the floor-crossing re-anchor is allowed. _fork_state() is cached
+# for FORK_STATE_TTL_S and costs direct peer probes, so this is several independent measurements, not a
+# tight spin: a transient misreading cannot reach the escalation, while a genuine wedge (which persists for
+# as long as nobody intervenes) reaches it in well under a minute instead of never.
+DEAD_FORK_ESCALATE_AFTER = 3
 
 
 
-def majority_on_our_canonical(majority_hash, get_block_fn, canonical_hash_at_fn):
+# NO AUTOMATED OPERATION MAY SPEND MORE THAN HALF THE SPENDABLE BALANCE IN ONE ACTION.
+#
+# Operator rule, and a hard ceiling rather than a heuristic: an unattended path may never put more than 50%
+# of what the node can spend behind a single transaction. Not for today's numbers (every automated tx here
+# is a rounding error against any node's balance) but because these paths size themselves from EARNINGS,
+# and an earnings model that is wrong — or a balance that collapsed while a loop kept running — must not be
+# able to empty an account with nobody watching.
+#
+# SPEND MEANS OUTFLOW, AND AUTO-BOND IS NOT ONE. An earlier revision applied this to auto-bond's
+# amount+fee, which was a scoping error with a real consequence: auto-bond takes a percentage of NEWLY
+# MINED coins, and for a fresh node new earnings ARE most of the balance — so at a high auto-bond percent
+# the ceiling would have silently refused the bond on exactly the nodes trying to compound their bond, quietly
+# turning a 99% setting into ~50%. Bonding moves coins between the owner's own columns and returns after
+# the unbond timelock; a fee is gone. So the ceiling governs fees, and auto-bond is governed instead by a
+# LIQUIDITY RESERVE: it must leave enough behind to keep paying for things.
+AUTO_SPEND_MAX_FRACTION = 2          # 1/2 of the spendable balance
+
+
+def auto_spend_allowed(balance, committed):
+    """True if an unattended path may commit `committed` raw (amount + fee) against `balance` raw."""
+    return committed > 0 and balance > 0 and committed <= balance // AUTO_SPEND_MAX_FRACTION
+
+
+def majority_on_our_canonical(majority_hash, get_block_fn, canonical_hash_at_fn, number_by_hash_fn=None):
     """CORROBORATED DEPTH FINALITY predicate, extracted for direct testing. True when the peer-majority tip
     hash lies ON OUR CANONICAL CHAIN (it is our tip or one of its ancestors — peers lagging a healthy
     producer by a block still corroborate it). False when we don't have that block (we are behind another
     chain) or when we have it only as an orphan (it is on a different fork). The depth-based finality floor
     must only advance under this corroboration: a node producing alone on a minority fork otherwise
     self-finalizes it (max(prev, tip - FINALITY_DEPTH)) and becomes permanently unable to reorg back — the
-    partition wedge. Two KV reads; no network."""
+    partition wedge. Two KV reads; no network.
+
+    Pass `number_by_hash_fn` (kv_ops.number_by_hash) on every live path: only the HEIGHT of the majority
+    block is needed, and get_block_fn loads the whole body (zstd + JSON, 10 MiB for a settle block) —
+    the health report and the corroboration probe paid that per call (8 % of relay GIL, 2026-09-06).
+    get_block_fn stays as the fallback and for the tests that drive this with fake block dicts."""
+    if number_by_hash_fn is not None:
+        try:
+            n = number_by_hash_fn(majority_hash)
+        except Exception:
+            n = None
+        if n is not None:
+            return canonical_hash_at_fn(n) == majority_hash
+        # index miss: fall through to the body lookup (a block we hold but have not indexed, and the
+        # test harnesses that drive this with a fake block store) — the slow path only when it matters
     blk = get_block_fn(majority_hash)
     if not blk:
         return False
@@ -100,6 +182,34 @@ def _same_network(st, min_protocol):
     live 2026-07-18: donor 103.236.77.164, protocol 2, snapshot 49000) and suppress our block production.
     Peer ADMISSION already enforces this; these fork-choice inputs must enforce it identically."""
     return st.get("protocol", 0) >= min_protocol
+
+
+def root_probe_candidates(latest_block, finalized_block, earliest_block):
+    """The blocks _root_known_to offers a candidate donor, in dial order. PURE, so the ORDER and the
+    MEMBERSHIP can be tested without a fleet — see tests/test_root_probe_candidates.py.
+
+    tip       -> the fast-forward precondition (donor can extend us from our latest hash)
+    finalized -> the REORG precondition (donor shares our immutable prefix). Without this a forked node
+                 can never select a donor at all: its tip is unknown to the majority BY DEFINITION of
+                 being forked, so the reorg leg it needs is unreachable.
+    earliest  -> full-sync-from-root, kept last because it is unsatisfiable on a snapshot-bootstrapped
+                 network (every peer's history starts above it).
+
+    Falsy entries are dropped, and duplicates are collapsed so a node whose tip IS its finalized block
+    costs one dial, not two."""
+    out, seen = [], set()
+    for block in (latest_block, finalized_block, earliest_block):
+        if not block:
+            continue
+        try:
+            key = (block["block_hash"], block["block_number"])
+        except (KeyError, TypeError):
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(block)
+    return out
 
 
 def reanchor_candidates(peers, statuses, our_weight, floor, min_protocol=None):
@@ -180,8 +290,92 @@ def old_block(block):
         return False
 
 
+def isolation_holds(agree, disagree, quorum):
+    """True when this node is ALONE among everyone who answered: a real quorum disagrees and NOT ONE peer
+    agrees. Deliberately counts only answers — a peer that stayed silent is not evidence of agreement, and
+    treating it as such is what let one unreachable peer veto a lone forker's recovery indefinitely."""
+    return (not agree) and len(disagree or ()) >= int(quorum)
+
+
+def isolation_since(prev_since, alone_now, now):
+    """Start/keep/clear the continuous-isolation clock. Any single probe that finds an agreeing peer RESETS
+    it — the override is meant to fire only on isolation that has held unbroken, so a transient partition
+    (which clears within a probe or two) can never accumulate toward it."""
+    if not alone_now:
+        return None
+    return prev_since if prev_since is not None else now
+
+
+def lighter_than_disagreeing(our_weight, disagree_peers, status_pool):
+    """(we_are_strictly_lighter, heaviest_disagreeing_weight) — the dead-fork escape's SYMMETRY BREAKER.
+
+    A purge is only safe if at most ONE side of a split can ever perform it. Quorum cannot decide that: on
+    both sides of a 2-2 split a node truthfully sees a majority of its non-self peers disagreeing, so a
+    quorum rule tuned to fire on one side fires on both, both wipe, and the fleet ends up on parallel chains
+    (observed live 2026-07-28). Weight decides it, exactly as fork choice does everywhere else — the lighter
+    side yields and the heavier side stays put.
+
+    STRICTLY lighter, and an unknown peer weight counts as 0 (i.e. not heavier): ties and missing data must
+    resolve to "nobody purges". Staying wedged is recoverable on the next probe; a mutual purge is not.
+    Pure, so the symmetric case is testable without a node — see tests/test_dead_fork_tiebreak.py."""
+    heaviest = 0
+    for peer in (disagree_peers or []):
+        status = (status_pool or {}).get(peer)
+        if not isinstance(status, dict):
+            continue
+        try:
+            heaviest = max(heaviest, int(status.get("latest_block_weight", 0) or 0))
+        except (TypeError, ValueError):
+            continue                                  # a peer advertising garbage weight is simply unknown
+    try:
+        ours = int(our_weight or 0)
+    except (TypeError, ValueError):
+        ours = 0
+    return heaviest > ours, heaviest
+
+
 FORCE_SYNC_MAX_S = 900   # a pinned sync donor is a RECOVERY tool, never a permanent mode
 CHECKPOINT_CATCHUP_EVERY = 25   # while advertising NO checkpoint, capture this often (not 1000)
+
+
+def _dividend_epoch_for(height):
+    """The dividend epoch this block accrues, or None. Thin wrapper so the hook reads clearly and the
+    boundary arithmetic lives in ONE place (records_effects.epoch_accrual_due), next to the accrual it mirrors."""
+    from execnode.records_effects import epoch_accrual_due
+    from protocol import EPOCH_LENGTH
+    return epoch_accrual_due(height, EPOCH_LENGTH)
+
+
+def settle_depth_reference(known_tip, mesh_median, height=None) -> int:
+    """The chain height the settle-proof depth gate (protocol.SETTLE_PROOF_DEPTH_GATED) measures a block against.
+    known_tip is the highest block number of a FETCHED sync batch — one donor's claim, recorded before any of those
+    blocks is verified; mesh_median is the upper median of the admitted statuses. The gate RELAXES verification, so
+    neither single source may open it: with both known, the reference is the LOWER of the two (a block is deep only
+    when the donor's batch and the mesh both say so); with no batch height, the median alone, as before.
+    INVARIANT: no single peer's claim makes a block deep (the max() here let one donor skip STARK checks).
+    A batch height at or below `height` (the block being judged) is STALE, not evidence: _known_tip_height only ever
+    rises and the inline tip-swap adoption never sets it, so min() against a stale one dropped the reference below the
+    block and sent every settle proof of a long catch-up through a 5-18 min STARK verify (the 2026-08-29 stall shape,
+    review 2026-10-11). A stale batch height counts as no batch height."""
+    k, m = int(known_tip or 0), int(mesh_median or 0)
+    if height is not None and k <= int(height):
+        k = 0
+    return min(k, m) if k > 0 else m
+
+
+def settle_proof_relaxed(reference, height, held_high_water) -> bool:
+    """True iff the settle-proof depth gate (protocol.SETTLE_PROOF_DEPTH_GATED) may skip verifying block `height`'s Stwo
+    settle: the block lies more than FINALITY_DEPTH below `reference` (settle_depth_reference) AND above every height this
+    node has ever held (`held_high_water`, the tallest block it applied since start-up, which a rollback never lowers).
+    WHY THE SECOND CONDITION (zk audit 2026-11-02): the relaxation exists so a node CATCHING UP need not fetch and replay
+    every historic span; a height this node already held was judged by this node, and a block replacing it arrives by a
+    REORG. Relaxed there, a heavier fork — or the peers of a node they eclipse — could bury a settle with an unverifiable
+    `stwo` commitment under FINALITY_DEPTH of blocks and have it marked proven (account_ops writes the marker either way,
+    and the marker lets settlement_justified accept the root with no quorum). Strict there, such a block is refused, or
+    deferred while its bundle is withheld, which is what a fork that cannot show its proof deserves.
+    INVARIANT: the relaxation is for NEW territory only; never pass a high-water mark a rollback lowered."""
+    h = int(height)
+    return h > int(held_high_water or 0) and int(reference or 0) - h > FINALITY_DEPTH
 
 
 class CoreClient(threading.Thread):
@@ -194,7 +388,7 @@ class CoreClient(threading.Thread):
         threading.Thread.__init__(self)
         self.duration = 0
         self.logger = logger
-        self.logger.info(f"Starting Core")
+        self.logger.info("Starting Core")
         self.memserver = memserver
         self.consensus = consensus
         self.run_interval = 1
@@ -208,10 +402,15 @@ class CoreClient(threading.Thread):
         # auto-bond per epoch (bond isn't per-block unique-keyed, so we self-limit).
         self.last_auto_bond_epoch = -1
         self.auto_bond_baseline = None
+        # A DIVIDEND IS EARNINGS TOO (2026-09-19): dividend that has been CLAIMED (a dividend_withdraw this
+        # node submitted) and not yet swept into savings. The baseline above counts `produced`, which a
+        # dividend never touches — so without this, auto-bond at ANY percentage swept none of it. See
+        # maybe_auto_bond. Mirrored by the wallet (static/interface.js state.autoBondDividend).
+        self.auto_bond_dividend = 0
         # AUTO-COLLECT (default on) + AUTO-REGISTER (opt-in): sweep the presence dividend, and keep the open-lane
         # PoSW lease alive, hands-free. Throttled to one of each per epoch (see maybe_auto_collect/register).
         self.last_auto_collect_epoch = -1
-        self.last_auto_register_epoch = -1
+        self.last_auto_vote_epoch = -1
         # anti-spam backoff for the emergency-mode "Could not find a syncable peer" retry (fires every ~1s
         # while no donor is reachable — a persistent normal state on a lone/bootstrap node).
         self._last_no_syncable_log = 0
@@ -224,7 +423,11 @@ class CoreClient(threading.Thread):
         # While the donor still advertises the current heaviest hash, it is re-verified with one
         # knows_block dial instead of a full pool re-scan every ~1s emergency pass.
         self._sync_donor = (None, None)
-        self._last_sync_donor_ip = None   # donor dialled for THIS attempt; cleared when none qualifies
+        # The donor most recently SELECTED by get_peer_to_sync_from. It is NOT cleared when a later pass finds no
+        # donor (a _clear_sync_donor helper written for that, 3dcd6be2, was never called and was deleted): a
+        # no-donor _reject_heaviest_tip() then passes this ip, and reject_tip strikes it only if it still
+        # advertises the failed tip — a stale ip that does not is filtered out, so nobody is struck either way.
+        self._last_sync_donor_ip = None
         self._minority_since = None       # first pass we saw a better-but-unheld tip (grace window)
         # LOG-ONCE guard for _candidate_pool: txids already surfaced as "Candidate excludes…" so the
         # same lingering pool tx (chiefly stale/duplicate RANDAO commit-reveal + attest txs that sit in
@@ -245,6 +448,112 @@ class CoreClient(threading.Thread):
         if self.memserver.reported_uptime < bt:
             return "init"
         return "produce" if self.memserver.since_last_block >= bt else "building"
+
+    def _accrual_effects(self, epoch, height, base_effects):
+        """Append epoch `epoch`'s presence-dividend accrual to a block's derived records effects.
+
+        Returns (effects, derivable, carry_out). Any missing or refused input yields (None, False, None) —
+        the block then rides the bonded quorum, which is always correct, just slower. This must never raise
+        into incorporate_block: a settlement optimisation may not be able to stop a block from applying.
+        """
+        try:
+            from execnode.records_effects import dividend_accrual_effects
+            from protocol import EPOCH_LENGTH
+            if int(epoch) == 0:
+                carry_in = 0                      # the first accrual starts from an empty carry
+            else:
+                prev = kv_ops.exec_summary_get(int(height) - int(EPOCH_LENGTH))
+                if not prev or prev.get("dc") is None:
+                    return None, False, None      # no chain to continue -> quorum
+                carry_in = int(prev["dc"])
+            inflow = int(kv_ops.dividend_inflow_get(int(epoch)) or 0)
+            from ops.dividend_ops import weights_at_epoch
+            weights = weights_at_epoch(int(epoch)) or {}
+            eff, carry_out = dividend_accrual_effects(inflow, weights, carry_in, int(epoch))
+            return list(base_effects or []) + list(eff), True, int(carry_out)
+        except Exception as e:
+            self.logger.info(f"dividend accrual not derivable at height {height} (epoch {epoch}): {e} "
+                             f"— this block rides the bonded quorum")
+            return None, False, None
+
+    def _seeds_answering(self) -> bool:
+        """Does at least one operator seed (seed_peers(), never ourselves) serve its genesis block right
+        now? A DIRECT probe, deliberately independent of the peer loop and the status pool: on 2026-09-01
+        the peer loop crashed, memserver.peers stayed empty all night, and every production gate read
+        "solo node, mint normally" while the dead-fork escape (which probes the seeds directly) saw three
+        reachable seeds disagreeing — the node re-forked from a REACHABLE fleet fourteen times. Memoised
+        SEED_PROBE_MEMO_S so the healthy path pays nothing."""
+        now = time.monotonic()
+        memo = getattr(self, "_seeds_answering_memo", None)
+        if memo and now - memo[0] < SEED_PROBE_MEMO_S:
+            return memo[1]
+        answering = False
+        try:
+            from ops.peer_ops import seed_peers, probe_block_hash
+            # own_ips(): self-identity is a SET (dual-stack host that is also a seed) — see peer_ops.own_ips
+            _me = own_ips() | {getattr(self.memserver, "ip", None), get_config().get("ip")} - {None}
+            for _s in seed_peers():
+                if _s and _s not in _me and probe_block_hash(_s, 0, port=self.memserver.port, timeout=3):
+                    answering = True
+                    break
+        except Exception:
+            answering = False
+        self._seeds_answering_memo = (now, answering)
+        return answering
+
+    def _genesis_cold_start_blocked(self, peers) -> bool:
+        """Refuse to mint THE FIRST BLOCK of a chain while we are merely early rather than actually alone.
+
+        This closes the race that split betanet-13 (see protocol.GENESIS_QUIET_S). At a reroll every node
+        purges and restarts, but not simultaneously; the first one back finds an empty peer table and, if the
+        operator set min_peers = 0, happily mines a solo chain from the shared genesis. Four minutes of head
+        start was enough to carry it past the finality depth, after which the split was permanent.
+
+        Every other production gate is blind here BY CONSTRUCTION, which is why this needs its own check:
+        peer_claims_heavier_tip cannot find a heavier tip when the whole fleet is at height 0, and the
+        min_peers gate is exactly the one an operator turns off to allow solo production.
+
+        The distinction that matters is between "no peers configured" (genuinely standalone — produce) and
+        "peers configured, none reached yet" (early — wait). Only height 0 is gated: once a single block
+        exists, fork choice and the caught-up gate govern normally and this returns False forever after.
+
+        Bounded by GENESIS_QUIET_S so a truly isolated node is never bricked, only delayed once."""
+        try:
+            if int((self.memserver.latest_block or {}).get("block_number", 0) or 0) != 0:
+                return False                      # the chain has started; this gate is over for good
+            from protocol import GENESIS_QUIET_S, GENESIS_QUIET_MIN_PEERS
+            from ops.peer_ops import seed_peers
+            if len(peers) >= GENESIS_QUIET_MIN_PEERS:
+                return False                      # the mesh is up — start together, which is the whole point
+            # own_ips(): self-identity is a SET (dual-stack host that is also a seed) — see peer_ops.own_ips
+            _me = own_ips() | {self.memserver.ip, get_config().get("ip")} - {None}
+            if not [p for p in seed_peers() if p not in _me]:
+                return False                      # no seeds configured: a standalone node, not an early one
+            waited = get_timestamp_seconds() - self.memserver.start_time
+            if waited >= GENESIS_QUIET_S and not peers and getattr(self, "_seeds_answering", lambda: False)():
+                # the quiet period may expire for a node that is GENUINELY alone; a node with zero peers
+                # while a seed answers its genesis is not alone, it is broken — never mint block 1 there
+                if get_timestamp_seconds() - getattr(self, "_seed_block_log", 0) >= 300:
+                    self._seed_block_log = get_timestamp_seconds()
+                    self.logger.error(f"genesis quiet period expired after {int(waited)}s with NO peers, but an "
+                                      f"operator seed answers directly — not minting block 1 (our peer path is "
+                                      f"the fault, not the fleet)")
+                return True
+            if waited >= GENESIS_QUIET_S:
+                self.logger.warning(
+                    f"GENESIS QUIET PERIOD expired after {int(waited)}s with {len(peers)} peer(s) — producing "
+                    f"the first block anyway. If other nodes are merely slow to restart, this is how a reroll "
+                    f"splits; if we really are alone, this is correct.")
+                return False                      # never brick a node that is genuinely by itself
+            self.logger.info(
+                f"genesis quiet period: {len(peers)}/{GENESIS_QUIET_MIN_PEERS} peers after {int(waited)}s of "
+                f"{GENESIS_QUIET_S}s — not minting block 1 yet (a reroll restarts nodes minutes apart; the "
+                f"node that starts alone builds the fork).")
+            return True
+        except Exception as e:
+            # A gate that throws must not stop block production on a healthy chain.
+            self.logger.warning(f"genesis cold-start check failed, allowing production: {e}")
+            return False
 
     def normal_mode(self):
         """The caught-up per-second pass. Keeps the single mempool within its byte budget (submitted
@@ -274,7 +583,14 @@ class CoreClient(threading.Thread):
             with self.memserver.mempool_lock:
                 pool = self.memserver.transaction_pool
                 if pool:
-                    kept = [t for t in pool if kv_ops.tx_get(t.get("txid")) is None]
+                    # ... and (3) EVICT EXPIRED txs (max_block behind the tip) HERE, every pass — not
+                    # only after producing a block ourselves. Eviction lived solely on the own-production
+                    # path, so a node that rarely wins slots NEVER evicted: measured 2026-08-18 as one
+                    # node re-serving an hour-dead claim to the whole fleet every reconcile (and hoarding
+                    # 54 expired bonds), a permanent pool-divergence pump.
+                    _tip_now = self.memserver.latest_block["block_number"]
+                    kept = [t for t in pool if kv_ops.tx_get(t.get("txid")) is None
+                            and t.get("max_block", 0) > _tip_now]
                     culled = cull_buffer(buffer=kept, limit=self.memserver.transaction_pool_max_bytes)
                     if len(culled) != len(pool):
                         self.memserver.transaction_pool = culled
@@ -294,15 +610,42 @@ class CoreClient(threading.Thread):
                 self._last_duty_height = _tip_h
                 # FFG (#6): refresh the committee-attested finalized checkpoint.
                 self.update_ffg_and_attest()
-                # MERGED EPOCH DUTY (doc/consensus-aggregation.md): if we hold a committee seat,
-                # one tx carries FFG attest + RANDAO commit/reveal for this epoch.
-                self.maybe_epoch_duty()
-                # AUTO-BOND (opt-in): unattended-compound a % of newly-mined earnings into bonded stake.
-                self.maybe_auto_bond()
-                self.maybe_auto_collect()
-                self.maybe_auto_register()
+                # NO SYSTEM TX WHILE CATCHING UP (2026-09-22). Each call below builds a tx whose SIGNED
+                # min_block is OUR tip + TX_INCLUSION_DELAY. After a restart this slot fires on every block
+                # we re-apply, so with a tip eight blocks stale the guard is already in the past for the rest
+                # of the network: the tx is eligible on arrival wherever it lands first and the mesh splits on
+                # it (h193750). Once we are at the network's tip they resume; nothing here is time-critical
+                # at the scale of a catch-up (ops.peer_ops.behind_network). Housekeeping below stays ungated.
+                if behind_network(self.consensus.status_pool.copy(), _tip_h):
+                    if not getattr(self, "_behind_noted", False):
+                        self._behind_noted = True
+                        self.logger.info(f"Catching up at {_tip_h}: system txs (duty, bond, collect, announce) wait for the tip")
+                else:
+                    self._behind_noted = False
+                    # MERGED EPOCH DUTY (doc/consensus-aggregation.md): if we hold a committee seat,
+                    # one tx carries FFG attest + RANDAO commit/reveal for this epoch.
+                    self.maybe_epoch_duty()
+                    # AUTO-BOND (opt-in): unattended-compound a % of newly-mined earnings into bonded stake.
+                    self.maybe_auto_bond()
+                    self.maybe_auto_collect()
+                    self.maybe_auto_register()
+                    self.maybe_auto_vote()
+                    # VENDOR-ENDORSED TPM ENROLMENT (doc/tpm-attestation-without-a-ca.md): answer the enrolments
+                    # this node was DRAWN to challenge. Without this every enrolment expires unanswered.
+                    self.maybe_tpm_challenge()
+                    # ...and enrol THIS machine's own chip, so a headless node attests itself and mines.
+                    self.maybe_tpm_self_enrol()
+                    # ...and tell the chain this node is willing to be drawn as a challenger.
+                    self.maybe_tpm_ready()
                 # ROLLING MODE (opt-in): on a pruned node, drop block bodies older than the retention window.
                 self.maybe_prune_history()
+                # ARCHIVE REFILL: advance earliest_block as the background canonical-chain fill (after a
+                # re-anchor) lands deeper bodies. The fill thread never writes block_ends itself — that
+                # file is core-thread-only — so it reports and this tick commits.
+                self._maybe_advance_earliest()
+                # ARCHIVE SELF-REPAIR: an archive whose history stops short of genesis fills the gap from a
+                # peer that reaches deeper, without waiting for a re-anchor to trigger it.
+                self._maybe_refill_archive()
                 # CONSERVATION INVARIANTS (ops/invariants.py): supply is a closed system, so any "coins from
                 # thin air" bug — the class this codebase has hit ~10 times — must break one of them. Runs
                 # in the node so it needs no external step, throttled hard because it scans the account
@@ -322,6 +665,44 @@ class CoreClient(threading.Thread):
                 # from status_pool (each peer's advertised latest_block_weight) rather than the lagging
                 # emergency_mode/heaviest_block_hash, which are None until the weight pool fills — the window
                 # that let a behind node mint 100+ divergent blocks.
+                # PRODUCTIVE-FORK SELF-CHECK. Everything below reasons about being BEHIND; nothing here ever
+                # asked "is the chain I am happily EXTENDING the one everyone else is on?". A node that forks
+                # and keeps MINING is invisible to all three recovery routes at once: it is the heaviest tip
+                # so minority_block_consensus never reports out-of-consensus, it therefore never enters the
+                # emergency loop where _maybe_escape_dead_fork lives, and its tip is never frozen so the
+                # escape's stall gate would refuse anyway. Observed live 2026-07-28: 208.87.242.141 forked at
+                # h5627 and mined 600+ blocks alone, FFG frozen, for hours — no local route could heal it and
+                # an operator had to purge the box by hand. Needing a human IS the defect.
+                #
+                # The check itself is the existing AUTHORITATIVE one (stranded_below_finality via
+                # _maybe_escape_dead_fork): it asks peers DIRECTLY over HTTP for their hash at OUR finalized
+                # height — no status pool, no advertised weights, no ffg, none of which a forked or hostile
+                # peer can be trusted on. It acts only when a QUORUM disagrees and NOBODY agrees with us, and
+                # it is rate-limited to one probe per DEAD_FORK_COOLDOWN_S, so a healthy node pays one cheap
+                # probe round per 30 min and exits immediately.
+                # DISABLED 2026-07-28, RE-ENABLED the same day once the symmetry was broken. Firing the
+                # escape from normal_mode makes every node evaluate it continuously, and DEAD_FORK_QUORUM=2
+                # is only half of a 4-node fleet's 3 non-self peers: in a 2-2 split BOTH pairs saw "2
+                # disagree, none agree", so BOTH purged, resynced from whichever peer answered first — often
+                # each other — and built PARALLEL chains. Observed live: the fleet went from one chain to two
+                # sharing only genesis.
+                #
+                # The escape now requires a THIRD confirmation that the disagreeing majority is strictly
+                # HEAVIER than us (see _maybe_escape_dead_fork), so exactly one side of a split can ever
+                # purge and a mutual wipe is impossible. That is the precondition this comment used to ask
+                # for, and it is a stronger one than a quorum tweak: no quorum value can distinguish the two
+                # sides of a symmetric split, because both sides genuinely hold a majority against the other.
+                #
+                # Without this caller a productive fork is invisible to every recovery route at once — which
+                # is exactly what happened next: local and .141 sat on two dead branches for hours on
+                # 2026-07-28 with a perfectly correct probe (stranded, 2 disagree, 0 agree) that nothing was
+                # allowed to act on. Needing a human IS the defect.
+                try:
+                    if self._maybe_escape_dead_fork():
+                        return
+                except Exception as _e:
+                    # the self-check must never cost the production pass (tests/test_productive_fork_escape)
+                    self.logger.warning(f"dead-fork self-check skipped: {_e}")
                 _our_w = self.memserver.latest_block.get("cumulative_weight", 0)
                 # .copy(): the peer loop admits/pops status_pool entries concurrently — iterating the
                 # live dict raises "dictionary changed size during iteration" and costs the whole
@@ -342,10 +723,98 @@ class CoreClient(threading.Thread):
                     rejected_tips=self.consensus.rejected_tips,
                     benched=self._benched_tip_hashes())
 
+                # MINORITY-FORK PRODUCTION GATE. The heavier-tip gate above cannot see the fork case that
+                # actually persists: production is DETERMINISTIC (same winner both sides, different tx set),
+                # so after a mempool split BOTH branches advance every slot at near-equal weight — neither
+                # side ever sees "heavier", and both extend their forks for hours (observed 2026-08-17/18,
+                # splits at 62655 and 62895). The measured verdict CAN see it, so never extend a branch it
+                # says is not the majority's.
+                #
+                # Cost discipline: the verdict walk is ~40 hash probes, so it must never run on the healthy
+                # path. Trigger only when the peer majority's tip hash differs from OURS (gossip, free) and
+                # that mismatch has PERSISTED (same 5 s hysteresis as minority_block_consensus — every block
+                # boundary mismatches for the propagation second). Then consult the cached verdict:
+                # POSITIVE evidence only — REORG/DEAD_FORK suppresses this slot; UNKNOWN/BEHIND never block
+                # production (ignorance must not halt a partitioned node, and the probe's seeds-first
+                # headcount resolves an even split toward the seeded side). Per-node suppression cannot
+                # stall the network: production is replicated — any node on the majority branch builds the
+                # identical canonical block.
+                _maj_hash = self.consensus.majority_block_hash
+                _on_minority = False
+                # A majority tip that is OUR OWN ANCESTOR is not a competing branch — those peers are merely
+                # behind us (a fleet booting together: two nodes still on genesis while two produce). The
+                # verdict below reads that as REORG (ancestor < our tip) and suppressed the only producers,
+                # freezing a 4-node testnet at block 4 with the other two stuck at genesis (2026-09-02).
+                if (_maj_hash and _maj_hash != self.memserver.latest_block["block_hash"]
+                        and majority_on_our_canonical(_maj_hash, get_block, get_block_hash_by_number, number_by_hash_fn=kv_ops.number_by_hash)):
+                    self._prod_minority_since = None
+                elif _maj_hash and _maj_hash != self.memserver.latest_block["block_hash"]:
+                    _now_g = get_timestamp_seconds()
+                    if getattr(self, "_prod_minority_since", None) is None:
+                        self._prod_minority_since = _now_g
+                    elif _now_g - self._prod_minority_since >= MINORITY_GRACE_S:
+                        _vs = self._fork_state()
+                        _our_w = int(self.memserver.latest_block.get("cumulative_weight", 0))
+                        _hv_w = int(self.consensus.heaviest_block_weight or 0)
+                        _tie_ours = (_hv_w == _our_w and self._tie_break_ours(_maj_hash) is True)
+                        # NEVER suppress the strictly-heaviest branch (2026-08-23 fleet deadlock): weight
+                        # is the fork-choice rule, so when no peer advertises anything heavier than OUR
+                        # chain, ours IS the canonical branch regardless of headcount — the lone heaviest
+                        # producer suppressed itself ("minority") while every lighter group was parked
+                        # unable to reorg, and the whole network stopped minting for 20+ minutes. The
+                        # docstring's "any node on the majority branch builds the identical block" only
+                        # holds when the majority branch is the heaviest; when it is not, suppressing the
+                        # heaviest halts the one branch everyone must converge to.
+                        # STRICTLY greater: an exact tie stays with _tie_ours (the stable first-divergent
+                        # tie-break) — a >= here would bypass it and revive the see-saw it fixed.
+                        _ours_heaviest = _our_w > 0 and _our_w > _hv_w
+                        if (_vs in (fork_resolution.REORG, fork_resolution.DEAD_FORK)
+                                and not _tie_ours and not _ours_heaviest):
+                            _on_minority = True
+                            if _now_g - getattr(self, "_last_minority_suppress_log", 0.0) >= _EMERGENCY_LOG_EVERY:
+                                self._last_minority_suppress_log = _now_g
+                                self.logger.warning(f"Production suppressed: measured fork state is {_vs} — "
+                                                    f"refusing to extend a minority branch")
+                else:
+                    self._prod_minority_since = None
+
                 # min_peers == 0 enables SOLO production (a single node mints without a peer mesh) —
                 # used for a stable single-node relay/demo where multi-node fork-choice churn is undesirable.
+                #
+                # POOL WARM-UP GATE: a freshly restarted node's pool is EMPTY, and deterministic
+                # production turns "my pool differs" straight into a same-height fork — every deploy
+                # wave seeded forks this way (blob h67007, bond h68376, duty h68345, all restart-window).
+                # Don't mint until the pool has reconciled once with an ELDER peer (peer_loop sets
+                # pool_warmed after a merge pass that included a peer up >= POOL_WARM_ELDER_S — a young
+                # peer's pool is as empty as ours in a wave; see ops.peer_ops.pool_warm_ready). Liveness-safe: warmed is
+                # forced True when there are no peers to reconcile with (solo mode) or 60 s after start
+                # (a mute mesh must not stall a producer forever).
+                if (not self.memserver.pool_warmed
+                        and (not peers or self.memserver.get_uptime() > 60)):
+                    self.memserver.pool_warmed = True
+                    if peers:
+                        self.logger.warning("Pool warm-up window expired unreconciled — producing anyway")
+                # ISOLATION GUARD (2026-09-02): min_peers 0 means "may mint alone" — alone as in NO reachable
+                # fleet, not "my peer loop is empty". If we hold no peers but a seed serves its genesis, we
+                # are cut off by our own fault and must not extend a private chain (the 14-purge night).
+                _isolated = (not peers) and self._seeds_answering()
+                if _isolated and get_timestamp_seconds() - getattr(self, "_isolated_log", 0) >= 300:
+                    self._isolated_log = get_timestamp_seconds()
+                    self.logger.error("Not producing: zero peers linked while an operator seed answers directly — "
+                                      "this node is isolated by its own peer path, not alone on the network")
                 if (len(peers) >= self.memserver.min_peers
-                        and not self.memserver.force_sync_ip):
+                        and not self._genesis_cold_start_blocked(peers)
+                        and not self.memserver.force_sync_ip
+                        and self.memserver.pool_warmed
+                        and not _on_minority
+                        and not _isolated
+                        and self._rules_evaluable_at_tip()
+                        and not self._tx_index_incomplete()        # blind to at-most-once -> build nothing
+                        and not getattr(self.memserver, "purge_breaker", False)):
+                    # PRE-ASSEMBLY TX-SET RECONCILE (leaderless assembly touch-up, doc/leaderless-assembly.md):
+                    # before building, hold the union of what our same-tip peers would build — see
+                    # memserver.reconcile_next_block_set. Once per tip, bounded, best-effort.
+                    self._reconcile_before_build(peers)
                     block_candidate = get_block_candidate(logger=self.logger,
                                                           transaction_pool=self._candidate_pool(),
                                                           latest_block=self.memserver.latest_block
@@ -376,6 +845,9 @@ class CoreClient(threading.Thread):
                             # winner, attach the detached authorship signature; a relay (or a fast-forward
                             # catch-up copy) leaves it unsigned — still valid (win-offline). Not signing a
                             # fast-forward copy avoids any same-height authorship edge case while behind.
+                            # INVARIANT (audit 2026-09-25 cross-generation slash replay): sign ONLY through
+                            # sign_block — its message names this chain (generation + genesis), and a
+                            # hand-built message here would be refused by every peer (and be slashable elsewhere).
                             if (not _peer_ahead
                                     and self.memserver.address == block_candidate["block_creator"]
                                     and block_candidate["block_number"] > self.last_signed_height):
@@ -404,12 +876,26 @@ class CoreClient(threading.Thread):
             self.logger.info(f"Error: {e}")
             raise
 
+    def _finalized_block_ref(self):
+        """{block_hash, block_number} at our finality floor, or None. Our immutable prefix — the one part
+        of our chain that ANY peer we could legitimately reorg toward must also carry."""
+        try:
+            from ops.block_ops import get_block_hash_by_number
+            h = int(self.memserver.finalized_height)
+            if h <= 0:
+                return None
+            bh = get_block_hash_by_number(h)
+            return {"block_hash": bh, "block_number": h} if bh else None
+        except Exception:
+            return None
+
     def _root_known_to(self, peer) -> bool:
         """the ONE network check of donor selection: can this peer actually serve us blocks?
 
-        It asks about the block the sync leg will ask FROM — our TIP — because that is the precondition
-        _fast_forward_from documents ("the donor knows our tip, so pull the gap from it"): get_blocks_after
-        is keyed off our latest hash, so a donor carrying our tip on ITS canonical chain can extend us.
+        It asks first about the block the sync leg will ask FROM — our TIP — because that is the
+        precondition _fast_forward_from documents ("the donor knows our tip, so pull the gap from it"):
+        get_blocks_after is keyed off our latest hash, so a donor carrying our tip on ITS canonical chain
+        can extend us.
 
         It used to probe our EARLIEST block instead, which is unsatisfiable on a snapshot-bootstrapped
         network and wedged this node in a re-anchor loop: after a re-anchor our earliest is whatever the
@@ -418,10 +904,23 @@ class CoreClient(threading.Thread):
         "ran out of options" -> "wedged behind a heavier chain" -> re-anchor to the same snapshot ->
         repeat, parked at one height while the chain moved on.
 
-        The earliest probe is kept as a FALLBACK, so a donor able to full-sync us from root still counts:
-        the gate now accepts strictly more donors than before, never fewer. knows_block itself checks
-        CANONICALITY (height -> hash on the peer's own chain), so a fork leftover still answers False and
-        the "donor knows a tip it cannot extend" bait this gate exists to stop remains closed."""
+        OUR FINALIZED BLOCK IS THE MIDDLE FALLBACK, and it is what makes a REORG donor selectable at all.
+        The tip probe is a FAST-FORWARD precondition, but the reorg leg is DEFINED by the donor not knowing
+        our tip (_rollback_one_for_reorg: "the donor does NOT know our tip, so our chain has diverged").
+        So on a genuine fork the tip probe must fail, and if earliest is also unsatisfiable the gate
+        excludes precisely the donors the reorg needs — donor selection returns None, and the node never
+        rolls back even one block. Measured on betanet-15 2026-08-03: 185.100.232.131 forked at h=7143 and
+        sat 431 blocks behind for over an hour with its height rising monotonically and never once dropping.
+        Its tip was unknown to the majority (it was forked) and its earliest block (2735) was below the
+        majority's snapshot-bootstrapped history, so every donor failed and no rollback was ever attempted.
+
+        Accepting a donor that holds our FINALIZED block is the right criterion for that leg: the finality
+        floor is immutable on our side, so any chain we may legitimately reorg onto contains it, and
+        knows_block checks CANONICALITY (height -> hash on the peer's own chain) — a donor whose chain does
+        NOT contain our immutable prefix still answers False. So this accepts strictly more donors than
+        before, never fewer, and the "donor knows a tip it cannot extend" bait the gate exists to stop
+        remains closed. Ordering is cost discipline: a healthy node matches on the tip and never dials
+        the rest."""
         def _knows(block):
             if not block:
                 return False
@@ -431,18 +930,36 @@ class CoreClient(threading.Thread):
                     hash=block["block_hash"], number=block["block_number"], logger=self.logger))
             except (KeyError, TypeError):
                 return False
-        return _knows(self.memserver.latest_block) or _knows(self.memserver.earliest_block)
+        for block in root_probe_candidates(self.memserver.latest_block,
+                                           self._finalized_block_ref(),
+                                           self.memserver.earliest_block):
+            if _knows(block):
+                return True
+        return False
 
     def _fetch_sync_batch(self, peer, from_hash):
         """pull one forward-sync batch (up to SYNC_BATCH_MAX blocks after from_hash) from the donor.
         Falsy on ANY failure — never raises, so it is safe to run in the emergency loop's prefetch
         thread (asyncio.run spins a private event loop per call, thread-safe)."""
         try:
-            return asyncio.run(get_blocks_after(
+            batch = asyncio.run(get_blocks_after(
                 target_peer=peer,
                 from_hash=from_hash,
                 count=SYNC_BATCH_MAX,
                 logger=self.logger))
+            # RECORD HOW FAR THE CHAIN IS KNOWN TO REACH. This is the only honest source of "is the block
+            # I am about to apply DEEP?": every measure derived from local state is ~0 during a sequential
+            # sync, because the node's own tip IS the block it is applying. A fetched batch proves chain
+            # exists above its own tail, so its tail height is a lower bound on the real tip — which is
+            # exactly what the depth gate on settle-proof verification needs (protocol.SETTLE_PROOF_DEPTH_GATED).
+            try:
+                if batch:
+                    top = max(int(b["block_number"]) for b in batch)
+                    if top > getattr(self, "_known_tip_height", 0):
+                        self._known_tip_height = top
+            except Exception:
+                pass                                   # a malformed batch is the caller's problem, not ours
+            return batch
         except Exception as e:
             self.logger.error(f"Failed to fetch sync batch after {from_hash} from {peer}: {e}")
             return None
@@ -464,13 +981,6 @@ class CoreClient(threading.Thread):
                                  unreachable_list=self.memserver.unreachable.keys(),
                                  peer_hash=source_pool.get(peer),
                                  required_hash=required_hash)["result"]
-
-    def _clear_sync_donor(self):
-        """Forget the donor we dialled. MUST run whenever selection yields none, or _last_sync_donor_ip
-        keeps a STALE ip from an earlier cycle: reject_tip would then filter holders to a peer that does
-        not hold the current tip, holders becomes empty, and NOBODY is struck — silently reintroducing the
-        wedge where a lone stale forker owns the donor pool and never accumulates strikes."""
-        self._last_sync_donor_ip = None
 
     def get_peer_to_sync_from(self, source_pool):
         """peer to synchronize pool when out of sync, critical part
@@ -568,6 +1078,24 @@ class CoreClient(threading.Thread):
             """we already hold the canonical tip locally; normal incorporation adopts it"""
             self._minority_since = None
             return False
+        # STABLE TIE-BREAK (equal weight). Weight increments are content-independent, so a same-height
+        # split is a PERMANENT exact tie — and the lowest-TIP-hash rule below the grace window re-rolled
+        # every block, flipping which side should switch faster than any reorg could finish (the
+        # hours-long see-saws at 62655/62895). Resolve ties at the FIRST DIVERGENT block instead
+        # (_tie_break_ours): permanent, computed identically by both sides, so exactly one side switches.
+        # True -> our branch is canonical: never switch. None (no evidence) -> don't switch either, but
+        # keep the grace timer running so evidence arriving later acts immediately. False -> fall through
+        # to the grace window and switch.
+        if int(self.consensus.heaviest_block_weight or 0) == int(
+                self.memserver.latest_block.get("cumulative_weight", 0)):
+            _tb = self._tie_break_ours(hh)
+            if _tb is True:
+                self._minority_since = None
+                return False
+            if _tb is None:
+                if self._minority_since is None:
+                    self._minority_since = get_timestamp_seconds()
+                return False
         # GRACE WINDOW — the fork-choice above is right, but "a better tip exists that we do not hold yet"
         # is ALSO what every normal block looks like for the second between a peer advertising it and the
         # gossip delivering it. Without hysteresis that transient reads as a fork: measured 51 emergency
@@ -620,6 +1148,31 @@ class CoreClient(threading.Thread):
         if self.memserver.latest_block["block_number"] != 0 and not force_reanchor:
             return False   # genesis-only for normal bootstrap; force_reanchor re-anchors an established node
         try:
+            # AN ARCHIVE NODE MUST NOT SHORTCUT ITS WAY PAST THE HISTORY IT EXISTS TO KEEP.
+            #
+            # A fresh bootstrap backfills only REWARD_WINDOW + 2*EPOCH_LENGTH + FINALITY_DEPTH bodies behind
+            # the anchor and nothing older, ever. Taking it with archive=true produces a node that keeps
+            # everything from its snapshot FORWARD, holds nothing before it, and advertises node_type
+            # "archive" to peers that read that as "can serve history". Convenient, and a lie — and the
+            # operator has no reason to suspect it, because the node syncs fast and looks healthy.
+            #
+            # `archive: true` is an explicit, deliberate setting. Honour it: refuse the shortcut and say
+            # what a real archive costs. This is deliberately NOT the default posture — rolling nodes take
+            # the snapshot path as before, which is the whole point of having it.
+            if getattr(self.memserver, "archive", False) and not force_reanchor:
+                self.logger.error("=" * 78)
+                self.logger.error("ARCHIVE NODE: REFUSING SNAPSHOT BOOTSTRAP.")
+                self.logger.error("  A snapshot carries STATE, not history — this node would start with a")
+                self.logger.error("  few hundred blocks of bodies and never obtain the chain before them,")
+                self.logger.error("  while telling peers it is an archive. That is not an archive.")
+                self.logger.error("  For a true archive, either:")
+                self.logger.error("    * sync from genesis (leave it running; it needs a peer that still")
+                self.logger.error("      serves deep bodies — rolling nodes do not), or")
+                self.logger.error("    * copy an existing archive node's data directory, or")
+                self.logger.error("    * set \"archive\": false to run as a rolling node instead.")
+                self.logger.error("=" * 78)
+                return False
+
             peers = list(self.memserver.peers)
             if len(peers) < 1:
                 return False
@@ -637,8 +1190,8 @@ class CoreClient(threading.Thread):
             # (mislabelled as ours) and ends up with a broken store — tip set, zero block bodies. chain_id is
             # informational for block LINKAGE, but it IS the network's identity, so a donor whose chain_id
             # isn't ours is dropped BEFORE any quorum / weight selection — the same gate the sync-donor path
-            # already applies ("Chain of X is not <ours>"). Observed live during the alphanet-11 reroll: a
-            # stranded seed on alphanet-10 poisoned a fresh node's bootstrap to a phantom 6000-block tip.
+            # already applies ("Chain of X is not <ours>"). Observed live during the betanet-11 reroll: a
+            # stranded seed on betanet-10 poisoned a fresh node's bootstrap to a phantom 6000-block tip.
             statuses = [s if (isinstance(s, dict) and s.get("chain_id") == CHAIN_ID) else None for s in raw]
             responders = [ip for ip, s in zip(peers, statuses) if s]
 
@@ -656,11 +1209,18 @@ class CoreClient(threading.Thread):
                 # and every tail block after the import is re-verified by verify_block, so a bogus checkpoint
                 # cannot be extended and the real heaviest chain re-triggers.
                 our_weight = self.memserver.latest_block.get("cumulative_weight", 0)
-                floor = 0 if allow_below_floor else self.memserver.finalized_height
+                # TWO-FLOOR: the re-anchor floor is the HARD floor, escalated or not. A snapshot below the
+                # depth floor but above the quorum floor is a legal landing point — that geometry used to
+                # force escalation, which then passed 0 and could cross ANY floor, which is how archives got
+                # truncated and the exec layer stranded. Crossing the hard floor is never recovery: it would
+                # adopt a chain conflicting with a checkpoint a >2/3 bonded quorum signed — joining an
+                # equivocation. When FFG has not finalized yet, hard is 0 and this degenerates to the old
+                # escalated behaviour; `allow_below_floor` survives only as the escalation LABEL.
+                floor = get_hard_finality()
                 cand = reanchor_candidates(peers, statuses, our_weight, floor)
                 if not cand:
                     self.logger.info("Re-anchor: no peer advertises a strictly-heavier chain with a snapshot "
-                                     f"above {'0 (ESCALATED)' if allow_below_floor else 'our finality floor'};"
+                                     f"above {'the HARD floor (ESCALATED)' if allow_below_floor else 'our finality floor'};"
                                      " staying put")
                     return False
                 # RANK BY CORROBORATION, NOT BY THE UNVERIFIED NUMBER. latest_block_weight is peer-asserted
@@ -740,6 +1300,13 @@ class CoreClient(threading.Thread):
                                     "anchor) — dead-end snapshot refused pre-import")
                 return False
 
+            # CAPTURE OUR OWN CHAIN'S INDEX BEFORE IT IS REPLACED. import_snapshot drops block_by_num /
+            # block_by_hash and repopulates them from the donor's payload, and that payload is WINDOWED
+            # ([C-INDEX_RETENTION_NUM, C]) — so an archive's deep index would be gone after this line, from
+            # any donor. It is also how the canonical restore below finds the fork point (where old and
+            # new agree) and re-derives every deep row the import throws away. Cheap: 144 B/height.
+            _old_index = dict(kv_ops.block_by_num_items())
+
             # 4) COMMIT: replace the carried consensus state. import_snapshot verifies every chunk
             # sha256 + the re-derived state_root BEFORE its write txn, so a failure here still leaves
             # the old identity fully intact.
@@ -747,8 +1314,9 @@ class CoreClient(threading.Thread):
                 return False
 
             # ...and retire the abandoned identity: every artifact NOT carried by the snapshot dies
-            # with the chain it described (tx history, block bodies + locators, GC reverts, our own
-            # checkpoints). One invariant instead of per-artifact cleanups — see adopt_new_identity.
+            # with the chain it described (tx history, GC reverts, our own checkpoints) — EXCEPT block
+            # bodies, which are reconciled against the adopted chain just below rather than wiped, because
+            # most of them are the canonical chain itself. See adopt_new_identity and ops/canonical_restore.
             snapshot_ops.adopt_new_identity(logger=self.logger)
 
             save_block(anchor, logger=self.logger)
@@ -764,27 +1332,25 @@ class CoreClient(threading.Thread):
             # lived here are both subsumed by adopt_new_identity above: nothing of the abandoned chain
             # survives the identity change, so there is nothing left to purge case by case.)
 
-            # BACKFILL the recent block BODIES the C+1..tip tail replay can NOT rebuild. block_by_num/hash
-            # arrived in the snapshot, so HASH lookbacks (beacon anchor (epoch-1)*EPOCH_LENGTH, FFG/PoSW
-            # epoch boundaries) already resolve — but rollback and block serving read block BODIES just
-            # behind C (the old get_block_reward body lookback is gone; REWARD_WINDOW is kept as margin).
-            # Without those bodies a post-snapshot rollback would fail. Walk back by
-            # parent_hash from the anchor, fetching + saving each body. Bounded + best-effort (a pruned donor
-            # may lack the deepest ones; we stop cleanly and set earliest to the oldest we actually got).
-            tail_depth = REWARD_WINDOW + 2 * EPOCH_LENGTH + FINALITY_DEPTH
-            oldest, filled = anchor, 0
-            for _ in range(tail_depth):
-                ph = oldest.get("parent_hash")
-                if not ph or int(oldest.get("block_number", 0)) <= 0:
-                    break
-                body = asyncio.run(snapshot_ops.fetch_block(source, self.memserver.port, ph))
-                if not body or body.get("block_hash") != ph:
-                    self.logger.warning(f"Snapshot body backfill stopped at height "
-                                        f"{int(oldest.get('block_number', 0)) - 1} ({filled}/{tail_depth} "
-                                        f"bodies) — donor lacks it; deeper lookbacks may skip until tail sync")
-                    break
-                save_block(body, logger=self.logger)
-                oldest, filled = body, filled + 1
+            # CANONICAL-CHAIN RESTORE (ops/canonical_restore). The fork that forced this was above the
+            # finality floor, so every block below the fork point is COMMON to both chains — the majority
+            # chain's own history, which we were serving a minute ago. It is kept, not re-fetched: a body's
+            # hash covers its bytes, so a body on the adopted chain IS vouched for by the new identity. Fork
+            # bodies are unreferenced. Deep index rows the windowed import dropped are re-put. What is
+            # canonical and absent is fetched from the donor: ALL of it on an archive node (an archive must
+            # come out of recovery with every canonical block it went in with — and, if it was truncated
+            # before, this is where it gets its history back), the rollback window on a rolling one.
+            try:
+                oldest = self._restore_canonical_chain(
+                    _old_index, anchor, source, fresh_bootstrap=not force_reanchor)
+            except Exception as e:
+                # The identity has already changed above; a fault here must not leave the node without an
+                # earliest pointer or wedge the recovery. Fall back to "history from the anchor" — no worse
+                # than the old behaviour, and the retained bodies are still there for the periodic archive
+                # refill (_maybe_refill_archive) to reconcile on its next pass.
+                self.logger.error(f"Canonical restore failed ({e}); history pointer set to the anchor and the "
+                                  f"archive refill will retry")
+                oldest = anchor
             set_earliest_block_info(earliest_block=oldest, logger=self.logger)
             self.memserver.earliest_block = oldest
 
@@ -808,15 +1374,51 @@ class CoreClient(threading.Thread):
                                     f"{target_height} — this node can now be re-anchored to")
             except Exception as e:
                 self.logger.error(f"Could not re-publish the adopted checkpoint (non-fatal): {e}")
+            # (NameError regression 2026-08-18: this line referenced a variable deleted in a refactor,
+            # so the except below treated every SUCCESSFUL bootstrap as failed and full-synced instead.)
             self.logger.warning(f"Snapshot bootstrap complete at height {target_height}; "
-                                f"backfilled {filled} recent bodies behind C; replaying tail")
+                                f"history floor {oldest}; replaying tail")
             return True
 
         except Exception as e:
             self.logger.error(f"Snapshot bootstrap failed, falling back to full sync: {e}")
             return False
 
+    def _held_high_water(self) -> int:
+        """The tallest block this node has held since start-up (settle_proof_relaxed). Seeded from the tip it started
+        on; incorporate_block raises it and nothing lowers it, so after a rollback it still names the old tip."""
+        hw = getattr(self, "_held_hw", None)
+        if hw is None:
+            hw = int((self.memserver.latest_block or {}).get("block_number", 0) or 0)
+            self._held_hw = hw
+        return hw
+
+    def _mesh_height_median(self) -> int:
+        """UPPER MEDIAN of the admitted statuses' advertised heights (0 with an empty pool). ONE reading for
+        every consumer that must not be steerable by a single peer's claim: the settle-proof depth gate and
+        the catch-up hold below. A lone peer is still its own median."""
+        try:
+            hs = sorted(int(v.get("latest_block_height") or 0)
+                        for v in self.consensus.status_pool.copy().values()
+                        if isinstance(v, dict) and isinstance(v.get("latest_block_height"), int))
+            return hs[len(hs) // 2] if hs else 0
+        except Exception:
+            return 0
+
     def _depth_floor_corroborated(self) -> bool:
+        """_depth_floor_corroborated_probe, with its verdict reused for SYNC_CORROB_TTL_S while the node is
+        fast-forwarding in emergency mode (see the constant); every other mode probes as before."""
+        if not getattr(self.memserver, "emergency_mode", False):
+            return self._depth_floor_corroborated_probe()
+        now = time.monotonic()
+        memo = getattr(self, "_sync_corrob_memo", None)
+        if memo and now - memo[0] < SYNC_CORROB_TTL_S:
+            return memo[1]
+        verdict = self._depth_floor_corroborated_probe()
+        self._sync_corrob_memo = (now, verdict)
+        return verdict
+
+    def _depth_floor_corroborated_probe(self) -> bool:
         """Whether the depth-based finality floor may advance right now: the visible network's majority tip
         must lie ON OUR CANONICAL CHAIN (majority_on_our_canonical — our tip or a recent ancestor of it,
         so peers lagging a healthy producer by a block still corroborate). No peers reporting = solo /
@@ -826,6 +1428,16 @@ class CoreClient(threading.Thread):
         pool = self.consensus.block_hash_pool
         if not pool:
             return True
+        # CATCH-UP HOLD (2026-09-02). Far behind the mesh every cheap check below fails by construction —
+        # we hold nobody's advertised tip — so only the signed prefix probe can answer, and incorporate_block
+        # asks this per block: up to four BLOCKING 3 s probes per applied block, memo-keyed on OUR height so
+        # the memo never hits while the height moves. Measured on this node's 10k-block resync: ~4 s per
+        # block, 14 blocks/min against a chain producing 10/min (a 35 h catch-up). The depth floor is the
+        # SOFT floor of the two-floor model; holding it is the documented safe direction, the sync needs
+        # nothing from it, and it resumes normally once we are within SYNC_FLOOR_HOLD_GAP of the tip.
+        _our = int((self.memserver.latest_block or {}).get("block_number", 0) or 0)
+        if self._mesh_height_median() - _our > SYNC_FLOOR_HOLD_GAP:
+            return False
         # THE OBJECTIVE TIP, NOT THE PLURALITY. This used to consult `majority_block_hash`, which
         # consensus_loop.py itself documents as "the Sybil-swingable plurality … replaced [for] the BLOCK
         # chain [by] OBJECTIVE heaviest-cumulative_weight fork-choice … (Plurality is kept for the tx-pool /
@@ -847,7 +1459,155 @@ class CoreClient(threading.Thread):
         heaviest = self.consensus.heaviest_block_hash
         if not heaviest:
             return True
-        return majority_on_our_canonical(heaviest, get_block, get_block_hash_by_number)
+        _budget = [4]      # shared prefix-probe budget for this pass (see LAGGING-PREFIX below)
+        if not majority_on_our_canonical(heaviest, get_block, get_block_hash_by_number, number_by_hash_fn=kv_ops.number_by_hash):
+            # LAGGING-PREFIX ESCAPE (2026-08-19, second landing of the same fix): this early return was
+            # the gate the first landing never reached — a lagging node NEVER holds the heaviest
+            # advertised tip (everyone is ahead of it), so this returned False before the veto-loop and
+            # fallback probes below ever ran, and the floor stayed frozen (measured: still frozen at
+            # 81242 after the first fix shipped; external probes confirmed every peer's signed hash at
+            # our height MATCHED ours). Same principle as below: if a heaviest-class peer's signed hash
+            # at OUR height equals OUR tip hash, the heavier chain CONTAINS us — we are behind it, not
+            # forked from it.
+            for _peer, _w in sorted(((p, w) for p, w in (self.consensus.weight_pool or {}).copy().items()
+                                     if isinstance(w, int)), key=lambda kv: -kv[1])[:4]:
+                if self._extends_us(_peer, _budget):
+                    break
+            else:
+                return False
+        # SOMEONE ELSE HAS TO SAY IT. The check above asks "is the heaviest tip on our chain", and for a node
+        # ALONE ON A FORK the answer is trivially yes — it mines every slot unopposed, so its own tip IS the
+        # heaviest and it corroborates itself. That is precisely the wedge this predicate exists to prevent,
+        # and it failed open in exactly that case.
+        #
+        # Observed live, betanet-13 h5924 (2026-07-29): .131 built a block for the same winner, same parent,
+        # same state_root, 4s earlier and without a blob tx whose min_block was that very height. It then
+        # mined alone, stayed heaviest, corroborated its own depth floor up to 5974 — 50 blocks PAST the fork
+        # — and became unable to roll back and rejoin. The other three had the same fork point below their
+        # floor too, so nothing could reorg and the only exit left was the data-destroying dead-fork purge.
+        # Had the floor stayed below 5924 on the isolated side, that node could simply have rolled back and
+        # resynced the 3-node chain: a plain reorg, no purge, no lost chain data.
+        #
+        # So corroboration now means what the word means — an INDEPENDENT peer advertising a tip on our
+        # canonical chain. Our own tip is not evidence about our own tip.
+        #
+        # Failing this only FREEZES the floor, which is the safe direction (it widens the honest-reorg
+        # window and nothing else), and a Sybil could already achieve that by withholding corroboration.
+        # HEAVIER-FOREIGN-CLAIM VETO (2026-07-30, restored + hardened; complements the independence rule
+        # below, it does not replace it). Independent corroboration stops a LONE forker self-finalizing,
+        # but a minority CLIQUE corroborates itself: two nodes on the same lighter branch each advertise
+        # an on-chain tip for the other, so both floors advance — observed live on betanet-14 while the
+        # strictly-heavier solo chain sat plainly advertised in their status pools (~92k vs ~65k weight),
+        # cementing 60+ blocks of a branch fork choice says must lose. Any peer claiming strictly MORE
+        # cumulative weight on a tip that is not on our canonical chain — or whose tip we cannot even
+        # locate this pass (the pools refresh on different cadences; an unanswerable heavier claim is the
+        # LEAST corroborated case, not a pass) — freezes the floor. Freezing is the safe direction; a
+        # liar merely delays our finality and its tip re-benches on the next failed fetch.
+        # LAGGING-PREFIX CORROBORATION (2026-08-19). Both checks below share a blind spot that froze this
+        # node's floor for 2.5 hours ON THE CANONICAL CHAIN: majority_on_our_canonical requires us to HOLD
+        # the peer's advertised tip block, but a node that is merely SLOW (overloaded host, ~30 blocks
+        # behind) never holds anyone's current tip — every peer is ahead of it. Every heavier peer claim
+        # was then "unanswerable" (the veto), no advertised hash was a block we hold (the corroboration
+        # loop), and the floor sat frozen at 81242 across restarts while the tip followed the fleet
+        # normally — starving the exec layer, which caps at finalized. "Behind on the SAME chain" is not
+        # "on a different chain", and it IS corroborable: a SIGNED peer claim that its hash at OUR height
+        # equals OUR tip hash proves our chain is a strict prefix of the peer's heavier one. A forker's
+        # hash at our height differs (that is what forking means), so a lone forker gains nothing; the
+        # betanet-14 minority clique still fails (the heavier foreign peer's hash at their height is not
+        # theirs); and a liar could already grant corroboration by advertising our tip in the hash pool,
+        # so no new trust is extended. Probes are memoized (_memo_probe, 90 s) and budgeted per pass —
+        # unmemoized serial probing is what caused the 2026-08-18 09:00 fleet freeze. (_budget is
+        # created above, before the heaviest-tip gate — ONE budget per pass, never reset mid-pass.)
+        _our_w = int((self.memserver.latest_block or {}).get("cumulative_weight", 0) or 0)
+        for _peer, _w in (self.consensus.weight_pool or {}).copy().items():
+            if not isinstance(_w, int) or _w <= _our_w:
+                continue
+            _t = self.consensus.block_hash_pool.get(_peer)
+            if _t is None or not majority_on_our_canonical(_t, get_block, get_block_hash_by_number, number_by_hash_fn=kv_ops.number_by_hash):
+                # FOREIGN-GENERATION EXEMPTION (2026-08-20, the betanet-4 cutover): a heavier claim can
+                # only veto if the claimant shares OUR genesis. Three un-purged reroll stragglers kept
+                # advertising the PREVIOUS chain's ~9M cumulative weight under the new CHAIN_ID and froze
+                # the fresh chain's depth floor at 0 from block 1 — but fork choice can NEVER adopt a
+                # chain whose blocks cannot link to our block 0, so vetoing on its weight honors a chain
+                # that is impossible to reorg onto. A probe failure keeps the veto (unknown != foreign —
+                # never widen the exemption on silence).
+                if not self._same_genesis(_peer):
+                    continue
+                if not self._extends_us(_peer, _budget):
+                    return False
+        # own_ips(): self-identity is a SET (dual-stack host that is also a seed) — see peer_ops.own_ips
+        _me = own_ips() | {self.memserver.ip, get_config().get("ip")} - {None}
+        for _peer, _hash in self.consensus.block_hash_pool.copy().items():
+            if _peer in _me or not _hash:
+                continue
+            if majority_on_our_canonical(_hash, get_block, get_block_hash_by_number, number_by_hash_fn=kv_ops.number_by_hash):
+                return True
+        # nobody advertises a tip we hold — the lagging case. Ask the heaviest few directly whether
+        # their chain contains our tip (see the header comment).
+        for _peer, _w in sorted(((p, w) for p, w in (self.consensus.weight_pool or {}).copy().items()
+                                 if isinstance(w, int) and p not in _me),
+                                key=lambda kv: -kv[1])[:4]:
+            if self._extends_us(_peer, _budget):
+                return True
+        return False
+
+    def _same_genesis(self, peer) -> bool:
+        """False when `peer`'s block 0 differs from OUR genesis — a FOREIGN-GENERATION chain (a reroll
+        straggler still mining the previous chain). Its weight claims are void for finality decisions:
+        fork choice can never adopt blocks that cannot link to our block 0. Memoized 600s per peer, so
+        a straggler that finally purges regains standing within one TTL. A failed probe reports True
+        (same genesis assumed): unknown must KEEP its veto power — freezing is the safe direction."""
+        _now = time.time()
+        _cache = getattr(self, "_genesis_id_cache", None)
+        if _cache is None:
+            _cache = self._genesis_id_cache = {}
+        _hit = _cache.get(peer)
+        if _hit is not None and _now - _hit[1] < 600.0:
+            return _hit[0]
+        try:
+            from ops.peer_ops import probe_block_hash
+            _ours = get_block_hash_by_number(0)
+            _theirs = probe_block_hash(peer, 0, port=self.memserver.port)
+            same = (not _ours) or (_theirs is None) or (_theirs == _ours)
+            if not same:
+                self.logger.warning(f"{peer} is on a FOREIGN-GENERATION chain (their block 0 "
+                                    f"{str(_theirs)[:16]}… != ours) — its weight claims carry no veto")
+        except Exception:
+            same = True
+        _cache[peer] = (same, _now)
+        for _p in [p for p, (_s, _t) in _cache.items() if _now - _t >= 600.0]:
+            _cache.pop(_p, None)                  # bounded: a churned-through peer set does not accumulate
+        return same
+
+    def _extends_us(self, peer, budget):
+        """True when `peer`'s SIGNED hash claim at OUR tip height equals our tip hash — proof our chain
+        is a strict prefix of the peer's (we are behind the same chain, not on a fork). Uses the same
+        90 s (peer, height) memo as the fork verdict; `budget` (single-element list) caps NEW probes per
+        corroboration pass so a large peer set can never serialize into a loop-freezing probe storm —
+        an exhausted budget just answers False, which only delays the floor one pass (the safe
+        direction)."""
+        lb = self.memserver.latest_block or {}
+        our_h = int(lb.get("block_number", 0) or 0)
+        our_hash = lb.get("block_hash")
+        if not our_h or not our_hash:
+            return False
+        memo = getattr(self, "_probe_memo", None)
+        cached = memo is not None and memo[1].get((peer, our_h))
+        # a memoized FAILURE (None-hash) must not stand for 90 s — under host load a single 3 s probe
+        # timeout would otherwise pin this peer un-corroborating for the whole memo window while the
+        # floor stays frozen. Successes are immutable facts and ride the memo; failures re-probe
+        # whenever the budget allows.
+        if not (cached and cached[0]):
+            if budget[0] <= 0:
+                return False
+            budget[0] -= 1
+            if memo is not None:
+                memo[1].pop((peer, our_h), None)       # drop the cached failure so _memo_probe re-asks
+        try:
+            h, _seats = self._memo_probe(peer, our_h, our_h)
+        except Exception:
+            return False
+        return h == our_hash
 
     def _fork_state(self):
         """Measured fork state (ops/fork_resolution.resolve), cached for FORK_STATE_TTL_S.
@@ -859,11 +1619,16 @@ class CoreClient(threading.Thread):
         try:
             now = get_timestamp_seconds()
             cached = getattr(self, "_fork_state_cache", None)
+            # TIME-KEYED ON PURPOSE. Keying this cache on the tip as well was tried (2026-09-13) and it
+            # made the verdict FLAP: a healthy chain moves its tip every block, so every pass re-measured,
+            # the reorg leg saw a different ancestor each time, and no adoption ever ran to completion —
+            # a 4-node loopback mesh sat on 3-4 distinct tips for a whole run. The cheap status read
+            # keeps its TTL; the one consumer that ROLLS BACK checks freshness itself, at the moment it
+            # matters (_fresh_ancestor_for_adoption).
             if cached and now - cached[0] < FORK_STATE_TTL_S:
-                return cached[1]
-            from ops.peer_ops import seed_peers, probe_block_hash
+                return cached[1]["state"]
+            from ops.peer_ops import seed_peers
             from ops.block_ops import get_block_hash_by_number
-            from ops.account_ops import get_finalized_height
             # SEEDS FIRST. The verdict here is a per-IP headcount (fork_resolution.majority_hash), and it
             # gates the re-anchor path — so if attacker-held slots crowd the operator seeds out of the [:8]
             # window they dictate the verdict. memserver.peers came first, so on a node with >=8 peers the
@@ -872,23 +1637,494 @@ class CoreClient(threading.Thread):
             # DEFAULT_SEED_PEERS[0]), so seeds-first would otherwise guarantee our own IP in slot 0 — we
             # would answer our own fork-state question with our own hash and count it in the tally.
             # ops/peer_ops.py:285 already applies exactly this carve-out to the dial set; mirror it here.
-            _me = {get_config().get("ip")} - {None}
+            # own_ips(): self-identity is a SET (dual-stack host that is also a seed) — see peer_ops.own_ips.
+            # This site kept probing OURSELVES after the other three were fixed: our own /hash_attest answered
+            # in 3.7 s from the loaded relay, and majority_hash waits for the slowest probe of the round.
+            _me = own_ips() | {self.memserver.ip, get_config().get("ip")} - {None}
             peers = [p for p in dict.fromkeys(list(seed_peers()) + list(self.memserver.peers))
                      if p not in _me][:8]
             if not peers:
                 return fork_resolution.UNKNOWN
             tip = self.memserver.latest_block["block_number"]
+            # HARD floor, not depth (two-floor model): classify() calls a fork DEAD (unrecoverable by
+            # rollback) only below what rollback actually refuses to cross. Using the depth floor here is
+            # what turned every >45-block fork into a floor-crossing "wedge recovery"; above the hard floor
+            # the verdict is now REORG and the ordinary rollback leg handles it.
+            from ops.account_ops import get_hard_finality as _ghf
             verdict = fork_resolution.resolve(
                 our_hash_at=get_block_hash_by_number,
-                tip=tip, finalized=get_finalized_height(), peers=peers,
-                probe=lambda peer, h: probe_block_hash(peer, h, port=self.memserver.port))
-            self._fork_state_cache = (now, verdict["state"])
+                tip=tip, finalized=_ghf(), peers=peers,
+                probe=lambda peer, h: self._memo_probe(peer, h, tip))
+            self._fork_state_cache = (now, verdict)   # FULL verdict: the reorg leg needs the ancestor too
             self.logger.info(f"Fork state: {verdict['state']} (ancestor={verdict['ancestor']}, "
                              f"tip={tip}, probes={verdict['probes']})")
             return verdict["state"]
         except Exception as e:
             self.logger.warning(f"fork-state probe failed: {e}")
             return fork_resolution.UNKNOWN
+
+    def _fork_verdict(self):
+        """The full measured verdict {state, ancestor, ...} behind _fork_state(), same cache. The reorg
+        leg is gated on this rather than on one donor's word — see emergency_mode."""
+        state = self._fork_state()
+        cached = getattr(self, "_fork_state_cache", None)
+        if cached and isinstance(cached[1], dict):
+            return cached[1]
+        return {"state": state, "ancestor": None}
+
+    def _rec_fail(self, why, **detail):
+        """Like _rec but PERSISTENT: failures land in their own /status field ("recovery_fail") that the
+        phase stream does not overwrite — a failure frame lived ~3 s before the next phase clobbered it,
+        unpollable from outside."""
+        try:
+            self.memserver.recovery_fail = {"why": why, "at": get_timestamp_seconds(),
+                                            "tip": self.memserver.latest_block.get("block_number"), **detail}
+        except Exception:
+            pass
+
+    def _rec(self, phase, **detail):
+        """Publish the recovery state machine's current step to /status ("recovery" field). Two nodes
+        (.26/.28, 2026-08-18) sat wedged behind opaque restarts with no shell access — the only readable
+        surface was their status page, so the recovery path now narrates itself there: verdicts, adoption
+        steps, refusals, and the last swallowed exception. Costs a dict assignment."""
+        try:
+            self.memserver.recovery_debug = {"phase": phase, "at": get_timestamp_seconds(),
+                                             "tip": self.memserver.latest_block.get("block_number"),
+                                             **detail}
+        except Exception:
+            pass
+
+    def _memo_probe(self, peer, h, tip):
+        """probe_block_hash_signed with a 90 s (peer, height) memo. A verdict round is ~46 probes and the
+        binary search re-asks the same heights every FORK_STATE_TTL_S — unmemoized, each emergency pass
+        burned ~65 s of serial probing, the core loop hit 140 s/pass, and the whole fleet starved each
+        other's event loops into timeouts (the 2026-08-18 09:00 freeze). Answers are immutable facts about
+        committed heights, so a short memo is safe; it dies with the verdict cache."""
+        from ops.peer_ops import probe_block_hash_signed
+        now = time.monotonic()
+        memo = getattr(self, "_probe_memo", None)
+        if memo is None or now - memo[0] > 90:
+            memo = (now, {})
+            self._probe_memo = memo
+        key = (peer, int(h))
+        if key in memo[1]:
+            return memo[1][key]
+        r = probe_block_hash_signed(peer, h, port=self.memserver.port, timeout=3, tip_hint=tip,
+                                    self_address=self.memserver.address)   # never our own answer
+        memo[1][key] = r
+        return r
+
+    def _inline_tip_swap(self):
+        """ONE-BLOCK TIE FAST PATH (2026-08-19). Every organic fork this week was a single divergent
+        block that self-heals — but healing went through full emergency recovery (verdict probing,
+        donor selection, mode churn), freezing finality for minutes over a paper cut (30 min at 14:20,
+        which is also what pushed the exec layer visibly behind L1). When the measured verdict already
+        says REORG with the ancestor exactly ONE below our tip, the entire fix is: fetch the sibling
+        branch, verify it, roll back one block, apply — which is precisely _adopt_branch(tip-1), the
+        tested possession-before-rollback path. Run it INLINE from check_mode and skip emergency mode
+        entirely; production and duty flow continue on the very next pass, so finality never freezes.
+        Anything deeper (ancestor < tip-1, UNKNOWN/BEHIND verdicts, refused rollbacks) falls through
+        to the existing machinery unchanged. Fork-choice is untouched: minority_block_consensus has
+        already decided WE are the yielding side before this runs — this only changes how cheaply the
+        yield happens."""
+        try:
+            v = self._fork_verdict()
+            tip = int(self.memserver.latest_block["block_number"])
+            if v.get("state") != fork_resolution.REORG or v.get("ancestor") != tip - 1:
+                return False
+            adopted = self._adopt_branch(tip - 1)
+            if adopted is True:
+                self._fork_state_cache = None      # the tip this verdict described no longer exists
+                self._rec("inline_tip_swap", h=tip)
+                self.logger.warning(f"One-block split at {tip} resolved inline — emergency skipped")
+                return True
+            return False
+        except Exception as e:
+            self.logger.info(f"Inline tip swap declined: {e}")
+            return False
+
+    def _adopt_heaviest_pairwise(self):
+        """THE NO-MAJORITY ESCAPE (fork_resolution.pairwise_ancestor doc): a multi-way scatter gives every
+        node an UNKNOWN verdict, UNKNOWN correctly never reverts, and the fleet deadlocks — each branch
+        producing alone. Weight still exists without a majority: find the common ancestor with the ONE
+        peer advertising the strictly-heaviest tip and possession-adopt its branch. Returns the same
+        tri-state as _adopt_branch (True adopted / False nothing usable / None escalate)."""
+        try:
+            hh = self.consensus.heaviest_block_hash
+            hw = int(self.consensus.heaviest_block_weight or 0)
+            our_w = int(self.memserver.latest_block.get("cumulative_weight", 0))
+            if not hh or hw <= our_w:
+                return False
+            src = next((ip for ip, st in self.consensus.status_pool.copy().items()
+                        if isinstance(st, dict) and st.get("latest_block_hash") == hh), None)
+            if not src:
+                # stale-hash race (see _adopt_branch): take the strictly-heaviest advertiser instead
+                best_w, src = our_w, None
+                for ip, st in self.consensus.status_pool.copy().items():
+                    if isinstance(st, dict):
+                        try:
+                            w = int(st.get("latest_block_weight") or 0)
+                        except (TypeError, ValueError):
+                            continue
+                        if w > best_w and st.get("latest_block_hash"):
+                            best_w, src = w, ip
+                if not src:
+                    return False
+            from ops.account_ops import get_hard_finality
+            from ops.block_ops import get_block_hash_by_number
+            tip = int(self.memserver.latest_block["block_number"])
+            anc = fork_resolution.pairwise_ancestor(
+                get_block_hash_by_number, tip,
+                lambda h: (lambda r: r[0] if isinstance(r, tuple) else r)(self._memo_probe(src, h, tip)),
+                floor=get_hard_finality())
+            if anc is None or anc >= tip:
+                return False
+            self.logger.warning(f"No probe majority but {src} advertises a strictly-heavier branch "
+                                f"(w {hw} > {our_w}); pairwise ancestor {anc} — attempting adoption")
+            return self._adopt_branch(anc)
+        except Exception as e:
+            self.logger.warning(f"pairwise adoption failed: {e}")
+            return False
+
+    def _reconcile_before_build(self, peers):
+        """Run memserver.reconcile_next_block_set ONCE per tip, right before we assemble (the production
+        pacing slot fires once per block_time, so this is once per block). Logs only when it changed
+        something or found disagreement — a quiet mesh stays quiet."""
+        tip = self.memserver.latest_block.get("block_hash")
+        if getattr(self, "_reconciled_tip", None) == tip:
+            return
+        self._reconciled_tip = tip
+        try:
+            t0 = time.monotonic()
+            r = self.memserver.reconcile_next_block_set(peers)
+            if r.get("fetched") or (r.get("same_tip") and r.get("agreed", 0) < r.get("same_tip", 0)):
+                self.logger.info(f"Pre-build reconcile: {r} in {time.monotonic() - t0:.2f}s")
+        except Exception as e:
+            self.logger.info(f"Pre-build reconcile skipped: {e}")
+
+    def _tie_break_ours(self, hh):
+        """STABLE equal-weight fork choice, wired to the measured verdict: True = our branch is canonical,
+        False = theirs is, None = no evidence either way (which never switches or suppresses anything).
+
+        Weight increments are content-independent, so a same-height split is a PERMANENT exact tie — and
+        the old lowest-TIP-hash tie-break re-rolled every block, flipping the verdict faster than any
+        reorg could complete (the hours-long see-saws at 62655/62895). The FIRST DIVERGENT block
+        (ancestor+1) never changes as branches grow: both sides compute one permanent winner
+        (fork_resolution.tie_winner) and exactly one side reorgs, once. Ours is a local index read;
+        theirs is one probe of a peer advertising `hh`, cached per-ancestor for FORK_STATE_TTL_S."""
+        from protocol import FORK_STATE_TTL_S
+        try:
+            v = self._fork_verdict()
+            anc = v.get("ancestor")
+            if v.get("state") != fork_resolution.REORG or anc is None:
+                return None
+            ours = get_block_hash_by_number(anc + 1)
+            if not ours:
+                return None
+            now = time.monotonic()
+            cached = getattr(self, "_tie_theirs_cache", None)
+            if cached and cached[0] == anc and now - cached[2] < FORK_STATE_TTL_S:
+                theirs, theirs_blk = cached[1], cached[3]
+            else:
+                from ops.peer_ops import probe_block_hash, fetch_block_by_hash
+                theirs, theirs_blk = None, None
+                for ip, st in self.consensus.status_pool.copy().items():
+                    if isinstance(st, dict) and st.get("latest_block_hash") == hh:
+                        theirs = probe_block_hash(ip, anc + 1, port=self.memserver.port)
+                        if theirs:
+                            # the BODY too: the tie-break prefers the more complete tx set
+                            # (fork_resolution.tie_winner) — a missing body degrades to the hash rule
+                            theirs_blk = fetch_block_by_hash(ip, theirs, port=self.memserver.port)
+                            break
+                self._tie_theirs_cache = (anc, theirs, now, theirs_blk)
+            if not theirs or theirs == ours:
+                return None
+            ours_blk = get_block(ours)
+            o_ids = ([t.get("txid") for t in ours_blk.get("block_transactions", [])]
+                     if isinstance(ours_blk, dict) else None)
+            t_ids = ([t.get("txid") for t in theirs_blk.get("block_transactions", [])]
+                     if isinstance(theirs_blk, dict) else None)
+            if o_ids is None or t_ids is None:
+                o_ids = t_ids = None                     # one side unknown -> hash rule on both sides
+            return fork_resolution.tie_winner(ours, theirs, o_ids, t_ids) == "ours"
+        except Exception as e:
+            self.logger.warning(f"tie-break probe failed: {e}")
+            return None
+
+    def _reapply_local_branch(self, old_tip):
+        """Restore OUR branch from the local store after a failed adoption: the bodies were never deleted
+        (they are content-addressed), so walk old_tip's parent chain down to the current (rolled-back) tip
+        and re-apply forward through the one canonical apply path. Best-effort — a partial restore leaves
+        the node lower but consistent, and ordinary sync continues from there."""
+        try:
+            chain = []
+            b = old_tip
+            while isinstance(b, dict) and b.get("block_number", 0) > self.memserver.latest_block["block_number"]:
+                chain.append(b)
+                b = get_block(b.get("parent_hash")) or None
+            for blk in reversed(chain):
+                if not self.produce_block(block=blk, remote=True, remote_peer=None):
+                    break
+            self.logger.warning(f"Re-applied our own branch back to {self.memserver.latest_block['block_number']} "
+                                f"after a failed adoption")
+        except Exception as e:
+            self.logger.error(f"local branch re-apply failed: {e}")
+
+    def _adopt_branch(self, anc):
+        """POSSESSION-BEFORE-ROLLBACK: never revert a real block until the competing branch is HELD and
+        pre-verified. The old order (roll toward the ancestor, then hope a donor serves the better chain)
+        made disruption free: any advertisement that survived the verdict probes cost us real rollbacks
+        and churn even when nothing valid was ever served. Now the branch is fetched FIRST — walked by
+        parent_hash from the advertised tip down to the measured ancestor, each block checked for content
+        hash and linkage, the claimed weight checked against ours — and only then do we roll to the
+        ancestor and apply it through the one canonical apply path (produce_block -> verify_block, which
+        re-derives and ENFORCES everything the pre-check cannot know without state). A branch that fails
+        mid-apply costs the attacker a benched tip and us seconds: our own bodies are still in the store
+        and _reapply_local_branch restores them.
+
+        Returns True (adopted), False (nothing usable — caller waits/strikes), or None (rollback refused:
+        budget/floor — caller escalates to the re-anchor ladder, exactly as before)."""
+        anc = self._fresh_ancestor_for_adoption(anc)
+        if anc is None:
+            return False                                   # the fresh verdict is not a reorg: nothing to adopt
+        hh = self.consensus.heaviest_block_hash
+        our_w = self.memserver.latest_block.get("cumulative_weight", 0)
+        src = next((ip for ip, st in self.consensus.status_pool.copy().items()
+                    if isinstance(st, dict) and st.get("latest_block_hash") == hh), None)
+        if not src:
+            # THE STALE-HASH RACE. heaviest_block_hash is derived from gossip, and on a 6 s chain every
+            # peer has advertised a NEWER tip by the time this scan runs — so the exact-hash lookup missed,
+            # adoption returned False, and the next pass raced the same way. Observed live 2026-08-18: the
+            # .26/.28 pair sat ONE BLOCK off the majority chain for 15+ minutes, failing this lookup every
+            # pass. The branch matters, not the momentary tip: fall back to the strictly-heaviest
+            # advertising peer and walk from ITS current tip — possession + full validation vet whatever
+            # branch it actually serves.
+            best_w, best_ip, best_tip = int(our_w), None, None
+            for ip, st in self.consensus.status_pool.copy().items():
+                if not isinstance(st, dict):
+                    continue
+                try:
+                    w = int(st.get("latest_block_weight") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if w > best_w and st.get("latest_block_hash"):
+                    best_w, best_ip, best_tip = w, ip, st["latest_block_hash"]
+            if best_ip is None:
+                return False
+            src, hh = best_ip, best_tip
+        if not hh:
+            return False
+        anc_hash = get_block_hash_by_number(anc)
+        if not anc_hash:
+            return False
+        from ops.block_ops import block_content_hash
+        from protocol import FINALITY_HARD_BACKSTOP
+        self._rec("adopt_fetching", src=src, start=str(hh)[:12])
+        staged, cur = [], hh
+        for _ in range(FINALITY_HARD_BACKSTOP + EPOCH_LENGTH):
+            # RESTART-PROOF RATCHET: bodies are content-addressed, so persist every fetched block
+            # immediately and check the LOCAL store first on the next attempt. The .26/.28 pair was
+            # restart-looping (cause on their boxes, not reachable from here), and every restart threw
+            # away a half-finished 300-block staged walk — the fetch could never outlive the process.
+            # Now each short life fetches what is still missing and the walk completes across lives.
+            b = get_block(cur) or None
+            if not isinstance(b, dict):
+                b = asyncio.run(snapshot_ops.fetch_block(src, self.memserver.port, cur))
+                if not isinstance(b, dict) or b.get("block_hash") != cur:
+                    self._rec_fail("donor stopped serving", at_hash=str(cur)[:12], src=src)
+                    self.logger.info(f"Branch adoption: {src} stopped serving its own branch at {cur[:12]}")
+                    self._reject_heaviest_tip()
+                    return False
+                try:
+                    if b.get("block_number", 0) != 0 and block_content_hash(b) != b["block_hash"]:
+                        raise ValueError("content hash mismatch")
+                except Exception as e:
+                    self._rec_fail(f"forged/corrupt: {e}", src=src)
+                    self.logger.warning(f"Branch adoption: {src} served a forged/corrupt block ({e}) — benching")
+                    self._reject_heaviest_tip()
+                    return False
+                save_block(b, logger=self.logger)          # the ratchet: survives our next restart
+            staged.append(b)
+            ph = b.get("parent_hash")
+            # GRAFT-POINT DISCOVERY (2026-08-23). `anc` was measured against the MAJORITY's chain, but the
+            # branch being walked comes from the heaviest ADVERTISER — a different branch whenever majority
+            # and weight disagree, and possibly an EXTENSION OF OUR OWN chain (we adopt the branch we are
+            # already on after it out-runs us). Walking blindly down to `anc` then rolled back every shared
+            # block just to re-apply it — observed live at 43589: an 84-block rollback (exhausting the
+            # 40-block budget mid-burst, abandoning the node at 43549) where the correct action was a
+            # 7-block fast-forward. The walk itself knows better: the FIRST staged block whose parent we
+            # already hold at parent height IS the true graft point — everything below it is shared by
+            # parent-linkage, so roll exactly to there and no further.
+            _bn = int(b.get("block_number", 0))
+            if ph and get_block_hash_by_number(_bn - 1) == ph:
+                anc, anc_hash = _bn - 1, ph
+                break
+            if not ph or _bn <= int(anc):
+                self._rec_fail("walk missed the ancestor", ancestor=int(anc), src=src)
+                self._reject_heaviest_tip()
+                return False                       # walk missed the measured ancestor — inconsistent branch
+            cur = ph
+        else:
+            # DEEP CATCH-UP: the branch from the advertised tip to our ancestor is longer than the staging
+            # cap — not an illegal reorg, just a long absence (OUR side of the fork is still bounded by the
+            # hard floor; THEIR side is however far the majority ran while we were away). Possession of the
+            # whole branch is impractical here, and unnecessary: the ROLL part is still small
+            # (ancestor-bounded, verdict-backed by the multi-peer hash probes — the substantiation the
+            # free-rollback fix actually requires), and everything after it is ordinary forward sync with
+            # full per-block validation. Roll to the ancestor, drop the spent verdict, and let the next
+            # pass's donor flow fast-forward from the common chain (knows_block at the ancestor is True on
+            # every majority donor).
+            # RE-MEASURE THE GRAFT BEFORE ROLLING (2026-09-13). The staging walk above discovers the true
+            # graft point and rolls no further; this path never did — it rolled straight to `anc`, a
+            # verdict that may be minutes and a hundred blocks stale on a node that kept syncing. The
+            # walk's own reasoning applies here unchanged: every block below the first one we share with
+            # the donor is ours already, and reverting it is pure loss plus a re-apply that can fail.
+            # One peer, ~log2(depth) probes, the same pairwise search the no-majority escape uses.
+            from ops.peer_ops import probe_block_hash as _pbh
+            try:
+                _graft = fork_resolution.pairwise_ancestor(
+                    get_block_hash_by_number, int(self.memserver.latest_block["block_number"]),
+                    lambda h: _pbh(src, h, port=self.memserver.port, timeout=5), floor=int(anc))
+            except Exception:
+                _graft = None
+            if _graft is not None and int(_graft) > int(anc):
+                self.logger.warning(f"Branch adoption: measured ancestor {anc} is stale — we share the donor's "
+                                    f"chain through {_graft}; rolling only to there")
+                anc = int(_graft)
+            self.logger.warning(f"Branch adoption: majority branch longer than the staging cap — rolling to "
+                                f"the ancestor {anc} and continuing by forward sync")
+            self.memserver.rollbacks = 0
+            _span = int(self.memserver.latest_block["block_number"]) - int(anc)
+            _budget = min(max(_span, self.memserver.max_rollbacks), FINALITY_HARD_BACKSTOP)
+            while self.memserver.latest_block["block_number"] > anc:
+                if self._rollback_one_for_reorg(ancestor=anc, budget=_budget):
+                    return None                    # budget/floor refused: escalate (re-anchor)
+            self._fork_state_cache = None
+            return False                           # not adopted here — the donor flow finishes the job
+        staged.reverse()
+        if int(staged[-1].get("cumulative_weight", 0)) <= int(our_w):
+            self._rec_fail("possession disproved the weight claim", src=src)
+            self._reject_heaviest_tip()
+            return False                           # possession disproved the advertisement
+        # FORK FORENSICS: this is the one moment both branches are in hand — ours still referenced,
+        # theirs staged. Record the FIRST divergent block's difference (the fork's seed) before the roll
+        # deletes our side's locators. Answers "what actually forks this chain" with data instead of
+        # theory: divergent tx sets point at propagation (which tx, which kind), identical tx sets point
+        # at ordering/creator/timestamp. Appended to ~/nado/fork_diffs.jsonl + the latest on /status.
+        try:
+            import json as _json
+            from ops.data_ops import get_home as _gh
+            for _blk in staged:
+                _n = int(_blk.get("block_number", -1))
+                _oh = get_block_hash_by_number(_n)
+                _ob = get_block(_oh) if _oh else None
+                if not isinstance(_ob, dict) or _ob.get("block_hash") == _blk.get("block_hash"):
+                    continue
+                # WHO SENT IT, IN WHICH FORM, WITH HOW MUCH WINDOW LEFT (2026-09-22): the duty diagnosis that
+                # day took two hours because a record held a short txid and nothing else — every split tx
+                # had to be found again in a block, and the ones that were LOST (never landed) could not be
+                # found at all. Fields 4-6: sender prefix, "w" windowed / "x" exact-landing, blocks of
+                # window remaining at the split height. Append-only: readers of [0..2] are unchanged.
+                _sig = lambda b: sorted((t.get("recipient"),
+                                         (t.get("data") or {}).get("op") if isinstance(t.get("data"), dict) else None,
+                                         str(t.get("txid"))[:16],
+                                         str(t.get("sender"))[:10],
+                                         "w" if t.get("min_block") else "x",
+                                         int(t.get("max_block") or 0) - _n)
+                                        for t in (b.get("block_transactions") or []))
+                _so, _st = _sig(_ob), _sig(_blk)
+                _d = {"at": get_timestamp_seconds(), "h": _n, "anc": int(anc), "src": src}
+                if _so != _st:
+                    _d["only_ours"] = [list(t) for t in _so if t not in _st][:6]
+                    _d["only_theirs"] = [list(t) for t in _st if t not in _so][:6]
+                else:
+                    _d.update({"same_txs": len(_so), "creator_ours": str(_ob.get("block_creator"))[:12],
+                               "creator_theirs": str(_blk.get("block_creator"))[:12],
+                               "ts_ours": _ob.get("block_timestamp"), "ts_theirs": _blk.get("block_timestamp")})
+                self.memserver.last_fork_diff = _d
+                with open(f"{_gh()}/fork_diffs.jsonl", "a") as _f:
+                    _f.write(_json.dumps(_d) + "\n")
+                break                                    # the first divergent block is the seed
+        except Exception:
+            pass
+        old_tip = self.memserver.latest_block
+        self._rec("adopt_rolling", src=src, staged=len(staged), to=int(anc))
+        self.memserver.rollbacks = 0
+        # the span is MEASURED and the branch is HELD: budget exactly what the roll needs, hard-capped by
+        # the backstop (the finality floor still refuses per-block inside the leg). See fix note in
+        # _rollback_one_for_reorg.
+        _span = int(self.memserver.latest_block["block_number"]) - int(anc)
+        _budget = min(max(_span, self.memserver.max_rollbacks), FINALITY_HARD_BACKSTOP)
+        while self.memserver.latest_block["block_number"] > anc:
+            if self._rollback_one_for_reorg(ancestor=anc, budget=_budget):
+                self._rec("adopt_roll_refused", to=int(anc))
+                # NEVER abandon the node mid-branch (2026-08-23: a refused burst left the tip at 43549 —
+                # neither our old tip nor the ancestor, a state nobody chose, with production suppressed).
+                # Our bodies are content-addressed and still in the store: restore the branch we came
+                # from, THEN escalate to the re-anchor ladder self-consistent.
+                self._reapply_local_branch(old_tip)
+                return None                        # budget/floor refused mid-burst: escalate (re-anchor)
+        self._rec("adopt_applying", src=src, staged=len(staged))
+        for blk in staged:
+            if not self.produce_block(block=blk, remote=True, remote_peer=src):
+                rej = getattr(self.memserver, "last_block_reject", None) or {}
+                if "our state diverged from the producer" in str(rej.get("error", "")):
+                    # NOT the donor's fault — OUR committed state is corrupt at a parent whose HASH we
+                    # agree on (the h4260 rollback-asymmetry class: hours of roll-and-remine cycles left
+                    # residue no rollback can fix, observed on .26/.28 with three different state roots at
+                    # one agreed block). No branch will ever validate on top of a wrong state DB, so
+                    # striking donors is self-harm: ESCALATE to the re-anchor ladder — a snapshot import
+                    # replaces the state wholesale (quorum-vouched), and canonical restore keeps our
+                    # bodies. Restore our branch first so we stay self-consistent until it lands.
+                    self.logger.error(f"Branch adoption: our L1 state is CORRUPT at agreed parent "
+                                      f"{int(anc)} ({rej.get('error', '')[:120]})")
+                    self._reapply_local_branch(old_tip)
+                    # A BRANCH WE CANNOT APPLY DOES NOT GET TO PIN US. Same reasoning as the sync leg: the
+                    # message is identical whether our state is wrong or theirs, and leaving the advertiser
+                    # unbenched is what let two gap-ridden nodes freeze nine correct ones. Bounded and
+                    # auto-clearing, so being wrong about it costs one retry, not a stall.
+                    self._reject_heaviest_tip()
+                    # TRY THE REPAIR THAT NEEDS NOBODY, FIRST (2026-09-13). This escalated straight to the
+                    # re-anchor ladder, which requires a peer advertising a strictly-heavier chain WITH a
+                    # snapshot above our finality floor. When the divergence is recent that donor does not
+                    # exist — snapshots are periodic and the fleet is only a few blocks ahead — so the node
+                    # looped: adopt, state corrupt, re-anchor, "no peer advertises ... staying put", adopt.
+                    # Measured on the relay at 77902 with the fleet 34 blocks ahead: the ladder could never
+                    # fire and the cheap fix was never reached.
+                    #
+                    # Reverting our own tip needs no donor at all, and the divergence entered while APPLYING
+                    # it — so undo that block from the journal and let the ordinary path re-apply it. Bounded
+                    # by STATE_HEAL_MAX_DEPTH; when the window is spent it falls through to the ladder
+                    # exactly as before, which is the right remedy for corruption older than we may revert.
+                    if self._heal_state_divergence():
+                        return None
+                    self._rec_fail("own state corrupt at agreed parent — escalating to re-anchor",
+                                   height=blk.get("block_number"))
+                    self.logger.error("Rollback did not clear it — re-anchoring to a quorum snapshot")
+                    return None
+                self._rec_fail("block failed full validation",
+                          height=blk.get("block_number"), src=src)
+                self.logger.warning(f"Branch adoption: block {blk.get('block_number')} from {src} failed "
+                                    f"full validation — restoring our own branch")
+                self._reapply_local_branch(old_tip)
+                self._reject_heaviest_tip()
+                # A BRANCH THE MEASURED MAJORITY HOLDS AND WE CANNOT APPLY IS OUR PROBLEM (2026-09-13). One
+                # refusal can be a bad donor; the same refusal on every pass at the same tip cannot — the
+                # verdict says the majority is on that branch, so the state that refuses it is ours. This
+                # returned False every time ("the donor flow finishes the job"), and nothing ever
+                # escalated: 185.238.249.208 looped for an hour, 350 blocks behind, striking honest donors.
+                # After ADOPT_FAIL_ESCALATE_AFTER consecutive failures at one tip, hand it to the re-anchor
+                # ladder exactly as a refused rollback does — the state gets replaced, not re-argued.
+                if self._note_adopt_validation_failure(blk.get("block_hash")):
+                    self._rec_fail("majority branch refused repeatedly at this tip — escalating to re-anchor",
+                                   height=blk.get("block_number"), src=src)
+                    return None
+                return False
+        self._fork_state_cache = None              # the tip this verdict described no longer exists
+        self.logger.warning(f"Adopted the measured majority branch: rolled to {anc}, applied "
+                            f"{len(staged)} block(s) from {src}, tip now "
+                            f"{self.memserver.latest_block['block_number']}")
+        return True
 
     def _maybe_escape_dead_fork(self) -> bool:
         """LAST-RESORT AUTORECOVERY: purge + resync when the node is provably stranded on a minority fork
@@ -902,54 +2138,223 @@ class CoreClient(threading.Thread):
         node sat wedged 40+ minutes through a restart AND a force_sync, and only scripts/purge_resync.sh
         moved it. A human had to notice. That is the gap this closes.
 
+        ALSO CALLED FROM normal_mode (the productive-fork case): a node that forks and keeps MINING never
+        stalls, is always the heaviest tip, and so never reaches the emergency loop where this used to be the
+        only caller. It was invisible to every recovery route at once (.141, 2026-07-28).
+
         DELIBERATELY PARANOID, because the remedy destroys chain-derived data:
-          * only after the tip has been frozen for DEAD_FORK_STALL_S (a healthy node never qualifies),
-          * only if peers we ask DIRECTLY (seed set + known peers — not the status pool, not weights, not
-            benching) report a different hash at OUR finalized height,
+          * only if peers we ask DIRECTLY (seed set + known peers — not the status pool, not benching)
+            report a different hash at OUR finalized height,
           * only if NOBODY agrees with us: one agreeing peer means we are merely poorly connected, and
             wiping then would be far worse than staying wedged,
+          * only if those disagreeing peers are strictly HEAVIER than us. Weight is NOT used to decide that
+            a fork exists — the direct probe above does that, and weight is exactly the signal that misled
+            every earlier recovery ladder. It is used only to decide WHICH SIDE of an already-proven fork
+            yields, because without a tie-break both sides of a symmetric split purge each other into
+            parallel chains. Asked directly too (peer_tip_weight), never via the status pool.
           * only every DEAD_FORK_COOLDOWN_S, and never when the operator has opted out.
         private/ (keys, config) is never touched — purge_chain_data drops chain-derived data only."""
-        from protocol import DEAD_FORK_STALL_S, DEAD_FORK_COOLDOWN_S, DEAD_FORK_QUORUM
+        from protocol import (DEAD_FORK_STALL_S, DEAD_FORK_COOLDOWN_S, DEAD_FORK_QUORUM,
+                              DEAD_FORK_ALONE_S)
         try:
             if self.memserver.config.get("auto_escape_dead_fork", True) is False:
                 return False
             now = get_timestamp_seconds()
             if now - getattr(self, "_last_dead_fork_check", 0) < DEAD_FORK_COOLDOWN_S:
                 return False
-            if self.memserver.since_last_block < DEAD_FORK_STALL_S:
-                return False                      # still moving (or only briefly stalled) -> nothing to do
-            self._last_dead_fork_check = now
+            # NOT gated on a frozen tip any more. "Still moving" was taken to mean "healthy", but a node
+            # alone on a fork MOVES FASTEST of all — it mines every slot unopposed. That reading is exactly
+            # what let .141 mine 600+ blocks on a dead branch while this check declined to even ask
+            # (2026-07-28). A stalled tip is one symptom of a dead fork, never its definition; the honest
+            # definition is the probe below (a quorum of peers serving a different block at OUR finalized
+            # height, and nobody agreeing with us), which is just as true of a node that is producing.
+            # DEAD_FORK_COOLDOWN_S already bounds this to one probe per 30 min, so dropping the stall
+            # precondition costs a healthy node one cheap probe round per cooldown and nothing else.
+            _stalled = self.memserver.since_last_block >= DEAD_FORK_STALL_S
 
-            from ops.peer_ops import seed_peers, stranded_below_finality
-            from ops.account_ops import get_finalized_height
+            from ops.peer_ops import seed_peers, stranded_below_finality, peer_tip_weight
+            from ops.account_ops import get_hard_finality
             from ops.block_ops import get_block_hash_by_number
-            height = get_finalized_height()
+            # TWO-FLOOR: probe at the HARD floor — the deepest point this node refuses to move. The depth
+            # floor is crossable now, so disagreement there is an ordinary REORG for the rollback leg, not
+            # grounds for the destructive purge. hard == 0 means no immutable prefix exists yet: every
+            # divergence is reachable by rollback or re-anchor, so there is nothing to escape from.
+            height = get_hard_finality()
+            if height <= 0:
+                return False
             ours = get_block_hash_by_number(height)
             if not ours:
                 return False
             # Ask the operator seed set FIRST (the weak-subjectivity anchor) plus whatever peers we know.
-            peers = list(dict.fromkeys(list(seed_peers()) + list(self.memserver.peers)))[:12]
+            # NEVER PROBE OURSELVES — _fork_state() already carves this out and it is even more critical here.
+            # This node's own IP can BE a seed (208.87.242.141 is in DEFAULT_SEED_PEERS), so seeds-first puts
+            # us in the probe set, we answer our own question with our own hash, that lands in `agree`, and
+            # "ANY peer agreeing means our prefix is not provably abandoned" vetoes the purge FOREVER. That is
+            # precisely why .141 — a seed — could not self-heal even once every other blind spot was fixed
+            # (2026-07-28): it was the one node whose peer list contained itself.
+            # own_ips(): self-identity is a SET (dual-stack host that is also a seed) — see peer_ops.own_ips
+            _me = own_ips() | {self.memserver.ip, get_config().get("ip")} - {None}
+            peers = [p for p in dict.fromkeys(list(seed_peers()) + list(self.memserver.peers))
+                     if p not in _me][:12]
             stranded, detail = stranded_below_finality(ours, height, peers, quorum=DEAD_FORK_QUORUM,
                                                        port=self.memserver.port)
+            # ONLY a probe that actually HEARD from peers consumes the full cooldown. An inconclusive round
+            # — nobody answered, which is the normal state for the first pass after boot, before the peer
+            # table is warm — must not lock this out for 30 minutes. That is exactly what happened to .141:
+            # it finally received the fix, ran one check at startup with no peers yet, and would have stayed
+            # forked for another half hour on a cooldown it never really used. Retry inconclusive rounds in
+            # a minute; a round that got real answers keeps the full rate limit.
+            _answered = bool(detail.get("agree") or detail.get("disagree"))
+            self._last_dead_fork_check = now if _answered else (now - DEAD_FORK_COOLDOWN_S + 60)
+            # PUBLISH THE VERDICT. A node that declines to heal itself must be able to SAY WHY from the
+            # outside — /log is authenticated and journalctl needs a shell, so a remote operator was left
+            # guessing which of the six preconditions vetoed (that guessing is what stretched the .141
+            # incident). This is diagnostics only; nothing reads it back.
+            self.memserver.dead_fork_probe = {
+                "at": now, "height": height, "ours": str(ours)[:16], "stranded": bool(stranded),
+                "agree": list(detail.get("agree") or []), "disagree": list(detail.get("disagree") or []),
+                "unknown": list(detail.get("unknown") or []), "answered": _answered,
+                "peers_asked": len(peers), "stalled": bool(_stalled),
+            }
             if not stranded:
                 return False
             # SECOND, INDEPENDENT CONFIRMATION before destroying chain data: the measured fork state must
             # ALSO say DEAD_FORK. Two different probes have to agree that the divergence is below the
             # finality floor, so a single bad answer can never trigger a purge.
-            if self._fork_state() != fork_resolution.DEAD_FORK:
-                self.logger.warning("dead-fork suspected but the measured fork state disagrees — not purging")
+            _fs = self._fork_state()
+            try:
+                self.memserver.dead_fork_probe["fork_state"] = str(_fs)
+            except Exception:
+                pass
+            if _fs != fork_resolution.DEAD_FORK:
+                self.logger.warning(f"dead-fork suspected but the measured fork state says {_fs} — not purging")
                 return False
+            # THIRD CONFIRMATION — ONLY THE LIGHTER SIDE YIELDS. This is what made the check unsafe to run
+            # continuously: in a SYMMETRIC split both sides see "a quorum disagrees and nobody agrees", so
+            # BOTH purge, both resync from whoever answers first (often each other), and the fleet ends up on
+            # parallel chains sharing only genesis. That is the purge storm that forced the normal_mode
+            # caller to be disabled on 2026-07-28, and no amount of quorum tuning fixes it — 2 of 3 non-self
+            # peers IS a majority on both sides of a 2-2 split.
+            #
+            # Weight breaks the symmetry the way fork choice already does everywhere else: the lighter side
+            # yields, the heavier side stays put, so EXACTLY ONE side of any split purges. Equal weight, or a
+            # peer whose weight we do not know, means nobody moves — the safe direction, because staying
+            # wedged is recoverable by the next probe while a mutual purge is not.
+            #
+            # Not a trust hole: a peer that lies about its weight only induces a purge if a QUORUM of peers
+            # tells the same lie AND serves a different block at our finalized height, and the resync that
+            # follows validates every block it accepts — a liar with no real heavier chain cannot be synced
+            # from. This reads the same advertised cumulative_weight fork choice already acts on.
+            _ours_w = int((self.memserver.latest_block or {}).get("cumulative_weight", 0) or 0)
+            _we_are_lighter, _their_w = lighter_than_disagreeing(
+                _ours_w, detail.get("disagree"),
+                {p: {"latest_block_weight": peer_tip_weight(p, port=self.memserver.port)}
+                 for p in (detail.get("disagree") or [])})
+            try:
+                self.memserver.dead_fork_probe["our_weight"] = _ours_w
+                self.memserver.dead_fork_probe["their_weight"] = _their_w
+            except Exception:
+                pass
+            # UNANIMOUS ISOLATION OVERRIDES WEIGHT. The weight tie-break exists to stop BOTH halves of an
+            # even split purging each other; it is not a claim that the heavier chain is the right one. When
+            # EVERY peer we know disagrees and not one agrees, there is no symmetry left to break — we are
+            # simply alone, and being alone is decisive however much work our branch carries. A lone miner on
+            # a fork is the FASTEST chain there is (it wins every slot unopposed), so "heavier" is exactly
+            # what a stranded node looks like.
+            #
+            # Observed live 2026-07-28 on betanet-13: 185.100.232.5 rerolled ~4 minutes ahead of the others,
+            # built its own chain from the shared genesis, and sat at tip 273 / weight 88725 against three
+            # agreeing nodes at ~217 / 70525. Its probe correctly said stranded, 3 disagree, 0 agree — and the
+            # weight rule I had just added vetoed the purge because the isolated node was the heavy one. The
+            # three-node side is the one that can reach an attestation quorum and finalize; the lone heavy
+            # branch never can.
+            #
+            # The storm case this still guards is a SILENT partner: 2 of 3 peers disagreeing while our own
+            # partner fails to answer is not unanimity, so weight still decides there and only one side moves.
+            _known_peers = [p for p in peers]
+            _dis = list(detail.get("disagree") or [])
+            _unanimous = bool(_known_peers) and len(_dis) >= len(_known_peers) and not detail.get("agree")
+            try:
+                self.memserver.dead_fork_probe["unanimous"] = _unanimous
+            except Exception:
+                pass
+            # SUSTAINED ISOLATION IS DECISIVE, even when we are heavier and one peer stayed silent.
+            #
+            # `_unanimous` demands that EVERY peer we asked disagrees, so a single peer that fails to answer
+            # makes it permanently False — and a lone forker is always the heavy side, because it wins every
+            # slot unopposed. Both escape hatches then shut at once and the node forks forever. Measured live
+            # on betanet-15 (2026-08-03): node .131 sat at stranded=True, fork_state=dead_fork, agree=[],
+            # disagree=2, peers_asked=3 -> unanimous False -> vetoed on weight, for hours, lead widening.
+            #
+            # Time breaks that deadlock without weakening the storm guard. In a symmetric split each side
+            # still has partners that AGREE with it, so `agree == []` is never true there; a transient
+            # partition clears within a probe or two; only a genuine strand persists. Requiring the SAME
+            # isolated verdict continuously for DEAD_FORK_ALONE_S turns "I might be alone" into "I have been
+            # alone for an hour", which is decisive however much work our branch carries.
+            _alone_now = isolation_holds(detail.get("agree"), _dis, DEAD_FORK_QUORUM)
+            self._dead_fork_alone_since = isolation_since(
+                getattr(self, "_dead_fork_alone_since", None), _alone_now, now)
+            _alone_for = (now - self._dead_fork_alone_since) if self._dead_fork_alone_since else 0
+            try:
+                self.memserver.dead_fork_probe["alone_for_s"] = int(_alone_for)
+            except Exception:
+                pass
+            _sustained = bool(self._dead_fork_alone_since) and _alone_for >= DEAD_FORK_ALONE_S
+
+            if not _we_are_lighter and not _unanimous and not _sustained:
+                self.logger.warning(
+                    f"DEAD FORK confirmed at {height}, but our chain is NOT the lighter one "
+                    f"(ours={_ours_w} theirs={_their_w}) and the disagreement is not unanimous "
+                    f"({len(_dis)}/{len(_known_peers)} peers) — not purging. The lighter side of an even "
+                    f"split is the side that yields. Alone for {int(_alone_for)}s of "
+                    f"{DEAD_FORK_ALONE_S}s needed to override on isolation alone.")
+                return False
+            if _sustained and not _we_are_lighter and not _unanimous:
+                self.logger.error(
+                    f"DEAD FORK at {height}: continuously ISOLATED for {int(_alone_for)}s — "
+                    f"{len(_dis)} peer(s) disagree, NONE agree, across every probe in that window. Our branch "
+                    f"is heavier (ours={_ours_w} theirs={_their_w}), which is exactly what a lone forker "
+                    f"looks like. A peer that never answers must not veto recovery forever. Purging.")
+            if _unanimous and not _we_are_lighter:
+                self.logger.error(
+                    f"DEAD FORK at {height}: every one of the {len(_known_peers)} peers we know disagrees and "
+                    f"none agree. Our branch is HEAVIER (ours={_ours_w} theirs={_their_w}) — which is what a "
+                    f"lone forker always looks like, since it mines every slot unopposed. Purging anyway: "
+                    f"weight measures work, agreement measures consensus.")
             self.logger.error("=" * 78)
-            self.logger.error(f"DEAD FORK: our FINALIZED block {height} is {str(ours)[:16]}… but "
+            self.logger.error(f"DEAD FORK ({'tip frozen' if _stalled else 'STILL MINING — productive fork'}): "
+                              f"our FINALIZED block {height} is {str(ours)[:16]}… but "
                               f"{len(detail['disagree'])} peers have a different block there and NONE agree.")
             self.logger.error("Finality refuses to roll back across it, so no local recovery can work. "
                               "Purging chain-derived data and resyncing. private/ (keys) is untouched.")
             self.logger.error("=" * 78)
-            from ops.data_ops import purge_chain_data, stamp_chain_generation
-            purge_chain_data(logger=self.logger)
+            from ops.data_ops import purge_chain_data, stamp_chain_generation, purge_storm, record_purge
+            _now_p = get_timestamp_seconds()
+            if purge_storm(_now_p):
+                # CIRCUIT BREAKER (2026-09-02): 14 correct verdicts in 12 h, each followed by a resync that
+                # re-forked from block 7 because THIS node's peer loop was broken. The verdict cannot tell
+                # "the chain is dead" from "I cannot sync"; the count can. Stop producing, keep serving,
+                # and say so — a human or the next update fixes the sync path, a 15th purge would not.
+                self.memserver.purge_breaker = True
+                self.logger.error("PURGE STORM: this node already purged twice in the last 24 h — REFUSING a "
+                                  "third dead-fork purge. Production is OFF until restart; the sync path, not "
+                                  "the chain, is the likely fault (see private/purge_log.json).")
+                self._last_dead_fork_check = _now_p
+                return False
+            record_purge(_now_p)
+            purge_chain_data(logger=self.logger, dead_fork=True)
             stamp_chain_generation()
-            self.memserver.terminate = True       # clean shutdown; systemd restarts us onto a fresh sync
+            self.memserver.terminate = True       # ask every loop to drain
+            # ...and then ACTUALLY GO. The flag alone is not enough: the aiohttp server keeps serving on the
+            # main thread, so the process stayed alive with its chain PURGED FROM DISK but still resident in
+            # memory, cheerfully answering /status with a tip it could no longer serve a single block of
+            # (observed live 2026-07-28 — it even ran its periodic update check eight seconds after logging
+            # "bye"). That zombie is worse than either running or stopped: peers fork-choose against a chain
+            # nobody can hand them, and the purge that was supposed to heal the node instead poisoned them.
+            # /terminate already hard-exits for precisely this reason; match it. The delay lets these log
+            # lines flush before the process disappears.
+            self.logger.error("Purge complete — exiting so systemd restarts us into a clean resync.")
+            threading.Timer(1.0, lambda: os._exit(0)).start()
             return True
         except Exception as e:
             self.logger.warning(f"dead-fork escape check failed: {e}")
@@ -981,9 +2386,57 @@ class CoreClient(threading.Thread):
         Returns True iff the chain identity changed (caller resumes on the new chain)."""
         state = self._fork_state()
         if state in (fork_resolution.BEHIND, fork_resolution.UNKNOWN, fork_resolution.SYNCED):
+            # UNKNOWN MUST NOT CLEAR THE DEAD-FORK STREAK. _fork_state() returns UNKNOWN on any measurement
+            # FAILURE — "we could not determine it", not "we are healthy". A wedged node flaps between
+            # DEAD_FORK and UNKNOWN as probes succeed or fail, so clearing on UNKNOWN would mean the streak
+            # never reaches the escalation threshold and the remedy never fires. Only a positive healthy
+            # verdict clears it.
+            if state != fork_resolution.UNKNOWN:
+                self._dead_fork_streak = 0
             return False
         if state == fork_resolution.DEAD_FORK:
+            # ESCALATE TO A FLOOR-CROSSING RE-ANCHOR BEFORE THE DESTRUCTIVE ESCAPE.
+            #
+            # snapshot_bootstrap already implements allow_below_floor for precisely this geometry, and its
+            # docstring reserves it for "operator recovery ... consecutive failed attempts" — but NOTHING
+            # ever passed True, so the escalation was dead code and the only route out of DEAD_FORK was the
+            # purge escape. That escape deliberately requires that NOBODY agrees with us, to stop both
+            # halves of a symmetric split from wiping each other (observed: the fleet went from one chain to
+            # two sharing only genesis). Correct, and it leaves this case wedged forever:
+            #
+            #   observed live 2026-08-04 — a 2-2 split at h20352. Branch A (this node + 185.100.232.131)
+            #   stalled at 20371 with weight 6,791,252; branch B (.141 + .210) advancing at 20447 with
+            #   weight 6,817,624. Rollbacks exhausted 40/40; rollback refused because the fork ancestor
+            #   (20352) sits below our own sticky finality floor (20371, persisted and monotonic, so a
+            #   restart does not lower it); and the purge escape was vetoed because .131 AGREED with us —
+            #   both nodes on the same dead branch, each vetoing the other's recovery indefinitely.
+            #
+            # WEIGHT ALREADY BREAKS THE SYMMETRY, which is what makes this safe without the "nobody agrees"
+            # precondition: snapshot_bootstrap(force_reanchor=True) selects by STRICTLY-heaviest cumulative
+            # weight, so only the lighter side can ever find a donor and act. A mutual wipe is impossible by
+            # construction, and unlike the purge escape this is NON-DESTRUCTIVE: the heavier chain's
+            # snapshot is imported over our forked state, our fork's blocks are simply orphaned in the
+            # store, and every tail block after the import is fully re-verified.
+            #
+            # Gated on CONSECUTIVE dead-fork verdicts (what the docstring asks for) so a transient
+            # misreading can never trigger it, and on the same cooldown as an ordinary re-anchor.
+            self._dead_fork_streak = getattr(self, "_dead_fork_streak", 0) + 1
+            if self._dead_fork_streak >= DEAD_FORK_ESCALATE_AFTER:
+                _now = get_timestamp_seconds()
+                if _now - self._last_reanchor_ts >= REANCHOR_COOLDOWN:
+                    self._last_reanchor_ts = _now
+                    self.logger.warning(
+                        f"DEAD FORK persisted {self._dead_fork_streak} consecutive checks — the finality "
+                        f"floor itself is on a minority fork; re-anchoring onto the strictly-heaviest "
+                        f"chain BELOW the floor (non-destructive: our fork's blocks are orphaned, every "
+                        f"imported tail block is re-verified)")
+                    if self.snapshot_bootstrap(force_reanchor=True, allow_below_floor=True):
+                        self.memserver.rollbacks = 0
+                        self._fork_state_cache = None     # identity changed; the cached verdict is stale
+                        self._dead_fork_streak = 0
+                        return True
             return self._maybe_escape_dead_fork()
+        self._dead_fork_streak = 0                        # not dead-forked: the streak must not persist
         now = get_timestamp_seconds()
         if now - self._last_reanchor_ts < REANCHOR_COOLDOWN:
             return False                                  # a failing import must not hammer peers
@@ -998,6 +2451,48 @@ class CoreClient(threading.Thread):
             return True
         return False
 
+    def _remeasure_on_competing_tip(self) -> bool:
+        """EVENT-DRIVEN VERDICT REFRESH, at most once per local tip. True when the cached verdict was dropped.
+
+        THE MINUTE ON THE SIDE BRANCH (2026-09-15, 76 episodes in one day on the relay). A same-height split is an
+        exact weight tie and only the measured majority verdict (_fork_state) breaks it — but that verdict is
+        cached for FORK_STATE_TTL_S, so a split that lands right after a measurement is invisible until the next
+        one, and every second of that is a solo block this node builds on its own branch and must later roll
+        back: measured 18:03:24 split -> 18:04:30 verdict -> 18:04:58 adopted, ten majority blocks re-applied.
+        Keying the cache on the tip was tried and made the verdict flap (see _fork_state), so this is not that:
+        it fires only on EVIDENCE of a split. When a heavier tip is advertised, ONE memoized probe asks the peer
+        advertising it for its hash at OUR height. Different hash -> a competing block exists -> the verdict is
+        stale in the direction that matters, drop it and re-measure now. Same hash -> the advertised tip descends
+        from ours, plain lag, nothing to do. Once per local tip hash, so a forward sync never re-probes per block,
+        and a verdict that already says minority is left alone (it is what the reorg leg is acting on)."""
+        try:
+            lb = self.memserver.latest_block
+            our_h, our_hash = int(lb["block_number"]), lb.get("block_hash")
+            if getattr(self, "_competing_checked_at", None) == our_hash:
+                return False
+            self._competing_checked_at = our_hash
+            cached = getattr(self, "_fork_state_cache", None)
+            if cached and cached[1].get("state") in (fork_resolution.REORG, fork_resolution.DEAD_FORK):
+                return False
+            hh = self.consensus.heaviest_block_hash
+            pool = self.consensus.status_pool or {}
+            _me = own_ips() | {self.memserver.ip, get_config().get("ip")} - {None}
+            peer = next((ip for ip, st in pool.items()
+                         if isinstance(st, dict) and st.get("latest_block_hash") == hh and ip not in _me), None)
+            if not peer:
+                return False
+            theirs = self._memo_probe(peer, our_h, our_h)
+            theirs_hash = theirs[0] if isinstance(theirs, (tuple, list)) else theirs
+            if not theirs_hash or theirs_hash == our_hash:
+                return False
+            self._fork_state_cache = None
+            self.logger.warning(f"Competing block at our height {our_h} on {peer} "
+                                f"({str(theirs_hash)[:12]} vs ours {str(our_hash)[:12]}) — re-measuring the fork state now")
+            return True
+        except Exception as e:
+            self.logger.debug(f"competing-tip check skipped: {e}")
+            return False
+
     def emergency_mode(self):
         """BEHIND-mode loop (entered when fork-choice says a strictly-better tip exists, or under
         operator force_sync_ip): pick a donor advertising the heaviest tip, then either FAST-FORWARD
@@ -1010,6 +2505,9 @@ class CoreClient(threading.Thread):
         must not re-enter us indefinitely). Rollback depth is rate-limited per burst (max_rollbacks)
         and hard-capped by the finality floor (FinalityViolation -> refuse, resync forward only).
         A still-at-genesis node that no donor can full-serve retries snapshot bootstrap from here."""
+        # A SPLIT IS AN EVENT, NOT A SCHEDULE: before anything else, ask whether the advertised tip competes with
+        # our own block rather than extending it, and if so refresh the verdict now instead of at the next TTL.
+        self._remeasure_on_competing_tip()
         # THROTTLE the entry/loop logs + the telemetry: emergency_mode() is RE-ENTERED every ~1s while
         # behind, so logging "Entering/Looping emergency mode" per entry spammed the journal once/second
         # and made a genuine event impossible to spot. Emit (and count) at most once per _EMERGENCY_LOG_EVERY
@@ -1048,6 +2546,96 @@ class CoreClient(threading.Thread):
                 if not self.minority_block_consensus() and not self.memserver.force_sync_ip:
                     self.logger.info("No heavier valid tip remains; leaving emergency mode")
                     break
+                # VERDICT FIRST, DONOR SECOND. When the measured verdict is REORG with a known ancestor,
+                # roll toward the ancestor WITHOUT consulting any donor. Observed live (2026-08-17 23:06,
+                # a real two-sided split at 62655): donor selection keys off the heaviest ADVERTISED tip,
+                # which flip-flops between the split's sides as both advance — a same-fork donor "knows"
+                # our tip, fast-forward re-inflates the very fork we just rolled back, and each pass burns
+                # a 5 s knows_block round-trip, throttling recovery to ~1 rollback a minute on a 12-block
+                # fork. The verdict already IS the decision; the donor only matters once we are at the
+                # ancestor and need the majority chain fetched.
+                verdict = self._fork_verdict()
+                vstate = verdict.get("state")
+                _anc = verdict.get("ancestor")
+                self._rec("verdict", state=str(vstate), ancestor=_anc)
+                # TREADMILL EXIT (2026-08-20). The break above requires momentarily holding the exact
+                # heaviest ADVERTISED tip — but a serial donor-pull pass costs a knows_block round-trip
+                # + fetch + verify, so on a chain producing every ~6-11s the check re-fails by 1-2 blocks
+                # every pass, forever: measured 7h20m continuously in emergency (03:20->10:43) with the
+                # node applying at chain speed the whole time. While trapped here the core thread never
+                # runs normal_mode (NO FFG duty votes from our committee seats, no production, and the
+                # busy loop starves this process's API event loop — the exec tail behind it froze 168
+                # cursors on local timeouts). A clean-prefix BEHIND within a couple of blocks of the
+                # advertised tip IS propagation, not a fork: leave, restart the grace window, and let
+                # normal cadence (gossip fast-forward / the next grace-gated entry) close the tail.
+                # Safety unchanged: fork evidence (REORG/DEAD_FORK/self-mined-above-ancestor) never
+                # takes this exit, and the caught-up production gate still refuses to MINT while behind.
+                if vstate == fork_resolution.BEHIND and not self.memserver.force_sync_ip:
+                    _ours_n = int(self.memserver.latest_block["block_number"])
+                    if _anc is not None and int(_anc) >= _ours_n:      # our tip is ON the majority chain
+                        _hh = self.consensus.heaviest_block_hash
+                        _hn = None
+                        for _st in self.consensus.status_pool.copy().values():
+                            if isinstance(_st, dict) and _st.get("latest_block_hash") == _hh:
+                                _hn = _st.get("latest_block_height")
+                                break
+                        # PROGRESS CONDITION (2026-08-21). The exit assumes normal cadence can close the
+                        # tail — true only when deterministic fast-forward can REBUILD the missing block
+                        # from our mempool. When it cannot (the producer path logs "un-reconstructable
+                        # tip; deferring to sync"), the two guards defer to each other forever: measured
+                        # 73 min frozen at 13206 with the tip advertised at 13208. So take the exit only
+                        # once per height: if we are still where we were the last time we took it, the
+                        # tail did not close by itself — fall through to the donor fetch below.
+                        if (_hn is not None and int(_hn) - _ours_n <= EMERGENCY_EXIT_LAG
+                                and getattr(self, "_treadmill_exit_height", None) != _ours_n):
+                            self._treadmill_exit_height = _ours_n
+                            self._minority_since = get_timestamp_seconds()
+                            self.logger.info(
+                                f"Clean prefix within {int(_hn) - _ours_n} block(s) of the advertised "
+                                f"tip — leaving emergency to normal cadence (treadmill guard)")
+                            break
+                        if _hn is not None and int(_hn) - _ours_n <= EMERGENCY_EXIT_LAG:
+                            self.logger.info(f"Treadmill guard already taken at {_ours_n} without progress "
+                                             f"— fetching the tail from a donor instead")
+                if (vstate == fork_resolution.REORG and _anc is not None
+                        and int(self.memserver.latest_block["block_number"]) > int(_anc)):
+                    # POSSESSION BEFORE ROLLBACK: fetch + pre-verify the competing branch, and only then
+                    # revert anything (see _adopt_branch — the free-rollback vector dies here: an
+                    # advertisement that cannot be substantiated with a held, hash-consistent, heavier
+                    # branch costs us NOTHING but the fetch, and the tip gets benched).
+                    adopted = self._adopt_branch(_anc)
+                    self._rec("adopt_reorg_result", result=repr(adopted), ancestor=_anc)
+                    if adopted is None:
+                        # rollback refused mid-adoption (budget/floor): the fork is deeper than the leg
+                        # can serve — escalate exactly as the old give-up path did.
+                        if self._maybe_reanchor():
+                            self.logger.warning("Re-anchored from seed snapshot; continuing with tail sync")
+                            continue
+                        break
+                    if adopted:
+                        continue
+                    time.sleep(1)
+                    continue
+                if vstate == fork_resolution.DEAD_FORK:
+                    if self._maybe_reanchor() or self._maybe_escape_dead_fork():
+                        self.logger.warning("Re-anchored from seed snapshot; continuing with tail sync")
+                        continue
+                    time.sleep(1)
+                    continue
+                if vstate == fork_resolution.UNKNOWN:
+                    # NO PROBE MAJORITY (multi-way scatter): the pairwise weight escape — see
+                    # _adopt_heaviest_pairwise. Without this, UNKNOWN + no donor froze the node for as
+                    # long as the scatter lasted (35 min observed), while it benched the very tips it
+                    # needed. Possession + full validation keep the safety story identical.
+                    adopted = self._adopt_heaviest_pairwise()
+                    self._rec("adopt_pairwise_result", result=repr(adopted))
+                    if adopted is None:
+                        if self._maybe_reanchor():
+                            self.logger.warning("Re-anchored from seed snapshot; continuing with tail sync")
+                            continue
+                        break
+                    if adopted:
+                        continue
                 peer = self.get_peer_to_sync_from(source_pool=self.consensus.block_hash_pool)
                 if not peer:
                     now = get_timestamp_seconds()
@@ -1064,6 +2652,11 @@ class CoreClient(threading.Thread):
                     # only exit — normal fast-forward/reorg both require a donor that knows our root).
                     elif self._maybe_reanchor() or self._maybe_escape_dead_fork():
                         self.logger.warning("Re-anchored from seed snapshot; continuing with tail sync")
+                    elif vstate == fork_resolution.UNKNOWN:
+                        # NO evidence + no donor: benching the heaviest tip here starves the recovery of
+                        # the very branch it needs (observed: one honest leader tip excluded per pass for
+                        # 35 minutes). The pairwise escape above is the exit; just wait.
+                        time.sleep(1)
                     else:
                         # STRIKE THE HEAVIEST TIP even though we never got as far as fetching from it.
                         # Donor selection only considers peers advertising the HEAVIEST tip, so a lone
@@ -1086,21 +2679,111 @@ class CoreClient(threading.Thread):
                         logger=self.logger))
 
                     if known_block:
+                        self._donor_unanswered = 0
                         self.logger.info(f"{peer} knows block {block_hash}")
-                        if self._fast_forward_from(peer=peer, from_hash=block_hash):
+                        ended = self._fast_forward_from(peer=peer, from_hash=block_hash)
+                        # blocks may have been adopted either way — the cached verdict describes a tip
+                        # that no longer exists; a stale REORG must never drive a rollback of the chain
+                        # we just fetched.
+                        self._fork_state_cache = None
+                        if ended:
                             break
-                    elif self._rollback_one_for_reorg():
-                        # the reorg leg gave up: rollback budget spent, no local parent left (snapshot floor),
-                        # or the finality floor refused it. If a strictly-heavier chain exists this is a
-                        # deep/minority fork we must re-anchor out of, rather than exit and re-mine our losing
-                        # fork (which would only advance our floor and cement the wedge).
-                        if self._maybe_reanchor():
-                            self.logger.warning("Re-anchored from seed snapshot; continuing with tail sync")
-                            continue
-                        break
+                    elif known_block is None:
+                        # THE DONOR COULD NOT ANSWER — timeout, momentarily behind us (404), malformed.
+                        # This used to be indistinguishable from "our tip is not on its chain" and went
+                        # straight to the ROLLBACK leg, converting every donor blip into a reverted real
+                        # block (2026-08-17: 2,609 rollbacks, 20 exhausted 40-block bursts, on a healthy
+                        # chain). A peer that cannot attest either way is evidence of NOTHING; retry, and
+                        # only after several consecutive non-answers strike the tip so a permanently mute
+                        # donor pool cannot pin us here.
+                        self._donor_unanswered = getattr(self, "_donor_unanswered", 0) + 1
+                        if self._donor_unanswered >= 3:
+                            self._donor_unanswered = 0
+                            self.logger.info(f"Donors cannot attest our tip either way ({peer} et al.) — "
+                                             f"striking the advertised tip, not our chain")
+                            self._reject_heaviest_tip()
+                        time.sleep(1)
+                    else:
+                        # POSITIVE mismatch on one donor's word, with a non-REORG verdict. Two honest
+                        # explanations, and striking was wrong for both (observed live on .28, 2026-08-18:
+                        # striking the LEADER tips emptied the peer-ahead production gate, the node won the
+                        # next slot, re-mined a one-block fork from its divergent mempool, and looped —
+                        # rolling to the ancestor and re-forking every few slots, forever):
+                        #   * a stale BEHIND verdict + blocks we SELF-MINED above its ancestor since it was
+                        #     cached — our tip is a fresh fork block; adopt the majority branch from the
+                        #     ancestor exactly like a REORG (possession + full validation as always);
+                        #   * genuinely BEHIND with this one donor lagging/forked — rotate donors, and
+                        #     leave the heavier tips alone so the caught-up gate keeps us from minting.
+                        self._donor_unanswered = 0
+                        _anc2 = verdict.get("ancestor")
+                        if (vstate == fork_resolution.BEHIND and _anc2 is not None
+                                and int(self.memserver.latest_block["block_number"]) > int(_anc2)):
+                            adopted = self._adopt_branch(_anc2)
+                            self._rec("adopt_selffork_result", result=repr(adopted), ancestor=_anc2)
+                            if adopted is None:
+                                if self._maybe_reanchor():
+                                    self.logger.warning("Re-anchored from seed snapshot; continuing with tail sync")
+                                    continue
+                                break
+                            if adopted:
+                                continue
+                            time.sleep(1)
+                        elif vstate == fork_resolution.BEHIND:
+                            # ONE donor refusing our tip while BEHIND is a lagging/forked donor — rotate.
+                            # But REPEATED positive refusals from DISTINCT donors contradict the verdict:
+                            # a stake-weighted majority_hash can be won at our own tip height by our own
+                            # partisans in a same-height split (4v5, h67961, 2026-08-18 — the seat-heavy
+                            # side outvoted the headcount side, classified BEHIND with ancestor == tip,
+                            # and parked forever while the other branch ran away: the "heavier branch"
+                            # never EXTENDS a tip it does not contain, so forward sync can never link).
+                            # Measurement beats the verdict: resolve pairwise against the heaviest
+                            # advertiser exactly like the no-majority escape.
+                            self._behind_refusals = getattr(self, "_behind_refusals", set())
+                            self._behind_refusals.add(peer)
+                            # ...and ONE donor refusing the SAME tip over and over is the same
+                            # contradiction when the pool never yields 3 distinct refusers (2026-08-23:
+                            # a lone heaviest advertiser on a divergent branch refused 651 times while
+                            # only one other donor ever refused — 2 < 3, parked 20+ min at 43510 with
+                            # the majority serving happily; "rotating donors" re-picks the heaviest
+                            # advertiser every pass, so the streak IS the rotation). Distinct-donor
+                            # evidence stays preferred; the streak is the fallback for thin pools.
+                            _bk = (peer, self.consensus.heaviest_block_hash)
+                            if getattr(self, "_behind_refusal_key", None) == _bk:
+                                self._behind_refusal_streak += 1
+                            else:
+                                self._behind_refusal_key, self._behind_refusal_streak = _bk, 1
+                            if len(self._behind_refusals) >= 3 or self._behind_refusal_streak >= 5:
+                                _why = (f"{len(self._behind_refusals)} distinct donors"
+                                        if len(self._behind_refusals) >= 3 else
+                                        f"donor {peer} refusing the same tip x{self._behind_refusal_streak}")
+                                self._behind_refusals = set()
+                                self._behind_refusal_key = None
+                                self.logger.warning(f"BEHIND verdict contradicted by {_why} "
+                                                    "positively refusing our tip — resolving pairwise "
+                                                    "against the heaviest advertiser")
+                                self._rec("behind_contradicted", why=_why)
+                                adopted = self._adopt_heaviest_pairwise()
+                                self._fork_state_cache = None
+                                if adopted is None:
+                                    if self._maybe_reanchor():
+                                        self.logger.warning("Re-anchored from seed snapshot; continuing "
+                                                            "with tail sync")
+                                        continue
+                                    break
+                                if adopted:
+                                    continue
+                            self.logger.info(f"Tip mismatch from {peer} while BEHIND — rotating donors, "
+                                             f"leaving the heavier tips unbenched")
+                            time.sleep(1)
+                        else:
+                            self.logger.info(f"Tip mismatch from {peer} but measured fork state disagrees — "
+                                             f"not rolling back; striking the tip instead")
+                            self._reject_heaviest_tip()
+                            time.sleep(1)
 
         except Exception as e:
             self.logger.info(f"Error: {e}")
+            self._rec("emergency_exception", error=str(e)[:160])
             raise
 
     def _fast_forward_from(self, peer, from_hash) -> bool:
@@ -1139,6 +2822,41 @@ class CoreClient(threading.Thread):
                     if self.memserver.terminate:
                         break
                     if not self.produce_block(block=block, remote=True, remote_peer=peer):
+                        # OUR STATE, NOT THEIR BLOCK (2026-09-13). Sort the two refusals before blaming
+                        # anyone: "our state diverged from the producer" means we agree on every block
+                        # HASH and disagree about the state those blocks commit to — which no donor
+                        # caused and no donor can fix. Striking peers for it is self-harm: the node works
+                        # through every honest peer in turn, benches them all, and never escalates,
+                        # because a BEHIND verdict never reaches the one handler that understands this
+                        # error (_adopt_branch, on the REORG leg). That is a permanent wedge reachable
+                        # from a completely healthy fleet — measured here for 11 hours at block 69285,
+                        # 5,100 blocks behind, oscillating build-refuse-rollback while this node is
+                        # get.nadochain.com, the wallet's default relay.
+                        if not self.memserver.terminate and self._state_diverged_reject():
+                            # BENCH THE TIP *AND* HEAL. The refusal cannot tell "my state is wrong" from
+                            # "their state is wrong" — it is the same sentence either way. Routing it away
+                            # from the bench, as the first version of this did, removed the only escape the
+                            # honest side had: a majority holding the CORRECT state stopped producing,
+                            # because a forked minority kept advertising a heavier tip that majority could
+                            # never adopt. Measured live 2026-09-13: nine nodes frozen at 77902 while two
+                            # nodes with GAPS in their own block store raced to 77970 on a state root
+                            # derived from blocks they do not have.
+                            #
+                            # Benching is bounded and auto-clearing, so it is correct in both directions.
+                            # If OUR state is wrong, the heal or the re-anchor repairs it and the bench
+                            # expires on its own. If THEIRS is, we resume producing and weight settles it.
+                            # A chain we cannot apply must never hold our own production hostage.
+                            self._reject_heaviest_tip()
+                            if self._heal_state_divergence():
+                                return True          # pass ends; the next one re-applies cleanly
+                            # THE CHEAP REPAIR IS SPENT — escalate, never freeze. Returning here regardless
+                            # made the exhausted case its own wedge: the donor is never struck (correctly)
+                            # and nothing else runs either, so the node sits still forever. A corruption
+                            # deeper than the heal window wants the state REPLACED, which is what
+                            # force_reanchor does: non-destructive (our blocks are orphaned, not deleted)
+                            # and it selects by strictly-heaviest weight, so only the wrong side can act.
+                            if self._reanchor_after_failed_heal():
+                                return True
                         # INVALID/FORGED sync block (verify failed): the advertised heavier tip is
                         # not backed by a valid chain — exclude it, or this loop re-enters forever
                         # on the same bad advertisement (Sybil-stall). Auto-cleared, so a transient
@@ -1166,16 +2884,270 @@ class CoreClient(threading.Thread):
             self._reject_heaviest_tip()
             return True
 
-    def _rollback_one_for_reorg(self) -> bool:
-        """REORG leg of emergency sync: the donor does NOT know our tip, so our chain has diverged —
-        revert ONE block (reinserting its txs into the mempool; revert symmetry: a reorg must
-        re-mine user transactions, never drop them) and let the next pass retry the donor one block
-        deeper. Returns True when the emergency pass should END: the per-burst rollback budget is
-        exhausted, no local parent remains to roll back through (snapshot-bootstrapped node), or
-        the finality floor refused the reorg — each rejects the tip so we don't spin on it."""
-        if self.memserver.rollbacks >= self.memserver.max_rollbacks:
+    def _note_adopt_validation_failure(self, block_hash) -> bool:
+        """Count a failed application of THE SAME block at the CURRENT tip; True when the count reaches
+        ADOPT_FAIL_ESCALATE_AFTER and adoption should escalate instead of retrying.
+
+        Keyed on (tip, block): a node that moves starts over — a fresh tip is a fresh question — and a
+        DIFFERENT block failing is a moving branch, not our state refusing. Only the identical block, at
+        the identical tip, refused again and again, says the state doing the refusing is ours. Not keyed
+        on the donor, so a bad one that is benched and replaced still counts toward the same answer."""
+        key = (int(self.memserver.latest_block["block_number"]), str(block_hash or ""))
+        prev = getattr(self, "_adopt_fail", None)                    # ((tip, hash), count)
+        count = (prev[1] + 1) if (prev and prev[0] == key) else 1
+        self._adopt_fail = (key, count)
+        if count >= ADOPT_FAIL_ESCALATE_AFTER:
+            self._adopt_fail = None                                  # the ladder gets a clean slate
+            return True
+        return False
+
+    def _fresh_ancestor_for_adoption(self, anc):
+        """The ancestor to roll to, re-measured if the verdict that produced `anc` is about another tip.
+
+        A VERDICT IS ABOUT A TIP (2026-09-13). _fork_state caches by time — it must, or it flaps — so a node
+        that kept syncing after the measurement can arrive here holding an ancestor that no longer
+        describes it: 185.238.249.208 was identical to the fleet through 78077 and rolled back to a cached
+        77979 — 99 shared, correct blocks reverted — then could not re-apply what it had just thrown away.
+        Rolling back is the one act that must never run on a stale answer, so this is where freshness is
+        checked. Returns the ancestor to use, or None when a fresh measurement no longer says REORG."""
+        tip = int(self.memserver.latest_block["block_number"])
+        cached = getattr(self, "_fork_state_cache", None)
+        v = cached[1] if (cached and isinstance(cached[1], dict)) else None
+        if v is not None and v.get("tip") == tip:
+            return anc
+        self._fork_state_cache = None
+        self.logger.info(f"Branch adoption: the verdict was measured at tip {v.get('tip') if v else None}, "
+                         f"we are at {tip} — re-measuring before any rollback")
+        fresh = self._fork_verdict()
+        if fresh.get("state") != fork_resolution.REORG or fresh.get("ancestor") is None:
+            self._rec_fail("verdict changed on re-measure — not rolling back",
+                           state=fresh.get("state"), tip=tip)
+            return None
+        return int(fresh["ancestor"])
+
+    def _tx_index_incomplete(self) -> bool:
+        """True while the tx-history index is being rebuilt, or a rebuild is pending resumption.
+
+        THE REPLAYS OF 09-12 AND 09-13 (13 txids included twice, at 69056/69057 and 78078). A node that
+        has just imported a snapshot holds the STATE but an incomplete tx index — the rebuild walks
+        0..tip in the background — so kv_ops.tx_get answers None for everything not yet re-walked and the
+        at-most-once gate is BLIND. Meanwhile the rollback had re-inserted the reverted blocks' txs into
+        the mempool. The node built them into a block, and a fleet that was mid-reindex itself accepted.
+        A node that cannot answer "was this mined?" must not build a block and must not judge one."""
+        t = getattr(self, "_tx_reindex_thread", None)
+        if t is not None and t.is_alive():
+            return True
+        try:
+            pending = os.path.exists(f"{get_home()}/index/tx_reindex.json")
+        except Exception:
+            return False
+        if pending:
+            # A marker with no thread behind it is a rebuild the last restart KILLED mid-walk (the thread is
+            # a daemon; the marker is its last checkpoint). Nothing at startup resumed it, so this predicate
+            # answered "rebuilding" forever and 185.100.232.5 sat frozen at 81467 for 12 minutes after the
+            # 4f5d6ab6 wave, building nothing and deferring every block. A pending rebuild is RESUMED here,
+            # not merely reported: _start_tx_reindex is idempotent and picks up at the marker's "next".
+            self._start_tx_reindex()
+        return pending
+
+    def _held_back(self, tx, next_height: int) -> bool:
+        """True when `tx` entered the pool THROUGH THIS NODE in the current slot, so it must not go into
+        the block this node builds now.
+
+        THE REORG DRIVER, MEASURED (2026-09-13, /root/nado/fork_diffs.jsonl over three days): of 141 splits
+        where the two sides built from different transaction sets, 115 were a `tpm_ready` that WE held and
+        the peer did not, and the rest were our own duty transactions or a wallet's fresh submit. Every node
+        assembles every block, so a transaction only one node knows guarantees a same-height split — and
+        maybe_epoch_duty / maybe_tpm_ready run at the top of the pass, before production, putting our own
+        announcement into our block in the very slot it was created, before any gossip pass could carry it.
+
+        One slot of patience (~7 s, several 1 s gossip passes) is the whole fix: eligible from the next tip
+        on, by which time the reconcile can see it on peers. Applies to everything born through us, not only
+        our own duties — a wallet's submit is the same hazard. Local pacing, never consensus: it decides what
+        WE include, not what is valid."""
+        born = self.memserver.own_born.get(tx.get("txid"))
+        return born is not None and int(born) >= int(next_height) - 1
+
+    def _purge_index_residue(self, txids) -> list:
+        """Drop tx-index rows that name a block which is NOT on our chain; return the txids dropped.
+
+        THE .26/.28 WEDGE, MEASURED (2026-09-13). The fleet's canonical 69056 carries two transactions
+        those nodes' tx index already calls mined — in a block that is not on their chain. Rows written
+        while applying a branch that was later orphaned survived the branch, so every canonical block that
+        legitimately includes those transactions is refused as "already-mined", forever. The reindex that
+        would clear it (drop-and-rebuild from canonical bodies) is only ever started by a re-anchor.
+
+        The primary row names its block. A row is canonical iff that height is at or below our tip and the
+        body we hold at that height actually contains the txid; anything else is residue — local
+        corruption, not consensus state — and removing it restores the state a correct node has. Pure
+        function of our own chain, so every node with the same chain reaches the same answer."""
+        from ops.block_ops import get_block_number as _gbn
+        tip = int(self.memserver.latest_block["block_number"])
+        dropped = []
+        for txid in txids:
+            row = kv_ops.tx_get(txid)
+            if not row:
+                continue
+            try:
+                h = int(row.get("block_number"))
+            except (TypeError, ValueError):
+                h = -1
+            canonical = False
+            if 0 <= h <= tip:
+                blk = _gbn(h)
+                canonical = bool(blk) and any(t.get("txid") == txid for t in (blk.get("block_transactions") or []))
+            if canonical:
+                continue
+            try:
+                kv_ops.tx_index_del(txid=txid, block_number=h, sender=row.get("sender"), recipient=row.get("recipient"))
+                dropped.append(txid)
+            except Exception as e:
+                self.logger.warning(f"index residue: could not drop {str(txid)[:12]} (block {h}): {e}")
+        if dropped:
+            self.logger.warning(f"Dropped {len(dropped)} orphaned tx-index row(s) that named a block not on our "
+                                f"chain: {[d[:12] for d in dropped[:6]]}")
+        return dropped
+
+    def _state_diverged_reject(self) -> bool:
+        """Did the last refusal say OUR committed state is wrong, rather than their block?
+
+        state_root is inside the block-hash preimage, so agreeing on a block hash IS agreeing on the state
+        it commits. A node refusing block N for a state-root mismatch therefore agrees with the producer
+        about every block through N-1 and disagrees about what APPLYING them produced — the h4260
+        rollback-asymmetry class. No peer can serve a fix for that, so it must never read as a bad donor."""
+        rej = getattr(self.memserver, "last_block_reject", None) or {}
+        return "our state diverged from the producer" in str(rej.get("error", ""))
+
+    def _heal_state_divergence(self) -> bool:
+        """Undo the block whose APPLICATION diverged, so the ordinary sync path can re-apply it.
+
+        The refused block is N, and N's state_root is the state after N-1 — which is OUR TIP. So the
+        divergence entered while applying our own tip, and reverting exactly that block is the whole
+        remedy: rollback_one_block restores from the JOURNAL (the exact inverse, never a re-derivation —
+        re-deriving is a second implementation of the rules and is what produced the h4260 wedge), the
+        next pass re-applies the same body through the one canonical apply path, and a node whose code has
+        since been corrected computes the right root the second time.
+
+        Bounded on purpose. If the corruption is DEEPER than the heal window the answer is not to keep
+        rolling — it is the re-anchor ladder, which replaces the state wholesale from a quorum snapshot.
+        Rolling indefinitely would walk the node down to its own finality floor one block at a time and
+        call that a repair. Returns True when a block was reverted."""
+        height = int(self.memserver.latest_block["block_number"])
+        # COUNT THE BURST, NOT THE HEIGHT (2026-09-13, same day, second bug). Keying the counter on the
+        # CURRENT height reset it after every successful rollback: each revert lands on a new height, so
+        # every attempt logged "1/3" and the bound never bit once. Live, that walked this node DOWN 16
+        # blocks in 70 seconds toward its finality floor, one block per pass, announcing a fresh attempt
+        # each time — the exact "walked down to the floor one rollback at a time while calling it a repair"
+        # failure the docstring above claims to prevent.
+        #
+        # The burst is anchored at the height where it STARTED and ends only when the tip climbs back
+        # ABOVE that — which is the only evidence the heal actually worked. Rolling further down is never
+        # progress, so it never resets the count.
+        tracker = getattr(self, "_state_heal", None)
+        if not tracker or height > tracker[0]:
+            tracker = (height, 0)
+        if tracker[1] >= STATE_HEAL_MAX_DEPTH:
+            self._rec_fail("state divergence deeper than the heal window — escalating to re-anchor",
+                           height=height, tried=tracker[1])
+            self.logger.error(f"State divergence at {height} survived {tracker[1]} rollback(s) — the "
+                              f"corruption is deeper than one block; leaving it to the re-anchor ladder")
+            # KEEP THE TRACKER. Clearing it here reset the counter, so the very next pass started again
+            # from zero and the "bound" became a 3-block burst repeated forever — the node would walk
+            # itself down to the finality floor while every log line claimed it was escalating. The
+            # tracker is keyed on HEIGHT, so a re-anchor (which moves the tip) resets it on its own; that
+            # is the only thing that should.
+            self._state_heal = (height, tracker[1])
+            return False
+        # REVERT SYMMETRY: a rollback re-mines the block's transactions, it never drops them (the rule
+        # _rollback_one_for_reorg follows). A user's tx must survive our repair. Captured BEFORE the revert.
+        reverted_txs = self.memserver.latest_block.get("block_transactions", []) or []
+        try:
+            self.memserver.latest_block = rollback_one_block(
+                logger=self.logger, block=self.memserver.latest_block, depth=tracker[1] + 1)
+        except FinalityViolation as e:
+            # The poisoned application is at/below the immutable prefix. Rollback cannot reach it, by
+            # design. Say so and stop — WITHOUT benching anyone: the chain we need is real and must stay
+            # visible, or every recovery route keyed on knowing it exists is disarmed (see the long note
+            # in _rollback_one_for_reorg's FinalityViolation arm for the night that cost).
+            self._rec_fail("state divergence below the hard floor — rollback refused", height=height)
+            self.logger.error(f"State divergence at {height} is at/below hard finality: {e}")
+            # Mark the window SPENT, not empty: rollback can never succeed here, so retrying it every
+            # pass is wasted work that also keeps the escalation from ever firing.
+            self._state_heal = (height, STATE_HEAL_MAX_DEPTH)
+            return False
+        except MissingParentError as e:
+            self._rec_fail("state divergence with no local parent — resync required", height=height)
+            self.logger.error(f"State divergence at {height}, no parent on disk: {e}")
+            self._state_heal = (height, STATE_HEAL_MAX_DEPTH)
+            return False
+        # Blind reinsertion is safe and is what the reorg leg does: remove_outdated_transactions drops
+        # any whose target block has passed, validate_transaction drops any now-invalid, merge_transaction
+        # dedups so live copies are not doubled.
+        for _tx in reverted_txs:
+            try:
+                self.memserver.merge_transaction(_tx, user_origin=True)
+            except Exception:
+                pass
+        self._state_heal = (height, tracker[1] + 1)
+        self._rec_fail("our state diverged at the agreed parent — reverted it to re-apply",
+                       height=height, attempt=tracker[1] + 1)
+        self.logger.warning(f"State divergence at {height}: reverted our own tip so it can be re-applied "
+                            f"(attempt {tracker[1] + 1}/{STATE_HEAL_MAX_DEPTH}) — NOT striking the donor, "
+                            f"this failure is ours")
+        return True
+
+    def _reanchor_after_failed_heal(self) -> bool:
+        """Replace the state wholesale when reverting our own tip could not repair it.
+
+        Reached only once _heal_state_divergence has spent its window (or the floor refused it), which
+        means the corruption is older than the blocks we may legally revert. Re-deriving it is not an
+        option — that is the h4260 lesson — so the remedy is the one that does not depend on our state
+        being right: import a quorum-vouched snapshot of the heaviest chain.
+
+        NON-DESTRUCTIVE, unlike the purge escape: our blocks are orphaned in the store rather than
+        deleted, and every imported tail block is fully re-verified. Weight breaks the symmetry, so only
+        the side that is actually wrong can find a donor and act. Rate-limited by the ordinary re-anchor
+        cooldown so a node that cannot import does not hammer its peers once per pass."""
+        now = get_timestamp_seconds()
+        if now - self._last_reanchor_ts < REANCHOR_COOLDOWN:
+            return False
+        self._last_reanchor_ts = now
+        self.logger.warning("State divergence survived the rollback window — re-anchoring onto the "
+                            "strictly-heaviest chain (our blocks are orphaned, not deleted)")
+        if self.snapshot_bootstrap(force_reanchor=True, allow_below_floor=False):
+            self.memserver.rollbacks = 0
+            self._fork_state_cache = None          # identity changed; the cached verdict is stale
+            self._state_heal = None                # a new state deserves a fresh heal window
+            return True
+        self._rec_fail("re-anchor after failed state heal found no donor")
+        return False
+
+    def _rollback_one_for_reorg(self, ancestor=None, budget=None) -> bool:
+        """REORG leg of emergency sync: the MEASURED verdict says our chain diverged (see emergency_mode
+        — one donor's word no longer reaches here) — revert ONE block (reinserting its txs into the
+        mempool; revert symmetry: a reorg must re-mine user transactions, never drop them) and let the
+        next pass retry the donor one block deeper. Returns True when the emergency pass should END: the
+        per-burst rollback budget is exhausted, no local parent remains (snapshot-bootstrapped node), the
+        finality floor refused the reorg — each rejects the tip so we don't spin on it — or the tip has
+        reached the verdict's common ANCESTOR and the donor still disagrees, which means the verdict is
+        stale or the donor is lying, and rolling PAST the proven ancestor is pure loss either way (the old
+        leg probed blindly one block at a time and could burn the whole 40-block budget on a bad donor)."""
+        if ancestor is not None and int(self.memserver.latest_block["block_number"]) <= int(ancestor):
+            self.logger.warning(f"Reorg leg reached the measured common ancestor {ancestor} and the donor "
+                                f"still disagrees — refusing to roll deeper; striking the tip")
+            self.memserver.rollbacks = 0
+            self._reject_heaviest_tip()
+            return True
+        # `budget` widens the per-burst cap for a MEASURED, POSSESSION-BACKED reorg: the span to the
+        # ancestor is known, the competing branch is fully staged, hash-linked and strictly heavier, so
+        # the blind-rollback risk max_rollbacks guards against does not exist — while a split runs,
+        # finality freezes and both sides legally outgrow any fixed cap (observed 2026-08-23: span 84 vs
+        # cap 40 — the reorg could NEVER complete and the node parked mid-branch). The finality floor
+        # (FinalityViolation below) and the hard backstop cap in the caller still bound the depth.
+        _cap = int(budget) if budget else self.memserver.max_rollbacks
+        if self.memserver.rollbacks >= _cap:
             self.logger.error(
-                f"Rollbacks exhausted ({self.memserver.rollbacks}/{self.memserver.max_rollbacks})")
+                f"Rollbacks exhausted ({self.memserver.rollbacks}/{_cap})")
             self.memserver.rollbacks = 0
             self._reject_heaviest_tip()
             return True
@@ -1202,7 +3174,23 @@ class CoreClient(threading.Thread):
             # the hard 51%/rollback cap (#17).
             self.logger.error(f"Rollback refused (finality): {e}")
             self.memserver.rollbacks = 0
-            self._reject_heaviest_tip()
+            # DO NOT BENCH THE TIP HERE. _reject_heaviest_tip() is the Sybil-stall / weight-DoS guard: it
+            # exists for a peer that ADVERTISES a heavier chain it cannot actually serve. A FinalityViolation
+            # is the opposite situation — the chain is real and genuinely heavier, and the failure is OURS
+            # (we may not legally roll back across our own finalized prefix). Benching it conflates the two
+            # and is actively harmful: rejected_tips feeds fork-choice, so the heavier chain goes INVISIBLE,
+            # _fork_state() degrades from DEAD_FORK to UNKNOWN ("ancestor=None"), and every recovery route
+            # keyed on knowing a heavier chain exists — including the floor-crossing re-anchor above — is
+            # disarmed. The node then blinds itself to the exact chain it needs.
+            #
+            # Observed live 2026-08-04: after the 2-2 split at h20352 the finality refusal repeated until
+            # "Excluding unreachable heavier-advertised tip e43691b2b7a1 (weight-DoS guard, failure #4)",
+            # after which fork state read `unknown (ancestor=None, probes=159)` and the node sat wedged with
+            # every remedy silently unreachable. This is the "a wrong bench makes the true chain invisible"
+            # failure the snapshot_bootstrap docstring warns about, reached from the other direction.
+            #
+            # Leaving it visible costs a re-entry into emergency_mode per pass, which is already rate-limited
+            # and is exactly what lets the DEAD_FORK verdict form and the escalation fire.
             return True
 
         # REINSERT the reverted block's txs into the mempool. Blind reinsertion is safe:
@@ -1276,6 +3264,9 @@ class CoreClient(threading.Thread):
                 # correct from the start. Same tx-index oracle verify_block/the pool-cull already use.
                 if kv_ops.tx_get(tx.get("txid")) is not None:
                     continue
+                # BORN THIS SLOT, THROUGH US -> NOT IN OUR BLOCK YET (2026-09-13). See _held_back.
+                if self._held_back(tx, next_height):
+                    continue
                 validate_transaction(transaction=tx, logger=self.logger, block_height=next_height)
                 ledger.add(tx)
             except Exception as e:
@@ -1292,7 +3283,508 @@ class CoreClient(threading.Thread):
         # keep the log-once set bounded and self-healing: drop ids no longer in the pool (mined or aged
         # out) so a genuinely fresh occurrence of the same id logs again.
         self._excluded_logged &= {tx.get("txid") for tx in pool}
+        # the born-tip map follows the pool the same way: an id that is mined or aged out leaves it
+        _in_pool = {tx.get("txid") for tx in pool}
+        for _k in [k for k in self.memserver.own_born if k not in _in_pool]:
+            self.memserver.own_born.pop(_k, None)
         return selected
+
+    def _tpm_tx_pending(self, recipient, enrol_id=None):
+        """True if our own message of this kind is already waiting in the pool. Without it the per-block
+        pass mints a fresh duplicate (new nonce -> new txid) until the first copy is mined; the stragglers
+        then fail validation inside later candidates and poison block production — the same failure
+        _reserved_tx_pending exists to prevent, in a path that runs once per enrolment per block.
+
+        enrol_id is None for `tpm_enrol`, and that is not laziness. An enrolment's id is DERIVED from its
+        content (chain id, endorsement identity, key name) and is therefore not carried in the message, so
+        there is no field to match on. Matching on recipient and sender alone is exact anyway: a node
+        derives one endorsement identity and one attestation key from fixed templates, so it can only ever
+        have one enrolment of its own in flight."""
+        for tx in self.memserver.transaction_pool.copy():
+            if tx.get("recipient") != recipient or tx.get("sender") != self.memserver.address:
+                continue
+            if enrol_id is None:
+                return True
+            if isinstance(tx.get("data"), dict) and tx["data"].get("id") == enrol_id:
+                return True
+        return False
+
+    def _tpm_secrets_path(self):
+        return f"{get_home()}/private/tpm_challenges.json"
+
+    def _tpm_secrets_load(self):
+        try:
+            with open(self._tpm_secrets_path()) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _tpm_secrets_save(self, store):
+        """Atomic replace. THE WRITE HAPPENS BEFORE THE CHALLENGE IS BROADCAST, never after: a challenger
+        that publishes a blob and then loses its (secret, seed) can never reveal, and the enrolment it was
+        drawn for is dead until it expires — the prover's chip did nothing wrong and has to start over with
+        a new attestation key. Update waves restart the whole fleet routinely, so this is the ordinary case
+        rather than a crash-only one (see memserver.randao_secrets for the same lesson)."""
+        path = self._tpm_secrets_path()
+        with open(path + ".tmp", "w") as f:
+            json.dump(store, f)
+        os.replace(path + ".tmp", path)
+
+    # Cached chip identity: (ek_identity, ek_chain, aik_pub). Deriving an RSA-2048 primary takes SECONDS
+    # on a real firmware TPM, and the self-enrolment check runs once per block — recomputing it every time
+    # would spend more wall clock inside the chip than the node spends producing. Both primaries are
+    # DERIVED from fixed templates, so the values never change for a given machine and a restart simply
+    # pays for one recomputation.
+    _tpm_identity_cache = None
+
+    def _tpm_open(self):
+        """This machine's TPM, or None if it has none. The node has exactly ONE place that decides both
+        questions, so there is exactly one thing for a test to substitute — tests/test_tpm_self_enrol.py
+        drives a simulator through this and every other line of the self-enrolment path runs unchanged.
+
+        Presence lives here rather than at the call sites because a check that consults the filesystem
+        while the open goes through a hook is a seam that tests pass and production fails, or the
+        reverse."""
+        from ops.tpm_linux import LinuxTpm
+        return LinuxTpm() if LinuxTpm.present() else None
+
+    def _tpm_identity(self):
+        """(endorsement identity, endorsement chain, attestation public area) for THIS machine, or None.
+
+        None means this node cannot use the vendor-endorsed path, and the reasons are all legitimate: no
+        TPM device, no endorsement certificate in NV, or a certificate that does not chain to a pinned
+        silicon-vendor root. A machine whose chip no vendor vouched for MUST NOT enrol — without the
+        vendor signature the whole design degrades to "some TPM somewhere said yes", which a software TPM
+        says just as convincingly.
+        """
+        if self._tpm_identity_cache is not None:
+            return self._tpm_identity_cache or None
+        from ops.tpm_linux import ek_template, aik_template, RH_ENDORSEMENT
+        from ops import attest_native
+        tpm = handles = None
+        try:
+            tpm = self._tpm_open()
+            if tpm is None:
+                self._tpm_identity_cache = False        # no TPM: the overwhelmingly common case
+                return None
+            cert = tpm.ek_certificate()
+            if not cert:
+                self.logger.info("TPM present but holds no endorsement certificate — "
+                                 "the vendor-endorsed path needs one and this node will not enrol")
+                self._tpm_identity_cache = False
+                return None
+            # Client-supplied intermediates are only a routing hint (every link is verified and only
+            # pinned roots are trust input), so offering whatever the chip also stores costs nothing and
+            # rescues the common case where the leaf does not chain straight to the root.
+            chain = [cert]
+            for extra in (0x01C00100, 0x01C00101, 0x01C00102):
+                nv = tpm.nv_read_public(extra)
+                if nv and nv[1]:
+                    try:
+                        chain.append(tpm.nv_read(extra, nv[1]))
+                    except Exception:
+                        pass
+            now = int(self.memserver.latest_block.get("block_timestamp") or time.time())
+            verdict = attest_native.verify_ek(chain, now)
+            # the roots consensus will judge this node's enrolment by (ek_roots_at the next block) — the base set
+            # alone refused Intel V2-root chips here too (protocol.py "ENROLMENT TRUSTS THE ROOTS IN FORCE")
+            from protocol import ek_roots_at
+            _nxt = int(self.memserver.latest_block.get("block_number") or 0) + 1
+            if not (verdict.get("ok") and verdict.get("root_sha256") in ek_roots_at(_nxt)):
+                self.logger.warning(
+                    f"endorsement certificate does not chain to a pinned vendor root "
+                    f"({verdict.get('reason') or verdict.get('root_sha256')}) — this node will not enrol")
+                self._tpm_identity_cache = False
+                return None
+            handles = []
+            _h, _pub, _ = tpm.create_primary(RH_ENDORSEMENT, ek_template())
+            handles.append(_h)
+            aik_h, aik_pub, _ = tpm.create_primary(RH_ENDORSEMENT, aik_template())
+            handles.append(aik_h)
+            self._tpm_identity_cache = (str(verdict["identity"]), chain, aik_pub)
+            self.logger.info(f"TPM ready: endorsement identity {verdict['identity'][:16]}… "
+                             f"({verdict.get('manufacturer')})")
+            return self._tpm_identity_cache
+        except Exception as e:
+            self.logger.warning(f"could not read this machine's TPM identity: {e}")
+            self._tpm_identity_cache = False
+            return None
+        finally:
+            if tpm is not None:
+                for h in (handles or []):
+                    tpm.flush(h)
+                tpm.close()
+
+    def maybe_tpm_self_enrol(self):
+        """ENROL THIS MACHINE'S OWN CHIP, AND KEEP ITS REGISTRATION ALIVE
+        (doc/tpm-attestation-without-a-ca.md).
+
+        A node with a vendor-certified TPM attests ITSELF: no operator, no browser, no human tap. That is
+        the point of the whole path — a headless Linux machine has never had a way to attest, and the
+        WebAuthn ceremony it would otherwise need cannot be automated by design.
+
+        One step per block, driven entirely by chain state and the chip. Nothing is persisted locally,
+        because both primaries are DERIVED from fixed templates: the same machine recomputes the same
+        endorsement identity and the same attestation key after any restart, so its enrolment id is
+        recoverable from public data alone.
+
+            no record          -> publish the endorsement chain and the attestation public area
+            open, all answered -> activate every challenge in the chip, publish the commitment
+            proven             -> register with a fresh certify, and renew before the lease lapses
+
+        Best-effort; never raises."""
+        try:
+            from protocol import CHAIN_ID, POSW_ANCHOR_OFFSET
+            from ops import tpm_enrol as _te, tpm_aik
+            from ops.transaction_ops import construct_tpm_tx, register_device_challenge
+            tip = self.memserver.latest_block["block_number"]
+            if tip < 1:                     # the enrolment rule holds from block 1 (gen 25's DEVICE_ATTEST_EK_HEIGHT)
+                return
+            ident = self._tpm_identity()
+            if not ident:
+                return
+            ek_id, chain, aik_pub = ident
+            me = self.memserver.address
+            eid = _te.enrol_id(CHAIN_ID, ek_id, _te.aik_name_hex(aik_pub))
+            rec = kv_ops.tpm_enrol_get(eid)
+            min_block = tip + TX_INCLUSION_DELAY
+
+            if rec is None:
+                if self._tpm_tx_pending("tpm_enrol"):
+                    return
+                data = {"ek": [c.hex() for c in chain], "pub": aik_pub.hex()}
+                tx = construct_tpm_tx(self.memserver.keydict, "tpm_enrol", data,
+                                      min_block + 4, min_block=min_block)
+                if self.memserver.merge_transaction(tx, user_origin=True).get("result"):
+                    self.logger.info(f"TPM self-enrolment {eid[:12]}…: published our endorsement chain")
+                return
+
+            if rec["state"] == "open":
+                blobs = {b[0]: b for b in (rec.get("blobs") or [])}
+                # A DELAYED DRAW HAS NO CHALLENGERS YET (ops/tpm_enrol "COMMIT, THEN DRAW"), and no blobs equals no
+                # challengers — without this the node would commit to nothing before anyone was drawn.
+                # INVARIANT: never commit against an empty set; consensus refuses it (tpm_enrol.apply_commit).
+                if not rec.get("challengers"):
+                    return                      # the set is drawn, and written, by the first challenge
+                if set(blobs) != set(rec["challengers"]):
+                    return                      # still waiting for the drawn challengers
+                if self._tpm_tx_pending("tpm_commit", eid):
+                    return
+                secrets = self._tpm_activate_all(rec, blobs)
+                if secrets is None:
+                    return
+                data = {"id": eid, "commit": tpm_aik.credential_commitment(secrets)}
+                # SAME CLAMP AS THE CHALLENGER PATH. The enrolment deadline can be hundreds of blocks
+                # past the tip and the mempool refuses anything beyond tip + TX_LANDING_WINDOW, so an
+                # unclamped commitment is rejected with "Target block too high" — stalling the node's
+                # own enrolment at exactly the step after it has already done the hard part.
+                _expiry = int(rec["h"]) + _te_window(rec["h"]) - 1
+                tx = construct_tpm_tx(self.memserver.keydict, "tpm_commit", data,
+                                      min(_expiry, tip + TX_LANDING_WINDOW - RESERVED_TX_MARGIN),
+                                      min_block=min_block)
+                if self.memserver.merge_transaction(tx, user_origin=True).get("result"):
+                    self.logger.info(f"TPM self-enrolment {eid[:12]}…: our chip opened every challenge")
+                return
+
+            if rec["state"] != "proven":
+                return                          # committed; the challengers reveal next
+
+            # PROVEN: register, and renew one epoch before the lease lapses rather than after. A lapsed
+            # lease drops this identity out of the registry until the next register lands, and the
+            # renewal costs one fee-exempt transaction.
+            epoch_now = tip // EPOCH_LENGTH
+            last = kv_ops.recert_latest(me)
+            if last >= 0 and epoch_now < last + kv_ops.lease_of(me, last) - 1:      # this identity's own grant
+                return
+            if last >= epoch_now:
+                return                          # one register per epoch
+            for t in self.memserver.transaction_pool.copy():
+                if t.get("recipient") == "register" and t.get("sender") == me:
+                    return
+            max_block = min_block + 4
+            anchor = get_block_hash_by_number(max(0, max_block - POSW_ANCHOR_OFFSET))
+            if not anchor:
+                return
+            challenge = register_device_challenge(me, anchor, max_block)
+            certified = self._tpm_certify(challenge)
+            if certified is None:
+                return
+            cert_info, sig = certified
+            device = {"ek": ek_id, "id": eid, "certinfo": cert_info.hex(), "sig": sig.hex()}
+            tx = construct_register_tx(self.memserver.keydict, max_block, device=device)
+            if self.memserver.merge_transaction(tx, user_origin=True).get("result"):
+                self.logger.info(f"TPM registration: certified by our own chip for epoch {epoch_now}")
+        except Exception as e:
+            self.logger.error(f"TPM self-enrolment failed: {e}")
+
+    def _tpm_activate_all(self, rec, blobs):
+        """Open every drawn challenger's credential inside the chip and return the concatenated secrets in
+        challenger order, or None if any of them will not open.
+
+        THE CONCATENATION ORDER IS CONSENSUS, not a local choice: apply_reveal checks the commitment
+        against the secrets sorted by challenger, so committing to any other order fails at the last
+        reveal and wastes the whole enrolment."""
+        from ops.tpm_linux import ek_template, aik_template, RH_ENDORSEMENT
+        tpm = handles = None
+        try:
+            tpm = self._tpm_open()
+            if tpm is None:
+                return None
+            handles = []
+            ek_h, _p, _ = tpm.create_primary(RH_ENDORSEMENT, ek_template())
+            handles.append(ek_h)
+            aik_h, _p2, _ = tpm.create_primary(RH_ENDORSEMENT, aik_template())
+            handles.append(aik_h)
+            out = b""
+            for challenger in sorted(blobs):
+                blob = bytes.fromhex(blobs[challenger][1])
+                enc = bytes.fromhex(blobs[challenger][2])
+                sess = tpm.start_policy_session()
+                try:
+                    tpm.policy_secret_endorsement(sess)
+                    out += tpm.activate_credential(aik_h, ek_h, sess, blob, enc)
+                finally:
+                    tpm.flush(sess)
+            return out
+        except Exception as e:
+            self.logger.warning(f"the chip could not open a challenge: {e}")
+            return None
+        finally:
+            if tpm is not None:
+                for h in (handles or []):
+                    tpm.flush(h)
+                tpm.close()
+
+    def _tpm_certify(self, challenge):
+        """A fresh TPM2_Certify over this block's challenge, under the enrolled attestation key."""
+        from ops.tpm_linux import aik_template, RH_ENDORSEMENT
+        tpm = handles = None
+        try:
+            tpm = self._tpm_open()
+            if tpm is None:
+                return None
+            handles = []
+            aik_h, _p, _ = tpm.create_primary(RH_ENDORSEMENT, aik_template())
+            handles.append(aik_h)
+            return tpm.certify(aik_h, aik_h, challenge)
+        except Exception as e:
+            self.logger.warning(f"the chip could not certify: {e}")
+            return None
+        finally:
+            if tpm is not None:
+                for h in (handles or []):
+                    tpm.flush(h)
+                tpm.close()
+
+    def maybe_tpm_ready(self):
+        """ANNOUNCE THAT THIS NODE WILL ANSWER CHALLENGES (the tpm_ready transaction).
+
+        The draw has to choose challengers from somewhere, and every on-chain signal it used before was a
+        proxy for the wrong thing: bonded stake measures capital, block production measures winning a
+        draw, and an FFG duty measures being a bonded participant — which a WALLET that mines is, while
+        running no daemon and no challenger loop. A mining wallet was drawn for a stranger's enrolment
+        and could never answer.
+
+        So a node says so itself. One zero-amount message, re-sent while it keeps running, and the draw
+        prefers addresses that have volunteered. Opt out with `"challenger": false` in config.json: the
+        node stops announcing and drops out of the pool when the window lapses."""
+        from protocol import DEVICE_ATTEST_EK_READY_EVERY, TX_LANDING_WINDOW, RESERVED_TX_MARGIN
+        from ops.transaction_ops import construct_tpm_tx
+        try:
+            if not self.memserver.config.get("challenger", True):
+                return
+            tip = int((self.memserver.latest_block or {}).get("block_number") or 0)
+            if tip < 1:                     # tpm_ready is valid from block 1 (gen 25's DEVICE_ATTEST_EK_READY_HEIGHT)
+                return
+            if tip - getattr(self, "_tpm_ready_at", -10 ** 9) < DEVICE_ATTEST_EK_READY_EVERY:
+                return
+            if self._tpm_tx_pending("tpm_ready", ""):
+                return
+            # A VOLUNTEER HAS STAKE (protocol.py "NO FREE REPEATABLE TRANSACTIONS"): only a bonded account may announce,
+            # so an unbonded node stays quiet instead of logging a refusal every interval. It rejoins by bonding B_MIN.
+            # (tip >= 1 here, so the next block is >= 2: the rule always applies.)
+            from protocol import B_MIN
+            from ops.account_ops import get_account
+            # (not `_me`: that name is reserved for own-ip SETS, which tests/test_own_ips_and_sync_corrob.py audits)
+            _my_acct = get_account(self.memserver.keydict["address"], create_on_error=False) or {}
+            if int(_my_acct.get("bonded") or 0) < B_MIN:
+                return
+            # AN INCLUSION DELAY, SIGNED (2026-09-17). tpm_ready lands FLEXIBLY (block_ops._lands_flexibly: it is
+            # not in the exact-landing set), so without min_block it was eligible the instant it existed: the
+            # canonical block at the split height carried an announcement created 1-3 s before the block —
+            # whoever had it built it in, whoever had not built without, and every node assembles every block.
+            # 63 of the relay's 86 split differences in one day were exactly this. min_block is in the signed
+            # body, so every node holds the announcement out until the same height (TX_INCLUSION_DELAY, the
+            # duty's own delay: ~55 s of gossip for a message nobody is waiting for). The one-slot _held_back
+            # was never enough — it delays only the originator, and a peer that received it by gossip built
+            # it in the very next slot.
+            from protocol import TX_INCLUSION_DELAY
+            tx = construct_tpm_tx(self.memserver.keydict, "tpm_ready", "",
+                                  tip + TX_LANDING_WINDOW - RESERVED_TX_MARGIN,
+                                  min_block=tip + TX_INCLUSION_DELAY)
+            result = self.memserver.merge_transaction(tx, user_origin=True)
+            if result and result.get("result"):
+                # Only mark it sent when it was ACCEPTED, or a refusal silences this node for the whole
+                # interval and it quietly drops out of the pool it thinks it is in.
+                self._tpm_ready_at = tip
+                self.logger.info("announced this node as a TPM enrolment challenger")
+            else:
+                self.logger.warning(f"challenger announcement refused: {(result or {}).get('message')}")
+        except Exception as e:
+            self.logger.error(f"challenger announcement failed: {type(e).__name__}: {e}")
+
+    def maybe_tpm_challenge(self):
+        """CHALLENGE THE ENROLMENTS THIS NODE WAS DRAWN FOR (doc/tpm-attestation-without-a-ca.md).
+
+        A machine proves it holds a vendor-certified TPM by opening a credential this node seals to its
+        endorsement key. We are one of DEVICE_ATTEST_EK_CHALLENGERS drawn for that enrolment — drawn, never
+        chosen by the prover, because a prover that picks its own challengers picks parties that will leak
+        the secret to it. Forgery needs ALL of us to collude.
+
+        WITHOUT THIS LOOP THE WHOLE PATH IS DEAD. The consensus rule accepts a completed enrolment, but an
+        enrolment only completes if the drawn challengers answer it; an unanswered one sits until
+        DEVICE_ATTEST_EK_ENROL_BLOCKS passes and expires. Every bonded node runs this, which is what makes
+        the challenger set something the network supplies rather than a service someone operates.
+
+        ORDERING IS ENFORCED BY CONSENSUS, NOT BY US: apply_challenge/apply_reveal refuse anything that does
+        not land strictly after the message it answers, so a badly-timed broadcast is rejected rather than
+        silently weakening the proof. What we must get right locally is never revealing before the prover's
+        commitment is ON CHAIN — which is why the reveal branch keys on the record's own state.
+
+        Best-effort; never raises."""
+        try:
+            tip = self.memserver.latest_block["block_number"]
+            if tip < 1:                     # the enrolment rule holds from block 1 (gen 25's DEVICE_ATTEST_EK_HEIGHT)
+                return
+            me = self.memserver.address
+            # NO ELIGIBILITY TEST HERE. The draw decides who may answer, and the only membership question
+            # is whether THIS enrolment drew us — which is checked per record below. There used to be a
+            # bonded-registry gate, left over from when the draw was stake-weighted, and it silently
+            # skipped every enrolment on a node that had been drawn as a PRODUCER without being bonded.
+            # The first real enrolment on this chain sat with zero challenges for 107 blocks because of
+            # it: the draw named three producers and the loop asked a different question.
+            # tip=: EXPIRED incomplete rows are never collected, and counted against the scan's limit they hid
+            # fresh enrolments from every challenger (kv_ops.tpm_enrols_live). Keep the tip here.
+            live = kv_ops.tpm_enrols_live(tip=tip)
+            # WHAT THIS DUTY LAST DID, READABLE FROM OUTSIDE. A duty that catches its own exceptions so it
+            # cannot stop block production is a duty that fails invisibly, and the only place the reason
+            # lands is a log file on a machine somebody else operates. The first real enrolment on this
+            # chain sat unanswered while three nodes were, as far as anyone could tell from the network,
+            # simply choosing not to answer.
+            self.memserver.tpm_duty = f"live={len(live)}"
+            if not live:
+                # No enrolment is in progress, so every secret we are still holding belongs to one that
+                # finished or expired. This is the only moment that fact is knowable for free.
+                self.maybe_tpm_prune_secrets(tip)
+                return
+            from ops.tpm_aik import make_credential
+            from ops.transaction_ops import construct_tpm_tx
+            store = self._tpm_secrets_load()
+            # THE SET A RECORD NAMES MAY NOT BE WRITTEN YET. An enrolment is stored
+            # with no challengers and its set is drawn from its draw epoch on — by the very challenge we are about to
+            # send. So membership is asked of the draw (tpm_drawn_challengers: the stored set, or the pure draw once
+            # the epoch has come), never of the stored field alone, or nobody would ever answer a delayed enrolment.
+            # INVARIANT: ask at the TIP, the height the mempool admits at; the challenge then lands after draw_opens.
+            from ops.transaction_ops import tpm_drawn_challengers, tpm_duty_bounds
+
+            def _drawn(r):
+                try:
+                    return tpm_drawn_challengers(r, tip) or []
+                except Exception:
+                    return []               # a window this node cannot read yet: skip, the next pass retries
+            drawn_of = {e: _drawn(r) for e, r in live}
+            mine_count = sum(1 for e, _r in live if me in drawn_of[e])
+            self.memserver.tpm_duty = f"live={len(live)} drawn_for={mine_count}"
+            for eid, rec in live:
+                if me not in drawn_of[eid]:
+                    continue
+                # THE DEADLINE IS THE ENROLMENT'S, THE WINDOW IS THE MEMPOOL'S, AND max_block MUST RESPECT
+                # BOTH. Setting it to the enrolment's expiry alone put it up to 719 blocks ahead of the
+                # tip, and the mempool refuses anything beyond tip + TX_LANDING_WINDOW — so every drawn
+                # challenger's answer was rejected with "Target block too high" and the enrolment sat at
+                # 0/3 looking exactly like nobody had been drawn. Clamp to the window, keeping a margin
+                # so the tx does not expire while it waits for inclusion.
+                # ONE DEFINITION (transaction_ops.tpm_duty_bounds): /tpm_duty tells a wallet challenger the same
+                # window. INVARIANT: never re-inline this arithmetic here — two copies drift.
+                min_block, max_block = tpm_duty_bounds(rec, tip)
+                if min_block > max_block:
+                    continue                # this enrolment expires before anything we send could land
+                mine = store.get(eid)
+                if rec["state"] == "open":
+                    if any(b[0] == me for b in (rec.get("blobs") or [])):
+                        continue            # our challenge is already on chain
+                    if self._tpm_tx_pending("tpm_challenge", eid):
+                        continue
+                    if mine is None:
+                        secret, seed = _secrets.token_bytes(32), _secrets.token_bytes(32)
+                        store[eid] = mine = {"secret": secret.hex(), "seed": seed.hex()}
+                        self._tpm_secrets_save(store)      # BEFORE the broadcast, see _tpm_secrets_save
+                    blob, enc = make_credential(bytes.fromhex(rec["ekpub"]),
+                                                bytes.fromhex(rec["name"]),
+                                                bytes.fromhex(mine["secret"]),
+                                                seed=bytes.fromhex(mine["seed"]))
+                    data = {"id": eid, "blob": blob.hex(), "enc": enc.hex()}
+                    tx = construct_tpm_tx(self.memserver.keydict, "tpm_challenge", data,
+                                          max_block, min_block=min_block)
+                elif rec["state"] == "commit":
+                    if any(r[0] == me for r in (rec.get("reveals") or [])):
+                        continue            # already revealed
+                    if mine is None:
+                        continue            # we never challenged this one, or lost the secret
+                    if self._tpm_tx_pending("tpm_reveal", eid):
+                        continue
+                    data = {"id": eid, "secret": mine["secret"], "seed": mine["seed"]}
+                    tx = construct_tpm_tx(self.memserver.keydict, "tpm_reveal", data,
+                                          max_block, min_block=min_block)
+                else:
+                    continue
+                result = self.memserver.merge_transaction(tx, user_origin=True)
+                ok = bool(result and result.get("result"))
+                self.memserver.tpm_duty = (f"sent {tx['recipient']} for {eid[:8]}" if ok
+                                           else f"REFUSED {tx['recipient']}: "
+                                                f"{(result or {}).get('message')}")
+                if ok:
+                    self.logger.info(f"TPM enrolment {eid[:12]}…: sent {tx['recipient']}")
+                else:
+                    self.logger.warning(f"TPM enrolment {eid[:12]}…: {tx['recipient']} refused: "
+                                        f"{(result or {}).get('message')}")
+                # ONE MESSAGE PER ENROLMENT PER PASS — not one message per pass in total. This was a bare
+                # `return`, which meant a node drawn for two live enrolments advanced only the FIRST one
+                # each block and starved the other: measured on the live chain, two challengers answered
+                # at +9 blocks while the third took +91, because that node was busy walking the other
+                # enrolment. The record then ran out of window with its last reveal still in flight, at
+                # +164 of 180, after the chip had already opened all three credentials.
+                #
+                # Continuing is safe because the pacing that matters is PER RECORD: consensus refuses any
+                # message that does not land strictly after the one it answers, so a record still advances
+                # at most one step per block. Two different records share no ordering constraint, and
+                # sending both in one pass costs one transaction each.
+                continue                    # one step for THIS enrolment; the next one gets its step too
+        except Exception as e:
+            import traceback
+            self.memserver.tpm_duty = f"FAILED {type(e).__name__}: {str(e)[:120]}"
+            self.logger.error(f"TPM challenge duty failed: {type(e).__name__}: {e}\n"
+                              + traceback.format_exc())
+
+    def maybe_tpm_prune_secrets(self, tip=None):
+        """Forget the secrets of enrolments that are finished or gone. A challenger's secret is worthless
+        once revealed, but keeping every one forever turns a small private file into an unbounded one.
+        EXPIRED counts as gone: an incomplete row is never collected from the chain, so "still open/commit"
+        alone kept an expired enrolment's secret forever. With `tip`, an open/commit record past its window
+        (tip >= h + enrol_window(h), as tpm_enrols_live) is pruned too."""
+        def _wanted(rec):
+            if (rec or {}).get("state") not in ("open", "commit"):
+                return False
+            return tip is None or int(tip) < int(rec["h"]) + _te_window(int(rec["h"]))
+        try:
+            store = self._tpm_secrets_load()
+            if not store:
+                return
+            keep = {eid: v for eid, v in store.items() if _wanted(kv_ops.tpm_enrol_get(eid))}
+            if len(keep) != len(store):
+                self._tpm_secrets_save(keep)
+        except Exception as e:
+            self.logger.warning(f"could not prune TPM challenge secrets: {e}")
 
     def _reserved_tx_pending(self, recipient, target_epoch):
         """True if our own reserved tx for this epoch is already waiting in the pool. Without this
@@ -1329,13 +3821,9 @@ class CoreClient(threading.Thread):
         # fork-choice + finality + an offline-win/relay-delegation decision. See #15/#16/#17.)
         parent = self.memserver.latest_block
         block_number = parent["block_number"] + 1
-        _epoch = epoch_of(block_number)
-        bonded_registry = get_bonded_registry()  # as-of-parent (tip == parent here)
-        # RANDAO gate (pass-through while RANDAO_ENFORCED is off — reveals are optional); the FULL
-        # registry always feeds block_fork_weight below (withholding must not move fork-choice).
-        winner = select_producer_two_lane(get_open_registry(_epoch),
-                                          randao_eligible_bonded(bonded_registry, _epoch),
-                                          epoch_beacon(_epoch), slot=block_number)
+        from ops.block_ops import derive_header
+        hdr = derive_header(parent, block_number)   # the ONE derivation production and verification share
+        winner = hdr["creator"]
         return construct_block(
             # CRITICAL: use the INCOMING block's OWN timestamp, NOT our wall-clock. rebuild_block
             # deterministically reconstructs a REMOTE block to re-derive the winner/reward/weight (anti-forgery),
@@ -1349,10 +3837,10 @@ class CoreClient(threading.Thread):
             parent_hash=parent["block_hash"],
             creator=winner,
             transaction_pool=block["block_transactions"],
-            block_reward=get_block_reward(),
+            block_reward=hdr["reward"],
             parent_cumulative_fees=parent.get("cumulative_fees", 0),
             parent_cumulative_weight=parent.get("cumulative_weight", 0),
-            block_weight=block_fork_weight(bonded_registry, block_number),
+            block_weight=hdr["block_weight"],
             # preserve the REMOTE block's own chain_id label (informational, not hashed) so the rebuilt
             # block stays byte-identical to what the peer sent; the hash is chain_id-invariant either way.
             chain_id=block.get("chain_id", CHAIN_ID),
@@ -1376,7 +3864,7 @@ class CoreClient(threading.Thread):
             self.logger.warning(f"Block {block['block_hash']} already incorporated; skipping (idempotent)")
             return
 
-        self.logger.warning(f"Producing block")
+        self.logger.warning("Producing block")
 
         # Body write FIRST (idempotent, safe to redo on replay): the fsynced segment record +
         # locator must exist before block_index references it. The parent's child pointer is no
@@ -1390,6 +3878,9 @@ class CoreClient(threading.Thread):
         # leaves the block UNapplied (and block_already_indexed lets the replay re-apply it
         # cleanly) instead of double-crediting the reward (audit LO-1/CO-4).
         with kv_ops.write_txn():
+            # UNDO LOG (shadow mode, kv_ops): record the prior bytes of every consensus key this block writes; stored
+            # with this txn's commit, checked by rollback_one_block against the hand-written reverts.
+            kv_ops.undo_begin(block["block_number"])
             index_transactions(block=block,
                                sorted_transactions=sorted_transactions,
                                logger=self.logger)
@@ -1400,11 +3891,45 @@ class CoreClient(threading.Thread):
             # wholesale, so no depth fence can make that read fleet-safe). Commits atomically with the
             # block; reverted in rollback_one_block. Not in any block hash preimage.
             try:
-                from execnode.stark.calls_commit import block_summary
-                from protocol import EXEC_SUMMARY_RETENTION
+                from execnode.calls_commit import block_summary
+                from protocol import EXEC_SUMMARY_RETENTION, SETTLE_PROOF_RECORDS
                 _inert, _calls = block_summary(block)
                 _h = block["block_number"]
-                kv_ops.exec_summary_put(_h, _inert, _calls)
+                # RECORDS-HALF EFFECTS (SETTLE_PROOF_RECORDS): derived HERE, for the same reason the call
+                # leaves are — this is the one place the body is present by definition. Without it the
+                # settle branch has no prune-safe way to know WHICH records a span moved, only the `inert`
+                # boolean saying THAT some did, and a boolean cannot be bound against. Gated because it
+                # changes what is written into `meta`, which feeds the L1 state root; see protocol.py.
+                _rec, _derivable, _dcarry = (None, None, None)
+                if SETTLE_PROOF_RECORDS:
+                    from execnode.records_effects import block_records_effects
+                    _rec, _derivable = block_records_effects(block)
+                    # PRESENCE-DIVIDEND ACCRUAL — the LAST records movement that was not derivable, and the
+                    # single largest reason a span was refused: measured over one day on betanet-15, "span
+                    # crosses a dividend epoch boundary" was 55 of 146 refusals. It moves records on a
+                    # boundary block with NO transaction at all, so the tx scan above can never see it.
+                    #
+                    # It IS derivable, because the accrual is a pure function of COMMITTED L1 state:
+                    # dividend_inflow_get(E) and weights_at_epoch(E), which is exactly what the exec node
+                    # reads over HTTP before calling state.accrue_dividend_epoch. The one input that is not
+                    # on L1 is the exec node's carried sub-unit remainder, so we chain it ourselves: each
+                    # boundary stores its own carry-out in its exec summary and reads the previous
+                    # boundary's as carry-in.
+                    #
+                    # STORED IN THE SUMMARY ITSELF, deliberately — not in a new meta row. exec_summary_put
+                    # already commits inside this atomic write txn and rollback_one_block already reverts
+                    # it, so the carry chain inherits an EXACT rollback inverse. A separate accumulator
+                    # would have needed its own, and "rollback_one_block is not the inverse of
+                    # incorporate_block for a meta row" is precisely what corrupted the L1 root at h4260.
+                    #
+                    # FAILS CLOSED at every edge: a missing previous summary (fresh snapshot anchor, GC),
+                    # a weights_at_epoch that refuses because idle-GC pruned the recert rows it replays, or
+                    # any other error marks the block non-derivable and it rides the bonded quorum.
+                    _E = _dividend_epoch_for(_h)
+                    if _derivable and _E is not None:
+                        _rec, _derivable, _dcarry = self._accrual_effects(_E, _h, _rec)
+                kv_ops.exec_summary_put(_h, _inert, _calls, records=_rec, derivable=_derivable,
+                                        div_carry=_dcarry)
                 # O(1) rolling GC: drop the one height falling out of the retention window. These live in
                 # the `meta` sub-DB, which IS snapshot-carried, so an unbounded set would grow with chain
                 # length and bloat every snapshot. Nothing a proof could use is lost — a span reaching
@@ -1446,6 +3971,23 @@ class CoreClient(threading.Thread):
             # Anti-hoard self-burn (doc/treasury.md §3.2): at period boundaries, destroy a slice of the idle
             # treasury. Runs in this same write txn, so it's atomic with the reward + reverts with the block.
             apply_treasury_burn(block, logger=self.logger)
+            # COMMITTED EPOCH WEIGHTS (ungated since gen 22): the FIRST block of every
+            # epoch freezes the JUST-COMPLETED epoch's open-lane weights into L1 state. Computed here —
+            # after this block's registers/recerts applied — from the recert rows <= E, i.e. a pure
+            # function of applied blocks at ONE code version, identically on every node at this height.
+            # rollback_one_block holds the exact inverse (row DELETED; re-apply recomputes it identically).
+            _bn = block["block_number"]
+            if _bn % EPOCH_LENGTH == 0:   # ungated since gen 22 — committed from epoch 0
+                from ops.dividend_ops import weights_at_epoch
+                _E = _bn // EPOCH_LENGTH - 1
+                kv_ops.epoch_weights_commit(_E, weights_at_epoch(_E))
+                # REGISTRY SNAPSHOT: this block anchors the NEXT epoch's beacon,
+                # so it also freezes the bonded registry that epoch's draw and committee read — after this block's
+                # own bonds applied (in-txn read). rollback_one_block deletes it; re-apply rewrites the same bytes.
+                # REGISTRY_SNAPSHOT_HEIGHT (gen 28's gate, 1 from gen 29, inlined in G9): `>= 1` stays because block 0
+                # is an epoch boundary too and never wrote regsnap:1 — rollback.py tests the same expression.
+                if _bn >= 1:
+                    kv_ops.regsnap_put(_bn // EPOCH_LENGTH + 1, get_bonded_registry())
 
             totals = get_totals(block=block)  # produced = full reward = total emission
             index_totals(produced=totals["produced"],
@@ -1465,61 +4007,114 @@ class CoreClient(threading.Thread):
         # Advance the tip pointer file only AFTER the atomic state commit. A crash before this
         # just leaves a stale tip that re-syncs forward; block_already_indexed prevents re-apply.
         set_latest_block_info(latest_block=block, logger=self.logger)
+        # the settle-proof depth gate's high-water mark (settle_proof_relaxed): raised here, never lowered by a rollback
+        self._held_hw = max(self._held_high_water(), int(block["block_number"]))
 
-        # ENFORCED FINALITY (#17 step 1): advance the persisted monotonic finalized-height floor. A
-        # block at height H finalizes everything at/below H - finality_depth; rollback_one_block then
-        # REFUSES to cross it. Monotonic (max), recomputable, and crash-conservative: a crash between
-        # the block commit above and this write leaves the floor one behind (never ahead) and it
-        # re-advances on the next block — it can never finalize something that wasn't committed.
+        # ENFORCED FINALITY (#17 step 1, two-floor model since 2026-08-17): advance BOTH persisted floors.
+        # `finalized_height` (depth) keeps its cadence for everything latency-sensitive; `hard_finality`
+        # (FFG quorum + wide backstop) is what rollback refuses to cross. Crash-conservative as before: a
+        # crash between the block commit above and these writes leaves the floors one behind (never
+        # ahead) and they re-advance on the next block.
         # The floor is the DEEPER (higher) of two guarantees: the CORROBORATED time/depth floor
         # (tip - finality_depth, advanced only while the peer-majority tip lies on OUR canonical chain —
         # see _depth_floor_corroborated: a node producing alone on a minority fork must never self-finalize
         # it, which is how a partition wedged a node permanently below its own floor), and the FFG
-        # checkpoint (block E*EPOCH_LENGTH that a >2/3 bonded-stake quorum attested — OBJECTIVE,
-        # accountable, slashable). Folding FFG in makes a stake-finalized checkpoint UN-REORGABLE
-        # (rollback_one_block refuses to cross finalized_height), so remote sync can never adopt a heavier
-        # chain that conflicts with it — the safety FFG was built for, now enforced instead of merely
-        # MEASURED REALITY (do not trust the paragraph above on this point): the FFG term can NEVER win
-        # this max() in any legal configuration. ffg_finalized_checkpoint requires the CHILD checkpoint
-        # block (e+1)*EPOCH_LENGTH to exist, so ffg_final <= tip - EPOCH_LENGTH = tip - 60; memserver
-        # asserts max_rollbacks < finality_depth < EPOCH_LENGTH and lifts finality_depth to at least
-        # FINALITY_DEPTH, so finality_depth in [45, 59] and depth_final = tip - finality_depth >= tip - 59.
-        # Hence ffg_final < depth_final ALWAYS. FFG is therefore OBSERVATIONAL today (still recorded,
-        # attested and slashable, and reported in /status) — the enforced floor is the corroborated depth
-        # floor. The ffg term and its gate below are kept as defence-in-depth so the formula stays correct
-        # if those bounds ever change; they are not load-bearing now. Anyone re-enabling real FFG
-        # enforcement must gate it on an FFG-specific liveness signal, NOT on heaviest_block_hash (which an
-        # attacker can withhold at zero cost).
+        # checkpoint (block E*EPOCH_LENGTH that a >2/3 bonded-seat quorum attested, it AND its child —
+        # OBJECTIVE, accountable, slashable).
+        #
+        # HISTORY: an earlier formula folded ffg into finalized_height itself, where — as its own comment
+        # eventually measured — ffg_final <= tip - 60 < depth_final = tip - [45..59] meant the FFG term
+        # could NEVER win the max() and quorum finality was purely observational. The enforced floor was a
+        # 45-block local observation, and treating THAT as un-crossable is what turned every deeper fork
+        # into a floor-crossing wedge recovery (2026-08-17: eight in one day, two archive truncations).
+        # Now FFG is the un-crossable floor and depth is cadence, which is what each actually is. The old
+        # warning stands and is honoured: FFG enforcement is gated on _depth_floor_corroborated (a real
+        # liveness/partition signal), never on heaviest_block_hash.
+        # TWO-FLOOR ADVANCE (protocol.FINALITY_HARD_BACKSTOP doc). finalized_height keeps its depth cadence
+        # — it feeds the exec layer, pruning, snapshots and status, and its latency must not move — but it
+        # is no longer what rollback refuses to cross. The UN-CROSSABLE floor is hard_finality: the
+        # FFG-finalized checkpoint (>2/3 bonded seats attested it AND its child — reverting it means
+        # slashable equivocation) folded with the wide liveness backstop (tip - FINALITY_HARD_BACKSTOP), so
+        # a stalled committee bounds reorg exposure at an hour instead of unbinding it entirely. The old
+        # formula folded ffg into finalized_height where, as its own comment measured, it could NEVER win
+        # the max() — quorum finality was observational. Now it is the thing rollback enforces.
         depth_final = block["block_number"] - self.memserver.finality_depth
         ffg_final = int(getattr(self.memserver, "ffg_finalized", 0) or 0)
+        # EXTERNAL CORROBORATION CLAMP ON THE BACKSTOP (L1-1, 2026-08-23). _depth_floor_corroborated
+        # passes when the heaviest advertised tip is OUR OWN — always true for the node on the strictly-
+        # heaviest branch, including a lone forker producing alone (observed: .28 alone on its fork for
+        # ~90 blocks during the fleet freeze). Left unchecked, tip - FINALITY_HARD_BACKSTOP eventually
+        # crosses the fork ancestor and hard-locks the fork: un-crossable by definition, and the only
+        # exit from there is the DESTRUCTIVE dead-fork purge (an archive node loses history). The FFG
+        # term needs no clamp — a lone branch can never hold a 2/3-seat quorum — but the backstop is a
+        # pure local clock, so it must not outrun the last height any OTHER node verifiably vouched for
+        # on our chain: a peer advertising a tip that IS a block of ours (their height <= ours and our
+        # index holds their hash) corroborates our prefix up to that height, checked against the LOCAL
+        # index — free, no probes. Sybil-soft in the safe direction: false corroboration merely restores
+        # today's behaviour, while withheld corroboration only slows the backstop (never the FFG floor).
+        # In-memory only — a restart starts at 0 and the term re-arms on the first external match.
+        _ours_n = int(block["block_number"])
+        _ext = int(getattr(self, "_ext_corrob_height", 0) or 0)
+        # NO solo exemption, deliberately: an empty peer pool means NOBODY vouches — a network-isolated
+        # node that kept producing past the backstop would otherwise hard-lock its own branch and, on
+        # heal, could only recover by the destructive purge (the 2026-08-17 archive-truncation class).
+        # A deliberately solo chain merely keeps hard_finality at its FFG value; rollback stays bounded
+        # by the verdict machinery, and the moment ANY peer vouches, the backstop re-arms.
+        try:
+            for _ip, _st in self.consensus.status_pool.copy().items():
+                if not isinstance(_st, dict):
+                    continue
+                _ph, _phash = _st.get("latest_block_height"), _st.get("latest_block_hash")
+                if (isinstance(_ph, int) and 0 < _ph <= _ours_n and _phash and _ph > _ext
+                        and get_block_hash_by_number(_ph) == _phash):
+                    _ext = _ph
+        except Exception:
+            pass                                   # corroboration is an enabler; failing to find it is safe
+        self._ext_corrob_height = _ext
+        backstop_final = min(block["block_number"] - FINALITY_HARD_BACKSTOP, _ext)
         if not self._depth_floor_corroborated():
-            # UNCORROBORATED TIP (minority side of a partition, or solo on a fork): neither floor may
-            # advance. The depth floor was already gated this way; FFG was NOT, and that was a hole. FFG's
-            # justification denominator applies an INACTIVITY LEAK (INACTIVITY_WINDOW = 3 epochs), so on the
-            # minority side of a partition lasting >3 epochs the absent majority validators leak OUT of the
-            # denominator, the minority's own committee becomes >2/3 of the "active" stake, and it
-            # FFG-finalizes its OWN fork. finalized_height is an enforced, un-crossable floor
-            # (rollback_one_block raises FinalityViolation), so on heal that node cannot roll back to rejoin
-            # the canonical chain — a self-inflicted permanent wedge escapable only by the drastic
-            # purge-and-resync dead-fork path. FFG stays fully OBJECTIVE and accountable (the attestations
-            # are still recorded and slashable, and ffg_finalized is still reported in /status); we only
-            # decline to ENFORCE an un-reorgable floor from a chain view the visible network does not
-            # corroborate. (Given ffg_final < depth_final always, zeroing ffg here changes nothing today —
-            # it keeps the two floors consistent rather than leaving one ungated.)
+            # UNCORROBORATED TIP (minority side of a partition, or solo on a fork): NO floor may advance.
+            # FFG's justification denominator applies an INACTIVITY LEAK (INACTIVITY_WINDOW = 3 epochs), so
+            # on the minority side of a partition lasting >3 epochs the absent majority validators leak OUT
+            # of the denominator, the minority's own committee becomes >2/3 of the "active" stake, and it
+            # FFG-finalizes its OWN fork. hard_finality is the enforced, un-crossable floor, so on heal that
+            # node could never roll back to rejoin the canonical chain — a self-inflicted permanent wedge.
+            # The gate matters MORE now that the ffg term is load-bearing, not less.
             depth_final = 0
             ffg_final = 0
-        new_final = max(self.memserver.finalized_height, depth_final, ffg_final)
-        if new_final > self.memserver.finalized_height:
+            backstop_final = 0
+        # READ THE PERSISTED FLOOR, not the memserver mirror: rollback_one_block now legally LOWERS
+        # finalized_height when a reorg crosses the depth floor, and max()ing against a stale high mirror
+        # here would resurrect the old branch's floor one block later, silently re-raising what the
+        # rollback just lowered. The mirror is refreshed below either way.
+        prev_depth = get_finalized_height()
+        new_final = max(prev_depth, depth_final)
+        if new_final > prev_depth:
             set_finalized_height(new_final)
-            self.memserver.finalized_height = new_final
+        self.memserver.finalized_height = new_final
+        prev_hard = get_hard_finality()
+        new_hard = max(prev_hard, ffg_final, backstop_final)
+        if new_hard > prev_hard:
+            set_hard_finality(new_hard)
 
-        # lazy NODE-LOCAL cleanup: idle-GC revert records below finality can never be needed
-        # (rollback refuses to cross the floor). Epoch boundaries only — negligible either way.
+        # lazy NODE-LOCAL cleanup of the rollback journals. Epoch boundaries only — negligible either way.
+        # INVARIANT: a journal is prunable only below HARD finality. Rollback crosses the depth floor
+        # (finalized_height) and stops only at hard_finality (rollback.py, two-floor model); the prunes
+        # here used finalized_height from before that model, so a legal reorg between the floors (86 blocks
+        # measured 2026-10-11) found its idle-GC record gone, restored nothing, and left a different
+        # state root: a wedge only a purge clears. Every journal a revert pops is pruned at the hard floor.
         if block["block_number"] % EPOCH_LENGTH == 0:
             from ops.gc_ops import prune_local_revert_records
-            prune_local_revert_records(self.memserver.finalized_height)
+            prune_local_revert_records(new_hard)
             try:
-                kv_ops.execsum_revert_prune(self.memserver.finalized_height)
+                kv_ops.execsum_revert_prune(new_hard)
+            except Exception:
+                pass
+            try:                                         # one store's trouble must not skip the others
+                kv_ops.undo_prune(new_hard)
+            except Exception:
+                pass
+            try:
                 kv_ops.attest_memo_prune(self.memserver.finalized_height // EPOCH_LENGTH - 2)
             except Exception:
                 pass
@@ -1590,8 +4185,10 @@ class CoreClient(threading.Thread):
             latest = self.memserver.latest_block
             X = epoch_of(latest["block_number"])
             from ops.block_ops import duty_committee_for_epoch
-            if me not in duty_committee_for_epoch(X):
-                return  # no seat this epoch — the committee is resampled from beacon(X+1) next epoch
+            # REVEAL_SEATLESS_HEIGHT (gen 28's gate, 1 from gen 29, inlined in G9; a duty lands at tip + 8 >= 1, so it
+            # always held): without a seat this epoch, a commitment made while seated is still revealed by a
+            # reveal-only duty. INVARIANT: the seatless tx carries no attest/commit section (validation refuses one).
+            seated = me in duty_committee_for_epoch(X)
             if self._reserved_tx_pending("duty", X):
                 return  # our duty tx is already in flight — don't mint a duplicate every loop
             kd = self.memserver.keydict
@@ -1599,12 +4196,36 @@ class CoreClient(threading.Thread):
             # the merged tx lands exactly at max_block; every section's window must admit it.
             reveal_hi = (X + 1) * EPOCH_LENGTH - FINALITY_DEPTH - 1
             epoch_hi = (X + 1) * EPOCH_LENGTH - 1
-            max_block = min(latest["block_number"] + 5, epoch_hi)
-            if max_block <= latest["block_number"]:
+            # PROPAGATION HEADROOM (see RESERVED_TX_MARGIN): tip+5 gave the duty tx ~30s to reach every
+            # producer, and a producer that has it builds a different block than one that does not — this
+            # forked betanet-12 at h12605. Aim further ahead, but never past a deadline a due section
+            # needs: the epoch always, and the RANDAO reveal window when a reveal is actually pending.
+            # The reveal clamp applies ONLY while that deadline is still ahead of us — otherwise a
+            # long-passed reveal_hi would drag max_block below the tip and suppress the whole duty tx
+            # (attest and commit included), which tip+5 never did.
+            _e_reveal = X + 1
+            _secret_due = self.memserver.randao_secrets.get(_e_reveal)
+            _reveal_due = bool(_secret_due and kv_ops.commit_get(me, _e_reveal) is not None
+                               and _secret_due not in kv_ops.reveals_for_epoch(_e_reveal))
+            _hi = epoch_hi
+            if _reveal_due and reveal_hi > latest["block_number"]:
+                _hi = min(epoch_hi, reveal_hi)
+            # WINDOWED DUTY (unconditional since the 81000 activation passed — gate deleted 2026-08-20
+            # per operator directive "delete gates after the blocks are passed"): land anywhere in
+            # [tip+8, deadline] instead of exactly at one height. The exact landing was the last organic
+            # fork class — a producer one gossip-hop ahead included its own duty and split the fleet
+            # (every 2026-08-19 seed). min_block gives the tx a full inclusion delay to reach every
+            # producer; max_block keeps every deadline clamp, so the section semantics (all bound to
+            # max_block) are unchanged. Deleting the gate was SAFE because it steered the BUILDER only:
+            # validation is content-keyed (a duty WITH min_block lands windowed, one without lands
+            # exact), so historical pre-81000 duties replay byte-identically without any constant.
+            min_block = latest["block_number"] + TX_INCLUSION_DELAY
+            max_block = _hi
+            if min_block > max_block:
                 return  # epoch tail — duties resume next epoch
 
             attest = commit = reveal = None
-            if X >= 1 and not kv_ops.attestation_exists(X, me):
+            if seated and X >= 1 and not kv_ops.attestation_exists(X, me):
                 checkpoint_hash = get_block_hash_by_number(X * EPOCH_LENGTH)
                 if checkpoint_hash:
                     # EQUIVOCATION SELF-PROTECTION. target_hash is re-read from the local tip on every
@@ -1631,7 +4252,7 @@ class CoreClient(threading.Thread):
                             kv_ops.attest_memo_put(X, checkpoint_hash)
                         attest = {"target_epoch": X, "target_hash": checkpoint_hash}
             e_commit = X + 2
-            if kv_ops.commit_get(me, e_commit) is None:
+            if seated and kv_ops.commit_get(me, e_commit) is None:
                 secret = self.memserver.randao_secrets.get(e_commit) or _secrets.token_hex(32)
                 self.memserver.randao_secrets[e_commit] = secret
                 commit = {"target_epoch": e_commit, "commitment": beacon_commitment(secret)}
@@ -1656,7 +4277,8 @@ class CoreClient(threading.Thread):
 
             if not (attest or commit or reveal):
                 return  # every duty already on-chain
-            tx = construct_duty_tx(kd, max_block, attest=attest, commit=commit, reveal=reveal)
+            tx = construct_duty_tx(kd, max_block, attest=attest, commit=commit, reveal=reveal,
+                                   min_block=min_block)
             result = self.memserver.merge_transaction(tx, user_origin=True)
             if result and result.get("result"):
                 self.logger.info(f"Epoch duty {X}: attest={bool(attest)} commit={bool(commit)} "
@@ -1664,18 +4286,523 @@ class CoreClient(threading.Thread):
         except Exception as e:
             self.logger.error(f"Epoch duty failed: {e}")
 
+    def _restore_canonical_chain(self, old_index, anchor, source, fresh_bootstrap=False):
+        """Reconcile our retained block bodies against the chain we just adopted, and refill what is
+        canonical and missing. Returns the block that history is now contiguous from (the new earliest).
+
+        Thin executor over ops/canonical_restore.plan — the decision is pure and tested there; this walks
+        its answer against LMDB, the segment store and the donor. Ordering is chosen so an interruption at
+        any point leaves a strictly-better state than before it ran:
+          1. re-put the deep index rows the windowed import dropped (restores get_block_number depth);
+          2. resolve any UNDETERMINED range (fork deeper than the donor's index window) by parent-hash
+             walk from the lowest named block, fetching from the donor as needed;
+          3. fetch the missing canonical bodies within the ROLLBACK WINDOW synchronously — the core loop
+             needs those before it validates another block;
+          4. unreference fork bodies: only a body at a height whose canonical hash we can NAME, and which
+             differs, is ever removed. A body we cannot place is kept — deleting history on the strength
+             of "I can't prove it" is the failure this exists to end;
+          5. on an ARCHIVE node, hand the deep remainder (everything else canonical-and-missing, then the
+             unnamed chain below our lowest index row, walked by parent_hash down to genesis) to a
+             background thread. Tens of thousands of fetches must not stall block production, and the
+             result is the same: the archive comes back whole, or as whole as any donor can make it —
+             and whatever is still missing is re-requested at the next re-anchor, because the plan is
+             recomputed from what is actually on disk every time."""
+        from ops import canonical_restore as CR
+        from ops.block_ops import get_block_number as _gbn
+        archive = bool(getattr(self.memserver, "archive", False))
+        C = int(anchor.get("block_number", 0))
+        new_index = {h: bh for h, bh in kv_ops.block_by_num_items() if h <= C}
+        has_body = lambda bh: kv_ops.block_loc_get(bh) is not None
+        p = CR.plan(old_index, new_index, C, has_body)
+        for n in p.notes:
+            self.logger.warning(f"Canonical restore: {n}")
+        self.logger.warning(f"Canonical restore: anchor {C}, fork point {p.fork_point}, imported index floor "
+                            f"{p.new_floor}; {p.kept} local bodies canonical, {len(p.missing)} missing, "
+                            f"{len(p.reput)} deep index rows to re-put"
+                            + (f", undetermined {p.undetermined}" if p.undetermined else ""))
+
+        # 1. deep index rows
+        if p.reput:
+            n = kv_ops.block_index_put_many(p.reput)
+            self.logger.warning(f"Canonical restore: re-put {n} deep number<->hash rows the import dropped")
+
+        # 2. undetermined range: walk parent_hash down from the lowest NAMED block. Each step names one
+        #    more height; a local body serves the walk, otherwise the donor does. Stops at the first
+        #    height whose hash equals our old index (that IS the fork point — everything below is ours),
+        #    or when neither we nor the donor have the body.
+        #
+        #    FRESH SNAPSHOT BOOTSTRAP HAS NO OLD CHAIN TO RECONCILE. Its pre-import index contains only
+        #    genesis while the checkpoint carries a window near C, so there is deliberately no overlap.
+        #    Treating that as a deep reorg walked parent hashes from the imported index floor toward genesis
+        #    one HTTP request at a time before tail sync could start. Measured 2026-10-12: a fresh rolling
+        #    node sat at the valid h178000 checkpoint for >75 min while the fleet moved 700+ blocks ahead; /status
+        #    still showed earliest=0 and recovery=null because the core thread was trapped right here. A
+        #    rolling joiner needs only the rollback window below C, which step 3 fetches. Established-node
+        #    reanchors still take this walk: they have history to preserve and a fork point to find.
+        canonical = dict(p.canonical)
+        missing = list(p.missing)
+        if p.undetermined and fresh_bootstrap:
+            self.logger.warning(f"Canonical restore: fresh snapshot bootstrap — not walking undetermined "
+                                f"pre-checkpoint range {p.undetermined}; fetching only the rollback window")
+        elif p.undetermined:
+            lo, hi = p.undetermined
+            cur_h = hi + 1
+            cur_hash = canonical.get(cur_h)
+            walked = 0
+            while cur_hash and cur_h > lo:
+                body = get_block(cur_hash) or None
+                if not body:
+                    body = asyncio.run(snapshot_ops.fetch_block(source, self.memserver.port, cur_hash))
+                    if body and body.get("block_hash") == cur_hash:
+                        save_block(body, logger=self.logger)
+                    else:
+                        self.logger.warning(f"Canonical restore: cannot resolve block {cur_h - 1} — neither we "
+                                            f"nor the donor hold block {cur_h}; deeper chain stays as it was")
+                        break
+                ph = body.get("parent_hash")
+                if not ph:
+                    break
+                cur_h -= 1
+                canonical[cur_h] = ph
+                walked += 1
+                if not has_body(ph):
+                    missing.append((cur_h, ph))
+                if old_index.get(cur_h) == ph:
+                    for h, bh in old_index.items():          # the fork point: our own index is authoritative below
+                        if h < cur_h:
+                            canonical[h] = bh
+                            if not has_body(bh):
+                                missing.append((h, bh))
+                    p.fork_point = cur_h
+                    self.logger.warning(f"Canonical restore: fork point {cur_h} found by parent-hash walk after "
+                                        f"{walked} steps; old index adopted below it")
+                    break
+                cur_hash = ph
+            deep = sorted((h, bh) for h, bh in canonical.items() if p.new_floor is not None and h < p.new_floor)
+            if deep:
+                kv_ops.block_index_put_many(deep)
+
+        # 3. the rollback window, synchronously
+        tail_depth = REWARD_WINDOW + 2 * EPOCH_LENGTH + FINALITY_DEPTH
+        missing = sorted(set(missing), reverse=True)
+        near = [(h, bh) for h, bh in missing if h >= C - tail_depth]
+        deep_missing = [(h, bh) for h, bh in missing if h < C - tail_depth]
+        fetched = 0
+        for h, bh in near:
+            body = asyncio.run(snapshot_ops.fetch_block(source, self.memserver.port, bh))
+            if body and body.get("block_hash") == bh:
+                save_block(body, logger=self.logger)
+                fetched += 1
+            else:
+                self.logger.warning(f"Canonical restore: donor {source} lacks block {h} inside the rollback "
+                                    f"window; deeper lookbacks may skip until tail sync")
+                break
+
+        # 4. unreference fork bodies — precisely: a body is removed iff we can NAME the canonical block at
+        #    its height and it is a different one. Anything we cannot place stays.
+        canon_hashes = set(canonical.values())
+        purged = 0
+        for bh in kv_ops.block_loc_hashes():
+            if bh in canon_hashes or bh == anchor.get("block_hash"):
+                continue
+            body = get_block(bh) or None
+            bn = int(body.get("block_number", -1)) if body else -1
+            if bn in canonical:
+                kv_ops.block_loc_del(bh)
+                purged += 1
+        self.logger.warning(f"Canonical restore: {fetched}/{len(near)} rollback-window bodies fetched, "
+                            f"{purged} fork bodies unreferenced, {len(deep_missing)} deep canonical bodies "
+                            f"still missing" + (" — refilling in the background" if archive else
+                                                " (rolling node: below retention, not fetched)"))
+
+        # 5. archive: the deep remainder, in the background
+        floor = CR.contiguous_floor(canonical, has_body, C)
+        lowest_named = min(canonical) if canonical else C
+        if archive:
+            self._start_deep_fill(source, deep_missing, lowest_named, canonical.get(lowest_named))
+        else:
+            self._start_tx_reindex()
+        return _gbn(floor) or anchor
+
+    def _start_deep_fill(self, source, deep_missing, lowest_named, lowest_named_hash):
+        """ARCHIVE: fetch every deep canonical body we can name, then EXTEND the chain downward past our
+        lowest index row by parent_hash — that is how a previously-truncated archive gets heights back that
+        no index we hold can name any more (this box: 0..6999 after today's imports). Every learned
+        (height, hash) is index-put so get_block_number resolves it. Runs in a thread: it is tens of
+        thousands of fetches on a truncated archive and must not stall the core loop. Reports progress via
+        self._deep_fill_progress; the core loop tick commits earliest_block from it. Ends by starting the
+        tx-history reindex, which needs the bodies to exist first."""
+        if getattr(self, "_deep_fill_thread", None) and self._deep_fill_thread.is_alive():
+            self.logger.warning("Canonical restore: a deep fill is already running; the new plan will be "
+                                "picked up at the next re-anchor")
+            return
+        self._deep_fill_progress = {"fetched": 0, "extended": 0, "done": False, "lowest": lowest_named}
+
+        def _run():
+            fetched = failed = 0
+            for h, bh in deep_missing:                                # highest first, as planned
+                try:
+                    body = asyncio.run(snapshot_ops.fetch_block(source, self.memserver.port, bh))
+                except Exception:
+                    body = None
+                if body and body.get("block_hash") == bh:
+                    save_block(body, logger=self.logger)
+                    fetched += 1
+                    self._deep_fill_progress["fetched"] = fetched
+                    if fetched % 1000 == 0:
+                        self.logger.warning(f"Archive refill: {fetched}/{len(deep_missing)} deep bodies fetched "
+                                            f"(at block {h})")
+                else:
+                    failed += 1
+                time.sleep(0.01)
+            # extend below the lowest height any index can name, by parent_hash, to genesis
+            extended = 0
+            cur_h, cur_hash = lowest_named, lowest_named_hash
+            while cur_hash and cur_h > 0:
+                body = get_block(cur_hash) or None
+                if not body:
+                    break                                             # the chain of custody is broken here
+                ph = body.get("parent_hash")
+                if not ph:
+                    break
+                cur_h -= 1
+                if kv_ops.block_loc_get(ph) is None:
+                    try:
+                        nb = asyncio.run(snapshot_ops.fetch_block(source, self.memserver.port, ph))
+                    except Exception:
+                        nb = None
+                    if not nb or nb.get("block_hash") != ph:
+                        self.logger.warning(f"Archive refill: donor {source} lacks block {cur_h}; the archive "
+                                            f"is contiguous from {cur_h + 1} — re-requested at the next re-anchor")
+                        cur_h += 1
+                        break
+                    save_block(nb, logger=self.logger)
+                kv_ops.block_index_put_many([(cur_h, ph)])
+                extended += 1
+                self._deep_fill_progress["extended"] = extended
+                self._deep_fill_progress["lowest"] = cur_h
+                if extended % 1000 == 0:
+                    self.logger.warning(f"Archive refill: extended {extended} blocks below the index floor "
+                                        f"(at block {cur_h})")
+                cur_hash = ph
+                time.sleep(0.01)
+            self._deep_fill_progress["done"] = True
+            self.logger.warning(f"Archive refill finished: {fetched} deep bodies fetched ({failed} unavailable "
+                                f"from {source}), chain extended {extended} blocks down to {cur_h}")
+            self._start_tx_reindex()
+
+        self._deep_fill_thread = threading.Thread(target=_run, name="archive-refill", daemon=True)
+        self._deep_fill_thread.start()
+
+    def _rules_evaluable_at_tip(self) -> bool:
+        """Can this node evaluate every consensus rule at its NEXT block? If not, it must not build one.
+
+        THE SPLIT OF 2026-09-13. The challenger draw scans DEVICE_ATTEST_EK_PROVEN_WINDOW blocks, and two
+        rolling nodes re-anchored from a snapshot were left with a hole inside that window — the restore
+        path skips deep bodies on rolling nodes ("below retention, not fetched"), and retention was never the
+        problem. They kept producing. When an enrolment landed they drew from the blocks they had, wrote a
+        state root nine complete nodes could not reproduce, and then raced ahead unopposed because a minority
+        alone on a fork mines every slot — while the correct majority sat frozen behind their heavier tip.
+
+        A node that cannot evaluate the rule at its tip has no way to know its next block is valid, so it
+        does not produce one. Production stops, weight stops accruing on the bad branch, the majority
+        overtakes, and the ordinary heavier-donor reorg brings the node back — no operator, no purge. The
+        same check starts the repair (_fill_window_gaps), so the condition clears itself.
+
+        Cheap: a positive answer is memoised for the epoch (the draw caches its own scan on success); a
+        negative one is re-asked every RULES_EVAL_RECHECK_S so a finished fill lifts the gate promptly."""
+        from ops.transaction_ops import _proven_challengers, proven_window
+        from protocol import EPOCH_LENGTH
+        # (next_h >= 1, where the proven-challenger draw always applies: gen 25's DEVICE_ATTEST_EK_PROVEN_HEIGHT is deleted)
+        next_h = int(self.memserver.latest_block["block_number"]) + 1
+        epoch = next_h // EPOCH_LENGTH
+        now = time.monotonic()
+        memo = getattr(self, "_rules_eval_memo", None)            # (epoch, ok, checked_at)
+        if memo and memo[0] == epoch and (memo[1] or now - memo[2] < RULES_EVAL_RECHECK_S):
+            return memo[1]
+        try:
+            _proven_challengers(next_h)
+            ok = True
+        except ProofUnavailable as e:
+            ok = False
+            lo, hi = proven_window(next_h)
+            self._rec_fail("cannot evaluate the challenger draw at the tip — not producing until the "
+                           "window is filled", height=next_h, window=[lo, hi], missing=str(e)[:160])
+            if not (memo and memo[0] == epoch):                    # say it once per window, not per pass
+                self.logger.error(f"Not producing: {e}")
+            self._fill_window_gaps(lo, hi)
+        self._rules_eval_memo = (epoch, ok, now)
+        return ok
+
+    def _fill_window_gaps(self, lo: int, hi: int):
+        """Start filling every missing body in [lo, hi) from peers, in the background, once at a time."""
+        t = getattr(self, "_window_fill_thread", None)
+        if t is not None and t.is_alive():
+            return
+        self._window_fill_progress = {"lo": lo, "hi": hi, "fetched": 0, "gaps": 0, "done": False}
+
+        def _run():
+            try:
+                res = self._fill_window_gaps_now(lo, hi)
+                self._window_fill_progress.update(res, done=True)
+                self.logger.warning(f"Window refill [{lo},{hi}): {res['fetched']} bodies fetched across "
+                                    f"{res['gaps']} gap(s), {res['unfilled']} still missing")
+            finally:
+                self._rules_eval_memo = None                       # re-ask the gate on the next pass
+        self._window_fill_thread = threading.Thread(target=_run, name="window-refill", daemon=True)
+        self._window_fill_thread.start()
+
+    def _fill_window_gaps_now(self, lo: int, hi: int) -> dict:
+        """Fill the holes in [lo, hi) by walking parent_hash DOWN from the first block above each hole.
+
+        Why by parent hash and not by number: a hole is exactly where the number->hash index may name
+        nothing, but the block just above it always names its parent. Each fetched body names the next.
+        That is the deep-fill's own technique, applied to a hole in the middle instead of below the floor.
+
+        Synchronous and returns counts, so the launcher above can thread it and a test can call it
+        directly. Every body is fetched by HASH and checked against it before it is saved, so a donor
+        cannot hand us a different block than the one our chain names."""
+        from ops.block_ops import get_block_number as _gbn
+        from ops.peer_ops import seed_peers
+        _me = own_ips() | {getattr(self.memserver, "ip", None), get_config().get("ip")} - {None}
+        donors = [p for p in dict.fromkeys(list(seed_peers()) + list(self.memserver.peers)) if p not in _me]
+        gaps, run_start = [], None
+        for h in range(lo, hi):
+            present = bool(_gbn(h))
+            if not present and run_start is None:
+                run_start = h
+            elif present and run_start is not None:
+                gaps.append((run_start, h - 1)); run_start = None
+        if run_start is not None:
+            gaps.append((run_start, hi - 1))
+        fetched = unfilled = 0
+        for a, b in reversed(gaps):                                   # highest first: the anchor is above
+            above = _gbn(b + 1)
+            if not above or not above.get("parent_hash"):
+                self.logger.warning(f"Window refill: nothing above the hole {a}..{b} to walk down from")
+                unfilled += b - a + 1
+                continue
+            cur_hash = above["parent_hash"]
+            for h in range(b, a - 1, -1):
+                body = get_block(cur_hash) or None
+                if not body:
+                    for src in donors:
+                        try:
+                            nb = asyncio.run(snapshot_ops.fetch_block(src, self.memserver.port, cur_hash))
+                        except Exception:
+                            nb = None
+                        if nb and nb.get("block_hash") == cur_hash:
+                            body = nb
+                            break
+                    if not body:
+                        self.logger.warning(f"Window refill: no peer served block {h} ({cur_hash[:12]}); "
+                                            f"hole {a}..{h} stays until a later pass")
+                        unfilled += h - a + 1
+                        break
+                    save_block(body, logger=self.logger)
+                    fetched += 1
+                    self._window_fill_progress["fetched"] = fetched
+                kv_ops.block_index_put_many([(h, cur_hash)])
+                cur_hash = body.get("parent_hash")
+                if not cur_hash:
+                    break
+                time.sleep(0.01)
+        return {"fetched": fetched, "gaps": len(gaps), "unfilled": unfilled}
+
+    def _maybe_refill_archive(self):
+        """ARCHIVE SELF-REPAIR, without waiting for a re-anchor. If this is an archive node and its history
+        does not reach genesis, find a peer whose does — or reaches deeper than ours — and start the same
+        background deep fill the re-anchor path uses, walking parent_hash down from our earliest block.
+
+        This is how the archive this box lost on 2026-08-17 (0..56734) comes back: rolling peers still hold
+        those bodies until their retention window passes block 0 (~2026-08-20), and after that only another
+        archive would. It cannot be done from outside the process (two writers on the live LMDB), so the
+        node does it itself. Throttled to one attempt per ARCHIVE_REFILL_EVERY seconds while a gap exists,
+        nothing at all otherwise, and never two fills at once."""
+        # STATE THE GATES, ONCE. The first deployment of this method produced no output for two full
+        # throttle windows and there was no way to tell WHICH silent early-return was taken — the exact
+        # "log line instead of a mechanism" failure, inverted: a mechanism with no evidence it runs.
+        eb = self.memserver.earliest_block if isinstance(self.memserver.earliest_block, dict) else None
+        cur = int((eb or {}).get("block_number") or 0)
+        if not getattr(self, "_refill_gates_logged", False):
+            self._refill_gates_logged = True
+            self.logger.warning(f"Archive refill armed: archive={getattr(self.memserver, 'archive', False)} "
+                                f"earliest={cur} peers={len(list(self.memserver.peers))} "
+                                f"interval={ARCHIVE_REFILL_EVERY}s")
+        if not getattr(self.memserver, "archive", False):
+            return
+        if cur <= 0:
+            return
+        if getattr(self, "_deep_fill_thread", None) and self._deep_fill_thread.is_alive():
+            return
+        now = time.time()
+        if now - getattr(self, "_last_refill_try", 0.0) < ARCHIVE_REFILL_EVERY:
+            return
+        try:
+            peers = list(self.memserver.peers)
+            if not peers:
+                # DO NOT consume the throttle slot on "nothing to try": at boot the peer list is empty for
+                # the first seconds, and burning the slot here silently pushed the first real attempt 10
+                # minutes out (observed 2026-08-17 20:45 — the refill logged nothing for its first window).
+                return
+            self._last_refill_try = now
+
+            async def _statuses(ips):
+                return await asyncio.gather(*[get_remote_status(ip, logger=self.logger) for ip in ips],
+                                            return_exceptions=True)
+            raw = asyncio.run(_statuses(peers))
+            cands = []
+            for ip, st in zip(peers, raw):
+                if not isinstance(st, dict) or st.get("chain_id") != CHAIN_ID:
+                    continue
+                try:
+                    pe = int(st.get("earliest_block_height", 10 ** 12))
+                except (TypeError, ValueError):
+                    continue
+                if pe < cur:
+                    cands.append((pe, ip))
+            if not cands:
+                self.logger.info(f"Archive refill: history starts at {cur} and no peer reaches deeper; will retry")
+                return
+            cands.sort()
+            depth, source = cands[0]
+            self.logger.warning(f"Archive refill: history starts at {cur}; peer {source} reaches {depth} — "
+                                f"filling {cur - max(depth, 0)} blocks in the background")
+            self._start_deep_fill(source, [], cur, eb.get("block_hash"))
+        except Exception as e:
+            self.logger.error(f"Archive refill attempt failed: {e}")
+
+    def _maybe_advance_earliest(self):
+        """Core-loop tick: if the background refill has landed deeper bodies, move earliest_block down to
+        the new contiguous floor. block_ends.dat is written by the core thread only, so the fill thread
+        never touches it. Cheap: a few locator lookups per tick, nothing when no fill is running."""
+        prog = getattr(self, "_deep_fill_progress", None)
+        if not prog:
+            return
+        try:
+            cur = int((self.memserver.earliest_block or {}).get("block_number") or 0) \
+                if isinstance(self.memserver.earliest_block, dict) else 0
+            if cur <= 0:
+                if prog.get("done"):
+                    self._deep_fill_progress = None
+                return
+            from ops.block_ops import get_block_number as _gbn
+            h = cur
+            # walk down through what is now present, contiguously
+            while h > 0:
+                nh = kv_ops.hash_by_number(h - 1)
+                if not nh or kv_ops.block_loc_get(nh) is None:
+                    break
+                h -= 1
+            if h < cur:
+                blk = _gbn(h)
+                if blk:
+                    set_earliest_block_info(earliest_block=blk, logger=self.logger)
+                    self.memserver.earliest_block = blk
+                    self.logger.warning(f"Archive refill: history now contiguous from block {h} (was {cur})")
+            if prog.get("done"):
+                self._deep_fill_progress = None
+        except Exception as e:
+            self.logger.error(f"advance-earliest failed: {e}")
+
+    def _start_tx_reindex(self):
+        """Rebuild the tx-history index from the canonical bodies on disk, in a background thread,
+        resumably. adopt_new_identity wipes tx history because rows for FORK blocks would make the
+        at-most-once replay gate reject a legitimate tx that was in both a fork block and its canonical
+        replacement — but rows for canonical blocks are correct, and they are what
+        /get_transactions_of_account (the thing a user's "where is my money" is answered from) reads.
+        Idempotent (tx_index_put is insert-or-ignore) and bounded per step; a marker file makes it resume
+        after a restart. Recipient is resolved against the CURRENT alias table, as incorporate does."""
+        import json as _json
+        from ops.data_ops import get_home
+        from ops.block_ops import get_block_number as _gbn
+        marker = f"{get_home()}/index/tx_reindex.json"
+        if getattr(self, "_tx_reindex_thread", None) and self._tx_reindex_thread.is_alive():
+            return
+        try:
+            start = int(_json.load(open(marker)).get("next", 0))
+        except Exception:
+            start = 0
+        top = int(get_finalized_height() or 0)
+
+        def _run():
+            from ops import alias_ops
+            h = start
+            done = 0
+            # ONE COMMIT PER BATCH, THEN YIELD. The walk used to commit per transaction row — one fsync each
+            # (the env opens sync=True), tens of thousands back to back. While the walk runs
+            # _tx_index_incomplete() is true, so the node builds nothing and defers every block: the walk's
+            # length IS the node's blind window, and 185.100.232.5 spent ~15 min in it after the d9af6549
+            # restart. The core loop also needs the same single LMDB writer lock every pass and the lock is not
+            # fair, so the sleep after each batch is what lets it take the lock. The marker is checkpointed
+            # AFTER the batch commits, so a restart loses at most one batch and never skips a row.
+            while h <= top and not getattr(self, "_stop_reindex", False):
+                rows = []
+                stop_h = min(h + TX_REINDEX_BATCH, top + 1)
+                while h < stop_h:
+                    blk = _gbn(h)
+                    if blk:
+                        for tx in blk.get("block_transactions") or []:
+                            try:
+                                recip = alias_ops.resolve_alias(tx["recipient"]) or tx["recipient"]
+                                rows.append((tx["txid"], h, tx["sender"], recip))
+                            except Exception:
+                                pass
+                    h += 1
+                    done += 1
+                if rows:
+                    try:
+                        kv_ops.tx_index_put_many(rows)
+                    except Exception as e:
+                        self.logger.warning(f"tx-history reindex: batch ending at {h - 1} failed ({e}); continuing")
+                try:
+                    _json.dump({"next": h}, open(marker, "w"))
+                except Exception:
+                    pass
+                time.sleep(0.02)          # release the writer lock long enough for the core loop to take it
+            try:
+                import os as _os
+                if h > top:
+                    if _os.path.exists(marker):
+                        _os.remove(marker)
+                else:
+                    _json.dump({"next": h}, open(marker, "w"))
+            except Exception:
+                pass
+            self.logger.warning(f"tx-history reindex: {done} blocks indexed ({start}..{h - 1})")
+
+        self._tx_reindex_thread = threading.Thread(target=_run, name="tx-reindex", daemon=True)
+        self._tx_reindex_thread.start()
+
     def maybe_prune_history(self):
         """ROLLING MODE (non-consensus, opt-in): on a pruned node (memserver.archive == False), delete
-        block BODIES finalized below the retention window. STATE + the number<->hash indexes are kept,
-        so the node keeps validating and serving the beacon/FFG lookbacks. Archive nodes (default) skip
-        this entirely. Best-effort + incremental (a meta watermark bounds per-call work); never raises
+        block BODIES and TX-HISTORY rows finalized below their retention windows. STATE + the
+        number<->hash indexes are kept,
+        so the node keeps validating and serving the beacon/FFG lookbacks. Rolling is now the DEFAULT
+        (config.py "archive": False); ARCHIVE nodes skip this entirely. Best-effort + incremental (a meta watermark bounds per-call work); never raises
         into the core loop. See doc/rolling-mode-and-da.md and block_ops.prune_block_bodies."""
-        if getattr(self.memserver, "archive", True):
+        if getattr(self.memserver, "archive", False):     # default matches config.py / memserver
             return
         try:
             finalized = get_finalized_height()
             retention = getattr(self.memserver, "history_retention_blocks", 0)
             prune_block_bodies(finalized, retention, self.logger)
+            # TX HISTORY, the other half of rolling mode. Bodies plateau once pruned, but the tx index
+            # never did — at 20 tx/block it is ~97% of a ten-year footprint. Its own retention knob
+            # (tx_history_retention_blocks) is floored in prune_tx_history_window so a small setting
+            # cannot open a replay hole. 0 keeps the floor; archive nodes never reach this code.
+            prune_tx_history_window(
+                finalized, getattr(self.memserver, "tx_history_retention_blocks", 0), self.logger)
+            # THE NUMBER<->HASH INDEX, the last store that grew forever in every mode (144 B/block,
+            # ~7 GiB/decade — the dominant term once bodies and tx history are pruned). Its depth is a
+            # PROTOCOL rule, not this node's choice: the snapshot payload carries [C-N, C] by the same
+            # constants, so rows below the window are outside the snapshot identity and dropping them here
+            # cannot move snapshot_hash. Archive nodes never reach this code and keep the full index.
+            from protocol import INDEX_RETENTION_NUM, INDEX_RETENTION_HASH
+            dropped = kv_ops.prune_index_window(finalized, INDEX_RETENTION_NUM, INDEX_RETENTION_HASH)
+            if dropped["num"] or dropped["hash"]:
+                self.logger.info(f"Index prune: dropped {dropped['num']} height->hash and "
+                                 f"{dropped['hash']} hash->height rows below the retention window")
         except Exception as e:
             self.logger.error(f"Rolling-mode prune failed: {e}")
 
@@ -1684,11 +4811,24 @@ class CoreClient(threading.Thread):
         that percentage of this node's NEWLY-MINED spendable earnings straight into bonded stake — fully
         unattended auto-compounding of the bonded lane. Best-effort; never raises into the core loop.
 
-        Earnings = the increase in our own spendable balance since the last accounted-for baseline. We
-        throttle to at most one auto-bond per epoch (a bond isn't per-block unique-keyed, so we self-
+        EARNINGS ARE MINED COINS, NOT INCOMING COINS. This measured the rise in our spendable BALANCE,
+        which is not the same thing and silently swept up every other credit the account received: a
+        transfer someone sent us, a faucet payout, a bridge deposit — and, worst of all, a matured
+        `withdraw`, i.e. the coins the operator had just deliberately taken OUT of savings. Unbond half
+        your stake and 24h later the withdraw lands, reads as a balance gain, and 99% of it goes straight
+        back into savings behind another 24h timelock. The operator's own instruction to leave the lane
+        was undone by the compounder, once per unbond, forever.
+
+        `produced` is the consensus counter of what this address actually MINED (open + bonded block
+        rewards; increase_produced_count is revert-symmetric, so it tracks reorgs). It moves only when we
+        win a slot, which is exactly the "newly-mined earnings" this feature claims to compound. Received
+        coins do not touch it, so they can no longer be locked up by a background loop that was never
+        asked to touch them.
+
+        We throttle to at most one auto-bond per epoch (a bond isn't per-block unique-keyed, so we self-
         limit to avoid spamming the mempool), accumulate below the AUTO_BOND_MIN_RAW dust floor instead
-        of emitting fee-dominated dust txs, and STOP once bonded >= BOND_CAP (extra bond buys no weight,
-        so locking more would just freeze coins for nothing)."""
+        of emitting fee-dominated dust txs. There is no upper stop: bonded weight is linear in stake
+        (the per-identity cap was removed 2026-08-25), so every mined coin bonded is weight."""
         pct = getattr(self.memserver, "auto_bond_percent", 0)
         if not pct or pct <= 0:
             return
@@ -1698,32 +4838,51 @@ class CoreClient(threading.Thread):
                 return                                  # already auto-bonded this epoch
             acc = get_account(self.memserver.address)
             balance = int(acc.get("balance", 0)) if acc else 0
-            bonded = int(acc.get("bonded", 0)) if acc else 0
+            mined = int(acc.get("produced", 0)) if acc else 0
             if self.auto_bond_baseline is None:
-                self.auto_bond_baseline = balance       # first observation: only FUTURE earnings bond
+                self.auto_bond_baseline = mined         # first observation: only FUTURE mining bonds
                 return
-            if bonded >= BOND_CAP:
-                self.auto_bond_baseline = balance       # already at the weight cap — nothing to gain
-                return
-            gain = balance - self.auto_bond_baseline
+            mined_gain = mined - self.auto_bond_baseline
+            if mined_gain < 0:
+                self.auto_bond_baseline = mined         # a reorg took some back
+                mined_gain = 0
+            # EARNINGS = MINED + DIVIDEND CLAIMED. Two counters because they are denominated differently: the
+            # mined side is a delta of the chain's `produced`, the dividend side a tally of claims we
+            # submitted (a dividend credits `balance` and never moves `produced` — see __init__).
+            gain = mined_gain + self.auto_bond_dividend
             if gain <= 0:
-                self.auto_bond_baseline = balance       # balance fell (a prior bond/send landed) — rebaseline
-                return
+                return                                  # nothing earned since
             to_bond = (gain * int(pct)) // 100
-            # never bond past the cap (no extra weight), and never bond what we can't pay the fee for
-            to_bond = min(to_bond, BOND_CAP - bonded)
+            # never bond what we can't pay the fee for
             if to_bond < AUTO_BOND_MIN_RAW or balance < to_bond + MIN_TX_FEE:
                 return                                  # accrue (don't rebaseline) until it's worth a tx
-            max_block = self.memserver.latest_block["block_number"] + 2
+            # LIQUIDITY RESERVE, not the half-ceiling (see the module note): bonding is not an outflow,
+            # but a node still has to be able to pay fees afterwards — collect_dividend, a treasury
+            # vote — and bonded coins are behind a 24h timelock. Never bond the node broke.
+            if balance - (to_bond + MIN_TX_FEE) < AUTO_COLLECT_MIN_RAW:
+                to_bond = balance - MIN_TX_FEE - AUTO_COLLECT_MIN_RAW      # bond what we can, keep the reserve
+                if to_bond < AUTO_BOND_MIN_RAW:
+                    return
+            # tip+2 gave this tx ~12s to reach every producer before its landing block was built. Blocks are
+            # deterministic, so producers that had not seen it yet assembled a DIFFERENT block — an auto-bond
+            # minted right after a node restart forked betanet-12 at h12506. See RESERVED_TX_MARGIN.
+            max_block = self.memserver.latest_block["block_number"] + RESERVED_TX_MARGIN
             tx = construct_bond_tx(self.memserver.keydict, to_bond, MIN_TX_FEE, max_block)
             self.memserver.merge_transaction(tx, user_origin=True)
             self.last_auto_bond_epoch = epoch
-            # account for the gain now; the bond+fee will reduce balance in a later block (negative
-            # delta, harmlessly rebaselined). Optimistic baseline = expected post-bond spendable.
-            self.auto_bond_baseline = balance - to_bond - MIN_TX_FEE
+            # Consume only the slice of the mined gain this bond actually covers. When nothing clamped,
+            # that is the whole gain; when the cap or the liquidity reserve cut `to_bond` down, the
+            # remainder stays claimable on a later pass instead of being written off. The baseline can
+            # only ever move FORWARD over mined coins, so a received or withdrawn credit never enters it.
+            # SPEND THE DIVIDEND TALLY FIRST, the mined baseline with what is left: the baseline may only
+            # ever move forward over coins `produced` actually counted, so a dividend must never enter it.
+            covered = min(gain, (to_bond * 100) // int(pct))
+            from_div = min(covered, self.auto_bond_dividend)
+            self.auto_bond_dividend -= from_div
+            self.auto_bond_baseline += (covered - from_div)
             self.logger.info(
-                f"Auto-bond: bonding {to_bond} raw ({pct}% of {gain} new earnings) into the bonded lane "
-                f"(max_block {max_block})")
+                f"Auto-bond: bonding {to_bond} raw ({pct}% of {gain} newly EARNED: {mined_gain} mined + "
+                f"{from_div + self.auto_bond_dividend} dividend) into the bonded lane (max_block {max_block})")
         except Exception as e:
             self.logger.warning(f"Auto-bond skipped: {e}")
 
@@ -1735,7 +4894,7 @@ class CoreClient(threading.Thread):
         import urllib.request as _rq
         try:
             port = int(_os.environ.get("NADO_EXEC_PORT", "9273"))
-            with _rq.urlopen(f"http://127.0.0.1:{port}{path}", timeout=3) as r:
+            with _rq.urlopen(f"http://127.0.0.1:{port}{path}", timeout=3) as r:  # nosec B310 # literal http:// to a peer/loopback host; redirects guarded process-wide (ops/outbound_guard.py)
                 return _json.loads(r.read(1_000_000))
         except Exception:
             return None
@@ -1781,7 +4940,6 @@ class CoreClient(threading.Thread):
             # letting a bare ok=true imply they passed.
             acct = self._exec_get("/exec/accounting")
             exec_state = self._ExecView(acct) if acct else None
-            self.memserver.exec_state_view = exec_state
             ok, results = invariants.check_all(kv_ops.iter_accounts, kv_ops.totals_get(),
                                                get_account, exec_state)
             self.memserver.invariant_report = {"height": height, "ok": ok, "checks": results}
@@ -1809,6 +4967,13 @@ class CoreClient(threading.Thread):
         member with leftover accrual still gets swept. Best-effort; never raises into the core loop."""
         if not getattr(self.memserver, "auto_collect_dividend", True):
             return
+        # NEVER while our consensus view is suspect: the min_block propagation guard below is computed
+        # from OUR tip, and in emergency/recovery that tip is stale — min_block = stale_tip + 8 can
+        # already be in the past network-wide, which is zero protection. A collect blob emitted mid
+        # catch-up seeded fork h67088 (fork_diffs.jsonl #6, 2026-08-18) exactly this way. The sweep is
+        # discretionary; it can always wait for the next healthy epoch.
+        if self.memserver.emergency_mode:
+            return
         try:
             epoch = epoch_of(self.memserver.latest_block["block_number"])
             if self.last_auto_collect_epoch == epoch:
@@ -1831,11 +4996,26 @@ class CoreClient(threading.Thread):
                     if not pr or not settled_root or pr.get("state_root") != settled_root:
                         continue                        # proof must be against the SETTLED root; retry next epoch
                     tx = construct_dividend_withdraw_tx(
-                        self.memserver.keydict, int(w["amount"]), str(w["nonce"]), pr["proof"], max_block)
-                    self.memserver.merge_transaction(tx, user_origin=True)
+                        self.memserver.keydict, int(w["amount"]), str(w["nonce"]), pr["proof"], max_block,
+                        min_block=self.memserver.latest_block["block_number"] + FLEX_TX_MIN_MARGIN)
+                    _r = self.memserver.merge_transaction(tx, user_origin=True)
+                    if isinstance(_r, dict) and _r.get("result"):
+                        # the claim is what credits `balance`, so this is where auto-bond learns these coins
+                        # are EARNINGS; a claim that never lands is caught by its balance guard and re-accrues
+                        self.auto_bond_dividend += int(w["amount"])
                     self.logger.info(
                         f"Auto-collect: claimed settled dividend withdrawal of {w['amount']} raw "
                         f"(nonce {w['nonce']}, max_block {max_block})")
+            # (1b) CLAIM the Stwo spend relay's fees (ops/stwo_relay.py): every relayed spend pays this node by an
+            # unshield exit to its address, which only an `unshield` claim against the SETTLED root brings to L1.
+            # Without this the relay pays MIN_TX_FEE per spend and never recovers it. Fee-exempt, so always worth
+            # sending; capped per pass so a busy relay's backlog drains over epochs instead of flooding one block.
+            # ITS OWN try: a relay-claim failure (an exec view in an odd shape, a KV read) must never cost the node its
+            # dividend sweep below — the shared try used to skip the sweep on any error here (suite, 2026-10-12)
+            try:
+                self._claim_relay_unshields()
+            except Exception as e:
+                self.logger.info(f"Auto-collect: relay-fee claims skipped: {e}")
             # (2) SWEEP the accrued balance once it dwarfs the fee; below the floor it keeps accruing fee-free.
             accrued = int(d.get("accrued", 0))
             if accrued < AUTO_COLLECT_MIN_RAW:
@@ -1846,49 +5026,124 @@ class CoreClient(threading.Thread):
             _tip = self.memserver.latest_block["block_number"]
             tx = construct_blob_tx(self.memserver.keydict, {"op": "collect_dividend"},
                                    _tip + TX_TARGET_MARGIN, MIN_TX_FEE,
-                                   min_block=_tip + TX_INCLUSION_DELAY)
+                                   min_block=_tip + FLEX_TX_MIN_MARGIN)
             self.memserver.merge_transaction(tx, user_origin=True)
             self.logger.info(
                 f"Auto-collect: swept presence dividend of {accrued} raw (fee {MIN_TX_FEE}, "
-                f"window [{_tip + TX_INCLUSION_DELAY}, {_tip + TX_TARGET_MARGIN}])")
+                f"window [{_tip + FLEX_TX_MIN_MARGIN}, {_tip + TX_TARGET_MARGIN}])")
         except Exception as e:
             self.logger.info(f"Auto-collect skipped: {e}")
 
-    def maybe_auto_register(self):
-        """AUTO-REGISTER (opt-in, default off, memserver.auto_register): keep this node present in the OPEN lane
-        hands-free — register when absent, and renew the PoSW lease inside its tail. OFF by default so a headless
-        node doesn't silently join (and Sybil-load) the open lane; ON = 'mine the free lane from this box too'.
-        Computes the ~2 s sequential PoSW inline, throttled to at most once per epoch. Best-effort."""
-        if not getattr(self.memserver, "auto_register", False):
+    _RELAY_CLAIMS_PER_PASS = 8
+
+    def _claim_relay_unshields(self):
+        """Claim up to _RELAY_CLAIMS_PER_PASS of this node's settled unshield exits (the Stwo relay's fees). Called
+        from maybe_auto_collect, inside its emergency-mode guard and its try. An exit whose proof is not against the
+        settled root waits for a later epoch, exactly as the dividend claims above."""
+        u = self._exec_get(f"/exec/unshields?addr={self.memserver.address}")
+        # ONLY EXITS L1 HAS NOT RELEASED (loopback walk 2026-10-12): the exec node lists every exit it ever recorded — it
+        # never learns that L1 claimed one — so taking the first 8 as-is re-sent eight refused claims forever once the
+        # first eight were claimed, and the relay never recovered another fee. L1's own record decides: the burned
+        # (addr, nonce) unshield nullifier the claim's validation checks (kv_ops.shield_nullifier_exists).
+        me = self.memserver.address
+        pending = [w for w in ((u or {}).get("unshields") or [])
+                   if not kv_ops.shield_nullifier_exists(me, str(w.get("nonce")))]
+        if not pending:
+            return 0
+        from ops.settlement_ops import latest_settled
+        _cur, settled_root = latest_settled()
+        if not settled_root:
+            return 0
+        tip = self.memserver.latest_block["block_number"]
+        sent = 0
+        for w in pending[:self._RELAY_CLAIMS_PER_PASS]:
+            pr = self._exec_get(f"/exec/unshield_proof?nonce={w['nonce']}&root={settled_root}")
+            if not pr or not pr.get("proof") or pr.get("addr") != self.memserver.address:
+                continue
+            # EXACT landing (unshield is not flexible): TX_INCLUSION_DELAY ahead, so it has gossiped to every
+            # producer before its one block — the wallet's claimUnshields lands at tip + 8 the same way
+            tx = construct_unshield_tx(self.memserver.keydict, int(pr["amount"]), str(pr["nonce"]), pr["proof"],
+                                       tip + TX_INCLUSION_DELAY)
+            if self.memserver.merge_transaction(tx, user_origin=True).get("result"):
+                sent += 1
+        if sent:
+            self.logger.info(f"Auto-collect: claimed {sent} settled relay-fee unshield exit(s)")
+        return sent
+
+    def maybe_auto_vote(self):
+        """AUTO-VOTE 'yes' on open treasury proposals paying a WHITELISTED recipient (memserver.auto_vote,
+        allow-list memserver.auto_vote_allow, default ["faucet"]). Throttled to once per epoch.
+
+        WHY THE NODE AND NOT JUST THE WALLET: treasury quorum is counted in BONDED SHARES. The browser
+        wallet has auto-voted since the feature shipped, but measured on betanet-2, 108 of 117 open miners
+        hold ZERO shares — their votes count for nothing — while all 42 shares sit with 9 bonded node
+        operators whose software never voted at all. Quorum is 28 of 42, so it was unreachable by
+        construction: the treasury accumulated 109 NADO and paid out nothing, ever, because the only
+        parties with weight had no way to say yes. Whitelisting is meaningless unless that side votes.
+
+        SAFETY IS THE WHITELIST, NOT THE FLAG. A listed recipient is the only thing this will ever approve,
+        and the shipped default is the reserved `faucet` escrow — keyless and impossible to redirect — so
+        the default behaviour cannot move treasury funds to any individual's address. A vote carries a
+        small anti-spam fee, so this refuses to guess: it votes only on proposals it can see it has NOT
+        already voted on, mirroring the wallet's `voted` rule (which is 'has cast a vote, yes OR no', so a
+        deliberate `no` is never flipped to yes)."""
+        if not getattr(self.memserver, "auto_vote", False):
             return
+        allow = [a for a in (getattr(self.memserver, "auto_vote_allow", None) or [])]
+        if not allow:
+            return                                   # an empty list means "approve anything" — never here
         try:
-            from protocol import POSW_S, POSW_K, POSW_ANCHOR_OFFSET, POSW_LEASE_EPOCHS
+            from ops import kv_ops
+            from ops.transaction_ops import construct_treasury_vote_tx
+            from ops.account_ops import get_bonded_registry
             epoch = epoch_of(self.memserver.latest_block["block_number"])
-            if self.last_auto_register_epoch == epoch:
+            if getattr(self, "last_auto_vote_epoch", None) == epoch:
                 return
-            acc = get_account(self.memserver.address)
-            if acc and int(acc.get("registered", 0)) == 1:
-                reg_ep = int(acc.get("reg_epoch", -1))
-                if reg_ep >= 0 and epoch < reg_ep + POSW_LEASE_EPOCHS - 10:   # still well inside the lease
-                    self.last_auto_register_epoch = epoch
-                    return
-            from ops import posw
-            from ops.block_ops import get_block_hash_by_number
-            from ops.reg_difficulty import mint_multiplier
-            from protocol import POSW_T
-            max_block = self.memserver.latest_block["block_number"] + 4
-            anchor = get_block_hash_by_number(max(0, max_block - POSW_ANCHOR_OFFSET))
-            if not anchor:
+            self.last_auto_vote_epoch = epoch
+            me = self.memserver.address
+            if me not in get_bonded_registry():       # no shares -> our vote carries no weight; skip the fee
                 return
-            # strict v2 requirement — the one and only difficulty mode
-            req_t = POSW_T * mint_multiplier(self.memserver.latest_block["block_number"], max_block)
-            proof = posw.prove(posw.challenge_bytes(self.memserver.address, anchor), T=req_t, S=POSW_S, k=POSW_K)
-            tx = construct_register_tx(self.memserver.keydict, max_block, proof)
-            self.memserver.merge_transaction(tx, user_origin=True)
-            self.last_auto_register_epoch = epoch
-            self.logger.info(f"Auto-register: (re)joined the open lane (max_block {max_block}, PoSW T={req_t})")
+            # NEVER SPEND MORE THAN THE NODE CAN AFFORD. A treasury vote carries MIN_TX_FEE, and this is the
+            # only automated path that pays a fee without a value it is unlocking to compare against
+            # (auto_bond and auto_collect each guard on AUTO_MIN_FEE_MULTIPLE x their own fee). Governance
+            # participation has no per-tx payout, so the guard is the same dust floor applied to the
+            # BALANCE: a node whose spendable balance is not worth many thousands of fees has no business
+            # burning them on votes. Today every voter is far above this; it matters the day one is not.
+            _bal = int((get_account(me) or {}).get("balance", 0))
+            if _bal < AUTO_COLLECT_MIN_RAW or not auto_spend_allowed(_bal, MIN_TX_FEE):
+                return
+            # And bound a single pass: a burst of proposals must not drain a node in one epoch. Whatever is
+            # left is picked up next epoch — votes are only refused, never lost.
+            _budget = max(1, _bal // (MIN_TX_FEE * AUTO_MIN_FEE_MULTIPLE))
+            _cast = 0
+            h = self.memserver.latest_block["block_number"]
+            for pid, spend in kv_ops.treasury_proposals_all():
+                expiry = int(spend.get("expiry", 0))
+                if h > expiry or kv_ops.treasury_executed_exists(pid):
+                    continue                          # expired or already paid
+                if str(spend.get("recipient", "")).lower() not in allow:
+                    continue                          # not whitelisted -> a human decides
+                if any(v.lower() == me.lower() for v in kv_ops.treasury_voters(pid)):
+                    continue                          # already voted (yes OR no) -> never re-cast
+                tx = construct_treasury_vote_tx(self.memserver.keydict, spend.get("recipient"),
+                                                int(spend.get("amount", 0)), spend.get("memo", ""),
+                                                spend.get("nonce"), h + RESERVED_TX_MARGIN,
+                                                expiry, choice="yes")
+                self.memserver.merge_transaction(tx, user_origin=True)
+                self.logger.info(f"Auto-vote: YES on {pid[:12]}… → {spend.get('recipient')} "
+                                 f"({int(spend.get('amount', 0)) / 1e10:.4f} NADO, whitelisted)")
+                _cast += 1
+                if _cast >= _budget:
+                    self.logger.info(f"Auto-vote: fee budget reached ({_cast} this epoch); the rest wait "
+                                     f"for the next one")
+                    break
         except Exception as e:
-            self.logger.info(f"Auto-register skipped: {e}")
+            self.logger.info(f"Auto-vote skipped: {e}")
+
+    def maybe_auto_register(self):
+        """RETIRED at gen 25: a headless node cannot attest a device, and the open lane is for attested devices
+        (doc/device-attestation.md). A node earns in the bonded lane. Kept as a no-op so the loop shape is unchanged."""
+        return
 
     def validate_transactions_in_block(self, block, logger, remote_peer, remote):
         """CONSENSUS validation of the block's tx set against PARENT state at the block's own height:
@@ -1926,6 +5181,20 @@ class CoreClient(threading.Thread):
             seen_txids.add(txid)
             if kv_ops.tx_get(txid) is not None:
                 already_mined.append(t)
+        if remote and self._tx_index_incomplete():
+            # NOT VALID, NOT INVALID — NOT YET. With the index rebuilding, "not mined" is not knowledge and
+            # "mined" may be a stale row: this node cannot judge at-most-once at all. Defer the block (the
+            # caller retries later, nobody is struck) rather than answer blind — answering blind is how
+            # 13 replays reached the canonical chain on gen 25 (its TX_AT_MOST_ONCE_STRICT_HEIGHT history).
+            raise ProofUnavailable("tx index is rebuilding — cannot judge at-most-once yet")
+        if already_mined and remote:
+            # RESIDUE IS NOT A REPLAY (2026-09-13). "Already mined" can mean a row left behind by a branch
+            # we no longer hold — see _purge_index_residue. Drop rows whose block is not on our chain, re-ask.
+            self._purge_index_residue([t.get("txid") for t in already_mined])
+            already_mined = [t for t in already_mined if kv_ops.tx_get(t.get("txid")) is not None]
+        # AT-MOST-ONCE IS STRICT AT EVERY HEIGHT. Gen 25 tolerated the replays its fleet had applied below
+        # TX_AT_MOST_ONCE_STRICT_HEIGHT; that gate was 1 from gen 26 and is deleted with the tolerance, which could
+        # only ever apply to block 0 — and a remote block is rebuilt at our tip + 1 (rebuild_block), never 0.
         if already_mined:
             if remote:
                 self.logger.error(f"Block {block['block_number']} replays {len(already_mined)} already-mined tx(s)")
@@ -1945,6 +5214,13 @@ class CoreClient(threading.Thread):
             assert_block_blob_cap(transactions)
         except Exception as e:
             self.logger.error(f"Block exceeds per-block blob cap: {e}")
+            raise
+        # BLOCK-WIDE BUDGET (from block 1): the bound the assembler applies (cap_block_budget), enforced on
+        # EVERY block validated — a limit checked only when building is no limit (aleo snarkVM#3443).
+        try:
+            assert_block_budget(transactions, block["block_number"])
+        except Exception as e:
+            self.logger.error(f"Block exceeds the per-block budget: {e}")
             raise
 
         try:
@@ -1977,9 +5253,46 @@ class CoreClient(threading.Thread):
                     # epoch_of(N) matches how apply_register records it (index_transactions applies
                     # with block["block_number"]); account STATE for spending/producer checks is
                     # still parent state (this block is not yet incorporated).
+                    # DEEP = this block is already buried under FINALITY_DEPTH of chain we KNOW exists
+                    # (learned from a sync batch's tail — see _fetch_sync_batch). Only the expensive
+                    # settle-proof verification consults it; every structural check runs regardless.
+                    # Our OWN candidate block is never deep: `remote` is False there and we are at the tip.
+                    # The mesh tip is whichever is freshest: the sync batch's tail OR the status pool's best
+                    # advertised height. 2026-08-29: blocks adopted through the inline tip swap never set
+                    # _known_tip_height, so a node 240 blocks behind verified EVERY settle proof in full
+                    # (5-18 min each, one per ~6 min of chain) and could never catch up — the depth gate
+                    # written for exactly that case was dead on that path.
+                    # UPPER MEDIAN of the advertised heights, not the max: the depth gate RELAXES
+                    # verification, so its input must not be one peer's claim. With max(), a single
+                    # admitted status advertising a tall-but-plausible height (the plausibility gate
+                    # allows ~2x wallclock) made every remote block "deep" on every node at once, and
+                    # SETTLE_PROOF_DEPTH_GATED then skipped the STARK check fleet-wide. The median needs
+                    # a majority of the pool to lie; honest peers sit within a few blocks of each other,
+                    # so a node catching up still sees the mesh tip. A lone peer is still its own median.
+                    # NEVER FOR A HEIGHT THIS NODE ALREADY HELD (settle_proof_relaxed): a block at or below the
+                    # high-water mark replaces chain this node judged itself, so it arrives by a reorg and is verified
+                    # in full — the relaxation is for catch-up only.
+                    _best_peer = self._mesh_height_median()
+                    _deep = bool(remote) and settle_proof_relaxed(
+                        settle_depth_reference(getattr(self, "_known_tip_height", 0), _best_peer,
+                                               int(block["block_number"])),
+                        int(block["block_number"]), self._held_high_water())
                     validate_transaction(transaction=transaction,
                                          logger=logger,
-                                         block_height=block["block_number"])
+                                         block_height=block["block_number"],
+                                         deep=_deep)
+                except ProofUnavailable:
+                    # THE THIRD OUTCOME: not valid, not invalid — NOT YET. A DA-published settle proof we do
+                    # not hold says nothing about whether this block is good, so we must neither accept it
+                    # nor reject it, and above all must not punish the peer that sent it. Propagate so the
+                    # whole block is deferred and retried on a later pass, by which time the shards will
+                    # normally have spread (da_fetch pulls k+1 from across the network).
+                    #
+                    # Every node applies this identically, so deferral cannot fork the fleet — a DA outage
+                    # costs liveness, never safety. And the wait is bounded: past FINALITY_DEPTH the depth
+                    # gate stops consulting the proof at all, so a proof that never arrives degrades to the
+                    # accumulated-weight path instead of stalling this node forever.
+                    raise
                 except Exception as e:
                     self.logger.error(f"Failed to validate transaction during block preparation: {e}")
                     if remote:
@@ -2007,13 +5320,9 @@ class CoreClient(threading.Thread):
         chain; once bond txs land, the rollback/snapshot re-verify path must reset the tip to the
         block's parent before calling this (else it would read post-apply state)."""
         block_number = block["block_number"]
-        epoch = epoch_of(block_number)
-        # RANDAO gate (consensus): verification draws over the same eligible set production uses
-        # (the full registry while RANDAO_ENFORCED is off; the revealed-for-epoch subset when on).
-        winner = select_producer_two_lane(get_open_registry(epoch),
-                                          randao_eligible_bonded(get_bonded_registry(), epoch),
-                                          epoch_beacon(epoch),
-                                          slot=block_number)
+        # the same derivation production used (block_ops.derive_header: draw from the frozen registry, RANDAO-gated)
+        from ops.block_ops import derive_header
+        winner = derive_header(self.memserver.latest_block, block_number)["creator"]
         if winner is None:
             raise ValueError("No eligible producer for this block (fail-closed)")
         if block.get("block_creator") != winner:
@@ -2046,7 +5355,7 @@ class CoreClient(threading.Thread):
         """this function has critical checks and must raise a failure/halt if there is one"""
         # todo move exceptions lower (as in rollback) and avoid rising here directly
         try:
-            self.logger.warning(f"Preparing block")
+            self.logger.warning("Preparing block")
 
             if not valid_block_timestamp(new_block=block):
                 raise ValueError(f"Invalid block timestamp {block['block_timestamp']}")
@@ -2066,7 +5375,9 @@ class CoreClient(threading.Thread):
             # before change_balance; the exact-match check below is the real validation.
             if not isinstance(reward, int) or isinstance(reward, bool) or reward < 0 or reward > BASE_SUBSIDY:
                 raise ValueError(f"Invalid block reward {reward!r}")
-            expected_reward = get_block_reward()
+            from ops.block_ops import derive_header
+            _hdr = derive_header(self.memserver.latest_block, block["block_number"])   # the shared derivation
+            expected_reward = _hdr["reward"]
             if reward != expected_reward:
                 raise ValueError(f"Block reward {reward} != deterministic {expected_reward}")
 
@@ -2080,8 +5391,7 @@ class CoreClient(threading.Thread):
             # in-block bond txs land, the rollback/snapshot re-verify path must reset the tip to the
             # block's parent before this runs.)
             parent_weight = self.memserver.latest_block.get("cumulative_weight", 0)
-            expected_weight = parent_weight + block_fork_weight(get_bonded_registry(),
-                                                                block["block_number"])
+            expected_weight = parent_weight + _hdr["block_weight"]
             if block.get("cumulative_weight") != expected_weight:
                 raise ValueError(
                     f"Block cumulative_weight {block.get('cumulative_weight')} != deterministic "
@@ -2092,15 +5402,27 @@ class CoreClient(threading.Thread):
             # This is what binds L1 STATE to consensus: a node whose account/producer state diverged from the
             # producer's — a non-deterministic apply, a rollback-path bug, silent corruption — rejects the
             # block HERE instead of extending it and carrying a different state that only surfaces, with no
-            # tiebreak, at snapshot sync (the alphanet-7 h76000 split). A rejected block just forks off and
+            # tiebreak, at snapshot sync (the betanet-7 h76000 split). A rejected block just forks off and
             # loses fork-choice; it can never become a silent state fork. DIVERGENCE IS FATAL BY DESIGN — a
             # halted node is recoverable, a node that climbs on diverged state is silent poison.
             from ops.snapshot_ops import l1_state_root
             our_state_root = l1_state_root()   # consensus subset only — block storage excluded (determinism)
+            # (betanet-3's h10047-16000 repair window was deleted at the gen-22 reroll: equality is
+            # enforced at every height of this generation.)
+            # EVALUATED FOR ITS REFUSAL (the value was once the repair-window bound, deleted at gen 22): in verify_block a
+            # block_number int() cannot parse raises and rejects the block, as it always has. Keep the evaluation.
+            int(block.get("block_number") or 0)
+            if block.get("state_root") != our_state_root:
+                # CONFIRM BEFORE REFUSING (2026-10-19): our root came from the incremental structure (NADO_ROOT_INC=trust,
+                # the default), which is checked against the full walk only periodically. A refusal must rest on the
+                # walk, so a wrong incremental root can never make this node reject a valid block — it re-derives
+                # the root here and only a mismatch that survives the walk refuses. INVARIANT: keep this before the reject.
+                from ops.snapshot_ops import confirm_l1_state_root
+                our_state_root = confirm_l1_state_root()
             if block.get("state_root") != our_state_root:
                 # DIAGNOSTIC (no consensus effect): dump OUR per-sub-DB root fingerprint + count the reject.
                 # Comparing this one line against another node's at the same height localizes the divergence
-                # to the exact sub-DB immediately (the alphanet-8 wedge needed a replay harness for this).
+                # to the exact sub-DB immediately (the betanet-8 wedge needed a replay harness for this).
                 # THROTTLED: a diverged node re-enters emergency ~1/s and retries every peer, and the
                 # fingerprint costs a FULL extra state walk + a stats file rewrite — unthrottled it amplifies
                 # the very wedge it reports. One report per _DIVERGENCE_LOG_EVERY seconds is plenty to diagnose.
@@ -2131,6 +5453,39 @@ class CoreClient(threading.Thread):
             # closes the K-withdraw bond drain / slash-escape / chain-halt, duplicate-slash over-burn,
             # and heartbeat/reveal DUPSORT desync forks.
             assert_unique_reserved(block["block_transactions"])
+
+            # AUTHORIZATION COMMITMENT (signature aggregation). Recompute (auth_root, auth_count) from the
+            # block's OWN transactions and enforce equality with what it committed inside its hash preimage.
+            # This is the statement an aggregate validity proof attests, so it must be DERIVED and never
+            # accepted: a prover free to choose the root would choose one covering fewer checks than the
+            # block demands, and "these zero authorizations are valid" is a proof of nothing.
+            #
+            # BE HONEST ABOUT WHAT THIS ADDS. Because the commitment lives inside the hash preimage and
+            # rebuild_block recomputes it from the block's own tx list, a block claiming the wrong root
+            # already fails the rebuilt-hash check — so on the ordinary path this is redundant. It is kept
+            # for two reasons: it gives the failure its own name instead of an opaque hash mismatch, and it
+            # holds on any path that reaches verify_block without a full rebuild. It is a pure function of
+            # committed block data, so unlike state_root a mismatch here means the BLOCK is malformed or
+            # forged — never that our state drifted.
+            from ops import mldsa_block_auth as _auth
+            _r, _c = _auth.auth_commitments(block)
+            if int(block.get("auth_count", -1)) != _c or int(block.get("auth_root", -1)) != int(_r):
+                raise ValueError(
+                    f"Block {block['block_number']} authorization commitment "
+                    f"(root={str(block.get('auth_root'))[:16]}, count={block.get('auth_count')}) != "
+                    f"recomputed (root={str(_r)[:16]}, count={_c}) — the block's committed signature "
+                    f"workload does not match its own transactions")
+
+            # DETACHED EVIDENCE, when the producer shipped an envelope. Absent -> the per-tx signatures
+            # below ARE the evidence (what every block ships today). Present -> it is checked against the
+            # commitment we just recomputed, with the key coming from OUR PUBKEY-ONCE resolution and never
+            # from the envelope. A present-but-invalid envelope is a forgery signal and rejects the block;
+            # it can never CHANGE block identity, because it lives outside the hash preimage.
+            if block.get("block_auth_evidence") is not None:
+                from ops.block_ops import check_block_auth_evidence
+                _ok, _why = check_block_auth_evidence(block)
+                if not _ok:
+                    raise ValueError(f"Block {block['block_number']} authorization evidence rejected: {_why}")
 
             # ALWAYS validate signatures + spending (never skipped for synced/old blocks) — else a
             # malicious sync peer could feed forged, unsigned transfers that reflect would still apply.
@@ -2203,7 +5558,7 @@ class CoreClient(threading.Thread):
 
             # the producer is identified by the winner ADDRESS (block_creator) alone
             if self.memserver.address == block['block_creator'] and block['block_reward'] > 0:
-                self.logger.warning(f"$$$ Congratulations! You won! $$$")
+                self.logger.warning("$$$ Congratulations! You won! $$$")
 
             self.logger.warning(f"Block hash: {block['block_hash']}")
             self.logger.warning(f"Block number: {block['block_number']}")
@@ -2222,6 +5577,26 @@ class CoreClient(threading.Thread):
 
         except Exception as e:
             self.logger.warning(f"Block production skipped due to: {e}")
+            # THE BLOCK WE CANNOT EVALUATE NAMES WHAT TO FETCH (2026-09-13). A WindowUnavailable is a
+            # deferral that carries the window it needs; starting the fill HERE — where validation trips
+            # over the hole — is what lets a node stuck in recovery repair itself. The production gate
+            # (_rules_evaluable_at_tip) also starts it, but a node in an adoption loop never reaches that
+            # gate: 185.238.249.208 sat there for an hour with its hole untouched. One fill runs at a time.
+            if isinstance(e, WindowUnavailable):
+                self._rec_fail("cannot evaluate the challenger draw for this block — filling the window",
+                               height=block.get("block_number") if isinstance(block, dict) else None,
+                               window=[e.lo, e.hi])
+                self._fill_window_gaps(e.lo, e.hi)
+            # remote diagnosis (/status "last_block_reject"): WHY this node refused a block its peers
+            # accepted — the .26/.28 pair rejected the majority's 64916 through six opaque False returns
+            # before this field existed.
+            try:
+                self.memserver.last_block_reject = {
+                    "height": block.get("block_number") if isinstance(block, dict) else None,
+                    "hash": str(block.get("block_hash"))[:16] if isinstance(block, dict) else None,
+                    "error": str(e)[:200], "at": get_timestamp_seconds()}
+            except Exception:
+                pass
             time.sleep(1)
             return False
 
@@ -2239,8 +5614,14 @@ class CoreClient(threading.Thread):
         otherwise. Also releases force_sync_ip once we agree with >80% of peers on a fresh tip —
         the forced donor has served its purpose and normal fork-choice takes back over."""
         if self.minority_block_consensus():
-            self.memserver.emergency_mode = True
-            self.logger.warning("We are out of consensus")
+            # ONE-BLOCK FAST PATH first: a same-height split with a common parent is a paper cut —
+            # swap the single block inline (see _inline_tip_swap) instead of dragging the node
+            # through emergency recovery and freezing finality. Deeper divergence falls through.
+            if self._inline_tip_swap():
+                self.memserver.emergency_mode = False
+            else:
+                self.memserver.emergency_mode = True
+                self.logger.warning("We are out of consensus")
         elif self.memserver.force_sync_ip:
             self.memserver.emergency_mode = True
             self.logger.warning("Forced sync switched to emergency mode")

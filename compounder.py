@@ -4,7 +4,7 @@ import json
 import aiohttp
 from ops.data_ops import sort_list_dict
 from ops.log_ops import get_logger
-from ops.net_ops import read_capped, unpack_zstd_peer, MAX_PEER_BODY
+from ops.net_ops import read_capped, unpack_zstd_peer, MAX_PEER_BODY, MAX_CONTROL_BODY
 from config import hostport
 """this module is optimized for low memory and bandwidth usage"""
 
@@ -23,10 +23,11 @@ async def get_list_of(key, peer, port, fail_storage, logger, semaphore, compress
         async with semaphore:
             
             async with aiohttp.ClientSession(timeout = aiohttp.ClientTimeout(total=5)) as session:
-                async with session.get(url_construct) as response:
-                    body = await read_capped(response, MAX_PEER_BODY)   # anti-OOM: cap untrusted peer body
+                # allow_redirects=False: a peer's 302 to 127.0.0.1 would be a loopback-authorized GET here (ops/outbound_guard.py)
+                async with session.get(url_construct, allow_redirects=False) as response:
+                    body = await read_capped(response, MAX_CONTROL_BODY)   # anti-OOM: cap untrusted peer body
                     if compress == "zstd":
-                        fetched = unpack_zstd_peer(body)                # bomb-capped zstd(msgpack) wire
+                        fetched = unpack_zstd_peer(body, cap=MAX_CONTROL_BODY)                # bomb-capped zstd(msgpack) wire
                     else:
                         fetched = json.loads(body.decode())[key]
         return fetched
@@ -66,16 +67,17 @@ async def compound_get_list_of(key, entries, port, logger, fail_storage, semapho
 async def get_tx_ids_of(peer, port, logger, fail_storage, semaphore):
     """GET /transaction_ids from one peer -> (peer, [txid,...]) or None. A peer that cannot serve
     the reconciliation wire is treated like any other failing peer (fail_storage -> purge queue) —
-    NO legacy-wire tolerance on alphanet; the whole mesh speaks one protocol version."""
+    NO legacy-wire tolerance on betanet; the whole mesh speaks one protocol version."""
     url_construct = f"http://{hostport(peer, port)}/transaction_ids?compress=zstd"
     try:
         async with semaphore:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
-                async with session.get(url_construct) as response:
+                # allow_redirects=False: a peer's 302 to 127.0.0.1 would be a loopback-authorized GET here (ops/outbound_guard.py)
+                async with session.get(url_construct, allow_redirects=False) as response:
                     if response.status != 200:
                         raise ValueError(f"HTTP {response.status}")
-                    body = await read_capped(response, MAX_PEER_BODY)
-                    fetched = unpack_zstd_peer(body)
+                    body = await read_capped(response, MAX_CONTROL_BODY)
+                    fetched = unpack_zstd_peer(body, cap=MAX_CONTROL_BODY)
                     if not isinstance(fetched, list):
                         raise ValueError("malformed id list")
                     return peer, fetched
@@ -84,6 +86,34 @@ async def get_tx_ids_of(peer, port, logger, fail_storage, semaphore):
             logger.error(f"Compounder: Failed to get transaction ids of {peer}: {e}")
             fail_storage.append(peer)
         return None
+
+
+async def get_next_block_txids_of(peer, port, logger, semaphore, timeout=1.5):
+    """GET /next_block_txids from one peer -> (peer, {tip, height, txids}) or None. The pre-assembly
+    reconcile's probe (memserver.reconcile_next_block_set): what THAT peer would put in the next block on
+    ITS tip. Short timeout — this runs inside the production slot — and a failure is silently None (the
+    peer simply does not take part in this pass; the pull reconcile remains the backstop)."""
+    url_construct = f"http://{hostport(peer, port)}/next_block_txids"
+    try:
+        async with semaphore:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+                # allow_redirects=False: a peer's 302 to 127.0.0.1 would be a loopback-authorized GET here (ops/outbound_guard.py)
+                async with session.get(url_construct, allow_redirects=False) as response:
+                    if response.status != 200:
+                        return None
+                    body = await read_capped(response, MAX_CONTROL_BODY)
+                    d = json.loads(body)
+                    if not isinstance(d, dict) or not isinstance(d.get("txids"), list):
+                        return None
+                    return peer, d
+    except Exception:
+        return None
+
+
+async def compound_get_next_block_txids(ips, port, logger, semaphore, timeout=1.5):
+    """{peer: {tip, height, txids}} for every peer that answered /next_block_txids in time."""
+    results = await asyncio.gather(*[get_next_block_txids_of(ip, port, logger, semaphore, timeout) for ip in ips])
+    return {peer: d for peer, d in filter(None, results)}
 
 
 async def compound_get_tx_ids(ips, port, logger, fail_storage, semaphore):
@@ -101,8 +131,13 @@ async def post_txs_by_id(peer, port, txids, logger, fail_storage, semaphore):
     url_construct = f"http://{hostport(peer, port)}/transactions_by_id?compress=zstd"
     try:
         async with semaphore:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
-                async with session.post(url_construct, data=codec.pack(list(txids))) as response:
+            # 15 s was sized for ~KB txs. Set reconciliation is the FALLBACK that is supposed to deliver a
+            # tx when push-gossip fails, so it must be able to carry the biggest legitimate tx there is: an
+            # inline settle proof at ~120 MiB. With both paths timing out, a proof-carrying settle could
+            # reach a peer by neither route. read_capped already bounds the body at MAX_PEER_BODY.
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300)) as session:
+                # allow_redirects=False: a peer's 302 to 127.0.0.1 would be a loopback-authorized GET here (ops/outbound_guard.py)
+                async with session.post(url_construct, data=codec.pack(list(txids)), allow_redirects=False) as response:
                     if response.status != 200:
                         return []
                     body = await read_capped(response, MAX_PEER_BODY)
@@ -119,36 +154,31 @@ async def send_transaction(peer, port, logger, fail_storage, transaction, semaph
     """PUSH one transaction to a peer's POST /submit_transaction, body = codec.pack(tx) — the exact
     wire net_ops.unpack_tx decodes. (The old GET `?data=<json>` form never matched the POST-body
     endpoint and silently failed.) Returns (peer, message) on success, None on failure. Shared by
-    push-gossip (nado._gossip_worker) and the wallet CLI (compound_send_transaction)."""
+    push-gossip (nado._gossip_worker)."""
     from ops import codec
     url_construct = f"http://{hostport(peer, port)}/submit_transaction"
+    _body = codec.pack(transaction)
+    # TIMEOUT MUST SCALE WITH THE BODY. This was a flat total=5 s, which is fine for the ~KB txs that make
+    # up all normal traffic but makes a proof-carrying settle IMPOSSIBLE to gossip: an inline settle proof
+    # is ~120 MiB, so 5 s would demand ~24 MB/s sustained AND a verdict inside the same window — and the
+    # peer VERIFIES the proof before it answers (measured ~22-94 s). Every push therefore timed out, the tx
+    # stayed in our pool alone, and since every node deterministically builds the winner's candidate, a
+    # peer's candidate (without our tx) won every time. That is the same "peers never hold it" symptom that
+    # DA was blamed for; the transport was only ever half the story.
+    # Allow ~2 MB/s plus a fixed verification allowance, floored at the old 5 s so ordinary traffic is
+    # unchanged. Best-effort either way: a failed push just means the peer pulls it later.
+    _timeout = max(5.0, len(_body) / (2 << 20) + 180.0)
     try:
         async with semaphore:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
-                async with session.post(url_construct, data=codec.pack(transaction)) as response:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=_timeout)) as session:
+                # allow_redirects=False: a peer's 302 to 127.0.0.1 would be a loopback-authorized GET here (ops/outbound_guard.py)
+                async with session.post(url_construct, data=_body, allow_redirects=False) as response:
                     body = await response.json(content_type=None)
                     return peer, (body.get("message") if isinstance(body, dict) else body)
     except Exception as e:
         if peer not in fail_storage:
             logger.error(f"Compounder: Failed to send transaction to {url_construct}: {e}")
             fail_storage.append(peer)
-
-async def compound_send_transaction(ips, port, logger, fail_storage, transaction, semaphore):
-    """returns a list of dicts where ip addresses are keys"""
-    result = list(
-        filter(
-            None,
-            await asyncio.gather(
-                *[send_transaction(ip, port, logger, fail_storage, transaction, semaphore) for ip in ips]),
-        )
-    )
-
-    result_dict = {}
-    for entry in result:
-        result_dict[entry[0]] = entry[1]
-
-    return result_dict
-
 
 async def get_status(peer, port, logger, fail_storage, semaphore, compress=None):
     """method compounded by compound_get_status_pool"""
@@ -162,10 +192,11 @@ async def get_status(peer, port, logger, fail_storage, semaphore, compress=None)
         async with semaphore:
             
             async with aiohttp.ClientSession(timeout = aiohttp.ClientTimeout(total=5)) as session:
-                async with session.get(url_construct) as response:
-                    body = await read_capped(response, MAX_PEER_BODY)   # anti-OOM: cap untrusted peer body
+                # allow_redirects=False: a peer's 302 to 127.0.0.1 would be a loopback-authorized GET here (ops/outbound_guard.py)
+                async with session.get(url_construct, allow_redirects=False) as response:
+                    body = await read_capped(response, MAX_CONTROL_BODY)   # anti-OOM: cap untrusted peer body
                     if compress == "zstd":
-                        fetched = unpack_zstd_peer(body)                # bomb-capped zstd(msgpack) wire
+                        fetched = unpack_zstd_peer(body, cap=MAX_CONTROL_BODY)                # bomb-capped zstd(msgpack) wire
                     else:
                         fetched = json.loads(body.decode())
 
@@ -203,7 +234,8 @@ async def announce_self(peer, port, my_ip, fail_storage, semaphore):
         async with semaphore:
             
             async with aiohttp.ClientSession(timeout = aiohttp.ClientTimeout(total=5)) as session:
-                async with session.get(url_construct) as response:
+                # allow_redirects=False: a peer's 302 to 127.0.0.1 would be a loopback-authorized GET here (ops/outbound_guard.py)
+                async with session.get(url_construct, allow_redirects=False) as response:
                     fetched = await response.text()
                     return fetched
 

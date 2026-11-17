@@ -10,6 +10,7 @@ MV_BASE(20)+mc keyed by gameId → the frontend reads mv[g*10000 + mc] (view str
 Methods: open(g)[stake] · join(g)[stake] · move(g,enc,ply) · agree(g,result) · resign(g) · abort(g) · cancel(g).
 """
 from execnode import zkvmasm
+from execnode.games import _lib
 from execnode.games import tictactoe as _t
 
 NN, ST, PT, P1, P2, SD, WR, MC, DL, LIST, A1, A2 = 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12
@@ -40,6 +41,10 @@ MOVE = f"""
     sload r3 r4
     mov r5 r3
     eq r5 r2
+    require r5
+    mov r5 r3
+    movi r6 {MAXMOVES}
+    lt r5 r6
     require r5
     mov r5 r3
     movi r6 2
@@ -193,7 +198,7 @@ AGREE = f"""
 """
 
 SRC = {"open": _t.SRC["open"], "join": _t.SRC["join"], "move": MOVE, "agree": AGREE,
-       "resign": _t.SRC["resign"], "abort": _t.SRC["abort"], "cancel": _t.SRC["cancel"]}
+       "resign": _t.SRC["resign"], "abort": _t.ABORT_REFUND, "cancel": _t.SRC["cancel"]}
 
 ABI = {
     "open": {"args": ["gameId"], "value": True},
@@ -214,4 +219,13 @@ ABI = {
 
 
 def build():
-    return zkvmasm.assemble_contract(SRC)
+    # C2 (security review 2026-09-23): every id-taking method refuses an id >= 2^32 before touching a slot;
+    # see _lib.id_guard. The ABI, the field layout and every honest call are unchanged.
+    ID_GUARDS = {m: ["r0"] for m in ("open", "join", "move", "agree", "resign", "abort", "cancel")}
+    return zkvmasm.assemble_contract(_lib.guard_ids(SRC, ID_GUARDS))
+
+
+def carry_in_flight(storage):
+    """Why this contract cannot cross a reroll yet ([] = it can): an open game (_lib.pvp_games_in_flight) — finish,
+    resign or abort it on the old chain first. Nothing else chess stores names the old chain."""
+    return [f"game {g} is open" for g in _lib.pvp_games_in_flight(storage, NN, SD, LIST)]

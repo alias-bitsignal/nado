@@ -21,12 +21,12 @@ creation (up to 3 addresses, M-of-N threshold; default = the creator, 1-of-1). B
 Payouts are PULL-based (each bettor claim()s their own share) so a market scales to any number of bettors.
 
 zkVM data model (this port): market ids are ints < 2^32. Metadata (the market title+outcome labels, source
-name, event id) are STRING args — digested to field elements at the call boundary, stored as digests, and
+name, event id) are STRING args — digested to 256-bit words at the call boundary, stored as digests, and
 resolved back to the original text by decode_view through the exec node's digest registry (the "hash
 on-chain, text in the transaction" model). Money is tracked in UNITs of 10^4 raw NADO (stakes must be UNIT
 multiples) so that stake×pot products stay inside the DIVMODW soundness window; a market's pot is capped at
-2^31 UNITs (~26% of total supply). Per-user slots are alghash-keyed: slot = HASH(tag, market, [outcome,]
-addr_digest) — the frontend reads them through /exec/view methods (claimable_of/stake_of/...), never by
+2^31 UNITs (~26% of total supply). Per-user slots are hash-keyed (the VM's BLAKE2s
+word hash): slot = HASH(tag, market, [outcome,] addr_digest) — the frontend reads them through /exec/view methods (claimable_of/stake_of/...), never by
 computing slots itself.
 
 Market fields (key = market id): 1 mk 2 no(outcomes) 3 lk(lock, epoch secs) 4 dl(deadline) 5 ds(desc digest:
@@ -39,6 +39,7 @@ Methods: create_market(m,nout,lock,deadline,desc,source,ev,thr,r0,r1,r2) · bet(
   void(m) · claim(m) · views: claimable_of(m,addr) · stake_of(m,i,addr) · total_of(m,addr) · claimed_of(m,addr).
 """
 from execnode import zkvmasm
+from execnode.games import _lib
 
 MK, NO, LK, DL, DS, SO, EV, RS, DN, VD, TOT, MRC, MTH, MCR = 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14
 PL_BASE, VC_BASE = 16, 24
@@ -55,6 +56,12 @@ MAX_OUT = 8
 POT_CAP = 1 << 31                 # per-market pot cap in UNITs — keeps stake×pot < 2^62 (DIVMODW-sound)
 
 _2_32 = 1 << 32
+
+# CARRY_STORAGE (tools/alphanet6_carryforward.carry_policy): markets cross a reroll as they are, pot included.
+# INVARIANT: nothing this contract reads is a height, a block hash or a beacon — lock and deadline are TIME (chain_clock,
+# wall-clock seconds), and a reroll starts the new chain's clock at the reroll moment, so every open market keeps its
+# real-world lock and deadline. Re-check before adding any method that reads `cursor`, BHASH or BEACON.
+CARRY_STORAGE = True
 
 
 def _sl(field):
@@ -96,7 +103,7 @@ CREATE = "\n".join(
      "movi r1 2", "arg r5 r1",                                       # lock again
      "lt r5 r3", "require r5"]                                       # lock < deadline
     # store nout/lk/dl/ds/so/ev (each: arg -> slot store)
-    + sum(([f"movi r1 {idx}", f"arg r5 r1"] + _sl(f) + ["sstore r4 r5"]
+    + sum(([f"movi r1 {idx}", "arg r5 r1"] + _sl(f) + ["sstore r4 r5"]
            for idx, f in ((1, NO), (2, LK), (3, DL), (4, DS), (5, SO), (6, EV))), [])
     # nout <= MAX_OUT (checked after store; revert discards)
     + ["movi r1 1", "arg r2 r1", f"movi r3 {MAX_OUT + 1}", "lt r2 r3", "require r2",
@@ -173,7 +180,10 @@ RESOLVE = "\n".join(
     + ["mov r5 r6", "notb r5", "mul r5 r3"]                                              # r5 = v
     + ["mov r3 r5", "mul r3 r2"] + _sl(VD) + ["sstore r4 r3"]                            # vd
     + ["notb r5", "mul r5 r2"] + _sl(DN) + ["sstore r4 r5", "mov r3 r5"]                 # dn
-    + ["mov r5 r1", "movi r6 1", "add r5 r6", "mul r5 r3"] + _sl(RS) + ["sstore r4 r5", "ret r0"])
+    # rs is recorded WHENEVER the oracle agreed, void or not: an auto-void (unbacked tote winner) still has a
+    # real result, and the BOOK settles on it (bclaim/bsweep branch on rs), so a void is never a free option
+    # against the bank (review 2026-09-23, medium: the old rs = dn·(i+1) left the book refunding).
+    + ["mov r5 r1", "movi r6 1", "add r5 r6", "mul r5 r2"] + _sl(RS) + ["sstore r4 r5", "ret r0"])
 
 # void(m): a resolver anytime before resolution; ANYONE once the deadline passes. Refunds via claim().
 VOID = "\n".join(
@@ -306,7 +316,7 @@ BCLAIM = "\n".join(
     # Branch on whether the market RESOLVED, not on the void flag: a market can auto-void because the
     # winning outcome had no TOTE backers while still having a real, oracle-agreed result. Refunding the
     # book there would be a free option against the bank.
-    + _sl(DN) + ["sload r2 r4", "nez r2", "notb r2", "jnz r2 @bvoid"]
+    + _sl(RS) + ["sload r2 r4", "nez r2", "notb r2", "jnz r2 @bvoid"]              # no RESULT -> stakes back
     + _sl(RS) + ["sload r5 r4", "movi r6 1", "sub r5 r6"]                          # winning outcome
     + ["ctx r6 caller", f"movi r4 {TG_BPAY}", "hash r2 <- r4 r0 r5 r6", "sload r3 r2", "jmp @bpay"]
     + ["bvoid:", "movi r3 0"]
@@ -323,7 +333,7 @@ BSWEEP = "\n".join(
     + _sl(BK) + ["sload r5 r4", "mov r3 r5", "nez r3", "require r3", "eq r5 r6", "require r5"]
     + _sl(BD) + ["sload r5 r4", "nez r5", "notb r5", "require r5", "movi r5 1", "sstore r4 r5"]
     + _sl(BR) + ["sload r3 r4"]
-    + _sl(DN) + ["sload r2 r4", "nez r2", "notb r2", "jnz r2 @bswvoid"]
+    + _sl(RS) + ["sload r2 r4", "nez r2", "notb r2", "jnz r2 @bswvoid"]            # no RESULT -> sweep refunds
     + _sl(BS) + ["sload r5 r4", "add r3 r5"]
     + _sl(RS) + ["sload r5 r4", "movi r6 1", "sub r5 r6"]
     + [f"movi r4 {BP_BASE}", "add r4 r5", f"movi r6 {_2_32}", "mul r4 r6", "add r4 r0",
@@ -387,4 +397,7 @@ ABI["_view"]["board4"] = {"name": "bp", "base": BP_BASE, "cells": MAX_OUT, "stri
 
 
 def build():
-    return zkvmasm.assemble_contract(SRC)
+    # C2 (security review 2026-09-23): every id-taking method refuses an id >= 2^32 before touching a slot;
+    # see _lib.id_guard. The ABI, the field layout and every honest call are unchanged.
+    ID_GUARDS = {m: ["r0"] for m in ("book", "quote", "back", "bclaim", "bsweep", "bet", "resolve", "void", "claim", "claimable_of")}
+    return zkvmasm.assemble_contract(_lib.guard_ids(SRC, ID_GUARDS))

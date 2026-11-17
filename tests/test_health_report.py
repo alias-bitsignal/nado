@@ -15,6 +15,10 @@ which asserts the exact shape of that outage does not roll up to "healthy".
 
 Run: python3 tests/test_health_report.py
 """
+import os as _os, tempfile as _tempfile  # ISOLATION FIRST (CLAUDE.md rule 4): never the live node's HOME or exec files
+_os.environ["HOME"] = _tempfile.mkdtemp(prefix="nado-test-")
+_os.environ["NADO_EXEC_STATE"] = _os.path.join(_os.environ["HOME"], "exec_state.json")
+_os.environ["NADO_EXEC_DA"] = _os.path.join(_os.environ["HOME"], "exec_da")
 import os
 import sys
 import traceback
@@ -22,18 +26,9 @@ import traceback
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from loops.message_loop import MessageClient
 
-fails = 0
-
-
-def check(name, fn):
-    global fails
-    try:
-        fn()
-        print(f"PASS  {name}")
-    except Exception as e:
-        fails += 1
-        print(f"FAIL  {name}: {e}")
-        traceback.print_exc()
+import _harness
+_report = _harness.Report()
+check = _report.run
 
 
 class _Mem:
@@ -225,5 +220,5 @@ if __name__ == "__main__":
     check("stale code is flagged", t_stale_code_is_flagged)
     check("health never raises", t_health_never_raises)
     check("code_is_stale agrees with the hashes", t_code_is_stale_agrees_with_the_hashes)
-    print("\n" + ("ALL PASS" if not fails else f"{fails} FAILED"))
-    sys.exit(1 if fails else 0)
+    print("\n" + ("ALL PASS" if not _report.fails else f"{_report.fails} FAILED"))
+    sys.exit(1 if _report.fails else 0)

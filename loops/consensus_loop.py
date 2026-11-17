@@ -65,12 +65,13 @@ class ConsensusClient(threading.Thread):
         self.duration = 0
         self.logger = logger
 
-        self.logger.info(f"Starting Consensus Manager")
+        self.logger.info("Starting Consensus Manager")
 
         self.memserver = memserver
 
         self.block_hash_pool = {}
         self.status_pool = {}
+        self._snap_pool_logged = set()       # (height, our_hash) pairs already CRITICAL-logged (snapshot pool)
         self.transaction_hash_pool = {}
         self.upcoming_block_hash_pool = {}   # SAME-TIP peers only -> advertised NEXT-block tx-set hash (rebuilt fresh per pass)
 
@@ -92,7 +93,6 @@ class ConsensusClient(threading.Thread):
         # loop us into emergency-mode/rollback. Auto-cleared periodically so a transiently-unreachable
         # REAL heavier tip is retried.
         self.rejected_tips = set()
-        self._reject_clear_counter = 0
         # BACKOFF state for benched tips. A tip we repeatedly fail to obtain is one nothing can serve; the
         # flat ~12s bench meant the node spent every window chasing it and never synced the best chain it
         # COULD reach. Observed live: a single-node fork stayed heaviest while a four-node chain was kept
@@ -273,6 +273,66 @@ class ConsensusClient(threading.Thread):
             if isinstance(status, dict) and status.get("latest_block_weight") is not None:
                 weight_pool[peer] = status["latest_block_weight"]
         self.weight_pool = weight_pool
+
+        # SNAPSHOT-HASH POOL (2026-08-19) — the hash-pool pattern for the CHECKPOINT layer. Every status
+        # already advertises (snapshot_height, snapshot_hash), checkpoint heights are fleet-aligned, and
+        # since the payload normalization in snapshot_ops (hard_finality + index watermarks excluded, the
+        # last node-local rows) two honest nodes at the same height MUST advertise the same hash. Nobody
+        # ever compared: at checkpoint 81000 this node advertised a digest 3-of-156277 rows apart from the
+        # entire fleet and no alarm existed anywhere (the alphanet-7 h76000 split shipped the same way).
+        # A mismatch splits agree_snapshot's bootstrap vote, so it is a fleet-health defect the moment it
+        # exists — log CRITICAL once per (height, our_hash) the instant we are out of majority.
+        try:
+            import ops.snapshot_ops as _snap
+            _h = _snap.latest_final_checkpoint_height(int(self.memserver.finalized_height or 0))
+            _cache = getattr(self, "_snap_advert_cache", None)      # (height, hash), reloaded on new checkpoint
+            if _h and (not _cache or _cache[0] != int(_h)):
+                _m = _snap.load_checkpoint_manifest(_h)
+                _cache = (int(_h), str(_m.get("snapshot_hash"))) if isinstance(_m, dict) else None
+                self._snap_advert_cache = _cache
+            _my = _cache
+            if _my:
+                _votes = {}
+                for _peer, _st in self.status_pool.copy().items():
+                    if (isinstance(_st, dict) and int(_st.get("snapshot_height", -1) or -1) == _my[0]
+                            and _st.get("snapshot_hash")):
+                        _votes.setdefault(str(_st["snapshot_hash"]), []).append(_peer)
+                _total = sum(len(v) for v in _votes.values())
+                if _votes and _total >= 2:
+                    _best_hash, _best = max(_votes.items(), key=lambda kv: len(kv[1]))
+                    _key = (_my[0], _my[1])
+                    if _my[1] != _best_hash and len(_best) * 2 > _total and _key not in self._snap_pool_logged:
+                        self._snap_pool_logged.add(_key)
+                        self.logger.error(
+                            f"CRITICAL: SNAPSHOT HASH OUT OF MAJORITY at checkpoint {_my[0]} — ours "
+                            f"{_my[1][:12]}… vs majority {_best_hash[:12]}… held by {len(_best)}/{_total} "
+                            f"({[str(x)[:15] for x in _best]}); our checkpoint cannot win a bootstrap "
+                            f"quorum vote — a payload row is leaking node-local state into the digest")
+        except Exception:
+            pass
+
+        # FLEET-BLIND RELEASE VALVE (2026-07-30, .210 post-reroll). Peer-benching is PER-PEER anti-DoS:
+        # one forker mustn't own the donor pool. But during the reroll restart storm a node struck out
+        # EVERY peer it knew (each fetch failed while everyone rebooted), and PEER_BENCH_MAX_S=7200 then
+        # left it blind to the whole honest fleet for up to two hours — minting a phantom solo chain at
+        # floor 0 the entire time, invisible to the dead-fork escape (a genesis-floor probe always finds
+        # agreement on a shared-genesis network). Benching ALL known peers while at least one of them
+        # claims a strictly heavier chain is self-evidently our own failure, not theirs ("our failure to
+        # fetch says more about us than about them" — reject_tip's own reasoning): drop the peer benches
+        # and let fork choice see the fleet again. Tip benches (per-hash, short) are kept, so a genuinely
+        # bogus advertised weight still cannot spin us — its tip re-benches on the next failed fetch.
+        if self._peer_until and weight_pool:
+            _now_m = time.monotonic()
+            _active = [p for p in weight_pool if p in self.status_pool]
+            _our_w = int(self.memserver.latest_block.get("cumulative_weight", 0) or 0)
+            if (_active and all(self._peer_until.get(p, 0) > _now_m for p in _active)
+                    and any(int(weight_pool[p] or 0) > _our_w for p in _active)):
+                self.logger.warning(
+                    f"Every one of our {len(_active)} status-answering peers is peer-benched while at "
+                    f"least one advertises a heavier chain — fleet-wide blindness is our own failure; "
+                    f"releasing the peer benches (tip benches kept)")
+                self._peer_until.clear()
+                self._peer_strikes.clear()
 
         # tip_weights: best advertised weight per distinct tip hash, INCLUDING our own tip so we never
         # switch away from an equal-or-heavier local chain (first-seen on ties). Excludes rejected tips.

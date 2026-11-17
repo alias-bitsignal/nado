@@ -46,7 +46,12 @@ def credit_block_reward(block, logger, revert=False):
     else:
         # BONDED lane: producer keeps the majority, a modest slice funds the presence dividend, treasury 10%.
         producer_cut, dividend, treasury = split_bonded_block_reward(reward)
-        change_balance(address=creator, amount=producer_cut, revert=revert, logger=logger)
+        # The whole producer cut is the creator's. (Gen 25's staking pools split it with delegators via
+        # _pool_split between POOL_HEIGHT and POOL_RETIRE_HEIGHT; from generation 26 on that window was empty —
+        # the split returned producer_cut on apply AND on revert (no "rw:<h>" journal row was ever written) — so it
+        # was deleted. INVARIANT: apply and revert pass the SAME integer here; any future split must journal it.)
+        creator_share = producer_cut
+        change_balance(address=creator, amount=creator_share, revert=revert, logger=logger)
         if dividend:
             change_balance(address=DIVIDEND_POOL, amount=dividend, revert=revert, logger=logger)
             # track the per-epoch dividend inflow (deterministic, revert-symmetric) so the exec node can
@@ -54,7 +59,7 @@ def credit_block_reward(block, logger, revert=False):
             kv_ops.dividend_inflow_add(epoch_of(block["block_number"]), dividend, revert)
         if treasury:
             change_balance(address=TREASURY_ADDRESS, amount=treasury, revert=revert, logger=logger)
-        increase_produced_count(address=creator, amount=producer_cut, revert=revert, logger=logger)
+        increase_produced_count(address=creator, amount=creator_share, revert=revert, logger=logger)
 
 
 def apply_treasury_burn(block, logger, revert=False):

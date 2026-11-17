@@ -33,12 +33,9 @@ TOKEN = zkvmasm.assemble_contract({
 })
 A, B = "ndoalice", "ndobob"
 
-fails = 0
-def check(name, fn):
-    global fails
-    try: fn(); print(f"PASS  {name}")
-    except Exception as e:
-        fails += 1; print(f"FAIL  {name}: {e}"); traceback.print_exc()
+import _harness
+_report = _harness.Report()
+check = _report.run
 
 
 def _states(nslist):
@@ -90,20 +87,22 @@ def t4_default_determinism_preserved():
 
 
 def t5_outbox_emit_commit_and_proof():
-    """Prove `emit` commits a cross-domain message in state_root and outbox_proof verifies against it."""
-    from execnode import exec_root as ER
+    """Prove `emit` commits a cross-domain message in state_root and the record_proof_at proof (what /exec/outbox_proof serves) verifies against it."""
     st = _states(["default"])["default"]
+    ER = _harness.exit_module(st.cursor)       # L1's verifier for this root (exit_root_module)
     r0 = st.state_root()
     st.apply_blob({"op": "emit", "to_ns": "rollupb", "data": {"hello": 1}}, A, "e1")
     st.apply_blob({"op": "emit", "to_ns": "rollupb", "data": [1, 2, 3]}, B, "e2")
     assert len(st.outbox) == 2, "two messages committed"
     assert st.state_root() != r0, "emitting a message changes the committed root"
-    p = st.outbox_proof(0)
-    assert p is not None and p["message"]["from"] == A and p["message"]["to_ns"] == "rollupb"
-    m = p["message"]
-    assert ER.verify_outbox_msg(st.state_root(), m["seq"], m["from"], m["to_ns"], m.get("data"), p["proof"]), \
+    m = st.outbox.get("0")
+    assert m is not None and m["from"] == A and m["to_ns"] == "rollupb"
+    # the proof /exec/outbox_proof serves: the message's leaf digest under T_DIGEST/"outbox"
+    proof, root = st.record_proof_at(None, ER.T_DIGEST, "outbox", ER.leaf_digest(ER.msg_outbox_leaf(m)), value=1)
+    assert root == st.state_root()
+    assert ER.verify_outbox_msg(root, m["seq"], m["from"], m["to_ns"], m.get("data"), proof), \
         "message proves against state_root"
-    assert st.outbox_proof(9) is None, "unknown seq -> None"
+    assert "9" not in st.outbox, "unknown seq -> no message to prove"
 
 def t6_outbox_determinism():
     """Prove two nodes emitting the same messages reach the same state_root (message commitment is deterministic)."""
@@ -128,5 +127,5 @@ for name, fn in list(globals().items()):
     if name.startswith("t") and callable(fn) and name[1].isdigit():
         check(name, fn)
 
-print(f"\n{'ALL PASSED' if not fails else str(fails)+' FAILED'}")
-sys.exit(1 if fails else 0)
+print(f"\n{'ALL PASSED' if not _report.fails else str(_report.fails)+' FAILED'}")
+sys.exit(1 if _report.fails else 0)

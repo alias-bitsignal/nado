@@ -4,10 +4,10 @@
 // it through the engine to derive the live world (my nation + every rival), and turns dashboard taps into
 // ply-bound act() calls. Practice mode runs the identical engine over a local sandbox of bot nations.
 import { NadoDapp, $, _m, base, notify, confirmingLabel, alertBar, disp, share, wireWallet, renderWallet, stickyInputs,
-         orderCards, resolveAliases, renderTopScores, uiPrompt, uiConfirm } from "./nadodapp.js?v=db1a59d7";
-import * as E from "./sovereign-engine.js?v=8ba0159c";
-import { ART } from "./sovereign-art.js?v=b1838f38";
-import { Practice, prand } from "./practice.js?v=69d3a659";
+         orderCards, resolveAliases, renderTopScores, uiPrompt, uiConfirm, BLOCK_TIME } from "./nadodapp.js";
+import * as E from "./sovereign-engine.js";
+import { ART } from "./sovereign-art.js";
+import { Practice, prand } from "./practice.js";
 
 const CID = "sovereign";                              // fixed-name deploy (like the faucet); set at deploy
 const dapp = new NadoDapp({ cid: CID, app: "Sovereign" });
@@ -19,7 +19,8 @@ const sign = (x) => (x >= 0 ? "+" : "") + (Math.abs(x) >= 100 ? Math.round(x) : 
 
 let world = {}, me = null, mc = 0, tab = "build", target = null, atkKind = "plunder";
 let myLastCur = 0, nowCur = 0, lastWall = 0;              // my last touch + live cursor + wall-time of last poll (turn clock)
-const BLOCK_SECS = 6;
+// BLOCK_TIME: protocol.BLOCK_TIME from the relay's /protocol.js via the SDK — never a literal copy (tests/test_constant_mirrors.py)
+const BLOCK_SECS = BLOCK_TIME;
 let comp = { soldier: 1, tank: 1, fighter: 1, bunker: 0, mech: 1 };
 let practice = null;                                  // {seed, log, bots} when in the offline sandbox
 const prac = new Practice("sovereign");

@@ -32,6 +32,7 @@ import os
 import re
 import shutil
 import subprocess
+import random
 import threading
 import time
 
@@ -41,7 +42,28 @@ _BRANCH = "main"                      # the single release channel this updater 
 _MIN_INTERVAL = 30                    # s between checks — spam does at most one fetch per this window
 _RESTART_DELAY = 5                    # s between "updated" and the service restart (lets the wave out)
 _SERVICES = ("nado", "nado-exec", "forum")   # every service that runs repo code (only installed ones restart)
-_CRATES = ("native/mldsa44", "native/alghash2", "native/starkcompose", "native/starkprove", "wasm/goldilocks")
+# native/stwo_js (the Stwo shielded-pool verifier) is REQUIRED from the commit that set STWO_POOL_HEIGHT (2026-10-12): a
+# verifier the chain depends on gets the required crates' protections — built when missing even if git is current, a
+# STALE library rebuilt (a stale verifier is a different verdict, i.e. a fork), and part of native.ok. A node without it
+# still STALLS a block carrying a Stwo spend instead of skipping it (execnode._apply_block).
+# G9 slice 6 deleted the Goldilocks crates (native/alghash2, starkcompose, starkprove, wasm/goldilocks) with their last
+# loader. INVARIANT: a crate leaves this tuple in the SAME commit that deletes it, and its directory is never reused
+# (doc/stwo-migration.md 9.6): fleet nodes keep the git-ignored target/ of a deleted crate, and everything that judges
+# libraries (native_report, _missing/_stale_required_libs, _rebuild_native_if_changed) iterates THIS tuple, never
+# native/*, so a leftover is invisible rather than reported "missing"/"stale" or rebuilt.
+_CRATES = ("native/mldsa44", "native/attest", "native/stwo_js", "native/pqsig")
+# OPTIONAL CRATES: built on update like the required ones (when their sources change, or their library was never built),
+# reported in /status native, but NEVER required — no refusal to start, no purge on a failed build, not part of
+# native.ok. The class exists for a crate that must reach the fleet BEFORE its gate is set (native/stwo_js was one until
+# STWO_POOL_HEIGHT). INVARIANT: an optional crate's failure must never stop an update or a node — it is not needed yet.
+# native/pqsig (the user-selectable signature schemes, doc/signature-schemes.md) is OPTIONAL while SIG_SCHEMES_HEIGHT is
+# dormant (2^62 on gen 28): every node builds it on this update, nothing needs it yet. The reroll that sets the gate to 1
+# moves it to _CRATES in the same commit — from then on a node without it would refuse a valid tagged transaction.
+# native/pqsig became required with the gen-29 reroll (SIG_SCHEMES_HEIGHT = 1). native/stwo_settle (2026-10-27): the
+# gen-29 settlement VM verifier (execnode/stwo_settle_native.py), stable Rust, default features (its prover is behind
+# a nightly-only feature no node enables). Optional until the settlement gate needs it: every node builds it now so the
+# gate can be set at a height the fleet already verifies at; nothing requires it before then.
+_OPTIONAL_CRATES = ("native/stwo_settle",)
 
 # Service-account installs (install.sh --user) run the node unprivileged, so it cannot call
 # `systemctl restart` itself. The installer writes a root-owned path unit (nado-restart.path) that
@@ -50,9 +72,95 @@ _CRATES = ("native/mldsa44", "native/alghash2", "native/starkcompose", "native/s
 _RESTART_FLAG = "/run/nado/restart-request"
 _RESTART_BRIDGE = "/etc/systemd/system/nado-restart.path"
 
+# A SECOND NODE ON THE SAME HOST (2026-10-29: an operator's lost machine's identity, run beside the relay in its own
+# network namespace). Its unit sets NADO_INSTANCE=<its unit name>, and then it restarts ONLY that unit, through its own
+# flag and bridge. Without this the fixed names above are the RELAY's: an unprivileged second node would write the
+# relay's flag (same service account, same /run/nado) and every update would bounce the relay while the second node
+# kept running old code — until a gate it never loaded forked it off. Unset (every ordinary node): unchanged.
+_INSTANCE = os.environ.get("NADO_INSTANCE", "").strip()
+if _INSTANCE and _INSTANCE != "nado" and re.fullmatch(r"nado[a-z0-9]{1,16}", _INSTANCE):
+    _SERVICES = (_INSTANCE,)
+    _RESTART_FLAG = f"/run/{_INSTANCE}/restart-request"
+    _RESTART_BRIDGE = f"/etc/systemd/system/{_INSTANCE}-restart.path"
+
+# PATHS NO RUNNING PROCESS EXECUTES OR SERVES. A fast-forward touching ONLY these does not need a restart:
+# bouncing a healthy validator to install a new paragraph is a self-inflicted outage, and it is not theoretical —
+# ten documentation commits pushed one at a time on 2026-09-10 restarted nado AND nado-exec ten times, and every
+# restart showed wallet users "the exec node returned no data (HTTP 502)" until it came back. Same reasoning as
+# the native-library digest check in check_and_update: restart when the bytes that RUN changed, not whenever git
+# moved.
+#
+# DELIBERATELY TINY, AND THE DEFAULT IS TO RESTART. Anything not listed here — the rest of static/ (the wallet and
+# games, which the node stamps and serves), and website/ — still restarts. A path wrongly called inert leaves the fleet running OLD code,
+# which is far worse than a needless bounce, so this list only grows with evidence that nothing loads the path.
+_INERT_PREFIXES = ("doc/",
+                   # THE LAND GAME (operator, 2026-11-06: "do not restart nado nodes for this!!! make an exception as there
+                   # is for docs"). Evidence, measured that day: no file under nado.py / ops / loops / execnode reads any of
+                   # these at import or keeps them; static/ is served through ops/static_versions.StaticVersions, which
+                   # re-stats every file within its TTL (2 s), so a running node serves a new land.js — and the i18n.js a
+                   # translation regenerates — without a restart. scripts/land_* run only as the nado-land service, which
+                   # this updater never restarted. tests/ is run by people and the pre-push hook, never by the node.
+                   "static/land.", "static/land-", "static/vendor/three/", "static/vendor/textures/",
+                   "static/i18n_games/land.json", "scripts/land_", "tests/",
+                   # …and the people's data (static/human: the body, hair and clothes binaries and textures, #172) and the
+                   # offline converters under tools/ — four pushes of 2026-11-12 (66aa92ea, 2aca010e, ad1bc57f and the
+                   # updater's own e7920488) restarted the fleet for hair and clothes files because these two were not
+                   # here; the operator: "I ALREADY TOLD YOU TO EXCLUDE THIS GAME FROM THE FLEET RESTARTS". Measured:
+                   # nothing under nado.py / ops / loops / execnode reads static/human or tools/ (the only mentions of
+                   # tools/ are in comments); static/human is served through StaticVersions like land.js, re-statted
+                   # within its TTL, so a running node serves a new wear.bin without a restart.
+                   "static/human/", "tools/")
+_INERT_FILES = ("README.md", "LICENSE", "CHANGELOG.md", "static/i18n.js")
+
+
+def _only_inert(paths) -> bool:
+    """True when EVERY changed path is inert (documentation, the Land game's files, tests). Empty input is False: no
+    information means restart."""
+    paths = [p for p in paths if p]
+    if not paths:
+        return False
+    # a markdown file at the repository root (ROADMAP.md, SCHEDULED_CLEANUPS.md…) is documentation like doc/: measured
+    # 2026-11-07, nothing under nado.py / ops / loops / execnode reads one — a roadmap edit restarted the fleet. A .md
+    # inside a code directory (ops/README.md) still restarts: the rule is the root only.
+    return all(p.startswith(_INERT_PREFIXES) or p in _INERT_FILES or ("/" not in p and p.endswith(".md")) for p in paths)
+
+
+def _restart_needed(local: str, remote: str) -> bool:
+    """Does the code that RUNS differ between these two commits? Any doubt — an unreadable diff, no paths at
+    all — answers True, because a MISSED restart is the dangerous direction."""
+    try:
+        # --no-renames EVERYWHERE A PATH LIST DECIDES SOMETHING: git's default rename detection prints only the NEW
+        # path, so moving a code file into doc/ read as a documentation-only update (no restart).
+        changed = _git("diff", "--no-renames", "--name-only", f"{local}..{remote}", timeout=30).splitlines()
+    except Exception as e:
+        _log().warning(f"update: could not diff {local[:12]}..{remote[:12]} ({e}) — restarting to be safe")
+        return True
+    if _only_inert(changed):
+        _log().info(f"update: {len(changed)} inert path(s) (docs, Land, tests) — no restart "
+                    f"({', '.join(changed[:5])}{'...' if len(changed) > 5 else ''})")
+        return False
+    return True
+
+
+def _log():
+    """Module logger. check_and_update() is reached from the HTTP handler, the timer and the peer-hint
+    cascade, none of which pass one in — and a disk failure that is only visible in a returned dict is
+    exactly how four nodes sat stranded for a day without anything in the journal saying why."""
+    import logging
+    return logging.getLogger("nado")
+
+
 _lock = threading.Lock()
 _last_check = [0.0]
 _latest_remote = [None]               # origin/main head seen by the LAST fetch — /status advertises it
+_last_fetch_error = [None]            # git's own words from the LAST failed fetch (None once one succeeds)
+
+# Free-disk thresholds for the checkout filesystem, measured against f_bavail (what a NON-root user may
+# use — ext4 holds back 5% for root, and the node does not run as root). A fetch of one of this project's
+# commits writes single-digit MiB in loose objects; 200 MiB is comfortably above that with room for the
+# repack a self-heal gc performs, and 1 GiB is early enough that an operator can act before it bites.
+_DISK_BLOCKING_MB = 200
+_DISK_WARN_MB = 1024
 
 
 def latest_known():
@@ -71,7 +179,8 @@ except Exception:
 
 
 def running_head():
-    """Short hash of the commit this PROCESS was started from (None outside a git checkout)."""
+    """Short hash of the commit this PROCESS runs: the one it started from, or a later one it ADOPTED because every path
+    in between is inert (apply_stale_checkout) — the same running code either way. None outside a git checkout."""
     return _RUNNING_HEAD
 
 
@@ -106,10 +215,151 @@ def code_is_stale():
     return bool(run and repo and run != repo)
 
 
+# --- Stale-checkout restart -------------------------------------------------------------------------------
+# A COMMIT THAT IS NOT RUNNING IS NOT A FIX. The updater only restarts after IT applied a fast-forward, so
+# the case where the checkout is already current never restarts anything: the operator commits locally and
+# pushes (which is how this fleet is developed), local HEAD already equals origin/main, /update answers
+# "up_to_date", and the RUNNING PROCESSES stay on the old code indefinitely. code_is_stale() has detected
+# exactly this the whole time and only ever produced a health WARNING — "RESTART to apply" — which is how a
+# finality stall once survived 34 minutes past its own fix landing, and how nado-exec ran an hour past the
+# row-commit fix that made records proofs 4x cheaper (the exec node is the one that matters here: it is where
+# the prover lives, and it is the service an operator is least likely to restart by hand).
+#
+# THREE GUARDS, each for a failure this could otherwise cause:
+#   • DIRTY WORKING TREE -> never restart. The repo dir is a live dev checkout on at least one box; loading a
+#     half-finished edit into a money node is far worse than running one commit behind. Same rule the
+#     fast-forward path already applies for the same reason.
+#   • ONCE PER HEAD -> a restart that does not change the running commit (unit masked, crash loop, exec
+#     fail-stopped on a stale native crate) must not re-arm forever. Record the head we acted on.
+#   • SETTLE PERIOD -> require the staleness to persist across two observations, so a checkout seen
+#     mid-`git merge` (index written, HEAD not yet moved) cannot trigger a restart.
+_STALE_MIN_AGE = 90                     # s the checkout must stay ahead before a restart is warranted
+_stale_since = [None]                   # (head, first_seen_monotonic) for the head currently observed stale
+_stale_acted = [None]                   # the repo head we have already restarted for
+
+
+def working_tree_dirty():
+    """True when tracked files have uncommitted changes. Any error answers True — 'I could not tell' must
+    behave like 'do not touch it'."""
+    try:
+        _git("diff", "--quiet")
+        _git("diff", "--cached", "--quiet")
+        return False
+    except Exception:
+        return True
+
+
+def apply_stale_checkout(now=None):
+    """Restart the services when the checkout is ahead of the running process, so a pushed fix actually runs.
+
+    Returns a dict describing what happened; the caller logs it. Never raises — this is called from the
+    health loop, and observability must not be able to take the node down."""
+    try:
+        run, repo = running_head(), repo_head()
+        if not (run and repo) or run == repo:
+            _stale_since[0] = None
+            return {"status": "current", "running": run, "repo": repo}
+        try:
+            from config import get_config
+            if get_config().get("auto_update", True) is False:
+                return {"status": "disabled", "reason": "auto_update=false in config"}
+        except Exception:
+            pass                                    # config unreadable: fall through to the safety guards
+        if _stale_acted[0] == repo:
+            return {"status": "already_restarted", "repo": repo}
+        # INERT: everything between the running commit and the checkout is a path nothing running loads (docs, the Land
+        # game's files, tests — _INERT_PREFIXES). The process already runs the new commit's code byte for byte, so it
+        # ADOPTS that commit (running_commit follows, and the fleet still reads uniform) instead of restarting. Before
+        # this the inert exception never held: an inert fast-forward skipped its restart in check_and_update, left
+        # running_head on the old commit, and this check restarted the node 90 s later anyway — on every fleet node
+        # and on the push host ("do not restart nado nodes for this!!!", operator 2026-11-06).
+        if not _restart_needed(run, repo):
+            global _RUNNING_HEAD
+            _RUNNING_HEAD = repo
+            _stale_since[0] = None
+            return {"status": "adopted", "running": repo, "was": run, "reason": "inert paths only — nothing that runs changed"}
+        if working_tree_dirty():
+            return {"status": "dirty", "reason": "uncommitted changes — refusing to load a half-finished edit",
+                    "running": run, "repo": repo}
+        t = time.monotonic() if now is None else now
+        seen = _stale_since[0]
+        if not seen or seen[0] != repo:
+            _stale_since[0] = (repo, t)
+            return {"status": "observing", "running": run, "repo": repo}
+        if t - seen[1] < _STALE_MIN_AGE:
+            return {"status": "observing", "running": run, "repo": repo,
+                    "for_s": round(t - seen[1], 1)}
+        # _schedule_restart, not _restart_services — the latter has never existed, so this raised
+        # NameError and the outer handler reported {"status": "error"} instead of restarting. The
+        # self-heal was dead in a way that HID itself: _stale_acted[0] is set on the line above, so
+        # after the first failure every later pass short-circuits to "already_restarted" for a restart
+        # that never happened. Found by test_no_undefined_names.
+        _stale_acted[0] = repo
+        # OPTIONAL CRATES FIRST (_rebuild_optional_crates): the /update path builds them before its restart; this path
+        # did not, so the push host never built native/stwo_js. Required crates are left as before on this path (the
+        # push host's operator builds them, CLAUDE.md "A .rs commit fail-stops nado-exec").
+        try:
+            try:
+                changed = _git("diff", "--no-renames", "--name-only", run, repo, timeout=30)
+            except Exception:
+                changed = None
+            cargo = shutil.which("cargo") or os.path.expanduser("~/.cargo/bin/cargo")
+            native = _rebuild_optional_crates(changed, bool(shutil.which("cargo")) or os.access(cargo, os.X_OK))
+            # ...and a REQUIRED crate this host never built (native/stwo_js became required with STWO_POOL_HEIGHT; the
+            # push host had never built it): built before the restart, as /update does (review 2026-10-12)
+            miss = _missing_required_libs()
+            if miss:
+                native.update(_build_crates(miss))
+        except Exception as e:
+            native = {"error": f"{type(e).__name__}: {e}"}
+        services = _schedule_restart()
+        return {"status": "restarting", "running": run, "repo": repo, "services": services,
+                **({"native": native} if native else {})}
+    except Exception as e:
+        return {"status": "error", "reason": f"{type(e).__name__}: {e}"}
+
+
+class GitError(RuntimeError):
+    """A git command failed, carrying git's ACTUAL stderr rather than a guess about why."""
+
+
 def _git(*args, timeout=15):
-    """Run a git command in the repo root; returns stripped stdout, raises on non-zero exit."""
-    return subprocess.check_output(["git", *args], cwd=_REPO_DIR, stderr=subprocess.DEVNULL,
-                                   text=True, timeout=timeout).strip()
+    """Run a git command in the repo root; returns stripped stdout, raises GitError on failure.
+
+    stderr is CAPTURED, not discarded. It used to go to DEVNULL, so every failure reached the caller as a
+    bare exception with nothing in it, and the caller had to GUESS — /update answered "could not reach
+    origin (offline?)" for a node whose network was fine, which sends an operator chasing connectivity for
+    something else entirely. This module exists so a node can SAY why it cannot update; throwing away the
+    one sentence that says so defeated it. (Same lesson as the dead-fork probe: instrument first.)"""
+    try:
+        p = subprocess.run(["git", *args], cwd=_REPO_DIR, capture_output=True, text=True, timeout=timeout)
+        # "fatal: expected flush after ref listing" is git's HTTP/2 (protocol v2) transport tripping over a
+        # truncated/odd reply from GitHub. Three fleet nodes sat on it for 7+ hours on 2026-09-02 — unable to
+        # fetch ANY update, including one to this updater. Forcing HTTP/1.1 + protocol v1 for one retry is
+        # the known workaround; a healthy transport never hits this branch.
+        if p.returncode != 0 and "expected flush after ref listing" in (p.stderr or "") \
+                and not any(str(a).startswith("http.version=") for a in args):
+            p = subprocess.run(["git", "-c", "http.version=HTTP/1.1", "-c", "protocol.version=1", *args],
+                               cwd=_REPO_DIR, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise GitError(f"git {args[0]}: timed out after {timeout}s")
+    except Exception as e:
+        raise GitError(f"git {args[0]}: {type(e).__name__}: {e}")
+    if p.returncode != 0:
+        tail = [ln for ln in (p.stderr or "").strip().splitlines() if ln.strip()]
+        raise GitError(f"git {_subcommand(args)}: exit {p.returncode}"
+                       + (f" — {tail[-1][:200]}" if tail else ""))
+    return (p.stdout or "").strip()
+
+
+def _subcommand(args):
+    """The git SUBCOMMAND in args, skipping any leading `-c key=value` pairs — so a call that sets config
+    inline still reports "git fetch: ..." and not "git -c: ...". The whole point of this module's error
+    handling is that a failure names the thing that failed."""
+    i = 0
+    while i < len(args) and args[i] == "-c":
+        i += 2
+    return args[i] if i < len(args) else (args[0] if args else "?")
 
 
 # --- NEAR-REAL-TIME UPDATE CASCADE (peer hints) ----------------------------------------------------
@@ -123,6 +373,72 @@ def _git(*args, timeout=15):
 
 _HINT_COOLDOWN = 3600                  # s per distinct advertised value — a stale or lying peer cannot loop us
 _hints = {}                            # advertised short-commit -> monotonic ts of its last evaluation
+
+
+_wave_pending = False
+
+
+def wave_delay(trigger, rng=random.random):
+    """Seconds a node waits before acting on an update signal. A PEER HINT is the cascade: every node that
+    heard one restarted at once, the whole fleet was down and back inside a few seconds, and no node came
+    back to a mesh with an elder to warm its pool from (protocol.POOL_WARM_ELDER_S) — so every wave split
+    (h191043, 2026-09-22). Spread over UPDATE_WAVE_JITTER_S, most of the fleet is up and warmed at every
+    moment of the wave. The operator's own /update and the timer are not a cascade and wait nothing."""
+    from protocol import UPDATE_WAVE_JITTER_S
+    return rng() * UPDATE_WAVE_JITTER_S if trigger == "peer-hint" else 0.0
+
+
+def _delayed_check(delay):
+    global _wave_pending
+    try:
+        time.sleep(max(0.0, float(delay)))
+        queue_recheck(check_and_update("peer-hint"))
+    finally:
+        _wave_pending = False
+
+
+# A KICK THAT LANDS ON A BUSY CHECK IS NOT LOST (2026-09-27). check_and_update answers `busy` while another check
+# holds the lock and `rate_limited` inside _MIN_INTERVAL — and both simply returned. When the running check had
+# fetched BEFORE the push landed, the node stayed on the old commit: its peer hint went into a one-hour cooldown
+# (_HINT_COOLDOWN) and the next chance was the 15-minute timer. Measured: 185.238.249.208 answered `busy` to a wave
+# kick and was still on the previous commit 12 minutes later, with update_available false and nothing blocking.
+# Now either answer queues ONE deferred re-check (after the rate-limit window, or _BUSY_RETRY_S); a re-check that
+# lands on busy again re-queues, at most _RECHECK_MAX times; at most one is pending at any moment.
+_BUSY_RETRY_S = 20
+_RECHECK_MAX = 5
+_recheck_lock = threading.Lock()
+_recheck_pending = False
+
+
+def queue_recheck(res, attempt=0):
+    """Queue one deferred check_and_update when `res` was busy/rate_limited. Returns True when one was queued."""
+    global _recheck_pending
+    st = (res or {}).get("status") if isinstance(res, dict) else None
+    if st not in ("busy", "rate_limited") or attempt >= _RECHECK_MAX:
+        return False
+    with _recheck_lock:
+        if _recheck_pending:
+            return False
+        _recheck_pending = True
+    try:
+        delay = int(res.get("retry_in_s") or 0) + 1 if st == "rate_limited" else _BUSY_RETRY_S
+    except (TypeError, ValueError):
+        delay = _BUSY_RETRY_S
+    threading.Thread(target=_recheck, args=(delay, attempt), daemon=True, name="update_recheck").start()
+    return True
+
+
+def _recheck(delay, attempt):
+    global _recheck_pending
+    try:
+        time.sleep(max(0.0, float(delay)))
+    finally:
+        with _recheck_lock:
+            _recheck_pending = False
+    try:
+        queue_recheck(check_and_update("deferred"), attempt + 1)
+    except Exception as e:                              # never raise out of a daemon thread
+        _log().warning(f"deferred update check failed: {e}")
 
 
 def peer_hint(commit):
@@ -150,7 +466,13 @@ def peer_hint(commit):
             return False
         except Exception:
             pass
-        threading.Thread(target=check_and_update, args=("peer-hint",), daemon=True,
+        # ONE DELAYED CHECK AT A TIME: the jitter below can outlast the hint cooldown, and a second hint
+        # must not start a second pull racing the first.
+        global _wave_pending
+        if _wave_pending:
+            return False
+        _wave_pending = True
+        threading.Thread(target=_delayed_check, args=(wave_delay("peer-hint"),), daemon=True,
                          name="peer_hint_update").start()
         return True
     except Exception:
@@ -201,6 +523,29 @@ def _has_restart_capability():
     return False
 
 
+def _free_disk_mb():
+    """MiB free on the checkout filesystem to a NON-root user (f_bavail, not f_bfree — ext4 reserves 5%
+    for root and the node does not run as root). None if it cannot be read."""
+    try:
+        st = os.statvfs(_REPO_DIR)
+        return round((st.f_bavail * st.f_frsize) / (1024 * 1024), 1)
+    except Exception:
+        return None
+
+
+def _looks_like_disk_pressure(err) -> bool:
+    """Is this git failure the out-of-space one, i.e. worth a repack-and-retry rather than a bare report?
+
+    Matched on git's own message. "unpack-objects failed" earns its place next to the explicit ENOSPC
+    strings: it is what the fleet actually reported, and it is emitted when the loose-object write path
+    cannot complete — which in practice means no space (verified by reproduction) or no inodes. Both are
+    exactly what a repack relieves."""
+    s = str(err).lower()
+    return any(m in s for m in ("no space left", "unpack-objects failed", "disk quota exceeded",
+                                "unable to write loose object", "cannot allocate memory",
+                                "no space", "enospc"))
+
+
 def updatability(probe_remote=True) -> dict:
     """Diagnose whether this node can self-update. Pure inspection — never mutates anything. Returns
     {capable, blocking[], warnings[], checks{}} where `capable` is False ONLY for local permanent defects."""
@@ -232,6 +577,115 @@ def updatability(probe_remote=True) -> dict:
             except Exception:
                 checks["origin"] = None
                 blocking.append("no 'origin' remote")
+            # LOCAL EDITS BLOCK THE FAST-FORWARD, AND THIS DID NOT SAY SO (2026-09-13). check_and_update
+            # refuses a dirty tree — correctly — but the refusal lived only in /update's reply, while
+            # /status kept advertising capable=true, blocking=[] for that same node. psychz sat on a
+            # commit 15 behind, answering every wave with "working tree has uncommitted changes", and
+            # nothing an operator could read from outside named the files or even the condition. It was
+            # the one node still producing on a dead branch, for exactly that reason. Name the files.
+            try:
+                # THE SAME TWO QUESTIONS check_and_update ASKS (`diff --quiet`, `diff --cached --quiet`),
+                # answered with names. Not `status --porcelain`: _git() strips its stdout, so the first
+                # line loses its leading status space and a fixed slice ate a character of the path —
+                # it reported "oops/core_loop.py". --name-only has no prefix to slice.
+                dirty = sorted({ln.strip() for ln in (_git("diff", "--name-only") + "\n"
+                                                      + _git("diff", "--cached", "--name-only")).splitlines()
+                                if ln.strip()})
+                checks["dirty_files"] = dirty
+                if dirty:
+                    # A WARNING, NOT A BLOCK: since 2026-09-13 the updater moves a local edit aside (as
+                    # `<file>.local-<time>`, never deleted) when the incoming commit changes that file, and
+                    # leaves the rest alone — so edits no longer stop an update. They are still named here,
+                    # because an unattended node should not be carrying any, and the name says what to look for.
+                    shown = ", ".join(dirty[:6]) + (f" (+{len(dirty) - 6} more)" if len(dirty) > 6 else "")
+                    warnings.append(f"local edits to tracked files: {shown} — an update moves one aside as "
+                                    f"<file>.local-<time> only if it changes that file; commit or discard them")
+            except Exception:
+                checks["dirty_files"] = None
+            # AND NAME WHAT AN UPDATE MOVED ASIDE. The move itself restores HEAD's copy, so the path is clean again
+            # and the check above never sees it; the list rode only in the /update reply, which the periodic and
+            # peer-hinted checks discard. CLAUDE.md promises a moved-aside file is "named in the reply and under
+            # update_warnings" — this is the /status half. The copies are untracked `<file>.local-<unix time>`.
+            try:
+                aside = sorted(ln.strip() for ln in _git("ls-files", "--others", "--exclude-standard").splitlines()
+                               if re.search(r"\.local-\d+$", ln.strip()))
+                checks["moved_aside"] = aside
+                if aside:
+                    shown = ", ".join(aside[:6]) + (f" (+{len(aside) - 6} more)" if len(aside) > 6 else "")
+                    warnings.append(f"moved aside by an update (the local copy, never deleted): {shown} — "
+                                    f"merge anything you still need, then delete them")
+            except Exception:
+                checks["moved_aside"] = None
+
+    # FREE DISK. This is the failure that actually stranded four nodes on betanet-3, and NOTHING here
+    # detected it: they answered /status with capable=true, blocking=[], remote_reachable=true while every
+    # single fetch died. Reproduced exactly (60 MiB loopback fs, fetch as the unprivileged service user):
+    #
+    #     fatal: unable to write loose object file: No space left on device
+    #     fatal: unpack-objects failed
+    #
+    # Two details that make this sneakier than "disk full". (1) The write that fails is a LOOSE OBJECT:
+    # git takes the unpack-objects path whenever an incoming pack holds fewer than transfer.unpackLimit
+    # (default 100) objects, which is every push this project makes — so fetches land in the most
+    # space-hungry form git has. (2) ext4 reserves 5% for root, so the SERVICE USER hits the wall while
+    # df still shows space and a root shell can write happily: the same fetch that fails under systemd
+    # succeeds when an operator tries it by hand, which sends them looking anywhere but here.
+    # BYTES ARE ONLY ONE OF THE THREE WAYS THIS WRITE FAILS, and on this fleet they were the wrong one:
+    # 89.143.197.28 reported 1424 GiB free while every fetch died with "unpack-objects failed". git prints
+    # that whenever the unpack-objects CHILD fails, for ANY reason, with no distinguishing detail — so the
+    # message alone cannot tell ENOSPC from ENOSPC-on-inodes from an OOM-kill. Record all three; a single
+    # observation at the next failure then names the cause instead of inviting another hypothesis.
+    try:
+        st = os.statvfs(_REPO_DIR)
+        free_mb = (st.f_bavail * st.f_frsize) / (1024 * 1024)      # f_bavail = free to a NON-root user
+        checks["free_disk_mb"] = round(free_mb, 1)
+        if free_mb < _DISK_BLOCKING_MB:
+            blocking.append(f"only {free_mb:.0f} MiB free on the checkout filesystem — git fetch cannot "
+                            f"write objects (needs > {_DISK_BLOCKING_MB} MiB); free space or the node "
+                            f"cannot update")
+        elif free_mb < _DISK_WARN_MB:
+            warnings.append(f"low disk: {free_mb:.0f} MiB free on the checkout filesystem "
+                            f"(fetch starts failing under ~{_DISK_BLOCKING_MB} MiB)")
+
+        # INODES. A filesystem with terabytes free still cannot create a file once it is out of inodes,
+        # and the unpack-objects path is the single worst consumer this node has: it writes ONE FILE PER
+        # OBJECT. f_favail is 0 on filesystems that do not report inodes (btrfs, some overlays) — absence
+        # is not exhaustion, so only a positive total is judged.
+        if st.f_files:
+            checks["free_inodes"] = st.f_favail
+            if st.f_favail < 10_000:
+                blocking.append(f"only {st.f_favail} inodes free on the checkout filesystem — git cannot "
+                                f"create objects no matter how many bytes are free")
+            elif st.f_favail < 100_000:
+                warnings.append(f"low inodes: {st.f_favail} free on the checkout filesystem")
+    except Exception as e:
+        checks["free_disk_mb"] = None
+        warnings.append(f"could not read free disk space: {type(e).__name__}: {e}")
+
+    # MEMORY. git spawns unpack-objects as a child; if the OOM killer takes it, git reports exactly the
+    # same "fatal: unpack-objects failed". That fits what this fleet shows better than disk does — the
+    # failure is INTERMITTENT (the same node fetches successfully on a retry minutes later), which is what
+    # memory pressure looks like and is not what a full disk looks like. Unproven, which is the point of
+    # recording it: nothing here could distinguish the two before.
+    try:
+        info = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, _, v = line.partition(":")
+                info[k] = int(v.split()[0]) if v.split() and v.split()[0].isdigit() else 0
+        avail_mb = info.get("MemAvailable", 0) / 1024
+        checks["mem_available_mb"] = round(avail_mb, 1)
+        if avail_mb and avail_mb < 128:
+            warnings.append(f"low memory: {avail_mb:.0f} MiB available — git's unpack-objects child can be "
+                            f"OOM-killed, which surfaces as 'unpack-objects failed'")
+    except Exception:
+        checks["mem_available_mb"] = None
+
+    # LAST FETCH OUTCOME. updatability() is pure inspection and cannot fetch, so a repo that is fine
+    # locally looks fine here even when every fetch fails. check_and_update records its verdict; surface
+    # it, so the condition is visible in /status instead of only to whoever calls /update by hand.
+    if _last_fetch_error[0]:
+        blocking.append(f"last git fetch failed: {_last_fetch_error[0]}")
 
     checks["restart_capable"] = _has_restart_capability()
     checks["restart_bridge"] = os.path.isfile(_RESTART_BRIDGE)
@@ -247,9 +701,9 @@ def updatability(probe_remote=True) -> dict:
         try:
             _git("ls-remote", "--exit-code", "origin", _BRANCH, timeout=30)
             checks["remote_reachable"] = True
-        except Exception:
+        except Exception as e:
             checks["remote_reachable"] = False
-            warnings.append("origin unreachable right now (offline?) — transient, will retry")
+            warnings.append(f"origin unreachable right now: {e}")
 
     return {"capable": not blocking, "blocking": blocking, "warnings": warnings, "checks": checks}
 
@@ -267,6 +721,12 @@ def heal(logger=None, force=False) -> dict:
     as root — writing a systemd unit needs it."""
     if _heal_attempted[0] and not force:
         return {"status": "already_attempted"}
+    # A TESTNET NODE NEVER RUNS THE INSTALLER (2026-09-28). A loopback node started as root from a worktree (branch
+    # reroll-gen28, not main) judged itself un-updatable and launched `install.sh --service --exec` on the live
+    # machine; the installer saw the live nado.service (User=nado), switched to its move-into-/srv/nado-home/nado mode
+    # and stopped only at its own "already exists — refusing" check. A testnet child is never a production install.
+    if os.environ.get("NADO_TESTNET"):
+        return {"status": "disabled", "reason": "testnet node (NADO_TESTNET): never runs the installer"}
     script = os.path.join(_REPO_DIR, "scripts", "install.sh")
     if not os.path.isfile(script):
         return {"status": "unavailable", "reason": "scripts/install.sh is missing from this directory"}
@@ -361,34 +821,157 @@ def check_and_update(trigger: str) -> dict:
             return _blocked(f"origin is '{url}', not the official repo — refusing to pull from it")
 
         try:
-            _git("fetch", "--quiet", "origin", _BRANCH, timeout=60)
-        except Exception:
-            return {"status": "fetch_failed", "reason": "could not reach origin (offline?) — will retry later"}
+            # --tags is REQUIRED, not cosmetic: the reported version is `git describe --tags`, so a node that
+            # fast-forwards the branch without fetching tags keeps naming whatever stale tag it happens to
+            # hold. The fleet then reports DIVERGENT versions (alpha.11 / alpha.12 / a bare hash) while every
+            # node runs the identical commit — which reads as a broken/partial rollout and makes the version
+            # column useless for spotting a genuinely un-updated node.
+            # transfer.unpackLimit=1 keeps the incoming pack AS a pack instead of exploding it into
+            # loose objects. git only takes the unpack-objects path below this limit (default 100),
+            # and every push this project makes is smaller than that — so without the flag the
+            # self-updater writes git's least space-efficient form on every single fetch, forever.
+            _git("-c", "transfer.unpackLimit=1",
+                 "fetch", "--quiet", "--tags", "--force", "origin", _BRANCH, timeout=60)
+            _last_fetch_error[0] = None
+        except Exception as e:
+            # SELF-HEAL THE SPACE CASE BEFORE GIVING UP — but do not oversell it. A repack is a real
+            # reclaim: measured on the dev checkout, 2030 loose objects occupied 35.1 MiB while 17112
+            # PACKED objects occupied 22.6 MiB (~17.7 KiB per loose object against ~1.4 KiB), because
+            # loose objects never delta-compress against each other and each burns a whole filesystem
+            # block. A failed fetch also strands tmp_obj_/tmp_pack_ garbage that only a prune removes.
+            #
+            # MEASURED LIMIT (do not weaken the disk warnings on the strength of this retry): `git gc`
+            # writes the NEW pack before deleting the old objects, so it needs free space of roughly the
+            # existing pack size. On a 13 MiB .git it failed at 6 MiB free, at 4, at 2, and at 0 —
+            # "fatal: failed to run repack", reclaiming nothing. This rescues the band where loose-object
+            # bloat has eaten the headroom but a repack still fits. It CANNOT rescue a genuinely full
+            # disk; the warning thresholds above are what has to catch that, early.
+            if _looks_like_disk_pressure(e):
+                try:
+                    _git("gc", "--prune=now", "--quiet", timeout=300)
+                    _git("-c", "transfer.unpackLimit=1",
+                         "fetch", "--quiet", "--tags", "--force", "origin", _BRANCH, timeout=60)
+                    _last_fetch_error[0] = None
+                    _log().warning("self-update: fetch failed on disk pressure; git gc reclaimed enough "
+                                   "to complete it. FREE DISK ON THIS HOST — a repack only buys one "
+                                   "reprieve and the next fetch may not be recoverable.")
+                except Exception as e2:
+                    _last_fetch_error[0] = f"{e2}"
+                    _log().error("THIS NODE IS OUT OF DISK AND CANNOT UPDATE. It will drift out of "
+                                 f"consensus. Free space on the checkout filesystem "
+                                 f"({_free_disk_mb()} MiB free) — a repack could not even run.")
+                    return {"status": "fetch_failed", "reason": f"git fetch failed: {e2}",
+                            "self_heal": "git gc could not run either — the host is out of disk, "
+                                         "not merely fragmented. Free space on the checkout filesystem.",
+                            "free_disk_mb": _free_disk_mb()}
+            else:
+                # git's OWN words. "offline?" was a guess, and it was usually wrong — the failures this
+                # actually reports are auth prompts, DNS hiccups, a stale index.lock, and genuine timeouts,
+                # which need completely different fixes from each other.
+                _last_fetch_error[0] = f"{e}"
+                return {"status": "fetch_failed", "reason": f"git fetch failed: {e}"}
 
         local, remote = _git("rev-parse", "HEAD"), _git("rev-parse", f"origin/{_BRANCH}")
         _latest_remote[0] = remote[:12]
+        _remove_retired_build_dirs()
         if local == remote:
+            # UP TO DATE IN GIT IS NOT THE SAME AS ABLE TO RUN. A node can sit on the right commit and still
+            # be missing a REQUIRED native library, and then it silently cannot do its job: measured
+            # 2026-08-06, peers on the correct HEAD lacked libgoldilocks.so (the Goldilocks crate, deleted in G9)
+            # and rejected every settle proof
+            # with "NativeMissing: native crate 'goldilocks' is REQUIRED but its library is missing". Since
+            # betanet-14 there is no Python fallback, so those nodes could never verify a proof at all.
+            # The rebuild used to run ONLY on the update path, so a node that was already current never
+            # built the missing library no matter how many times /update was called — which is exactly the
+            # state .141 was left in after it happened to be mid-cascade during the wave that built it.
+            # Building here costs nothing when everything is present (_missing_required_libs returns []).
+            miss = _missing_required_libs()
+            if miss:
+                built = _build_crates(miss)
+                return {"status": "up_to_date", "head": local[:12], "trigger": trigger, "native": built,
+                        "note": "rebuilt required native libraries that were missing"}
+            # ...AND A PRESENT LIBRARY IS NOT NECESSARILY A USABLE ONE. A node that fast-forwarded across a
+            # commit touching native/*.rs keeps a .so that is now older than its sources; native_guard
+            # refuses it and BLOCK PRODUCTION STOPS, while this function kept answering "up_to_date" because
+            # in git it was. See _stale_required_libs for the live failure this repairs.
+            stale = _stale_required_libs()
+            if stale:
+                # REFUSE ON LOCAL EDITS. A rebuild here compiles whatever is in the working tree, so on a box
+                # where someone is mid-edit it would build and then RESTART INTO their unfinished work. The
+                # same reason the update path refuses to fast-forward over a dirty tree; the check belongs on
+                # both, because this branch never reaches that one.
+                try:
+                    _git("diff", "--quiet"); _git("diff", "--cached", "--quiet")
+                except Exception:
+                    return {"status": "up_to_date", "head": local[:12], "trigger": trigger,
+                            "native_stale": stale,
+                            "note": "native libraries are STALE but the working tree has uncommitted "
+                                    "changes — refusing to rebuild; commit or stash, then retry"}
+                before = _lib_digests(stale)
+                built = _build_crates(stale)
+                # VERIFY, DO NOT ASSUME. cargo can exit 0 and leave the artifact untouched, so re-ask the
+                # guard: it is the only evidence that the thing which refused to load now loads, and
+                # restarting while it is still stale would just fail-stop again.
+                still = _stale_required_libs()
+                if still:
+                    return {"status": "up_to_date", "head": local[:12], "trigger": trigger, "native": built,
+                            "native_stale": still,
+                            "note": "rebuild did not clear the staleness — this node needs cargo and a "
+                                    "manual `cargo build --release` in the listed crates"}
+                # RESTART ONLY IF THE LIBRARY ACTUALLY CHANGED. Staleness is an MTIME question, so a crate
+                # goes stale when a manifest is merely TOUCHED — on this box native/mldsa44 read stale
+                # because a thin-LTO commit rewrote Cargo.toml, while the node was serving happily on a
+                # library whose BYTES were correct. Bouncing a healthy validator to install an identical
+                # .so is a self-inflicted outage; the rebuild silences the guard either way.
+                after = _lib_digests(stale)
+                changed = [c for c in stale if before.get(c) != after.get(c)]
+                if not changed:
+                    return {"status": "up_to_date", "head": local[:12], "trigger": trigger, "native": built,
+                            "native_rebuilt": stale, "restarting": False,
+                            "note": "rebuilt STALE native libraries; bytes unchanged, so no restart"}
+                restarting = _schedule_restart()
+                return {"status": "up_to_date", "head": local[:12], "trigger": trigger, "native": built,
+                        "restarting": restarting, "native_rebuilt": changed,
+                        "note": "rebuilt STALE native libraries and restarted" if restarting else
+                                "rebuilt STALE native libraries — restart the node manually"}
             return {"status": "up_to_date", "head": local[:12], "trigger": trigger}
         try:                                            # only advance if remote is strictly AHEAD of us
             _git("merge-base", "--is-ancestor", local, remote)
         except Exception:
             return _blocked(f"local HEAD {local[:12]} diverged from origin/{_BRANCH} (local commits) — update manually")
-        try:
-            _git("diff", "--quiet"); _git("diff", "--cached", "--quiet")
-        except Exception:
-            return _blocked("working tree has uncommitted changes — refusing to touch local edits")
+        # LOCAL EDITS NO LONGER BLOCK THE FLEET (2026-09-13). This refused ANY dirty tracked file, and on an
+        # unattended node that refusal is permanent — psychz answered every wave with it for a day, most
+        # likely over a Cargo.lock its own rebuild had rewritten. An edit the incoming commit would change is
+        # moved aside as `<file>.local-<time>` (never deleted, named in the reply); an edit the commit does
+        # not touch is left alone, because git fast-forwards over those. See _move_aside_dirty_conflicts.
+        # UNTRACKED FILES THE TARGET TRACKS block the fast-forward the same way (2026-09-07: a cargo-written
+        # Cargo.lock that a later commit started tracking) — same remedy, same helper convention.
+        moved_aside = _move_aside_dirty_conflicts(remote) + _move_aside_untracked_collisions(remote)
+        if moved_aside:
+            _log().warning(f"update: moved aside untracked files the target tracks: {moved_aside}")
         try:
             _git("merge", "--ff-only", "--quiet", f"origin/{_BRANCH}", timeout=60)
-        except Exception:
-            return _blocked(f"fast-forward to {remote[:12]} failed — left on {local[:12]}")
+        except Exception as e:
+            # the ff failed for another reason: put the moved files back so nothing changed on this box
+            _restore_moved_aside(moved_aside)
+            return _blocked(f"fast-forward to {remote[:12]} failed — left on {local[:12]}: {e}")
 
         native = _rebuild_native_if_changed(local, remote)
-        restarting = _schedule_restart()
+        # A documentation-only fast-forward leaves every running byte identical, so it does not restart. The
+        # native rebuild is consulted FIRST and independently: if a crate was rebuilt then code changed whatever
+        # the diff of tracked files said, so that path keeps its restart.
+        if native or _restart_needed(local, remote):
+            restarting = _schedule_restart()
+            note = None if restarting else "no systemd services found — restart the node manually"
+        else:
+            restarting = []
+            note = "inert update (docs, Land game files, tests) — nothing the node runs changed, so no restart"
         out = {"status": "updated", "from": local[:12], "to": remote[:12], "trigger": trigger,
-               "restarting": restarting,
-               "note": None if restarting else "no systemd services found — restart the node manually"}
+               "restarting": restarting, "note": note}
         if native:
             out["native"] = native                      # per-crate build outcome; "purged-stale" ⇒ fell back to pure-Python
+        if moved_aside:
+            out["moved_aside"] = moved_aside            # untracked files renamed to <path>.local-<ts> so the ff could land
         return out
     finally:
         _lock.release()
@@ -408,6 +991,265 @@ def _shared_libs(crate_path):
     return out
 
 
+def _loader_lib(crate):
+    """The ONE library file each crate's loader opens: target/release/libnado_<name>.so. The one exception was
+    wasm/goldilocks (libgoldilocks.so), deleted in G9 slice 6; its absence from the staleness and digest checks once let a
+    node keep a stale library its loader then refused (found 2026-09-25 adding the /status native report). A crate whose
+    loader opens any other name must be special-cased HERE, or it is never checked. Keep this in step with the loaders."""
+    name = os.path.basename(crate)
+    return os.path.join(_REPO_DIR, crate, "target", "release", f"libnado_{name}.so")
+
+
+_PROC_START = __import__("time").time()          # when THIS process loaded its libraries (native_report)
+_NATIVE_REPORT = [0.0, None]
+
+
+def native_report(max_age=60):
+    """{crate: {"state": ok|stale|missing, "built": ISO-8601 UTC or None, "restart_needed": bool}} plus "ok": bool —
+    published in /status so an operator can read every peer's native libraries without a shell on the box. States
+    use native_guard.is_stale, the loader's own definition. `restart_needed`: the library on disk is newer than this
+    process, so the process still runs the copy it loaded (a rebuild without a restart). Cached `max_age` seconds:
+    it is a few stat calls, but /status is hit constantly."""
+    import time as _t
+    now = _t.time()
+    if _NATIVE_REPORT[1] is not None and now - _NATIVE_REPORT[0] < max_age:
+        return _NATIVE_REPORT[1]
+    try:
+        from execnode import native_guard as _ng
+    except Exception:
+        _ng = None
+    out, all_ok = {}, True
+    for crate in _CRATES:
+        path = os.path.join(_REPO_DIR, crate)
+        if not os.path.isdir(path):
+            continue
+        so = _loader_lib(crate)
+        try:
+            m = os.path.getmtime(so)
+        except OSError:
+            out[crate] = {"state": "missing", "built": None, "restart_needed": False}
+            all_ok = False
+            continue
+        stale = bool(_ng and _ng.is_stale(so, path))
+        out[crate] = {"state": "stale" if stale else "ok",
+                      "built": _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime(m)),
+                      "restart_needed": m > _PROC_START}
+        all_ok = all_ok and not stale
+    for crate in _OPTIONAL_CRATES:                       # reported, never part of `ok` (see _OPTIONAL_CRATES)
+        path = os.path.join(_REPO_DIR, crate)
+        if not os.path.isdir(path):
+            continue
+        so = _loader_lib(crate)
+        try:
+            m = os.path.getmtime(so)
+        except OSError:
+            out[crate] = {"state": "missing", "built": None, "restart_needed": False, "optional": True}
+            continue
+        out[crate] = {"state": "stale" if (_ng and _ng.is_stale(so, path)) else "ok",
+                      "built": _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime(m)), "restart_needed": m > _PROC_START,
+                      "optional": True}
+    rep = {"ok": all_ok, "crates": out, "rustc": rustc_version()}
+    _NATIVE_REPORT[:] = [now, rep]
+    return rep
+
+
+_RUSTC = []
+
+
+def rustc_version():
+    """The rustc this node would build native crates with ("1.95.0"), or None without one — resolved like _build_crates
+    resolves cargo (PATH, then ~/.cargo/bin). Read once per process. Published in /status (native.rustc) because a
+    crate that needs a newer compiler than a fleet node has would fail on that node's update, and nodes are run by
+    operators who give us no shell: the oldest compiler in the fleet must be READ before such a crate ships
+    (doc/stwo-migration.md §5.1)."""
+    if _RUSTC:
+        return _RUSTC[0]
+    import re as _re
+    import shutil as _sh
+    import subprocess as _sp
+    rustc = _sh.which("rustc") or os.path.expanduser("~/.cargo/bin/rustc")
+    ver = None
+    try:
+        r = _sp.run([rustc, "--version"], capture_output=True, text=True, timeout=20)
+        m = _re.match(r"rustc (\d+\.\d+\.\d+)", r.stdout or "")
+        ver = m.group(1) if m else None
+    except Exception:
+        ver = None
+    _RUSTC.append(ver)
+    return ver
+
+
+def _missing_required_libs():
+    """Crates from _CRATES that exist in the tree but have NO compiled shared library. These are the ones a
+    node cannot run without (there is no Python fallback since betanet-14), so an /update should build them
+    even when git is already current."""
+    out = []
+    for crate in _CRATES:
+        path = os.path.join(_REPO_DIR, crate)
+        if os.path.isdir(path) and not _shared_libs(path):
+            out.append(crate)
+    return out
+
+
+def _stale_required_libs():
+    """Crates whose .so EXISTS but was built before the Rust sources it claims to implement.
+
+    PRESENT IS NOT THE SAME AS USABLE, and this is the gap that stopped a node dead. `_missing_required_libs`
+    only notices an ABSENT library, so a node that fast-forwarded across a commit touching native/*.rs kept a
+    perfectly present — and now older — .so. native_guard then refuses it, correctly and loudly, and the node
+    cannot produce blocks at all:
+
+        ERROR Failed to validate transaction during block preparation: native crate 'alghash2' library …
+        is STALE — its Rust sources are newer than the built library … Rebuild it.
+        WARNING Block production skipped due to: …
+
+    Observed on a peer 2026-08-08 after commits 6af13f71 and 5f372758 (both 2026-08-04) changed
+    native/alghash2. The updater reported "up_to_date" the whole time, because in GIT it was.
+
+    Uses native_guard.is_stale so the updater and the loader agree on the definition by construction — a
+    second mtime comparison here would be one more thing to drift.
+
+    ONLY THE ARTIFACT THE LOADER RESOLVES COUNTS. The first version of this walked every .so under the crate
+    and flagged the crate if ANY was stale, which on this very box flagged native/mldsa44 because of
+    `_thin_test.so` and an old copy left in the crate root — neither of which anything loads. The loader
+    always uses target/release/libnado_<name>.so (_loader_lib), so that is the only file worth asking
+    about; a stray build artifact must never be able to trigger a rebuild and a RESTART of a healthy node.
+    """
+    try:
+        from execnode import native_guard as _ng
+    except Exception:
+        return []                                   # no guard ⇒ nothing refuses a stale lib ⇒ nothing to fix
+    out = []
+    for crate in _CRATES:
+        path = os.path.join(_REPO_DIR, crate)
+        if not os.path.isdir(path):
+            continue
+        so = _loader_lib(crate)
+        if not os.path.exists(so):
+            continue                                # absent is _missing_required_libs' job, not ours
+        try:
+            if _ng.is_stale(so, path):
+                out.append(crate)
+        except Exception:
+            pass
+    return out
+
+
+def _lib_digests(crates):
+    """sha256 of each crate's loader-resolved library, for deciding whether a rebuild CHANGED anything."""
+    import hashlib
+    out = {}
+    for crate in crates:
+        so = _loader_lib(crate)
+        try:
+            with open(so, "rb") as fh:
+                out[crate] = hashlib.sha256(fh.read()).hexdigest()
+        except Exception:
+            out[crate] = None
+    return out
+
+
+def _build_crates(crates):
+    """cargo build --release each named crate. Returns {crate: "built"|"build-failed"|"no-cargo"} — the same
+    shape _rebuild_native_if_changed reports, so /update responses stay uniform. Never raises."""
+    cargo = shutil.which("cargo") or os.path.expanduser("~/.cargo/bin/cargo")
+    have_cargo = bool(shutil.which("cargo")) or os.access(cargo, os.X_OK)
+    report = {}
+    for crate in crates:
+        path = os.path.join(_REPO_DIR, crate)
+        if not have_cargo:
+            report[crate] = "no-cargo"
+            continue
+        # REPRODUCIBLE DEPENDENCY SET WITHOUT TRACKING Cargo.lock AT THE PATH CARGO WRITES. A crate's lock is
+        # tracked as Cargo.lock.pinned and copied in before every build, so all nodes compile the SAME crate
+        # versions (a verifier that resolves a different x509/ECDSA release than its peers is a consensus
+        # risk). It is NOT tracked as Cargo.lock because cargo creates that file on any node that built the
+        # crate before the lock was committed, and an untracked file at a newly tracked path makes `git merge
+        # --ff-only` refuse — see _move_aside_untracked_collisions for the day that stalled the whole fleet.
+        pinned = os.path.join(path, "Cargo.lock.pinned")
+        if os.path.isfile(pinned):
+            # BYTES-EQUAL ⇒ DO NOT TOUCH. native_guard.is_stale is pure mtime and counts Cargo.lock as a source, so
+            # rewriting an identical lock on every /update would mark a healthy .so stale (it did, on this box,
+            # 2026-09-07: attest_kernel=False from a `cp` alone). copy2 keeps the pinned file's mtime when it does copy.
+            try:
+                lock = os.path.join(path, "Cargo.lock")
+                same = os.path.isfile(lock) and open(lock, "rb").read() == open(pinned, "rb").read()
+                if not same:
+                    shutil.copyfile(pinned, lock)       # fresh mtime: the lock DID change, the build below makes the .so newer
+            except OSError:
+                pass
+        try:
+            r = subprocess.run([cargo, "build", "--release"], cwd=path, timeout=600,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            report[crate] = "built" if r.returncode == 0 else "build-failed"
+            # A REBUILD MUST NOT DIRTY THE TREE (2026-09-13). Only native/attest carries a Cargo.lock.pinned;
+            # the other crates track Cargo.lock at the path cargo writes, and cargo may rewrite it (a newer
+            # cargo bumps the lockfile format, a registry refresh re-resolves). A dirty tracked lock then
+            # made the node refuse ITS OWN next update, forever — the fleet's wave bricking the fleet. Put
+            # HEAD's copy back the moment the build is done; the .so is already built from it.
+            if _restore_tracked_lock(path):
+                _log().warning(f"update: cargo rewrote the tracked Cargo.lock in {crate}; restored HEAD's copy "
+                               f"so this node keeps taking updates")
+            if r.returncode == 0:
+                # CARGO'S EXIT 0 CERTIFIES THE ARTIFACT MATCHES TODAY'S SOURCES — but it does NOT promise
+                # to rewrite the .so: when only mtimes moved (git checkout stamps pulled files with pull
+                # time; a manifest or license-header commit touches sources without changing what
+                # compiles) cargo's fingerprinting deems the build current and leaves the artifact's
+                # mtime old, while native_guard's staleness test is PURE MTIME. Observed fleet-wide
+                # 2026-08-23: seven nodes answered "built" on every /update yet kept rejecting any block
+                # carrying a settle proof with "alghash2 is STALE", and the update path's own verify
+                # reported "rebuild did not clear the staleness" forever. Refreshing the artifact mtime
+                # after a certified-current build is truthful (cargo just proved the correspondence) and
+                # heals the guard live — it re-evaluates per load attempt, no restart needed.
+                _now = time.time()
+                for _lib in _shared_libs(path):
+                    try:
+                        if os.path.getmtime(_lib) < _now:
+                            os.utime(_lib, (_now, _now))
+                    except OSError:
+                        pass
+        except Exception:
+            report[crate] = "build-failed"
+    return report
+
+
+def _has_shared_lib(crate_path):
+    """True if this crate already has a compiled shared library. Used to tell "unchanged, already built"
+    (skip) apart from "unchanged, NEVER built" (must build) — see _rebuild_native_if_changed."""
+    return bool(_shared_libs(crate_path))
+
+
+# THE GOLDILOCKS CRATES G9 DELETED (slice 6). Their target/ dirs are git-ignored, so every node kept the compiled
+# Goldilocks libraries after the update that removed the sources — inert (nothing loads them; native_report and the
+# stale/missing checks iterate _CRATES only), but Goldilocks code on every disk of the fleet (measured on the relay
+# 2026-10-28: ~1.1 MB under native/{alghash2,starkprove,starkcompose}, plus wasm/goldilocks/target).
+_RETIRED_BUILD_DIRS = ("native/alghash2", "native/starkcompose", "native/starkprove", "wasm/goldilocks")
+
+
+def _remove_retired_build_dirs():
+    """Delete each retired crate's build output (<crate>/target), then the crate dir if that left it empty. Only when
+    git tracks NOTHING under the crate: a path a later commit tracks again is a live crate, never a leftover.
+    INVARIANT: removes only `target/` and empty dirs, under _REPO_DIR, at the four fixed paths above — a hand-made
+    file left in a retired crate (a Cargo.toml, a src/) is the operator's and stays. Never raises; returns the
+    paths removed."""
+    removed = []
+    for crate in _RETIRED_BUILD_DIRS:
+        path = os.path.join(_REPO_DIR, crate)
+        try:
+            if not os.path.isdir(path) or _git("ls-files", "--", crate):
+                continue
+            target = os.path.join(path, "target")
+            if os.path.isdir(target) and not os.path.islink(target):
+                shutil.rmtree(target)
+                removed.append(f"{crate}/target")
+            if not os.listdir(path):
+                os.rmdir(path)
+                removed.append(crate)
+        except Exception:
+            continue
+    return removed
+
+
 def _purge_shared_libs(crate_path):
     """Delete a crate's compiled shared libs so its loader sees an ABSENT (not STALE) artifact and takes the
     pure-Python path. Returns True if anything was removed."""
@@ -420,16 +1262,142 @@ def _purge_shared_libs(crate_path):
     return removed
 
 
+def _move_aside_untracked_collisions(remote):
+    """Move aside every UNTRACKED file that the fast-forward to `remote` would have to write, so `git merge
+    --ff-only` cannot refuse with "untracked working tree files would be overwritten by merge".
+
+    THE 2026-09-07 FLEET STALL. Commit 070023a9 added native/attest with only Cargo.toml + src, so every node's
+    `cargo build --release` wrote an UNTRACKED native/attest/Cargo.lock. The very next commit (e42cfce9) started
+    TRACKING that path. From then on git refused the fast-forward on every peer, the old updater answered
+    "fast-forward failed" forever, and the whole fleet sat on 070023a9 while this box alone moved on — an
+    updater that cannot update itself is the one failure it must never have. The tip stopped tracking the
+    lock at that path (it lives at Cargo.lock.pinned, copied in by _build_crates), which unblocked the old
+    code; this helper is what stops the class from recurring: a build product, a stray download, an
+    operator's scratch file at a path the official repo later tracks.
+
+    Nothing is DELETED: each collision is renamed to `<path>.local-<unix time>` beside itself, and the list is
+    returned for the /update response so an operator can see what moved. Only files the target tree tracks are
+    touched — every other untracked file stays exactly where it is. Never raises; on any git error it returns
+    [] and the fast-forward is left to fail loudly as before."""
+    try:
+        tracked = set(_git("ls-tree", "-r", "--name-only", remote, timeout=30).splitlines())
+        untracked = _git("ls-files", "--others", "--exclude-standard", timeout=30).splitlines()
+    except Exception:
+        return []
+    return _move_aside([rel for rel in untracked if rel in tracked])
+
+
+def _move_aside(rels):
+    """Rename each repo-relative path to `<path>.local-<unix time>` beside itself. Never deletes; returns
+    the list actually moved. One convention for every kind of file the updater has to get out of the way."""
+    moved, stamp = [], int(time.time())
+    for rel in rels:
+        src = os.path.join(_REPO_DIR, rel)
+        try:
+            os.replace(src, f"{src}.local-{stamp}")
+            moved.append(rel)
+        except OSError:
+            pass
+    return moved
+
+
+def _restore_moved_aside(rels):
+    """Undo _move_aside for `rels` after a fast-forward that did not land: put back the copy THIS update moved.
+
+    THE NEWEST `.local-<time>`, NOT THE FIRST ONE LISTED. A path can already carry an older copy from an earlier
+    update (they are never deleted). The loop this replaced took sorted(listdir)'s first match — the OLDEST — so a
+    failed fast-forward restored a previous edit over the current one and left the current one aside, while the
+    reply said "left on <HEAD>" as if nothing had changed. Never raises."""
+    for rel in rels:
+        src = os.path.join(_REPO_DIR, rel)
+        d, prefix = os.path.dirname(src) or _REPO_DIR, os.path.basename(rel) + ".local-"
+        try:
+            stamps = [int(n[len(prefix):]) for n in os.listdir(d)
+                      if n.startswith(prefix) and n[len(prefix):].isdigit()]
+            if stamps:
+                os.replace(os.path.join(d, f"{prefix}{max(stamps)}"), src)
+        except OSError:
+            pass
+
+
+def _move_aside_dirty_conflicts(remote):
+    """Local edits to TRACKED files that the fast-forward to `remote` would change: move each aside, restore
+    HEAD's copy so git sees a clean path, and return the list. Edits to files the update does not touch are
+    left exactly as they are — git fast-forwards over those without complaint.
+
+    THE psychz WEEK (2026-09-13). check_and_update refused ANY dirty tracked file — "working tree has
+    uncommitted changes — refusing to touch local edits" — and on an unattended fleet node that refusal is
+    permanent: nobody is there to commit. psychz sat 15 commits behind for a day answering every wave with
+    it, missed the fix for the fork it was on, and was the last node still producing a dead branch. Worse,
+    the edit was almost certainly the fleet's OWN doing: _build_crates runs cargo in crates whose Cargo.lock
+    is tracked, cargo rewrites the lock, and from then on the node's own update path refuses the node its
+    updates. "it is crucial for the updates to be automatic."
+
+    So the rule is now the same one _move_aside_untracked_collisions already applies: nothing is deleted,
+    the edit survives as `<file>.local-<time>` beside itself, the reply and /status name it, and the update
+    lands. A node that refuses its own updates is the one failure the updater must never have. Local
+    COMMITS still block (they are deliberate, and the is-ancestor check above catches them). Never raises;
+    on any git error returns [] and the fast-forward fails loudly as before."""
+    try:
+        # --no-renames: with rename detection an upstream rename A -> B lists only B, so a local edit to A was not
+        # moved aside and the merge refused ("local changes would be overwritten") — a node answering `blocked`.
+        incoming = set(_git("diff", "--no-renames", "--name-only", "HEAD", remote, timeout=30).splitlines())
+        dirty = set((_git("diff", "--no-renames", "--name-only", timeout=30) + "\n"
+                     + _git("diff", "--no-renames", "--cached", "--name-only", timeout=30)).splitlines())
+    except Exception:
+        return []
+    conflicts = sorted(p for p in (dirty & incoming) if p)
+    moved = _move_aside(conflicts)
+    for rel in moved:
+        try:
+            _git("checkout", "HEAD", "--", rel, timeout=30)      # index AND worktree back to HEAD's copy
+        except Exception:
+            pass
+    return moved
+
+
+def _restore_tracked_lock(path):
+    """If cargo just rewrote a Cargo.lock that git TRACKS, put HEAD's copy back. Returns True if it did.
+
+    A rebuild must never dirty the tree: a dirty tracked file used to block every later /update on that
+    node, permanently, with the fleet's own update wave as the cause (see _move_aside_dirty_conflicts).
+    Crates with a Cargo.lock.pinned copy it in before the build and are unaffected; this is for the crates
+    that track Cargo.lock at the path cargo writes."""
+    rel = os.path.relpath(os.path.join(path, "Cargo.lock"), _REPO_DIR)
+    try:
+        _git("ls-files", "--error-unmatch", rel, timeout=15)          # raises when untracked
+        if _git("diff", "--name-only", "--", rel, timeout=15).strip():
+            _git("checkout", "HEAD", "--", rel, timeout=15)
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _rebuild_native_if_changed(old, new):
     """Rebuild the Rust accelerator crates whose sources changed in this update, BEFORE the restart, so the
     node never runs the new Python against a STALE binary.
 
-    Correctness hinges on one fact: a STALE .so is NOT the same as an ABSENT one. The STARK loaders
-    (alghash2/starkprove/starkcompose/goldilocks) fall back to pure Python only when the .so is ABSENT — a
-    stale one is loaded and TRUSTED, so e.g. an old 8-round alghash2 .so against new 54-round Python silently
-    diverges. Therefore a crate whose source changed but that we CANNOT rebuild (no cargo, or the build fails)
-    has its stale .so DELETED, forcing the pure-Python fallback (slower, but bit-identical and consensus-safe).
-    A crate with no prior .so and no cargo simply stays pure-Python — nothing to purge, safe to proceed.
+    Correctness hinges on one fact: a STALE .so is NOT the same as an ABSENT one. A stale one is loaded and
+    TRUSTED, so e.g. an old 8-round alghash2 .so against new 54-round Python silently diverges. Therefore a
+    crate whose source changed but that we CANNOT rebuild (no cargo, or the build fails) has its stale .so
+    DELETED — purging is still the right call, because a wrong answer is worse than no answer.
+
+    WHAT PURGING NO LONGER BUYS YOU, and this paragraph is the correction: it used to force "the pure-Python
+    fallback (slower, but bit-identical and consensus-safe)". Since BETANET-14 there is no Python fallback.
+    execnode/native_guard.require() raises NativeMissing for an ABSENT library exactly as loudly as for
+    a stale one ("There is no Python fallback: since betanet-14 the Rust kernel is the only production
+    implementation"), unless NADO_ALLOW_ABSENT_NATIVE is set. So on a box without cargo, a crate whose sources
+    changed ends with a purged .so and an exec node that REFUSES TO START — not a slow one.
+
+    That failure is silent from the outside: L1 keeps producing blocks and /status stays 200 while
+    nado-exec restart-loops, and the only user-visible symptom is the wallet reporting "exec node
+    unreachable". It cost this fleet two days once already. An update wave that reports
+    "no-cargo-stale-purged" for any crate means that box needs cargo and a rebuild before its exec layer
+    comes back; treat it as an outage, not a degradation.
+
+    A crate with no prior .so and no cargo is reported "pure-python" for historical reasons — that name is
+    now only accurate for crates nothing mandatory loads.
     (mldsa44 additionally self-guards via a startup interop self-test, and every STARK loader now runs the same
     known-answer self-test at load, so a stale binary is rejected even outside this path — belt and suspenders.)
 
@@ -438,7 +1406,7 @@ def _rebuild_native_if_changed(old, new):
     live money node right before the restart."""
     report = {}
     try:
-        changed = _git("diff", "--name-only", old, new, timeout=30)
+        changed = _git("diff", "--no-renames", "--name-only", old, new, timeout=30)   # both sides of a rename
     except Exception:
         changed = None                                   # diff unavailable → be conservative, treat all as touched
     # service-account installs get a per-user rustup under $HOME/.cargo which is NOT on systemd's PATH
@@ -449,17 +1417,27 @@ def _rebuild_native_if_changed(old, new):
         path = os.path.join(_REPO_DIR, crate)
         if not os.path.isdir(path):
             continue
-        touched = changed is None or re.search(rf"^{re.escape(crate)}/.*\.(rs|toml|lock)$", changed, re.M)
-        if not touched:
-            continue                                     # this crate's sources unchanged → its .so is still valid
-        ok = False
-        if have_cargo:
-            try:
-                r = subprocess.run([cargo, "build", "--release"], cwd=path, timeout=600,
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                ok = (r.returncode == 0)
-            except Exception:
-                ok = False
+        touched = changed is None or re.search(rf"^{re.escape(crate)}/.*\.(rs|toml|lock|pinned)$", changed, re.M)   # .pinned: a lock-only change must rebuild too
+        # MISSING IS NOT THE SAME AS UNCHANGED. "sources unchanged → its .so is still valid" only holds if a
+        # .so was ever built here. A box that has NEVER built a crate has unchanged sources forever, so this
+        # loop skipped it on every update and the library never appeared.
+        #
+        # That is not hypothetical. Measured 2026-08-06: all three peers were missing libgoldilocks.so, so
+        # every proof-carrying settle they were offered was rejected outright —
+        #     "Settle proof invalid: segment 0: epoch proof invalid: malformed proof: NativeMissing:
+        #      native crate 'goldilocks' is REQUIRED but its library is missing"
+        # — and since there is no Python fallback since betanet-14, NO settle proof could EVER have been
+        # verified anywhere on this fleet, at any size, through DA or inline. It is the deepest reason no
+        # proof has ever landed on betanet-15, underneath every transport problem.
+        if not touched and _has_shared_lib(path):
+            continue                                     # unchanged AND already built → its .so is still valid
+        # ONE BUILD PATH: _build_crates, never a bare `cargo build`. The bare call here skipped all three things
+        # _build_crates does around cargo — copy Cargo.lock.pinned in (so a commit that changed ONLY the pinned
+        # lock, which `touched` deliberately matches, rebuilt against the node's OLD untracked Cargo.lock and
+        # reported "built" while running the old dependency set, and nothing ever corrected it: is_stale compares
+        # against Cargo.lock, not .pinned), restore a tracked Cargo.lock cargo rewrote (a dirty tracked lock
+        # refuses every later update), and refresh the .so mtime after a certified-current build.
+        ok = have_cargo and _build_crates([crate]).get(crate) == "built"
         if ok:
             report[crate] = "built"
         elif _purge_shared_libs(path):
@@ -468,6 +1446,32 @@ def _rebuild_native_if_changed(old, new):
             report[crate] = "pure-python"                # no cargo / build failed, but no stale .so existed anyway
       except Exception:
         continue                                         # one crate's trouble never aborts the others (or the update)
+    report.update(_rebuild_optional_crates(changed, have_cargo))
+    return report
+
+
+def _rebuild_optional_crates(changed, have_cargo):
+    """Build each optional crate (_OPTIONAL_CRATES) whose sources changed in `changed` (a `git diff --name-only`, None =
+    treat all as touched) or whose library was never built. Report, never purge or require. ONE function for BOTH
+    restart paths: the /update fast-forward (_rebuild_native_if_changed) and the stale-checkout restart
+    (apply_stale_checkout) — the second is how the node a push is made FROM restarts, and it built nothing, so the relay
+    reported native/stwo_js "missing" after every other node had built it (2026-10-12). For a verifier that is a stall
+    at STWO_POOL_HEIGHT; a STALE one (sources changed, old .so kept) would be worse — a different verdict. Never raises."""
+    report = {}
+    for crate in _OPTIONAL_CRATES:                       # see _OPTIONAL_CRATES: build, report, never purge or require
+        try:
+            path = os.path.join(_REPO_DIR, crate)
+            if not os.path.isdir(path):
+                continue
+            touched = changed is None or re.search(rf"^{re.escape(crate)}/.*\.(rs|toml|lock|pinned)$", changed, re.M)
+            if not touched and _has_shared_lib(path):
+                continue
+            if not have_cargo:
+                report[crate] = "optional-no-cargo"
+                continue
+            report[crate] = "built" if _build_crates([crate]).get(crate) == "built" else "optional-build-failed"
+        except Exception:
+            continue
     return report
 
 

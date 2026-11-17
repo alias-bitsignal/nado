@@ -9,7 +9,7 @@
 // deterministic game logic calls at MODULE-LOAD time (e.g. Scrapline's solo-offer render paints before init()
 // runs). Gating it behind the async loadCrypto() made that logic throw "blake2b is not a function" before the
 // bundle finished loading, which aborted the whole module (so sign-in return handling never ran). Binding it
-// eagerly removes that entire class of races. (Node's ESM loader rejects the ?v= cache-bust query, and
+// eagerly removes that entire class of races. (Node's ESM loader rejects a version query on the specifier, and
 // merkle.js / messaging.js / the crosscheck tests already import this bundle by its bare path — so we match.)
 import { blake2b, ml_dsa44, bytesToHex, hexToBytes } from "./vendor/nado-crypto.js";
 
@@ -67,12 +67,29 @@ export function blake2bHash(data, size = 32) { return bytesToHex(blake2b(canonic
 
 // ---- keys / address ------------------------------------------------------------------------------
 // ADDRESS FORMAT — mirrors protocol.py ADDRESS_PREFIX/BODY/CHECKSUM (the one-constant rebrand point).
-export const ADDR_PREFIX = "mldsa44";
-export const ADDR_BODY = 42;                                   // hex chars of pubkey in the address
-export const ADDR_LEN = ADDR_PREFIX.length + ADDR_BODY + 4;    // + 4-hex blake2b checksum (49 today)
-export const ADDR_RE = new RegExp("^" + ADDR_PREFIX + "[0-9a-f]{" + (ADDR_BODY + 4) + "}$");
+// THE ONE PINNED COPY (2026-10-10). Every other client imports these from the relay's /protocol.js; this file does not,
+// because it is the environment-free crypto SDK: the game engines and their contract cross-checks load it in plain
+// Node (tests, vector generators) where there is no relay to import from. tests/test_constant_mirrors.py names exactly
+// these four as the exemption and pins each one's VALUE to protocol.py, so the copy cannot drift silently.
+export const ADDR_PREFIX = ""    // removed at betanet-14; NO backwards compatibility;
+// ADDRESS FORMAT 2 (gen 28; protocol.py "ADDRESS FORMAT 2"): the body is a hash of the WHOLE public key — format 1's
+// first 21 bytes are the key's rho, which a forger chooses. Byte-identical to ops/address_ops.make_address
+// (tests/test_address_format_v2.py derives both and compares).
+export const DOMAIN_ADDRESS_V2 = "nado-address-v2";
+// a 4-byte checksum (protocol.ADDRESS_CHECKSUM; format 1 had 2): a format-1 address is REJECTED by shape — 46
+// characters is not an address
+export const ADDR_CK = 4;
+export const ADDR_BODY = 42;                                   // hex chars of the address body
+export const ADDR_LEN = ADDR_PREFIX.length + ADDR_BODY + ADDR_CK * 2;    // 50
+export const ADDR_RE = new RegExp("^" + ADDR_PREFIX + "[0-9a-f]{" + (ADDR_BODY + ADDR_CK * 2) + "}$");
 export const isAddress = (a) => typeof a === "string" && ADDR_RE.test(a);
-export function makeAddress(pubHex) { const body = ADDR_PREFIX + pubHex.slice(0, ADDR_BODY); return body + blake2bHash(body, 2); }
+export function addressBodyV2(pubHex) { return blake2bHash([DOMAIN_ADDRESS_V2, String(pubHex).toLowerCase()], ADDR_BODY / 2); }
+export function makeAddress(pubHex) {
+  const body = ADDR_PREFIX + addressBodyV2(pubHex);
+  return body + blake2bHash(body, ADDR_CK);
+}
+// the FORMAT-1 name of a key, for recognising a format-1 account in the legacy-claim flow — never authorisation
+export function legacyAddress(pubHex) { const body = ADDR_PREFIX + pubHex.slice(0, ADDR_BODY); return body + blake2bHash(body, 2); }
 // The seed MUST be exactly 32 bytes (64 hex). noble zero-PADS a short seed into the SHAKE preimage while the
 // node's dilithium builds a different-length preimage, so a 63-hex seed (e.g. a dropped leading-zero byte)
 // derives a DIFFERENT address in the browser than on the node -> the node rejects the tx as pubkey!=sender.

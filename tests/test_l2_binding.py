@@ -12,6 +12,10 @@ L1<->L2 BINDING + REROLL wipe (the alphanet-7 reroll hardening):
 
 Run: python3 tests/test_l2_binding.py
 """
+import os as _os, tempfile as _tempfile  # ISOLATION FIRST (CLAUDE.md rule 4): never the live node's HOME or exec files
+_os.environ["HOME"] = _tempfile.mkdtemp(prefix="nado-test-")
+_os.environ["NADO_EXEC_STATE"] = _os.path.join(_os.environ["HOME"], "exec_state.json")
+_os.environ["NADO_EXEC_DA"] = _os.path.join(_os.environ["HOME"], "exec_da")
 import os, sys, tempfile, glob
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -31,6 +35,10 @@ def _fresh_home(prefix):
     kv_ops.close_all()
     h = tempfile.mkdtemp(prefix=prefix)
     os.environ["HOME"] = h
+    # an EMPTY exec layer and no L1 carry: genesis_data/ holds the real chain's carried genesis on a reroll tree (the
+    # gen-29 rehearsal: a reset loaded its 27 contracts, whose root is not the empty layer's). Paths that do not exist.
+    os.environ["NADO_EXEC_GENESIS"] = os.path.join(h, "no_exec_genesis.json")
+    os.environ["NADO_GENESIS_CARRY"] = os.path.join(h, "no_genesis_carry.dat")
     for d in ("index", "blocks", "logs", "peers", "snapshots"):
         os.makedirs(f"{h}/nado/{d}", exist_ok=True)
     from genesis import create_indexers
@@ -43,13 +51,16 @@ def test_exec_root_in_block_hash():
     from ops import account_ops
     from ops.block_ops import construct_block, block_content_hash
     from ops.settlement_ops import settled_header_commitment
-    from protocol import EXEC_GENESIS_ROOT
+    # the empty sentinel is the GENERATION's empty exec root (exec_root_b2.genesis_canary): EXEC_GENESIS_ROOT_B2 at every
+    # height (BLAKE_EXEC_HEIGHT inlined in G9) — a gen-29 header never carries a Goldilocks root
+    from execnode.exec_root_b2 import genesis_canary
+    EXEC_GENESIS_ROOT = genesis_canary()
 
     account_ops.create_account("a", balance=100)
 
     # Empty chain: no settlement is justified, so the header commits the empty sentinel.
     c, r = settled_header_commitment()
-    check("empty-chain settled commitment is the (-1, EXEC_GENESIS_ROOT) sentinel",
+    check("empty-chain settled commitment is the (-1, the generation's empty exec root) sentinel",
           c == -1 and r == EXEC_GENESIS_ROOT)
 
     blk = construct_block(block_timestamp=123, block_number=1, parent_hash="0" * 64,
@@ -116,7 +127,7 @@ def test_exec_resets_when_cursor_outruns_finalized():
         ex._reset_states_to_genesis(reason="test: cursor outran finalized")
         check("reset drops the cursor back to genesis (-1)", ex.state.cursor == -1)
         check("reset state hashes to EXEC_GENESIS_ROOT (canary-clean)",
-              ex.state.state_root() == ex._EXEC_GENESIS_ROOT)
+              ex.state.state_root() == ex._genesis_canary())   # the generation's empty-layer root (exec_root_b2)
         check("reset re-stamps the generation marker (next reroll still detected once)",
               os.path.exists(ex._EXEC_GEN_MARK))
     finally:

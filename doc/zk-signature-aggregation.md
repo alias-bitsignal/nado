@@ -1,114 +1,124 @@
-# Validity-proof signature aggregation (proof of block validity)
+# Signature aggregation — built, measured, removed
 
-A design note on a "some time down the road" upgrade: replacing per-transaction signature verification with
-a single STARK proof of block validity. This is the L1 sibling of the exec-layer settle-with-proof
-(`zk-settlement-completion.md`) — it applies the same "prove it once, verify it cheaply everywhere"
-principle to the most expensive thing an L1 node does, which on nado is **post-quantum signature
-verification**.
+**Status: REMOVED, 2026-07-31.** This is a post-mortem, kept deliberately. The idea is attractive and most of
+its reasoning was sound; the only thing that settled it was measurement. Anyone proposing it again should
+start here.
 
-## The idea
+## What was proposed, and what was right about it
 
-Today every node re-verifies every transaction's signature: a block with N txs costs N ML-DSA-44 verifies
-on every node. Instead, the block producer proves **in-circuit** that
+Replace per-transaction signature verification with one STARK proving that every transaction in a block
+carries a valid ML-DSA-44 signature, then ship **one proof plus the transactions with signatures stripped** —
+a block as a validity-rollup of its own transactions.
 
-> "every one of the N transactions in this block carries a valid ML-DSA-44 signature over its txid (and
-> applies to valid state)"
+Two of the three supporting arguments hold up:
 
-and ships **one proof + the transactions with their signatures stripped**. Every node then checks **one
-proof** instead of N signatures. This is *validity-proof signature aggregation*; taken to include the state
-transition it is *proof of block validity* — a block becomes a validity-rollup of its own transactions.
+- **STARKs are the right vehicle if you do this at all.** Aggregating post-quantum signatures under a
+  pairing-based SNARK would reintroduce exactly the weakness ML-DSA exists to remove. nado's proofs are
+  hash-based and PQ-sound, so the guarantee survives end to end.
+- **Data availability was the strong framing.** An ML-DSA transaction is a ~10-byte body wrapped in a ~2.4 KB
+  signature. Signatures dominate what a block *weighs*, and the original note correctly posed this as a
+  crossover threshold rather than an unconditional win.
 
-## Why this fits nado specifically
+One argument was wrong, and was never checked:
 
-1. **Signatures ARE the cost.** An ML-DSA-44 transaction is a ~10-byte body wrapped in a **~2.4 KB
-   signature** (plus a ~1.3 KB public key on first use). Post-quantum signatures are large precisely because
-   they are the thing you would most want to compress away. Stripping signatures from what is gossiped and
-   stored is a large **bandwidth + data-availability** win, and verification drops from O(N) signature
-   checks to ~O(1) proof check. (nado already strips the *pubkey* after an address's first tx — PUBKEY-ONCE,
-   `interface.js`/`transaction_ops.create_txid` — so the residual per-tx weight this targets is the
-   signature.)
+- **"Signature verification is the expensive thing."** Measured: `nado_pq_native.verify_internal` is
+  **120.4 µs**. A 200-transaction block spends ~**24 ms** on signatures — a rounding error beside execution.
 
-2. **nado already has a PQ-sound proof system.** This upgrade only preserves nado's post-quantum guarantee
-   if the *aggregating* proof is itself PQ-sound. nado's proofs are **STARKs** — hash-based, no trusted
-   setup, PQ-sound (`execnode/stark/*`) — so aggregating PQ signatures under a STARK keeps the quantum
-   guarantee end to end. A pairing-based SNARK (e.g. Mina's Kimchi/Pickles) is **not** PQ, so aggregating
-   ML-DSA signatures under it would reintroduce exactly the weakness ML-DSA exists to remove. nado's choice
-   of STARKs is what makes this coherent.
+## What killed it: the numbers
 
-3. **The toolbox is already here.** nado has the recursion + in-circuit hashing machinery this needs
-   (`recursion.py`, `fs_incircuit.py`, `alghash2`, `vm_circuit.py`, the native Rust prover). What is missing
-   is one specific circuit — see below.
+Proving the *butterfly half* of the `w'` computation for **one** signature — not a block, not a batch, one
+signature, and only part of it:
 
-## The honest catches (why it is "past a certain tx volume," not "always")
+| | measured |
+|---|---|
+| prove | **7.11 min** (T = 16384, W = 193) |
+| proof size | **1.87 MB** |
+| verify | **6.98 s** |
+| against | 2420 B and 120.4 µs |
 
-- **Proving ML-DSA in-circuit is the hard, expensive side.** Verifying one ML-DSA-44 signature *natively*
-  is ~0.15 ms; expressing that verification as an arithmetic circuit is genuinely heavy. Dilithium
-  verification involves **NTTs, rejection-sampling bounds, and SHAKE/Keccak hashing** — among the harder
-  primitives to arithmetize (Keccak's bit-oriented permutation is notoriously circuit-unfriendly; nado uses
-  the STARK-friendly `alghash2` internally for exactly this reason, but the *signature scheme's own* hashing
-  is fixed at SHAKE-256 and must be proven as-is). So there is a real **crossover threshold**:
-  - at low tx volume the proving overhead dwarfs the savings (you spent more proving than you saved
-    verifying),
-  - at high tx volume the per-tx proving cost amortizes and the DA + verify savings dominate.
+≈ **770× the size** and **58,000× the verify time**, for half of one signature. The full `w'` schedule is
+18432 rows per signature (13312 butterflies + 5120 pointwise products).
 
-  That threshold is the whole premise ("if a chain has more than a certain amount of txs"). It moves down as
-  the native prover gets faster and as the Dilithium circuit is optimized.
+Aggregation only wins by amortising a fixed cost over a batch of size B:
 
-- **The data must still be available.** The proof replaces *re-checking signatures*, not the transaction
-  data — nodes still need the tx bodies to reconstruct state. This is the same data-availability requirement
-  the exec layer already reasons about (`doc/execution-layer.md` §DA), and it nudges toward specialized
-  provers / a proving market rather than every phone proving its own block.
+- **size** break-even: B ≈ 116
+- **verify** break-even: B ≈ 12
+- **achievable**: B ≤ 7, from the trace-row budget
 
-- **The new component is a Dilithium-verification circuit** (an ML-DSA-44 verify AIR). That is a substantial
-  build on top of what nado has, and signature-verification-in-ZK is an active research area generally
-  (see e.g. work on hash-based and lattice signature circuits). It is the gating artifact.
+It loses on both axes at every reachable batch size. The crossover the original note asked about is real — it
+just sits on the wrong side of what the machine can build.
 
-## How it maps onto nado's architecture
+### Two escapes were tested; both failed
 
-A block already carries `block_transactions`. The change:
+- **"It's Python."** No. 97.6% of prove wall-clock was already in Rust, and the verifier's hot kernel was
+  native too (pure-Python permute 3167 µs vs 54 µs through ctypes). Batching every Merkle path in a proof
+  into ONE native call bought **1.07×** — the boundary crossings were not dominant, the permutation
+  arithmetic was.
+- **"It's the recursion."** Partly, and spectacularly: folding three sub-proofs that together cost 16.7 s ran
+  **>32 min and >26 GB** before being killed, ~1000× the size of what it compressed. Worth fixing for other
+  reasons; deleting it does not close a 770× size gap.
 
-- **Block format** — transactions ride with signatures **stripped** (the txid still commits the body, as
-  today; `create_txid` already excludes `public_key`, so it would exclude `signature` too). The block gains
-  one `validity_proof` field over `(txids, pubkeys-or-commitment)`.
-- **Producer** — after selecting the tx set, prove in-circuit: for each tx, `ML_DSA44.verify(pubkey, txid,
-  sig)` holds, with `pubkey` bound to the sender via `proof_sender` (the same binding
-  `ops/address_ops.proof_sender` enforces natively) and `txid` bound to the committed body. This is a new
-  AIR composed (via the existing recursion) with the block's other commitments.
-- **Verifier (block validation)** — `validate_transactions_in_block` replaces the per-tx `validate_origin`
-  signature check with a single `verify(validity_proof)`. Everything else (spending, reserved-tx rules,
-  target matching) is already a pure function of committed state and stays.
-- **Interplay with existing pieces** — `PUBKEY-ONCE` means most txs already omit the pubkey (recoverable
-  on-chain), so the proof binds each tx to its established sender pubkey rather than re-shipping keys. The
-  `_CRYPTO_LOCK`-serialized native verify (`signatures.py`) — a per-verify global lock that is itself a
-  scaling limit — disappears from the hot path entirely, which is a second, separate win.
+## What the work paid for
 
-## Relationship to the settlement / recursion track
+**Two forgery-class bugs**, both "valid AIR, invalid witness" — the circuit computes the right thing, but the
+witness was never constrained to be honest:
 
-- **settle-with-proof** proves the **exec/L2 state transition** (contract execution) — it is prover-limited,
-  not verifier-limited, and mostly wired (`zk-settlement-completion.md`).
-- **signature aggregation** proves **L1 transaction-signature validity** — it needs one genuinely new,
-  expensive circuit (Dilithium-in-STARK) and is gated on throughput.
-- Both fold under the **same** recursion + in-circuit-FS machinery, so the two compose: a fully
-  proof-validated nado block would carry one recursive proof attesting *both* "all signatures valid" *and*
-  "the state transition is correct" — which is the Mina-style "block is one proof" endpoint, reached the
-  post-quantum way.
+1. `mldsa_ntt_air.apply_inverse` emitted `(d, 1, z)` per Gentleman–Sande step. The butterfly AIR constrains
+   `t = zeta*b`, `out0 = a + t`, so it proved `out0 = d + z` — a SUM — while the value actually stored was
+   `z*d`. **0 of 1024 rows** had the AIR's output equal to the value used.
+2. `mldsa_hint_air`'s `KQ` was a free witness and `M = 44` is invertible mod P, so a prover could solve
+   `kq = (raw − out)·M⁻¹` and satisfy the only constraint mentioning it for **any** claimed UseHint output.
+   Forging `out ∈ {0, 1, 43, 12345}` — all four accepted.
 
-## Status and where it slots in
+Both were inert *only because `w'` was a public input*, and both would have become keyless universal forgery
+the moment the NTT moved into the witness. Earlier the same day, constraint #60 in the same file compared `r`
+against `q−1` where Dilithium's wrap case is `r − r0 == q−1`, so ~half of all signatures produced a trace
+violating its own AIR (12 of 24 failed before the fix, 0 of 24 after).
 
-- **Not built.** There is no ML-DSA verification circuit today; this is the gating artifact.
-- **Reachable, not free.** The proof system (PQ-sound STARK), recursion, in-circuit hashing, and native
-  prover are all in place; the remaining work is (a) the Dilithium-44 verify AIR, (b) composing it with the
-  block commitments via the existing recursion, (c) the sig-stripped block format + the block-validation
-  swap, and (d) enough proving throughput (the native Rust prover) that the crossover threshold sits below
-  real block sizes.
-- **Sequencing.** This is *after* the settle-with-proof line lands (it shares and stresses the same prover),
-  and its value grows with tx volume — so it is a "reach for it once blocks are consistently full" upgrade,
-  exactly as posed. The consensus-aggregation note (`doc/consensus-aggregation.md` §5, "succinct
-  proof-of-threshold") is the same shape applied to attestations and lands behind the same seam.
+**The lesson that outlives the feature:** all three passed the semantic tests, because the AIRs matched
+Dilithium. What was wrong was what the witness was ALLOWED to be, and no semantic test can see that.
+`final layer is not low-degree` is the symptom — it means the trace violates its own AIR, not that FRI is
+broken.
 
-## One-line summary
+**Speed-ups that stayed**, none signature-specific:
 
-Treat each block as a validity-rollup of its own transactions: prove "all N post-quantum signatures verify"
-once, ship the block without its signatures, and check one PQ-sound STARK instead of N ML-DSA verifies —
-worth it past the tx-volume crossover, gated on a Dilithium-in-STARK circuit, and directly on nado's
-existing recursion / settle-with-proof trajectory.
+- `alghash2` permute **54.11 µs → 28.71 µs**, by deleting two u128 *divisions* per call (`addf`, and the MDS
+  accumulation) sitting directly beneath a comment observing that division was the dominant cost. On the hot
+  path of every proof the chain makes.
+- `merkle_verify_paths` — M authentication paths in one native call instead of a Python loop invoking a
+  native permute per level.
+- ExpandA **285–456 ms → 1.76 ms** (removed with the stack, but the pattern generalises: the proven sponge
+  exists to emit a witness trace; computing a *value* only needs the bytes).
+
+## What was already the right answer
+
+Not signatures — **execution**. And it was built before this was attempted.
+
+`execnode/settlement_proofs.py` proves an entire epoch as ONE zkVM trace (N calls across many contracts,
+concatenated into a single STARK). **L1 verifies one proof in ~0.3 s, independent of the call count**,
+replaying the authenticated I/O log to recompute the post-state root with **no re-execution**.
+
+That is the asymmetry ZK exists for: re-running ten thousand contract calls is genuinely expensive; checking
+a proof that they ran correctly is not. Live as `SETTLE_PROOF_RECURSIVE` since the betanet-14 reroll. The
+shielded pool (`execnode/stark/joinsplit2.py`) is the other legitimate use, for a different reason — its
+inputs are hidden by construction, so there is no cheaper alternative for it to compete against.
+
+**The rule this episode is evidence for: prove what is expensive to REDO; do not prove what is cheap to
+CHECK.**
+
+## What stayed
+
+`execnode/stark/mldsa_block_auth.py` (now `ops/mldsa_block_auth.py`) — the block-level authorization **commitment**. Every block binds
+`(auth_root, auth_count)` into its hash preimage and every verifier recomputes both from the block's own
+transactions. A pure function of committed block data, costs nothing, never depended on an aggregate proof
+being accepted, and imports only `alghash` and `field`.
+
+## If anyone revisits this
+
+The one change that would move the verdict is **in-circuit Keccak/SHAKE** — what would let a block genuinely
+DROP signature bytes rather than merely replace the arithmetic, turning a 770× size regression into a size
+win and vindicating the data-availability argument that motivated this. `mldsa_keccak_air` reached W = 6080;
+its composition trace would need 12178 columns against a `MAX_COLUMNS` of 8192.
+
+That is a separate project with its own budget, and it should begin with a measurement of what a block
+actually spends its time and bytes on — not with an assumption about it.

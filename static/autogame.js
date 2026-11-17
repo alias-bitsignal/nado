@@ -9,26 +9,26 @@
 // map, rendering the world, editing a plan, and the four calls that move a run.
 //
 // The step function is NOT here. It lives in autogame-engine.js, which is the same program as
-// execnode/games/autogame.py and is diff-tested against it (tests/autogame_contract_test.py). The client
+// execnode/games/autogame.py and is diff-tested against it (tests/test_autogame_contract_matches_the_reference_model.py). The client
 // uses it to preview and to animate; the contract remains the authority, and wherever the two disagree the
 // chain wins and the view snaps to it.
 import {
   NadoDapp, randId, $, base, gate, guardedAction, relocalize, alertBar, okBar, wireWallet,
   renderWallet, renderTopScores, resolveAliases, disp, algHashn, ALG_P, esc, blocksToTime, modeBar,
-  confirmingLabel,
-} from "./nadodapp.js?v=db1a59d7";
-import * as E from "./autogame-engine.js?v=8a997c33";
-import { ACTS_FOR } from "./autogame-rules.js?v=a3d6848d";
-import * as ART from "./autogame-art.js?v=4aad5b61";
-import { drawWarrior, unpackItem, FRAME_W, FRAME_H } from "./autogame-art.js?v=4aad5b61";
-import { createDaily } from "./autogame-dailyui.js?v=1a136a0d";
-import * as D from "./autogame-daily.js?v=01e604ed";
-import { createAudio } from "./autogame-audio.js?v=afd7538c";
+  confirmingLabel, BLOCK_TIME } from "./nadodapp.js";
+import * as E from "./autogame-engine.js";
+import { ACTS_FOR } from "./autogame-rules.js";
+import * as ART from "./autogame-art.js";
+import { drawWarrior, unpackItem, FRAME_W, FRAME_H } from "./autogame-art.js";
+import { createDaily } from "./autogame-dailyui.js";
+import * as D from "./autogame-daily.js";
+import { createAudio } from "./autogame-audio.js";
 
-const CID = "66cbdaae8c6c868805c8834945bacf4e";          // execnode/games/autogame.py (zkVM) — set by the deploy script
+const CID = "f6ccb08e979e1989516f35c4bfb7dea1";          // execnode/games/autogame.py (zkVM) — set by the deploy script
 const dapp = new NadoDapp({ cid: CID, app: "Autogame" });
 const P = ALG_P();
-const BLOCK_SECS = 6;
+// BLOCK_TIME: protocol.BLOCK_TIME from the relay's /protocol.js via the SDK — never a literal copy (tests/test_constant_mirrors.py)
+const BLOCK_SECS = BLOCK_TIME;
 
 // drawWarrior anchors the sprite's TOP-LEFT corner, but everything here thinks in ground coordinates —
 // the warrior stands ON the road line, and the gear panel stands him on its floor. Converting once, here,
@@ -1050,7 +1050,7 @@ function drawWorld() {
     drawWarrior(ctx, footX(hx2, 3), footY(GY + 2 + bob, 3), {
       gear: view ? view.gear : new Array(6).fill(0),
       frame: attacking ? atkFrame : frame, scale: 3, facing: 1,
-      hurt: hurt || !!flinch, dead: false,
+      hurt: !!flinch, wounded: hurt, dead: false,   // a flinch recoils; low health only bloodies
       attacking,                              // his final blow lands before he falls
     });
     if (flinch) {                              // a red wash over the flinching hero

@@ -16,7 +16,6 @@ Methods: open(g)[stake] · join(g)[stake] · move(g,cell,ply) · resign(g) · ab
 from execnode import zkvmasm
 from execnode.games import _lib
 from execnode.games import tictactoe as _t
-from execnode.stark.field import P as _P
 
 NN, ST, PT, P1, P2, SD, WR, MC, DL, LIST, LP = 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11
 
@@ -65,13 +64,23 @@ def _bsl(bidx_reg, out):
             f"add {out} r7", f"add {out} r0"]
 
 
+def _word(d):
+    """A direction as a VM word. INVARIANT (bug fixed 2026-10-28): the word is mod 2^256 (_lib.vm_mod), so -|d| is
+    2^256 - |d|, and base + k*(2^256 - |d|) wraps to base - k*|d| because ADD and MUL wrap at 2^256. The field VM spelt
+    it `d % P` (Goldilocks); carried into the 256-bit zkvm2 that literal was a huge positive number, every one of the four
+    negative directions (-16, -1, -15, -17) walked to a garbage board index, never flipped, and a move legal only
+    through one of them was refused. No field constant may come back here; a negative literal must reduce by
+    vm_mod() (tests/test_reversi_flips_in_every_direction_on_the_256_bit_vm.py)."""
+    return d % _lib.vm_mod()
+
+
 def _dir_block(d):
     """One direction's count + conditional flip. base=SC0, k=SC1, opp=SC2, fl=SC3; n=SC5, i=SC6."""
     L = [f"movi r4 {_s(5)}", "movi r5 0", "sstore r4 r5"]            # n = 0
     # walk: while bd[base + (n+1)*d] == opp: n++
     L += [f"wk_{d}:",
           f"movi r4 {_s(5)}", "sload r5 r4", "movi r6 1", "add r5 r6",     # n+1
-          f"movi r6 {d % _P}", "mul r5 r6",                                # (n+1)*d
+          f"movi r6 {_word(d)}", "mul r5 r6",                                # (n+1)*d
           f"movi r4 {_s(0)}", "sload r4 r4", "add r4 r5"]                  # bidx = base + (n+1)*d  (r4)
     L += _bsl("r4", "r6") + ["sload r6 r6"]                               # bd[bidx] -> r6
     L += [f"movi r4 {_s(2)}", "sload r4 r4", "eq r6 r4",                   # == opp ?
@@ -81,7 +90,7 @@ def _dir_block(d):
     # valid = (n>0) AND bd[base+(n+1)*d] == k
     L += [f"movi r4 {_s(5)}", "sload r5 r4", "nez r5",                     # r5 = (n>0)
           f"movi r4 {_s(5)}", "sload r6 r4", "movi r4 1", "add r6 r4",     # n+1
-          f"movi r4 {d % _P}", "mul r6 r4",
+          f"movi r4 {_word(d)}", "mul r6 r4",
           f"movi r4 {_s(0)}", "sload r4 r4", "add r4 r6"]                  # bidx (r4)
     L += _bsl("r4", "r6") + ["sload r6 r6"]
     L += [f"movi r4 {_s(1)}", "sload r4 r4", "eq r6 r4", "mul r5 r6",      # valid
@@ -93,7 +102,7 @@ def _dir_block(d):
           f"movi r4 {_s(6)}", "sload r5 r4", f"movi r4 {_s(5)}", "sload r6 r4",
           "movi r7 1", "add r6 r7", "lt r5 r6",                            # i < n+1
           f"jnz r5 @flb_{d}", f"jmp @fdone_{d}", f"flb_{d}:",
-          f"movi r4 {_s(6)}", "sload r5 r4", f"movi r4 {d % _P}", "mul r5 r4",   # i*d
+          f"movi r4 {_s(6)}", "sload r5 r4", f"movi r4 {_word(d)}", "mul r5 r4",   # i*d
           f"movi r4 {_s(0)}", "sload r4 r4", "add r4 r5"]                  # bidx = base + i*d (r4)
     L += _bsl("r4", "r6")                                                 # slot -> r6
     L += [f"movi r5 {_s(1)}", "sload r5 r5", "sstore r6 r5",              # bd[bidx] = k
@@ -124,11 +133,13 @@ def _move():
           f"movi r4 {_s(0)}", "sload r5 r4"]
     L += _bsl("r5", "r6") + [f"movi r4 {_s(1)}", "sload r4 r4", "sstore r6 r4",     # bd[base]=k
           "slot r4 8 r0", "sload r5 r4", "movi r6 1", "add r5 r6", "sstore r4 r5",  # mc++
+          "slot r4 9 r0", "ctx r5 cursor", "movi r6 300", "add r5 r6", "sstore r4 r5",   # dl refresh (review 2026-09-23)
           "slot r4 11 r0", "movi r5 0", "sstore r4 r5", "ret r0",                   # lp=0
           "pass:",
           "slot r4 11 r0", "sload r5 r4", "nez r5", "jnz r5 @endgame",
           "slot r4 11 r0", "movi r5 1", "sstore r4 r5",
-          "slot r4 8 r0", "sload r5 r4", "movi r6 1", "add r5 r6", "sstore r4 r5", "ret r0",
+          "slot r4 8 r0", "sload r5 r4", "movi r6 1", "add r5 r6", "sstore r4 r5",
+          "slot r4 9 r0", "ctx r5 cursor", "movi r6 300", "add r5 r6", "sstore r4 r5", "ret r0",   # dl refresh
           "endgame:",
           f"movi r4 {_s(3)}", "movi r5 0", "sstore r4 r5",                          # n1=0
           f"movi r4 {_s(4)}", "movi r5 0", "sstore r4 r5",                          # n2=0
@@ -209,4 +220,22 @@ def build():
     src = dict(SRC)
     src["open"] = "\n".join(_open())
     src["move"] = "\n".join(_move())
-    return zkvmasm.assemble_contract(src)
+    # C2 (security review 2026-09-23): every id-taking method refuses an id >= 2^32 before touching a slot;
+    # see _lib.id_guard. The ABI, the field layout and every honest call are unchanged.
+    ID_GUARDS = {**{m: ["r0"] for m in ("open", "join", "resign", "abort", "cancel")}, "move": ["r0", ("r1", 65)]}
+    return zkvmasm.assemble_contract(_lib.guard_ids(src, ID_GUARDS))
+
+
+def carry_in_flight(storage):
+    """Why this contract cannot cross a reroll yet ([] = it can): an open game (_lib.pvp_games_in_flight) — finish,
+    resign or abort it on the old chain first."""
+    return [f"game {g} is open" for g in _lib.pvp_games_in_flight(storage, NN, SD, LIST)]
+
+
+def carry_rebase(storage, tip):
+    """This contract's storage on a new chain whose block 0 stands where the old chain's `tip` stood: only the daily
+    board's unresolved anchors move (_lib.rebase_daily_anchors); everything else is at rest once carry_in_flight is []."""
+    slots = {str(k): v for k, v in ((storage or {}).get("slots") or {}).items()}
+    out = dict(storage or {})
+    out["slots"] = _lib.rebase_daily_anchors(slots, tip, A_H, A_V, DCNT_SLOT, DLIST)
+    return out

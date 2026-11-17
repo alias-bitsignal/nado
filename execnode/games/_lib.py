@@ -12,13 +12,133 @@ Table field convention (shared by all banked games; keep these fixed):
     1 ta(banker)  2 tk(bankroll)  3 tp(pot = banker-withdrawable)  4 tc(committed/at-risk)  6 tz(closed)
 Index convention: slot 0 = table count, <tlist> field = table-id list. (Game index is game-specific.)
 
-Each helper returns asm TEXT (assembled by zkvmasm). Register/scratch usage matches the hand-written originals
-so the produced code is identical to what the audited contracts shipped — this is a de-duplication, not a
-behaviour change. `id` (the table/game id) is always the method's first arg in r0.
+Each helper returns asm TEXT (assembled by zkvmasm). Register/scratch usage matches the hand-written originals.
+`id` (the table/game id) is always the method's first arg in r0.
+
+ID BOUNDS (security review 2026-09-23, C2). A slot is `field * 2^32 + key` with no mask, so an id >= 2^32
+addresses ANOTHER field's storage: `fund(9*2^32 + 88)` moved a player's own settle height, a stranger's
+`bet(7*2^32 + 88, ...)` locked a table forever, `open(5*2^32 + 42)` locked a live tic-tac-toe game — reproduced
+on an isolated ExecState. Only `open_table` bounded its id. `id_guard`/`guard_ids` below put the same bound
+at the top of EVERY id-taking method (fund_table/close_table carry it inline), so `fund`/`close` are no longer
+byte-identical to the originals: they are the originals plus the guard.
 """
 
 # The banked-table field ids — the fixed convention every banked game shares.
 TA, TK, TP, TC, TZ = 1, 2, 3, 4, 6
+
+
+# ---- the reference models' arithmetic --------------------------------------------------------------------------------
+# Every game's Python reference model (what tests and the browser mirrors check the contract against) hashes and reduces
+# the way the contract's VM does: zkvm2.hash_words and mod 2^256 (the wrapping word). The gen-28 field VM's branch
+# (alghash.hashn, mod the Goldilocks prime) and the `isa=` switch went with that VM in G9 slice 3b; BLAKE_EXEC_HEIGHT was 1
+# from gen 29, so the v2 branch is the only one generation 29 ever took. INVARIANT: a model never hashes or reduces any
+# other way.
+def vm_hash(words):
+    from execnode import zkvm2
+    return zkvm2.hash_words([int(w) for w in words])
+
+
+def vm_mod():
+    """the modulus a model reduces by: 2^256, the wrapping word"""
+    return 1 << 256
+
+
+def id_guard(reg="r0", limit=1 << 32, scratch=("r4", "r5")):
+    """asm TEXT that REVERTS unless `reg` < `limit` (default 2^32: the key half of a slot). The same four
+    instructions `open_table` has always carried, so the produced code stays inside the audited opcode set:
+        movi r4 <limit> ; mov r5 <reg> ; lt r5 r4 ; require r5
+    (`lt` is one LT, exact over the whole 256-bit word on zkvm2 — the field VM's RANGE ; RANGE ; LT expansion went
+    in G9 slice 3b — so the bound holds for any operand.) `scratch` (r4/r5 by default) must be registers the body
+    WRITES before reading and that hold no declared argument; a method with four or more arguments passes a higher pair. The guard
+    WRITES both before reading either — a caller may preload up to eight registers through extra args (the
+    ABI arg count is UX metadata, never enforced), so a guard must not assume a register is zero."""
+    a, b = scratch
+    if reg in (a, b) or a == b:
+        raise ValueError(f"id_guard: scratch {scratch} overlaps the guarded register {reg}")
+    return f"""
+        movi {a} {int(limit)}
+        mov {b} {reg}
+        lt {b} {a}
+        require {b}"""
+
+
+def guard_ids(src, plan):
+    """Prefix the id guard onto each method named in `plan` ({method: [reg, ...]} or {method: [(reg, limit)]}).
+    `src` is a game's {method: asm text}; methods absent from `plan` are returned untouched. Applied in each
+    game's build(), after any generated methods are spliced in, so inherited strings (connect4/chess/stormhold
+    reuse tictactoe's open/join/...) are guarded once, in the module that ships them."""
+    out = dict(src)
+    for m, regs in plan.items():
+        if m not in out:
+            raise KeyError(f"guard_ids: method {m!r} is not in this contract")
+        pre = ""
+        for r in regs:
+            # an entry is "r0", ("r1", limit), or ("r1", limit, ("r6", "r7")) for a method whose arguments
+            # occupy r4/r5 (the default scratch); the scratch pair must be written-before-read by the body.
+            if isinstance(r, tuple):
+                reg, limit = r[0], r[1]
+                scratch = r[2] if len(r) > 2 else ("r4", "r5")
+            else:
+                reg, limit, scratch = r, 1 << 32, ("r4", "r5")
+            pre += id_guard(reg, limit, scratch)
+        out[m] = pre + "\n" + out[m]
+    return out
+
+
+CARRY_PIN_FLOOR = 2          # the first new-chain block (or beacon epoch) a re-pinned roll may read
+
+
+def carry_ids(slots: dict, cnt_slot: int, lst: int) -> list:
+    """The ids a contract's own index lists (count at raw slot `cnt_slot`, ids at field `lst`, 0-indexed) — the only safe
+    way for a reroll hook to reach (field, id) slots: hashed keys are 256-bit hash words whose high bits can fall in any
+    field's range, so decoding a key's field from its value is never trusted."""
+    return [int(slots.get(str((lst << 32) + i), 0)) for i in range(int(slots.get(str(cnt_slot), 0)))]
+
+
+# (Owner, BANKED_CARRY_WORDS, daily_carry_words and carry_tote_preimages — the gen-28 -> gen-29 carry's re-encoding
+# hooks, which re-derived hash keys and owner digests from the field VM's formats — went with that carry in G9 slice 3b.
+# A carry between two generations of the same VM re-encodes nothing: tools/carry.py.)
+
+
+def rebase_daily_anchors(slots: dict, tip: int, a_h: int, a_v: int, dcnt_slot: int, dlist: int) -> dict:
+    """The daily-board anchors (daily_anchor) on a new chain whose block 0 stands where `tip` stood: a day whose anchor
+    is PINNED but not yet resolved (a_v == 0) re-pins to a new-chain block >= CARRY_PIN_FLOOR, unknown when the carry
+    is built, so no caller can have steered it. A resolved day keeps its stored hash VALUE — clients and verifiers
+    read the value, never the old chain. Mutates and returns `slots` (str keys).
+    INVARIANT: the pin is written as an INT — exec_root.kv_projection commits only int-valued slots at their slot
+    positions, while the settle proof's sparse_projection int()s every slot, so a string made the carried genesis root
+    unprovable (review 2026-10-11)."""
+    for day in carry_ids(slots, dcnt_slot, dlist):
+        h = int(slots.get(str((a_h << 32) + day), 0))
+        if h and not int(slots.get(str((a_v << 32) + day), 0)):
+            slots[str((a_h << 32) + day)] = int(max(CARRY_PIN_FLOOR, h - int(tip)))
+    return slots
+
+
+def pvp_games_in_flight(storage: dict, nn: int = 1, sd: int = 6, lst: int = 10) -> list:
+    """Game ids of a PvP board game (the tictactoe skeleton: connect4, reversi, chess) that are OPEN — created and not
+    settled. Their moves race an old-chain deadline, so the reroll carry refuses them; finish, resign or abort them on
+    the old chain first. Index: slot 0 count, field `lst` ids."""
+    slots = (storage or {}).get("slots") or {}
+    return [g for g in carry_ids(slots, 0, lst)
+            if int(slots.get(str((nn << 32) + g), 0)) and not int(slots.get(str((sd << 32) + g), 0))]
+
+
+def banked_tables_in_flight(storage: dict, tlist: int) -> list:
+    """Table ids of a banked game (slots, dice, roulette, mines, blackjack) that still carry OPEN BETS — a non-zero
+    committed liability `tc`, the same test close_table() uses to refuse. Read through the game's own table index
+    (slot 0 = count, field `tlist` = ids; open_table caps an id below 2^32, so field*2^32 + id is exact).
+    The reroll carry keeps a banked game's storage only when this is empty (tools/alphanet6_carryforward.carry_policy):
+    INVARIANT: with tc == 0 on every table no seat is in flight, so nothing left in storage refers to the old chain's
+    heights or beacons in a way any method still reads — settled seats are history and every method refuses them."""
+    slots = (storage or {}).get("slots") or {}
+    n = int(slots.get("0", 0))
+    out = []
+    for i in range(n):
+        t = int(slots.get(str((tlist << 32) + i), 0))
+        if t and int(slots.get(str((TC << 32) + t), 0)) != 0:
+            out.append(t)
+    return out
 
 
 def open_table(tlist):
@@ -32,6 +152,10 @@ def open_table(tlist):
         movi r2 0
         lt r2 r0
         require r2
+        movi r2 4294967296
+        mov r5 r0
+        lt r5 r2
+        require r5
         slot r4 1 r0
         sload r5 r4
         nez r5
@@ -57,7 +181,7 @@ def open_table(tlist):
 
 def fund_table():
     """fund(tableId)[value]: banker-only, table open — add value to bankroll (tk) and pot (tp)."""
-    return """
+    return id_guard("r0") + """
         ctx r1 value
         ctx r2 caller
         slot r4 1 r0
@@ -89,7 +213,7 @@ def close_table():
     mark the table closed (tz). The tc==0 guard is a solvency invariant: without it a banker could close over
     unsettled bets, pay themselves the pot (which still holds those bets' committed cover) and strand the
     players — see the escrow-accounting fix (every banked game shares this close)."""
-    return """
+    return id_guard("r0") + """
         ctx r1 caller
         slot r4 1 r0
         sload r5 r4
@@ -116,14 +240,6 @@ def close_table():
         sstore r4 r5
         ret r0
     """
-
-
-def index_append(cnt_slot, list_field):
-    """asm lines that append the id in r0 to an enumeration index: list[count]=r0 ; count++.
-    Uses r3/r4/r5 as scratch (matches the hand-written game code). `cnt_slot` is a bare slot number, not a
-    field*2^32 address; `list_field` is a field id (keyed by the running count)."""
-    return [f"movi r4 {cnt_slot}", "sload r5 r4", f"slot r6 {list_field} r5", "sstore r6 r0",
-            "movi r3 1", "add r5 r3", "sstore r4 r5"]
 
 
 def view_table_maps(index="tables"):
@@ -296,3 +412,57 @@ repin:
     movi r5 1
     ret r5
 """
+
+
+# --- EPOCH-BEACON OUTCOMES (banked games) --------------------------------------------------------------------------
+# A seat placed from the beacon rule settles from BEACON(gb), gb = epoch(landing cursor) + 2: that epoch's reveals
+# land during the NEXT epoch, after the seat is on chain. gh = gb * EPOCH_LENGTH - 1 keeps every "settle at gh + 1"
+# gate, horizon and client readiness rule unchanged. A seat with gb == 0 was placed under the block-hash rule and
+# keeps settling from BHASH(gh) + BHASH(gh + 1).
+# INVARIANT: the beacon seed is the block-hash seed with (BHASH(gh) + BHASH(gh+1)) replaced by BEACON(gb) — the
+# client derives it as chainResultAlg(bc(gb), "0", salt, mod).
+EPOCH_LENGTH = 60          # protocol.EPOCH_LENGTH (tests/test_banked_games_settle_from_the_epoch_beacon.py pins it)
+
+
+def beacon_bind(gh_field, gb_field, key="r0"):
+    """Bind the seat `key` to its beacon epoch: gb = cursor // EPOCH_LENGTH + 2, gh = gb * EPOCH_LENGTH - 1.
+    Clobbers r4, r5, r6, r7 (DIVMOD's remainder)."""
+    return f"""
+        ctx r5 cursor
+        movi r6 {EPOCH_LENGTH}
+        divmod r5 r6
+        movi r6 2
+        add r5 r6
+        slot r4 {gb_field} {key}
+        sstore r4 r5
+        movi r6 {EPOCH_LENGTH}
+        mul r5 r6
+        movi r6 1
+        sub r5 r6
+        slot r4 {gh_field} {key}
+        sstore r4 r5
+    """
+
+
+def seed_q(gh_field, gb_field, out="r3", key="r0", tag="sq"):
+    """out = the seat's randomness base: BEACON(gb) for a beacon seat, BHASH(gh) + BHASH(gh + 1) for a seat placed
+    before the beacon rule (gb == 0). Callers add their salt exactly as before. Clobbers r4, r5, r6 (and `out`);
+    `tag` keeps the labels unique when a method expands this more than once."""
+    return f"""
+        slot r4 {gb_field} {key}
+        sload r5 r4
+        mov r6 r5
+        nez r6
+        jnz r6 @{tag}_beacon
+        slot r4 {gh_field} {key}
+        sload r5 r4
+        bhash {out} r5
+        movi r6 1
+        add r5 r6
+        bhash r6 r5
+        add {out} r6
+        jmp @{tag}_done
+        {tag}_beacon:
+        beacon {out} r5
+        {tag}_done:
+    """

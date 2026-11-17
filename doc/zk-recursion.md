@@ -1,5 +1,7 @@
 # STARK recursion for NADO — O(1) settlement verification
 
+> **HISTORICAL (G9, 2026-10-28):** Kept for its measurements and soundness lessons; the recursion, folds and `alghash2` are gone, and nothing in the Stwo settlement folds proofs today. The Goldilocks stack it describes (`execnode/stark/`, the field VM `execnode/zkvm.py`, `native/starkprove`, `native/starkcompose`, `native/alghash2`, `wasm/goldilocks`) was retired at the generation-29 reroll and deleted in G9. Live now: the contract VM `execnode/zkvm2.py` (256-bit word wrapping mod 2^256, BLAKE2s `hash`), the BLAKE2s exec root (`execnode/exec_root_b2.py`, `execnode/csmt.py`), and Stwo proofs (Circle STARK over M31): the shielded pool via `native/stwo_js`, settlement via `execnode/settle_b2.py` + `native/stwo_settle` (dormant behind `STWO_SETTLE_HEIGHT`). See doc/stwo-migration.md.
+
 **Status:** research + implementation (this doc drives `execnode/stark/alghash2.py`, the alghash hash
 backend, and `execnode/stark/recursion.py`). Grounded in the *actual* proof stack: `execnode/stark/stark.py`
 (the STARK), `fri.py` (FRI), `merkle.py`, `transcript.py`, `alghash.py`, and the execution AIR
@@ -187,15 +189,15 @@ choice is performance, not soundness.
    `air_ir.gadget_max_degree`, which gives the gadget exactly the `max_degree` headroom the inner AIR needs
    (prover + verifier derive it identically). The wrapper is still committed as CAPABILITY, NOT wired as the
    authoritative settlement verifier UNTIL step 8; the proof it checks is producible + verifiable at real scale.
-8. **On-chain settle-with-proof — BUILT but DISABLED (quorum-only today) (`ops/transaction_ops.py` `settle` branch, `ops/settlement_ops.py`,
+8. **On-chain settle-with-proof — LIVE since betanet-14 (`SETTLE_PROOF_RECURSIVE`) (`ops/transaction_ops.py` `settle` branch, `ops/settlement_ops.py`,
    `ops/kv_ops.py`, `tests/test_settle_with_proof.py`).** A `settle` tx MAY carry the recursion bundle; EVERY
    node verifies it deterministically at block-validation — at the PROTOCOL query strength (never the bundle's
    own count), binding the proof's `post_root` to the tx's attested `state_root`, its `cursor` to `exec_cursor`,
    and its `pre_root` to the namespace's committed settled tip (`EXEC_GENESIS_ROOT` for the first settlement, so
    a proof can never start from a fabricated pre-state). On success it records the on-chain marker
    `kv_ops.settlement_proven`, and `settlement_ops.settlement_justified` is WIRED to accept a root when that marker is set
-   OR the bonded quorum is met — both PURE functions of committed on-chain state — but the proof branch is currently
-   commented out, so the bonded quorum is the only live settlement authority (no prover posts proofs yet). When enabled (this is
+   OR the bonded quorum is met — both PURE functions of committed on-chain state; the proof branch is live behind
+   `protocol.SETTLE_PROOF_TRUSTLESS` (True) and exec nodes prove unconditionally (`execnode.py` `SETTLE_PROVE`). Enabled (this is
    what makes it fork-safe: the old node-local `_EPOCH_PROOFS`/`settlement_verifier` callback — which would have
    forked a node that had a proof from one that didn't — is REMOVED). The soundness hole flagged here before
    (a verifier that ignored the attested full root) is closed: the exact `state_root` is the binding.
@@ -291,7 +293,7 @@ is scoped precisely.
 runs the whole prove (LDE → Merkle → composition → FRI → openings) in u64 buffers, so the Python prover never
 materializes N-sized column lists — the recursion memory wall. Byte-identical to `stark.prove` for every mode
 (column/row, single/two-phase, RECURSION + ALGHASH2), wired into `stark.prove`, shielded/BLAKE2B untouched.
-`tests/test_starkprove.py`, `tests/test_holistic_wired.py`. This is what makes recursion proofs memory-feasible.
+`tests/test_starkprove.py`, `tests/test_native_prover_verifies.py`. This is what makes recursion proofs memory-feasible.
 
 **Authoritative depth (`execnode/stark/recursion_authdepth.py`).** `recursive_verify` applied to a bundle's own
 fold_0 + comp_0 (RECURSION-committed) → a root that attests the bundle verifies — the fold/comp CRYPTO collapsed
@@ -318,6 +320,11 @@ collapse to ONE field element (`calls_commitment` = a `merkle_node` chain over t
 fold, hence provable + foldable); the io collapses the same way (`io_commitment`, domain-separated). So the
 settlement public statement is the O(1)-shaped `(calls_commitment, io_commitment, sparse_pre_root,
 sparse_post_root)` (`settlement_sparse.public_statement_o1`). `tests/test_calls_commit.py`.
+From `ZK_HARDEN_HEIGHT` the calls commitment is NOT one element (audit 2026-09-24/25 HIGH): one Goldilocks element is a
+~2^32 birthday search for a second calldata with the same binding, and the settler submits both calldatas itself. The
+leaves are 256-bit blake2b digests and the chain is the alghash2 sponge, a 4-element commitment (~2^128 collision);
+a segment is keyed on its end cursor and one straddling the gate is refused. The binding is checked natively on both
+sides, so no AIR changed; `prove_calls_commitment` stays the narrow demonstrator. `tests/test_calldata_binding_is_wide.py`.
 
 **In-circuit statement rebuild — the STATE half + the binding primitive (built).**
   * `logup_bind.py` — LogUp multiset-equality: two lists of tuples are the same multiset inside a proof (the
@@ -413,7 +420,7 @@ fallback until the single-bundle aggregation lands (soundness-first — no parti
 
 **DEPLOYMENT.** Swapping the sparse root in as THE consensus settled root (settle-tx `state_root`,
 `ops/transaction_ops` bridge/dividend/unshield exits, `state.py`) is a genesis-level state-root-scheme change,
-wired on the live chain, so it rides the reroll (CHAIN_ID→alphanet-6; settle-with-proof present but disabled, quorum-only).
+wired on the live chain, so it rides the reroll (CHAIN_ID→betanet-6; settle-with-proof present but disabled, quorum-only).
 
 ## 6. Soundness ledger (what each piece rests on)
 

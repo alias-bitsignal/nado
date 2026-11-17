@@ -33,20 +33,20 @@ of it is still open.
 | Layer | Solana Q1'26 | NADO status | Blocker |
 |---|---|---|---|
 | **Fungible asset primitive** | SPL token | **BUILT** (was ABSENT) — state-level ledger committed in the settled root, derived ids a contract computes in-circuit, 5 zkVM opcodes, asset-denominated call value ([`doc/assets.md`](doc/assets.md)). Open: wallet UI, settlement-by-proof | Keystone. Was blocking everything below. |
-| **Launchpad** | $144M (42%) — Pump.fun, Bags, LetsBonk | **ABSENT** | Needs asset primitive |
-| **Trading terminals** | $79M — Axiom, Photon, BullX, GMGN, Trojan | **ABSENT** — no charts, no indexer, no price history | Needs markets + indexer |
+| **Launchpad** | $144M (42%) — Pump.fun, Bags, LetsBonk | **BUILT** (2026-11-07) — in the DEX contract, upgraded in place, and its Launch tab; [`doc/launchpad.md`](doc/launchpad.md) §8 | Upload of coin images from the DEX host waits on an nginx route |
+| **Trading terminals** | $79M — Axiom, Photon, BullX, GMGN, Trojan | **PARTIAL** (2026-11-07) — the DEX page's board: every pair with exact txns, volume, makers and 5M/1H/6H/24H change, candles and recent trades, from a trade index INSIDE the exec node (`execnode/dex_trades.py`, `/exec/dex_trades` · `dex_candles` · `dex_stats`). Open: per-address P&L, watchlist, a terminal page | Phase 5 below |
 | **Wallet swaps** | $49.6M — Phantom | **PARTIAL** — wallet has send/receive/stake/deploy/HTLC lock, but the "swap" UI is a raw HTLC lock/claim/refund form: no pair, no price, no counterparty discovery | Needs AMM + router |
-| **AMM / DEX** | Raydium, Orca, Meteora, Pumpswap | **DESIGN** — `doc/dex-bridge.md` specifies an on-chain order book + atomic VM swap; zero lines of it implemented | Needs asset primitive |
+| **AMM / DEX** | Raydium, Orca, Meteora, Pumpswap | **SHIPPED (AMM + order book)** — the constant-product AMM (`execnode/games/dex.py`) and the cross-chain OTC order book (`execnode/games/otc.py`, dex-bridge phase 1, live 2026-08-26 as the dex dApp's Cross-chain mode) are both on-chain; router still open | Needs asset primitive |
 | **Aggregator/router** | Jupiter, $812B routed in 2025 | **ABSENT** | Needs ≥2 venues |
 | **Liquid staking** | Jito, Sanctum, Marinade | **ABSENT** — bonding is BUILT (`bond`/`unbond`, `B_MIN`, slashing, bond-elastic emission) but there is no derivative token, no delegation | Needs asset primitive + delegation |
-| **Lending** | Kamino, Save, Drift, Sentora | **ABSENT** — no collateral/liquidation/interest code, and **no oracle** except the app-specific sports resolver | Needs assets + oracle |
+| **Lending** | Kamino, Save, Drift, Sentora | **PARTIAL** — `execnode/games/lend.py` is peer-to-peer collateralised fixed-term loans with no oracle (terms fixed at offer, default by deadline); no pooled or variable-rate market, and **no price oracle** except the app-specific sports resolver | Needs assets + oracle |
 | **Stablecoin** | USDC/USDT rails | **DESIGN** — `doc/stablecoin.md` (nUSD, CDP + stability pool + stake-secured oracle), explicitly "nothing here is implemented" | Needs assets + oracle |
 | **RWA** | >$2B, +43% QoQ | **ABSENT** | Needs everything above + counterparties |
-| **Bridge / on-ramp** | CEX listings + wrapped everything | **PARTIAL** — HTLC atomic swap is BUILT and tested on the NADO leg (`tests/test_htlc.py`, 9 tests); no counterparty-chain client, no order book, no listing | The real gate on all demand |
+| **Bridge / on-ramp** | CEX listings + wrapped everything | **PARTIAL** — HTLC atomic swap BUILT and tested on the NADO leg (`tests/test_htlc.py`), and the OTC order book (maker/taker discovery + dual-hashlock escrow) is LIVE (`execnode/games/otc.py`); still missing: counterparty-chain clients (BTC/ETH leg wiring, dex-bridge phase 2), no listing | The real gate on all demand |
 | **MEV / block engine** | Jito | **N/A by design** — fees are burned, there is no priority-fee auction | See §2 |
 
 **What we have that they don't** (and should not throw away):
-21 provable game contracts on a permissionless zkVM (`execnode/games/`, 788 KB — banked games with a
+27 provable contracts (games and finance) on a permissionless zkVM (`execnode/games/`, 788 KB — banked games with a
 real 1% edge, two parimutuel markets, a full NFT with marketplace and escrowed bids in `pets.py`), a
 shielded pool, post-quantum signatures throughout, HTLC without a custodian, a working forum, and a
 faucet. That is a *product* layer with no *market* layer under it.
@@ -81,9 +81,8 @@ Concretely:
 4. **The chain metric we optimize is not "app revenue," it is `fees burned + volume settled`.**
    See §10. Copying Solana's *numbers* would mean copying its extraction; we copy its *machine*
    and let the value land on holders instead of on an app company.
-5. **No priority-fee auction, no MEV lane.** But note: today a block producer still chooses intra-block
-   ordering, so sandwiching an AMM would be possible. Fair ordering becomes a *requirement* the moment
-   an AMM exists — see Track C.
+5. **No priority-fee auction, no MEV lane.** There is no proposer to order a block, and since 2026-11-07 the AMM
+   clears every block's swaps on a pool at ONE price (Track C), so position inside a block is worth nothing.
 
 ---
 
@@ -146,6 +145,95 @@ incompatible token contracts. Full rationale and the resulting design: [`doc/ass
 - **Settlement by proof for asset calls** — give `settlement_proofs._run_call` a shadow asset ledger and
   let `verify_epoch` replay with `with_assets=True`. The AIR needs nothing more; it already proves the io
   log that carries every asset effect.
+
+**State proofs are the ZK line; signature aggregation is not.** Settlement-by-proof went live at the
+betanet-14 reroll (`SETTLE_PROOF_RECURSIVE`): an epoch is proven as ONE zkVM trace and L1 verifies it in
+**~0.3 s independent of the call count**, replacing re-execution. That is the asymmetry ZK exists for —
+re-running ten thousand contract calls is expensive, checking a proof that they ran is not.
+
+Signature aggregation was built far enough to measure and then **removed** (2026-07-31). Proving the
+butterfly half of ONE ML-DSA signature cost 7.11 min, produced a 1.87 MB proof and took 6.98 s to verify,
+against a 2420-byte signature that verifies natively in 120.4 µs — ~770x the size, ~58,000x the verify.
+Break-even needed ~116 signatures for size against a batch cap near 7. Full post-mortem, including two
+forgery-class bugs it uncovered and the prover speed-ups that outlived it, in
+[`doc/zk-signature-aggregation.md`](doc/zk-signature-aggregation.md).
+
+The rule to carry forward: **prove what is expensive to REDO, not what is cheap to CHECK.** The remaining
+ZK work therefore sits on the state-proof line — proving execution, and (separately) the shielded pool,
+where inputs are hidden by construction so there is no cheaper alternative to compete with.
+
+### 2026-08-06 — a settle proof LANDED, and what that changed
+
+Block **43153** settled `exec_cursor 42876` on a STARK validity proof: a peer verified it in 114.5 s, all
+four nodes agree on the block hash, it is final at depth 71, and `/get_settled` returns the proven root.
+Until this point the honest status was "the prover produces correct proofs and none has ever landed".
+
+**The reason it took so long is worth recording, because it was not one bug.** Six independent failures
+were stacked, each individually fatal, so fixing any one of them changed nothing observable:
+
+1. **All three peers were missing `libgoldilocks.so`** — with no Python fallback since betanet-14, no peer
+   could verify a settle proof under any circumstances. `self_update` rebuilt only crates whose *sources
+   changed*, and a box that has never built a crate has unchanged sources forever. Invisible from outside:
+   L1 keeps producing blocks and `/status` stays 200.
+2. **The fold's prover trace was linear in K** (~65,536 rows per folded proof). Now folded through
+   `recursion_depth.fold_tree`, bounding it at T=131,072 for any K.
+3. **DA could not deliver it** — only one node in the fleet runs `nado-exec`, so k=4/n=8 erasure coding had
+   exactly one provider.
+4. **The size caps were knobs, not consensus.** `MAX_TX_BODY` (1 MiB, aiohttp's default) was the real
+   limit — and `SETTLE_INLINE_MAX` (7 MiB) already exceeded it. Nothing in consensus bounds tx or block
+   size. The proof now rides **inline**, in a 126.6 MiB block.
+5. **Gossip timeouts of 5 s / 15 s** sized for kilobyte transactions.
+6. **The landing runway** (60 blocks) was shorter than the ~8-minute transfer of an exact-landing tx.
+
+Full evidence and the measurements in [`doc/settle-proof-transport.md`](doc/settle-proof-transport.md) §6.
+
+**Still open, and it gates the next step:** the landed proof was **unfolded** (`calls=0`). A span containing
+a call the chain skips or reverts is currently unprovable *at all* — `vm_circuit.prove_epoch_calls` refuses
+to prove a reverting execution — so on a busy chain proof-carrying settlement still falls back to the bonded
+quorum. `calls_commit.block_calls` already documents the intended semantics ("the proof's state transition
+treats a skip/revert as a no-op"), so the implementation contradicts its own design. Fixing it means either
+the AIR proves reverting executions, or the verifier can re-derive which calls were no-ops — a
+prover-supplied flag would be forgeable. Folded proof SIZE also remains unmeasured, and `prove_transition`
+now dominates at ~126 s per state update.
+
+### The state-proof line: what is left
+
+> Goldilocks-era plan (2026-08): the modules it names went with `execnode/stark/` in G9. Its Stwo successor — the whole
+> span's state transition as one statement — is doc/stwo/g4-settlement-statement.md.
+
+**1. Full-state composition — the ceiling on everything below it.** `settlement_proofs` proves the **zkVM
+projection only**. The bridge, dividend and shielded families still settle by their own paths, so there is no
+single proof of a whole state transition. Until that exists, "one proof settles the block" is only true of
+part of the block, and there is no complete object to merge or fold.
+
+*Progress:* the records half — the other half of `rnode(kv_root, rec_root)` — is now both **provable**
+(`execnode/stark/records_transition.py`) and **bound** (`execnode/stark/records_bind.py`, the records
+analogue of `exec_state_bind`: derive the update set from committed data, require the transition to prove
+exactly that set). Derivation covers the bridge deposit, the faucet/treasury mirror and the presence-dividend
+accrual — the last one mattering out of proportion because it accrues with *no transaction at all*, which is
+why the settle branch can currently only refuse any span crossing an epoch boundary. Shielded/field
+transfers, asset movements, allowances, xmsg and the withdrawal records are still `Unbindable`.
+
+The binding compares derived against proven updates for **exact equality**, so a missing derivation refuses
+the span and falls back to quorum — it can cost coverage, never soundness. That is what makes the remaining
+effect families landable one at a time instead of as one flag day. `block_records_inert` stays exactly as
+strict as it is until they do, and relaxing it is a consensus change that rides a reroll.
+
+**2. State merging** ([`doc/state-merge.md`](doc/state-merge.md)) — how proofs compose once they exist.
+*Sequential* merge is live (the K→1 fold: chain segments, `A.roots[-1] == B.roots[0]`, keys may overlap).
+*Parallel* merge is implemented (`execnode/stark/state_merge.py`, `tests/test_state_merge.py`): two
+transitions proven from the SAME pre-root over disjoint keys, composed into one. Parallel is what lets
+proving spread across machines, which is the enabler for off-chain bulking with on-chain reuptake.
+
+**3. One hash for everything provable.** A proof can only be FOLDED if its hash is the algebraic one — the
+in-circuit verifier speaks `alghash2` and nothing else. So any proof committed under `blake2b` is
+structurally excluded from composition, no matter how fast it is. That makes the backend choice an
+*architectural* question rather than a performance one: the shielded pool proving under `blake2b` cannot ever
+join a full-state proof.
+
+**Why this ordering.** (3) decides whether (1) is even reachable, and (1) decides whether (2) has anything to
+operate on. Measured basis for the whole line: `prove_epoch_calls` verify is **flat at ~0.11 s** and proof
+size **constant at 1263 KB** while calls go 1 → 8.
 - A real "build your first dApp" guide (we still don't have one — see Track D).
 
 **Exit criteria:** a user creates an asset in the wallet in under 60 seconds, sends it to a friend,
@@ -182,12 +270,26 @@ interpreter-vs-proof-vs-replay check our money-code rule demands. Wallet half ou
 - Frontend: `static/swap.html` + `swapdapp.js` built on `nadodapp.js`, with the standard
   confirming→confirmed lifecycle and a real `settleInflight` landed function.
 
-**Exit criteria:** live E2E script (`_amm_e2e.py`, same pattern as `_pets_e2e.py`) creates a pool,
+**Exit criteria:** live E2E script (`_amm_e2e.py`, same pattern as `scripts/live/_pets_e2e.py`) creates a pool,
 swaps both directions, adds/removes liquidity, and proves reserves and fees conserve exactly.
 
 ---
 
 ## Phase 3 — Launchpad (the 42%)
+
+> **Status: BUILT (2026-11-07) — in `execnode/games/dex.py` (upgraded in place) and the DEX's Launch tab; as built:
+> [`doc/launchpad.md`](doc/launchpad.md) §8.** The plan: It was prompted by a request
+> to deploy `higherdotfun/launchpad-template`, a pump.fun clone for Solana that cannot run on NADO as-is; we take its
+> product, not its code. Two corrections to the mechanic below, forced by what is built: (a) creating is the creator's
+> two steps in one flow — `asset_create` with a fixed supply, then `launch` carrying all of it — because a call carries
+> one asset and only a contract's deployer may issue *for* it; the page calls a coin a fair launch only when the settled
+> root proves `mintable == false` and the curve holds 100 % of the supply; (b) graduation cannot seed a Phase-2 pool
+> (no cross-contract calls), so the curve contract itself becomes a constant-product pool — nobody holds its shares, so
+> its liquidity is locked forever by construction. **Adapted to NADO's philosophy, the vision kept** (operator,
+> 2026-11-07): no platform fee and no creator cut — the curve's trade fee and the creation fee are burned; an opening
+> batch and then one uniform price per block, so first-block sniping, txid grinding and sandwiches earn nothing; no
+> per-wallet caps (fairness from the uniform price, not from counting identities); no admin, no pause, no curation;
+> content-addressed images. Next step: confirm the parameter values (§6 of the plan) and build L1.
 
 **Goal:** the Pump.fun analogue — one-click asset creation with an instant market, no listing, no
 liquidity bootstrap problem.
@@ -198,8 +300,9 @@ liquidity bootstrap problem.
    one and no LP required.
 3. At a market-cap threshold the token **graduates**: curve reserves are deposited into a Phase-2 AMM
    pool and the **LP is permanently locked/burned** (this is what makes a launchpad not a rug).
-4. Fees: creation fee, and a trade fee on the curve. Split: **burn + creator**, both declared,
-   creator share capped, all visible pre-signature.
+4. Fees: creation fee, and a trade fee on the curve, **both burned** — no creator share (the creator earns as an early
+   holder, at the opening window's one price like everyone; [`doc/launchpad.md`](doc/launchpad.md) §2a). Declared,
+   visible pre-signature.
 
 **Anti-rug rules baked into the contract, not the UI** — these are our differentiator vs. every
 launchpad that lets a deployer drain:
@@ -208,7 +311,7 @@ launchpad that lets a deployer drain:
 - Graduation is permissionless and deterministic (anyone can trigger it once the threshold is met).
 - Full trade history readable on-chain; the explorer shows creator holdings from block one.
 
-**Exit criteria:** a token launched, traded, and graduated end-to-end on alphanet; a written
+**Exit criteria:** a token launched, traded, and graduated end-to-end on betanet; a written
 adversarial review specifically hunting for the drain paths (the banked-solvency and field-wrap class
 of bug we've already been bitten by twice — treat the curve math as money code).
 
@@ -240,8 +343,8 @@ an asset's NADO price without a full-storage poll.
 Axiom is worth $42.4M/quarter for *execution and routing UX*, not custody. That's a front-end
 business built on public state. The prerequisite is not consensus work — it's **an indexer**.
 
-**Reality check on latency:** NADO blocks are 6s (`config.py:119`) with finality at depth 45
-(`protocol.py:469`, ~4.5 min). We will never win a sniping-latency race against 400ms slots, and we
+**Reality check on latency:** NADO blocks are 6s (`config.py` `block_time`) with finality at depth 45
+(`protocol.FINALITY_DEPTH`, ~4.5 min). We will never win a sniping-latency race against 400ms slots, and we
 should not pretend to. What we can offer instead, and should build the terminal *around*:
 - **Deterministic finality** — a fill is final, not probabilistically final.
 - **No priority-fee auction** — nobody outbids you into the front of the block (contingent on Track C
@@ -250,8 +353,12 @@ should not pretend to. What we can offer instead, and should build the terminal 
   venue can say a trade was *proven* correct, not just observed.
 
 **Deliverables**
-- Indexer service (sibling to `forum/server.py`): trades, OHLCV candles, holder counts, new-launch
-  feed, per-address P&L. Reads exec state; no new trust.
+- ~~Indexer service (sibling to `forum/server.py`)~~ — BUILT INSIDE THE EXEC NODE instead (2026-11-07), because work
+  that only reads the chain runs inside the node (doc/jobs.md: a hand-started sibling process is how the price chart
+  froze for two days): `execnode/dex_trades.py` records every swap, liquidity change, launch fill (at the block its
+  batch cleared) and graduation with exact amounts, sharing the asset-history index's lifecycle; served at
+  `/exec/dex_trades`, `/exec/dex_candles`, `/exec/dex_stats`. Holder counts come from `/exec/assets`. Open:
+  per-address P&L (the trades endpoint already filters by `?trader=`).
 - `static/terminal.html`: launch feed, chart, one-click buy/sell, portfolio, watchlist, i18n via the
   `merge_games.py` T_GAMES pipeline.
 - Public read API so third parties can build competing terminals — a plural terminal layer is what
@@ -261,7 +368,7 @@ should not pretend to. What we can offer instead, and should build the terminal 
 
 ## Phase 6 — Liquid staking
 
-Bonding is BUILT (`bond`/`unbond`, `B_MIN` = 10 NADO, `BOND_CAP`, slashing, `BOND_UNLOCK_DELAY`) but
+Bonding is BUILT (`bond`/`unbond`, `B_MIN` = 10 NADO, linear uncapped weight since betanet-5, slashing, `BOND_UNLOCK_DELAY`) but
 bonded capital is **frozen and non-composable**, and `B_MIN` plus the unlock delay prices out small
 holders. A liquid staking token fixes both and is the standard second-order demand driver (Jito,
 Sanctum, Marinade).
@@ -307,25 +414,72 @@ None of the above generates a cent if a person cannot get NADO. Today: mine it, 
   PQ signer is the real work). Package a reference adapter so a listing is an afternoon, not a quarter.
 - Fiat is out of scope; the realistic path is BTC/ETH ↔ NADO atomic swaps plus one listing.
 
+### Track A2 — Harden the challenger draw against resampling — **OPEN, security**
+
+PoSEA's CA-free TPM enrolment (`doc/tpm-attestation-without-a-ca.md`) rests on "forgery requires every
+drawn challenger to collude". That is only half the property. The other half is **being drawn**, and an
+adversary can retry that.
+
+An unanswered enrolment must be abandonable or a prover whose challengers are unreachable is excluded
+permanently through no fault of its own — which is not hypothetical, it is what blocked every enrolment
+on 2026-09-11 when the drawn set was running older code. Abandoning means republishing, republishing at
+a new height redraws, and nothing caps the attempts. Expected time to forgery is about `W / p^k`, not
+infinity.
+
+Simulated against the live weight distribution (13 candidates, `k = 3`, weighted, without replacement):
+
+| adversary share of draw weight | P(forge) per window | expected time at W = 180 blocks |
+|---|---|---|
+| 25.5 % | 0.53 % | ~64 h |
+| 36.4 % | 2.91 % | ~12 h |
+| 44.4 % | 6.59 % | ~5 h |
+
+The bond is **rented, not burned**, so this is a cost of capital for the duration. Each success mints one
+identity per endorsement certificate held, and endorsement certificates are public and copyable.
+
+Directions, none analysed and none chosen — every one of them trades against the liveness requirement
+that created the problem:
+
+- keep the FIRST draw for an enrolment id across supersedes and re-draw only the slots that did not
+  answer (needs a way to tell a silent challenger from a slow one);
+- charge an **escalating fee per republication**, so grinding pays super-linearly while one honest retry
+  stays cheap (prices a remedy that exists for blameless provers);
+- raise `k`, or grow the candidate pool — the only direction with no trade, but both are properties of
+  deployment size rather than of the construction. The table above is dominated by `n = 13`.
+
+Mitigated in part since: the draw now prefers nodes that have volunteered (`tpm_ready`) or have actually
+acted as challengers, so an adversary must run announcing infrastructure rather than merely look like a
+validator. That changes `p`; it does not remove the attack.
+
+Narrowed further by challenger pool v2 (block 100000 on gen 28, block 1 since gen 29): the pool is online bonded
+stake (weight `bonded // B_MIN`, a landed duty in >= 50 of the last 100 epochs), k = 5, and a drawn challenger that
+fails a record sits out a day — see doc/tpm-attestation-without-a-ca.md. The table above predates it (k = 3). A
+supersede still redraws, so the resampling weakness is narrower, not gone.
+
+**This is a small-network weakness, which is exactly when it is cheapest to exploit and least likely to
+be noticed.** It does not touch the phone path, which re-verifies a self-contained chain every time.
+
 ### Track B — Throughput and cost
 `BLOB_MAX_BYTES = 512 KB`, `MAX_BLOB_BYTES_PER_BLOCK = 1 MB`, 6s blocks. A trading chain's load
 profile is many tiny calls, not few large ones — the opposite of the game contracts that set these
 limits. Before Phase 5 volume: measure calls/block, batch calls into one blob, and revisit whether the
 flat `MIN_TX_FEE` per blob is the right shape when a blob carries 200 swaps. (Keep the fee burned.)
 
-### Track C — Fair ordering / anti-MEV
-The moment an AMM has real volume, block producers can sandwich it. "No MEV" is currently true only
-because there's nothing to extract. Options to evaluate before Phase 2 ships to mainnet-scale volume:
-deterministic intra-block ordering (e.g. by tx hash), per-block batch auctions with a uniform clearing
-price, or encrypted mempool. **This is a consensus-level commitment and cheaper to make now than
-after a sandwich bot exists.** Position it publicly as a feature — it is one.
+### Track C — Fair ordering / anti-MEV — **BUILT (2026-11-07): per-block batch auctions**
+Chosen by the operator over a consensus reorder. In-block order is txid order, which a submitter grinds, and NO
+in-block shuffle can stop a sandwich whose two legs sit in different blocks (the mempool is public; the only
+unpredictable consensus seed, the RANDAO beacon two epochs ahead, would delay all execution ~15 minutes). So the DEX
+contract (upgraded in place) makes every swap an order in its block's batch: buys and sells net at the pool's spot,
+the remainder trades through the curve, every buyer in the block gets one price and every seller another, and minOut
+is enforced against the whole batch (an order that would push anyone past their limit reverts). What remains is a
+front-runner whose leg clears in an EARLIER block — that moves the spot before your order and your minOut refuses it.
+Open: commit-reveal swaps (intent hidden until execution) as an opt-in protected swap.
 
 ### Track D — Developer surface
 We are permissionless at the protocol level (`_apply_blob_inner` does zero sender checks on deploy;
 cid = `H(deployer, code, nonce)`), but we have **no "build your first dApp" guide, no published SDK
 package, and no versioned API**. The seven apps that made Solana's money were built by *other people*.
-- Split `execnode/games/` → `execnode/apps/` with games and finance side by side; fix the known gap
-  where `hamster` is missing from `deploy.py`'s `GAMES` list.
+- Split `execnode/games/` → `execnode/apps/` with games and finance side by side.
 - Publish `nadodapp.js` as a real package with a version and a changelog.
 - A quickstart: deploy a counter, call it from a webpage, in 15 minutes.
 - Grants/bounties aimed squarely at the categories in §1 that we won't build ourselves.
@@ -335,6 +489,218 @@ The existing app layer is not a distraction — it is 21 shipped, provable, *fun
 demand of a kind Solana's numbers don't capture. Assets make it better: game-native tokens, tradeable
 pets (already a full NFT + marketplace), tournament prize pools denominated in any asset. Every phase
 above should ask "what does this give the games?"
+
+### Track F — Zero-knowledge / proof system
+
+> **Generation 29 replaced the proof system (2026-10-28).** The Goldilocks STARK this track was built on — our field,
+> FRI, AIRs, `alghash`/`alghash2`, recursion and folds, the field and wide pools, the shielded-contract pool, and the
+> crates `starkprove`/`starkcompose`/`alghash2`/`wasm/goldilocks` — was retired at the reroll and deleted in G9. Live
+> now: the contract VM `execnode/zkvm2.py` (256-bit wrapping word, BLAKE2s `hash`), the BLAKE2s exec root over a
+> compressed sparse tree (`execnode/exec_root_b2.py`, `execnode/csmt.py`), and the Stwo shielded pool. The Stwo
+> settlement prover (`execnode/settle_b2.py`, `native/stwo_settle`) is built and dormant behind `STWO_SETTLE_HEIGHT`;
+> the bonded quorum settles until then. The plan and its phases are [`doc/stwo-migration.md`](doc/stwo-migration.md).
+> The open-work list and the shielded-contracts design below are the Goldilocks-era record.
+
+Full map, with measured numbers and per-component status:
+[`doc/zk-components.md`](doc/zk-components.md).
+
+| Item | Status | Note |
+|---|---|---|
+| Goldilocks field, FRI, STARK, AIR IR, LogUp | **RETIRED (G9)** | Replaced by Stwo (Circle STARK over M31). Was `NUM_QUERIES=320`, blowup 2, 18 grind bits → ~146 provable bits (Johnson) |
+| alghash2 (in-circuit hash) | **RETIRED (G9)** | Replaced by BLAKE2s everywhere provable. Was a wide sponge, WIDTH 12 / RATE 8 / CAPACITY 4, α=7, 54 rounds. Post-quantum: 128-bit collision + Grover preimage |
+| Execution zkVM + its AIR | **BUILT** | `execnode/zkvm2.py` (256-bit word, BLAKE2s) since gen 29, its Stwo AIR in `native/stwo_settle`. The only contract runtime; **27 contracts** (`execnode/games/deploy.py` `GAMES`) |
+| Shielded pool (join-split, membership) | **LIVE (Stwo)** | `execnode/shielded_stwo.py`, proved on-device with `native/stwo_js`; the Goldilocks pools were deleted in G9 |
+| Recursion (in-circuit STARK/FRI verify, FS, fold-of-folds) | **RETIRED (G9)** | Was the O(1) verify side, on the consensus path from betanet-14 to the gen-29 reroll |
+| K→1 fold | **RETIRED (G9)** | Built and never run: it needed contract calls to fold, and an idle chain had none |
+| State-root binding (sparse tree, calls/records commitment) | **LIVE (BLAKE2s)** | Compressed sparse Merkle over BLAKE2s (`exec_root_b2`, `csmt`); the depth-256 alghash2 tree was deleted in G9 |
+| Rust prover crates | **BUILT** | `stwo_js`, `stwo_settle`, `mldsa44`, `pqsig`, `attest` (`starkprove`, `alghash2`, `starkcompose` deleted in G9). **Rust-only, no fallback** — a Python path shadowing a Rust one is invisible degradation |
+| DA transport (k-of-n + commitment + defer) | **BUILT** | Availability ≠ validity: unresolved defers, never rejects |
+| **Trustless settlement, end to end** | **LANDED ONCE** | Rule is live and unconditional; block 43153 (2026-08-06) settled on a proof a peer verified (see 2026-08-06 above). Spans that move withdrawals, unshields or xmsgs cannot be proven yet (doc/stwo/g4-settlement-statement.md §1), so routine settlement still rides the bonded quorum |
+| Signature aggregation | **REMOVED** | Built, measured, deleted 2026-07-31 — post-mortem kept deliberately |
+| **Shielded contracts (private application state)** | **DELETED (G9 slice 5)** | Was built (f5e4e7c8) and paused; `private_call` is refused at every height. Before deletion, every `private_call` was refused from block 1 (`ExecState.rules_privacy_pause`; review 2026-09-24: a deposit could commit a note worth more than it paid). Private *state* with public *code*. Reuses the shielded pool's note/nullifier machinery and the DA→commitment→verify loop; see below |
+| Program obfuscation (Diamond iO) | **RESEARCH** | Nothing implemented, scheduled, or promised |
+
+**Open work, in the order the measurements justify:**
+
+1. ~~**Land one proof-carrying settle and have a peer verify it.**~~ **Done** — block 43153, 2026-08-06.
+2. **Prove cadence vs. prove time.** A prove takes ~250 s while the settle cadence is 30 blocks (~180 s),
+   so a new conforming span arrives before the previous prove finishes and hits the in-flight guard. With
+   the epoch re-anchor in place a span may safely run up to 59 blocks — roughly one proof per epoch.
+3. **Rust port of `ops/da.py`** — now 0.428 s/MiB in Python after the algorithmic fix; Rust would take a
+   118 MiB proof from ~50 s to ~1–2 s.
+4. **Proving cost.** `sparse_projection` is the largest stage (137–158 s of a 240–270 s prove), and inside
+   it `SparseStore.root()` is 65.8 s. But it is **kernel-bound, not seam-bound** — native `permute12` is
+   26.9 µs of the 35.4 µs `rnode` call — so porting the tree walk buys only ~24%. A Toeplitz-Karatsuba
+   MDS could cut the permutation ~1.8× without changing the hash, but that is consensus-critical and
+   **time is not the binding constraint**. Do this last.
+
+#### Shielded contracts — private application state on our own machinery
+
+The shielded pool hides **values**; every contract deployed today is public bytecode with public storage and
+public inputs (`doc/obfuscation-diamond-io.md` §1 states this plainly). The gap between those two is the whole
+of "private apps": **private state with public code**. That is strictly less than the iO research goal, which
+hides the *code*. Keep the two apart in every discussion; they are different projects and only one of them is
+buildable today.
+
+What makes this cheap for us is that the pipeline already exists and already carries traffic. A private
+contract call is the **same** proof→DA→commitment→L1-order→verify loop the shielded pool runs; only the
+statement inside the proof changes. Of the components a private call touches, exactly two are new.
+
+**The finding that decides the cost: no reroll.** `execnode/exec_root.py` folds the settled root as
+`rnode(KV_ROOT, RECORDS_ROOT)`, and the RECORDS half already commits the shielded and field pool roots and
+nullifier sets as *digests in the position*. Its tag table is FROZEN-**append-only**, and the module says so:
+"extending validity proofs over MORE of the root later is forward-compatible work on the SAME tree — no future
+genesis reroll, no hard fork". A per-contract note root and nullifier set are two more tags (11, 12). Tags 1–10
+never move, so no historical root is invalidated. Given that every `CHAIN_GENERATION` reroll wipes all 25
+contracts and forces a coordinated redeploy, this is the difference between a feature and a relaunch.
+
+**The five pieces, in dependency order:**
+
+1. **Generalise the note.** Today `(value, owner, rho)` with conservation hardcoded into
+   `joinsplit_circuit.py`. A state note is `(cid, note_type, fields…, owner, rho)`; conservation becomes a
+   per-type predicate rather than a global law. Concretely: `cid` and `type` join the COMMIT region's sponge
+   input, and `VIN`/`VOUT` become generic field slots. The C-3 range gadget stays — any field standing for a
+   quantity still needs it, for the same mod-P wraparound reason.
+2. **The private kernel circuit.** Two routes. **(A) per-contract AIRs** — cheap to prove, but needs a
+   compiler and makes every contract a bespoke circuit to audit. **(B) the zkVM with a private input tape** —
+   `vm_circuit.py` already proves a *public* program on *public* inputs producing a *public* I/O log; add a
+   private tape plus note-read/note-emit opcodes and the same AIR proves a private call. B is far more
+   expensive per call and has one VM, one circuit, one thing to get right. **Start with B**; move hot
+   contracts to A once cost is measured rather than guessed.
+3. **Client-side proving — the piece that decides whether any of this is real.** `shielded_field.py` today:
+   "the wallet hands the exec node the witness, the exec node builds the path and proves the whole
+   join-split." That is private from the chain and from other users, but **not from whoever runs the exec
+   node**. A sequencer that never sees a witness is the bar; ours sees all of them. The kernels are already native Rust
+   (Track F), so the work is a WASM target plus browser witness generation, not a new prover. Until it ships,
+   say "private except from the operator" — do not let the word do work it has not earned.
+4. **Two-domain call semantics.** A private call yields nullifiers, new commitments, an optional enqueued
+   public call, and a proof. Apply in L1 order: verify → every nullifier unseen → append commitments → run the
+   enqueued public call in the existing zkVM. The only legal direction is private → public; public state must
+   never read private state.
+5. **Size and reach.** A per-call proof is the same 1–4 MB order as a shielded transfer, so it rides DA. The
+   K→1 fold keeps a many-call span at one verification. Reach is the unsolved half and it is operational, not
+   architectural: DA k-of-n is meaningless while one node in the fleet runs `nado-exec` (Track F, item 3 of the
+   2026-08-06 post-mortem).
+
+**The hazard this design specifically must not walk into.** A call the chain *skips* or *reverts* is a no-op on
+chain but the prover cannot represent one, so a single skipped call makes the whole settlement span unprovable
+— the open blocker recorded above under 2026-08-06. Observed on the live node again on 2026-08-16:
+
+```
+block 42282  skip: insufficient bridge balance for call value
+settle-with-proof SKIPPED — span 42270 -> 42300 contains an unprovable call at block 42282
+```
+
+A private call whose proof fails to verify must therefore be **rejected at blob admission**, never admitted and
+then skipped during apply. Get that wrong and any user can switch the chain off validity proofs at will by
+submitting one bad proof per span. This is a hard precondition, not a nice-to-have — and it argues for fixing
+the skip/revert representation *before* private calls exist, not alongside them.
+
+**Phasing** (each independently shippable; nothing after P0 needs a reroll):
+
+| | Delivers | Turns on |
+|---|---|---|
+| **P0** | Raise the field pool tree from `TREE_DEPTH = 12` to production depth; migrate the pool tree + browser client BLAKE2b → alghash | Nothing new — finishes the rollout `doc/privacy.md` §6 already lists as pending |
+| **P1** | Generalised note `(cid, type, fields)` + record tags 11–12 | Per-contract shielded balances: private state exists, one note type |
+| **P2** | Private kernel over the zkVM with a private input tape | Arbitrary private functions, delegated proving |
+| **P3** | WASM prover in the wallet | Privacy becomes **unilateral** — the operator stops seeing witnesses |
+| **P4** | Per-contract circuits for hot paths; DA shards on peer nodes | Cost and reach — usable rather than demonstrable |
+
+**What would sink it: proving cost, not cryptography.** Route B multiplies the VM trace by every step of every
+private call, and we have already met the ceiling from the other direction — a span of 119 record updates was
+declined on 2026-08-16 because the proof would be ~1 794 MiB against `SETTLE_INLINE_MAX` and take ~5 355 s to
+build. The number that decides this is **proving seconds per private call on a phone**, and nobody has measured
+it. That measurement belongs before P1, not after P2 — it is the cheapest possible way to find out whether the
+rest of this is worth building.
+
+### Track G — Signature-scheme agility (more post-quantum, never less)
+
+**Status 2026-10-25: BUILT, dormant until generation 29 — [doc/signature-schemes.md](doc/signature-schemes.md)** (ML-DSA-65/87 and SLH-DSA-128s offered; FN-DSA-512 built, off until FIPS 206 is final). It supersedes the design below where they differ: the address commits to the scheme (`[domain, alg, pubkey]`) instead of an account field, and there is a fee multiplier per scheme, since the fee is flat, not by byte size.
+
+Today the chain is single-scheme: ML-DSA-44 everywhere, dispatched through the one chokepoint
+(`signatures.py` — `sign`/`verify`/`from_private_key`/`generate_keydict`; every consumer imports those
+four and nothing else). The goal is user choice among **post-quantum** schemes with ML-DSA-44 as the
+default. Pre-quantum schemes (Ed25519, secp256k1) are explicitly out: the weakest offered scheme is the
+chain's effective security floor, and PQ-throughout is a differentiator we don't sell back for
+convenience.
+
+**Why the architecture makes this cheap:** consensus checks `verify(sig, pk, msg) == True` and never
+compares or hashes signature bytes (only the txid is recomputed, over the body *excluding* the
+signature), so schemes with different signature shapes perturb nothing. Pubkey-once already binds each
+address to one on-chain pubkey; the scheme becomes one more thing that binding fixes.
+
+**Design (settled 2026-08-10):**
+- `signatures.py` becomes a registry (`{alg_id: backend}`); the four public functions grow an `alg`
+  parameter defaulting to `"mldsa44"`. Callers don't change until they offer the choice.
+- **Optional `alg` field on the tx, absent = mldsa44.** Absence-as-default keeps every existing tx
+  byte-identical — txids, block hashes, genesis root untouched, **no reroll**. The field rides in
+  `canonical_bytes`, so the txid commits it and the signature binds it for free.
+- **Scheme bound at pubkey-once:** the first tx from an address establishes `(public_key, alg)` in the
+  account record; `validate_origin` dispatches on the bound alg thereafter and rejects mismatches. No
+  address-format change — `make_address` stays a pubkey truncation (cross-scheme address grinding is
+  2^168, a non-issue), and the network learns an address's scheme exactly when it learns its pubkey.
+  Belt-and-suspenders: pubkey sizes are disjoint across the roster (1312/1952/2592/32 bytes), so
+  ambiguity is structurally impossible even without the tag — but the tag ships; length-sniffing is the
+  `startswith(ADDRESS_PREFIX)` class of discriminator betanet-14 already removed.
+- **Validators, blocks, attestations, shielded, forum stay ML-DSA-44.** User key choice only; the
+  consensus-critical surfaces remain single-scheme.
+- **Multisig:** optional per-member `alg` in the descriptor, default mldsa44 — new descriptors only.
+- Per-scheme: the interop self-test pattern and the native-required rule (`_fallback`) carry over.
+  Fee-by-byte-size already prices large signatures — no special-casing.
+
+**Phase G1 — ML-DSA-65 / ML-DSA-87 (near-free).** All three stacks already contain them as parameter
+sets of libraries in the tree: `dilithium_py` exports `ML_DSA_65`/`ML_DSA_87` with the same
+`_*_internal` methods; the RustCrypto `ml-dsa` crate behind `nado_pq_native` has all three; the browser's
+`@noble/post-quantum` bundle exports `ml_dsa65`/`ml_dsa87` in the same internal-mode convention already
+cross-validated for 44. Same 32-byte seed model, no new conventions. NIST categories 3 and 5 for the
+cost of plumbing — and it shakes out the multi-scheme dispatch on the easiest case.
+
+**Phase G2 — SLH-DSA-128s (the diversity win).** Bigger lattice parameters don't hedge a structured-
+lattice break; hash-based SLH-DSA (FIPS 205) does — it's the one addition that changes the security
+story rather than the knob settings. Support exists in all three stacks, but it's real new code with a
+real interop trap: keygen wants three seed components, so one deterministic 32-byte-seed → key
+expansion must be defined and pinned identically in Python, Rust, and JS (extend the per-scheme interop
+self-test; this is exactly the bug class it exists for). ~7.8 KB signatures pay their own block space
+via the byte-size fee.
+
+**Skip Falcon/FN-DSA:** FIPS 206 not final, thin library support, and floating-point signing is
+precisely the cross-implementation determinism hazard this codebase keeps paying for.
+
+**Deployment rule:** the whole fleet must carry the dispatch code *before* the first tagged tx is
+submitted — an old node sees a new-scheme tx as "Invalid signature", which is a manufactured mempool
+split. One push, no live experiments in flight.
+
+**Cost split, honestly:** node-side (registry, `alg` field, pubkey-once storage, tests) is small; the
+larger half is the browser wallet/light-miner parity and multisig UI. Note for Track F: each scheme
+added is another verification circuit if in-circuit signature verification is ever revisited — decide
+the roster before that build starts, not after.
+
+### Track H — Account authentication: rotate keys, recover accounts, keep the address
+
+**Design: [doc/key-rotation.md](doc/key-rotation.md)** (2026-08-25). Status: **LIVE since chain generation 24** (built 2026-08-26) — `protocol.AUTH_ACTIVE = CHAIN_GENERATION >= 24`; every rule, the wallet panel and the node CLI are in place and tested (core, consensus end-to-end with reorgs, multi-node testnet lifecycle).
+
+Before this track an address *was* its ML-DSA key; a lost or stolen key lost the bonded stake and its ramp, the
+fidelity streak, aliases and every exec-side balance with it, and there was no proactive rotation.
+The track makes authentication **state**: an account carries `authenticators` + a `signing` policy
+(who may spend) + a `reconfig` policy (who may change the keys), `ID`/`THRESHOLD` only, hard-capped
+(4 keys, depth 2, one scheme). Recovery is not a mechanism, it is a policy: the wallet's "protected"
+preset is `signing = hot key`, `reconfig = hot AND recovery`, so a stolen hot key can spend the
+liquid balance but cannot take the account. Proof of possession on install, `config_version` replay
+guard, a 1-day pending window for partial-policy changes with cancel + 7-day freeze by a key the
+thief lacks — the war of resubmission is settled by policy, not by delay.
+
+- **What it does NOT do:** no PQ migration (already ML-DSA), no multi-scheme, no programmability, no
+  key→address index. Composes with Track G's `alg` field, which becomes a per-authenticator attribute.
+- **Cost / risk:** one `authorized()` predicate replacing every `proof_sender` call (a source
+  assertion pins it), a new snapshot DB `auth_history` → **genesis-root change → ships at a reroll**
+  or behind a generation-keyed gate on the `auth` recipient; exact rollback symmetry required
+  (`auth_revert`). Single-key accounts keep exactly one verify per tx.
+- **Who it is for:** validators (240 NADO bonded + a 30-epoch ramp on this box alone) and long-streak
+  open miners — the identities that cannot be recreated. Everyone else gets a one-time "protect your
+  account" prompt and can ignore it.
+- **Sequence:** predicate + tests → config/state/revert → `auth` recipient → evidence `at_height` →
+  `/get_account` fields → wallet Security panel (two presets) → node `rotate-key` CLI. Shipped with
+  the generation-24 reroll.
 
 ---
 
@@ -363,7 +729,7 @@ honestly is rarer than it should be.
 |---|---|---|---|
 | 1 | **Asset primitive** | — | Keystone — **chain half BUILT**; wallet UI + proof settlement open |
 | 2 | **AMM** | 1 | Price discovery; the venue everything routes into |
-| 3 | **Launchpad** | 1, 2 | 42% of app revenue on the reference chain |
+| 3 | **Launchpad** | 1, 2 | 42% of app revenue on the reference chain — **BUILT**, [`doc/launchpad.md`](doc/launchpad.md) |
 | 4 | **Router + wallet swap** | 2, 3 | 15% of app revenue; highest-converting surface |
 | 5 | **Indexer + terminal** | 2, 3 | 23% of app revenue; pure front-end leverage |
 | 6 | **Liquid staking** | 1 | Unfreezes bonded capital; composability |
@@ -373,6 +739,7 @@ honestly is rarer than it should be.
 | C | Fair ordering | **before 2 at scale** | Cheaper to commit now |
 | D | Dev surface | continuous | Other people build the winners |
 | E | Games | continuous | Already shipped; assets make them better |
+| H | Account authentication (key rotation / recovery) | — | **LIVE since generation 24** (doc/key-rotation.md) |
 
 ---
 
@@ -382,10 +749,114 @@ honestly is rarer than it should be.
    classes have already bitten us (banked-table solvency, field-wrap on static payout math); an AMM
    and a bonding curve are the same class of arithmetic with more zeroes attached.
 2. **Bugs are caught by running code, not reading it.** Every phase ships with a live E2E script in
-   the `_*_e2e.py` pattern and is proven on alphanet before it's called done.
-3. **Upgrade in place, no legacy paths.** Alphanet has no activation gates; consensus changes go live.
+   the `scripts/live/_*_e2e.py` pattern and is proven on betanet before it's called done.
+3. **Upgrade in place, no legacy paths.** A consensus change goes live behind a generation-keyed gate
+   (`<h> if CHAIN_GENERATION == 28 else 1`, the GATE LEDGER in `protocol.py`), deleted after the next reroll.
 4. **Close the whole usability loop** — ids, results, feedback, history, search, i18n, routes. A
    half-wired swap is worse than no swap.
 5. **No hidden fees, no admin keys, no authority.** If a design needs a privileged address to work,
    it is the wrong design — that is the one thing that makes NADO worth choosing over the chain this
    roadmap is learning from.
+
+### Why settle-with-proof is not submittable (measured 2026-08-03)
+
+A settle-with-proof carrying **one** segment serialises to **97.30 MiB**, against an 8 MiB submit cap.
+That is the whole reason the validity-proof path has never run in production, on any generation,
+whatever the consensus flags said.
+
+Where the bytes are, measured rather than assumed (`prove_settlement_sparse`, one call, toy depth):
+
+| field | NUM_QUERIES=2 | NUM_QUERIES=8 |
+|---|---|---|
+| `segment.proof.openings` | 0.574 MiB | 2.295 MiB |
+| `segment.transition` | 0.278 MiB | 0.750 MiB |
+| `segment.pre_contracts` | ~0 | ~0 (1.6 MiB with 25 real contracts) |
+| **total** | **0.892 MiB** | **3.166 MiB** |
+
+FRI openings scale **linearly with the query count** (4× queries → 4.0× openings), and protocol strength
+is `NUM_QUERIES = 320` (`execnode/stark/fri.py`). That extrapolates to the ~97 MiB observed live.
+
+So the payload is **O(queries), not O(state)** — and `pre_contracts`, the obvious suspect, is ~1.6 MiB of
+97. The succinct `verify_bound_epoch_replay` path (in-circuit membership instead of shipping state) is
+therefore *not* the fix; it would save under 2%.
+
+The two real levers:
+
+1. **Fewer queries for the same security** — raise the FRI blowup factor and lean on grinding. 320 queries
+   implies a low blowup; standard parameterisations reach comparable security at 40–80. This is a
+   consensus change and rides a reroll. **Now quantified with our OWN soundness model:
+   [`doc/fri-parameters.md`](doc/fri-parameters.md)** — blowup 16 at 96 queries is 164.4 provable bits
+   (vs 156.0 today) at 0.30x the opening size, i.e. better on BOTH axes. The one unmeasured cost is the
+   8x-larger LDE domain on the prover; benchmark before choosing.
+2. **Publish the proof to DA and carry only its commitment on chain** — what a rollup normally does, and
+   the plumbing already exists (`/da/publish`, `exec_da`, and the shielded path already submits this way).
+
+Note the K→1 fold does not help here: with a single segment there is nothing to collapse, and the fold's
+own cost is separately prohibitive (5h07m at 492% CPU without completing, 2026-08-02).
+
+#### Can the query lever alone fix it? No — measured, and it is not close.
+
+FRI parameters today: `FRI_BLOWUP = 2` (fixed — `stark.prove` always passes 2), `NUM_QUERIES = 320`,
+`GRIND_BITS = 18`, giving the documented `320 × 0.4 + 18 ≈ 146 bits provable (Johnson)`. Blowup 2 buys only
+**0.4 provable bits per query**, which is exactly why 320 are needed.
+
+Raising the blowup buys bits per query, so fewer queries reach the same 146 bits. Best realistic case is
+blowup 16 at ~64–80 queries. Measured payload, one call, toy depth:
+
+| NUM_QUERIES | openings | total tx |
+|---|---|---|
+| 2 | 0.574 MiB | 0.892 MiB |
+| 8 | 2.295 MiB | 3.166 MiB |
+| 64 | 18.364 MiB | **24.385 MiB** |
+| 320 (protocol) | — | ~97 MiB (observed live) |
+
+Perfectly linear at **0.381 MiB per query**.
+
+**The binding constraint is not the 8 MiB HTTP cap — it is the BLOCK.** A full block is ~256 KiB
+(`transaction_pool_max_bytes` comment: "4 MiB (>> 256 KiB block …)"; a produced block logged 71,163 bytes),
+and `MAX_BLOB_BYTES_PER_BLOCK` is 1 MiB. So:
+
+* today's proof is **~380× an entire block**;
+* the best query/blowup reparameterisation still gives 24 MiB, **~95× a block**.
+
+A 4–6× reduction cannot close a 380× gap. **The proof can never ride inside a block**, at any FRI
+parameters, so publishing it to DA and carrying only a commitment is not an optimisation — it is the only
+available architecture. The codebase already does exactly this for shielded proofs
+(`/da/publish` + `proof_da` + `da_fetch`, `execnode.py`: "the caller publishes it to /da/publish and
+submits an L1 blob carrying only the commitment").
+
+The open question is therefore not *whether* to use DA but **when the proof is fetched**: a settle proof is
+re-verified by every node on block APPLY (and on fresh sync), so a naive DA reference makes block
+validation block on a ~100 MiB retrieval. That is the design problem to solve next — not proof size.
+
+#### Update 2026-08-04 — DA transport is built; the blocker moved
+
+That "design problem to solve next" is **solved and shipped**. Availability is not validity, so a proof we
+cannot fetch **defers** the block rather than rejecting it — three outcomes, not two (verified → accept,
+resolved-and-bad → reject, unresolved → defer). Rejecting on unavailability would split the chain along
+*who happens to hold shards*, since the justified `(exec_cursor, exec_root)` sits in the L1 header;
+deferral is fork-free because every node applies the same rule, and the wait is bounded by
+`SETTLE_PROOF_DEPTH_GATED` (past `FINALITY_DEPTH` the proof is not consulted at all, so a withholder can
+only make us wait). Tests: `tests/test_settle_proof_da_defer.py`.
+
+Four further blockers were found and fixed by running it, not reading it:
+
+| | |
+|---|---|
+| **Cadence** | The settle cadence left the justified tip at an arbitrary offset, so spans straddled the 60-block dividend epoch boundary — **95 of 128 observed skips**, making a proof structurally impossible. The stale comment claimed straddling spans re-anchored the tip; they never did. Fixed by re-anchoring on epoch entry (`fde96f46`) |
+| **Silence** | A prove completed and *nothing* followed it — no publish, no error, no settle. There was no log line at all between the prove and the publish, so "finished and vanished" was indistinguishable from "still running" (`966f5c31`) |
+| **Root/records skew** | `state_root = rnode(kv, records)`, but the root was captured at cursor C while the records half was recomputed later from a live state the detached tail had advanced — two roots that were never simultaneously true (`6a903a09`) |
+| **DA encode** | `ops.da.encode` ran at ~15 s/MiB, so erasure-coding one 118 MiB proof took **~30 minutes**. Algorithmic, not the language: a full modular exponentiation in the innermost loop, ~141 million per proof, recomputing Lagrange coefficients that are *constants*. Hoisted to a cached generator matrix: **15.08 → 0.428 s/MiB (35×)**, bit-identical (`08945e50`) |
+
+**Current status: still not landed.** Measured over 33 064 journal lines (2026-08-01 → 08-06): **89
+proofs built and submitted, 0 accepted, 85 refused** with `HTTP 413, Maximum request body size 8388608
+exceeded` at 97.30–97.45 MiB. Zero proof-carrying settles have ever completed.
+
+Note what that says: **the self-check was never the historical blocker — size was.** 89 proofs passed
+their self-checks and bounced off the 8 MiB cap. The `PRE MISMATCH` self-check failures seen on 08-04
+(pre-state does not reproduce L1's justified root; post side exact) are a *later* condition, not the
+long-standing one. See [`doc/zk-components.md`](doc/zk-components.md) §0 and §14.
+
+Note also that the **query lever is not needed to be the answer** — the K→1 fold would make the payload
+smaller, but it has never run: it needs contract calls to fold and the chain has been idle, so the exec
+node deliberately falls through to the unfolded prove.

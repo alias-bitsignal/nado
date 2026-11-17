@@ -9,8 +9,9 @@ select_producer into block production/verification) is the S4.3 integration laye
 
 Design (from the red-teamed "Option A" hybrid):
   - Sybil cost = locked refundable BOND, not a public IP. Selection weight is SPLIT-NEUTRAL:
-    shares = min(bonded, BOND_CAP) // B_MIN, so sharding capital across many addresses gives
-    exactly zero advantage, and the cap stops a whale from monopolising selection.
+    shares = bonded // B_MIN, linear in stake — sharding capital across many addresses gives
+    exactly zero advantage and merging it gives none either (no per-identity cap since 2026-08-25:
+    the old one was per KEY and only ever bound honest single-key miners).
   - Randomness = a commit-reveal RANDAO beacon contributed by always-on bonded participants and
     CHAINED with the previous beacon, so it cannot be ground by the previous producer (the
     grindable parent_block_hash seed — audit M6 — is abandoned) and a single withholder gets at
@@ -20,9 +21,9 @@ Design (from the red-teamed "Option A" hybrid):
     (R,S) and would be grindable); signing stays only for authenticating heartbeats/reveals.
 """
 from hashing import blake2b_hash
-from protocol import DOMAIN_REGISTER, DOMAIN_RANDAO_COMMIT, DOMAIN_RANDAO_BEACON
-from protocol import (B_MIN, BOND_CAP, EPOCH_LENGTH, FIDELITY_CAP, BOND_RAMP_EPOCHS,
-                      K_OPEN, OPEN_BASE_FLOOR, OPEN_FID_BONUS, REGISTER_POW_BITS)
+from protocol import DOMAIN_RANDAO_COMMIT, DOMAIN_RANDAO_BEACON
+from protocol import (B_MIN, EPOCH_LENGTH, FIDELITY_CAP, BOND_RAMP_EPOCHS,
+                      K_OPEN, OPEN_BASE_FLOOR, OPEN_FID_BONUS)
 
 
 def epoch_of(block_number: int) -> int:
@@ -31,15 +32,15 @@ def epoch_of(block_number: int) -> int:
 
 
 def selection_shares(bonded: int, fidelity=None) -> int:
-    """Split-neutral, capped selection weight for a bonded identity.
+    """Split-neutral, linear selection weight for a bonded identity.
 
-    shares = min(bonded, BOND_CAP) // B_MIN  (0 if under the minimum bond).
+    shares = bonded // B_MIN  (0 if under the minimum bond).
     Optional fidelity ramp (anti-whale time dimension): a newcomer's weight ramps linearly to
     full over FIDELITY_CAP epochs of continuous presence, so an instant whale cannot buy its
     full proportional share on day one. fidelity=None disables the ramp (full weight)."""
     if bonded < B_MIN:
         return 0
-    shares = min(bonded, BOND_CAP) // B_MIN
+    shares = bonded // B_MIN
     if fidelity is not None and fidelity < FIDELITY_CAP:
         shares = shares * fidelity // FIDELITY_CAP
     return shares
@@ -55,8 +56,8 @@ def total_shares(registry: dict) -> int:
 def total_bonded_shares(bonded_registry: dict) -> int:
     """Fork-choice CHAIN-WEIGHT contribution of one block (#16/#17 step 2): the TOTAL bonded selection
     capacity of the registry as-of-the-block's-PARENT, summed as pure committed stake (NO fidelity
-    ramp) so it is a stable, grind-proof, integer measure. Per identity: min(bonded,BOND_CAP)//B_MIN
-    (== capped at MAX_SHARES). Deliberately the TOTAL registry weight, NOT the slot winner's share —
+    ramp) so it is a stable, grind-proof, integer measure. Per identity: bonded//B_MIN (linear, no
+    per-identity cap). Deliberately the TOTAL registry weight, NOT the slot winner's share —
     that makes cumulative_weight BEACON-INDEPENDENT (a proposer cannot grind the beacon to inflate
     fork weight) and removes any self-bond-on-a-private-fork leverage. Browser-reproducible (integer
     only). fidelity is intentionally excluded so the weight does not drift with presence ramps."""
@@ -141,18 +142,20 @@ def lane_of(slot: int, beacon: str) -> str:
     return "open" if i in order[:K_OPEN] else "bonded"
 
 
-def open_shares(fidelity) -> int:
+def open_shares(fidelity, epoch=None) -> int:
     """OPEN-lane selection weight for a registered, present identity: a flat floor every newcomer
     gets (so a zero-coin miner is ALWAYS winnable, never scaled to 0) plus a diligence bonus that
     ramps to full over FIDELITY_CAP epochs of continuous presence. Range OPEN_BASE_FLOOR ..
     OPEN_BASE_FLOOR+OPEN_FID_BONUS (1..10). NOT money-weighted — this lane is capital-FREE, so no
-    whale can buy advantage in it."""
+    whale can buy advantage in it. `epoch` is accepted (and ignored) so every caller keeps one signature:
+    gen 24 used it for probation (weight 1 until the first renewal), retired at gen 25 — an identity is an
+    attested device now, so the curve is the same clean line at every fidelity level from the first lease."""
     f = 0 if fidelity is None or fidelity < 0 else fidelity
     return OPEN_BASE_FLOOR + min(f, FIDELITY_CAP) * OPEN_FID_BONUS // FIDELITY_CAP
 
 
 def _bonded_shares(info: dict) -> int:
-    """bonded-lane weight of one registry entry: split-neutral capped shares incl. fidelity ramp"""
+    """bonded-lane weight of one registry entry: split-neutral linear shares incl. fidelity ramp"""
     return selection_shares(info["bonded"], info.get("fidelity"))
 
 
@@ -174,14 +177,35 @@ def bond_ramp_weight(base_shares: int, bond_since, epoch: int) -> int:
     return base_shares * tenure // BOND_RAMP_EPOCHS
 
 
+def open_lane_draw_registry(open_registry: dict, slot: int) -> dict:
+    """The registry the OPEN-lane draw runs over: the whole attested registry, staked or not — one device, one slot.
+    (Gen 25 excluded stakers between OPEN_LANE_EXCLUDE_BONDED_HEIGHT and OPEN_LANE_EXCLUDE_RETIRE_HEIGHT; both gates
+    were 0 / 1 from generation 26 on, so the filter never ran and was deleted — protocol.py "THE SAVINGS LANE IS
+    PLAIN STAKE".) Returns its argument itself, never a copy.
+    INVARIANT: this is the ONE place the open draw would filter; /mining_status mirrors it through the same function,
+    so `open_excluded_bonded` follows automatically and must never be recomputed at a call site."""
+    return open_registry
+
+
+def bonded_producer_registry(bonded_registry: dict, open_registry: dict, slot: int) -> dict:
+    """The registry the bonded PRODUCER draw runs over: the raw bonded registry, weight = stake — no device filter, no
+    pools, no cap, no curve. (Gen 25 shaped it with BOND_DEVICE_CAP_HEIGHT, BOND_WEIGHT_CURVE_HEIGHT, POOL_HEIGHT and
+    their retire gates; from generation 26 on every one of them resolved to "plain stake" for every slot, so the
+    shaping was deleted — protocol.py "THE SAVINGS LANE IS PLAIN STAKE".) Returns its argument itself, never a copy.
+    INVARIANT: the draw, the wallet's /mining_status and the tests all call this one function — never re-filter the
+    bonded registry at a call site."""
+    return bonded_registry
+
+
 def _bonded_ramped_weight(epoch: int):
     """Weight function (closure over the draw's epoch) for the ramped bonded producer draw."""
     return lambda info: bond_ramp_weight(_bonded_shares(info), info.get("bond_since"), epoch)
 
 
-def _open_weight(info: dict) -> int:
-    """open-lane weight of one registry entry: capital-free open_shares of its fidelity"""
-    return open_shares(info.get("fidelity"))
+def _open_weight(epoch: int):
+    """Weight function (closure over the draw's epoch) for the open-lane draw: capital-free open_shares of the
+    entry's fidelity, probation-aware from SYBIL_RULES_EPOCH."""
+    return lambda info: open_shares(info.get("fidelity"), epoch)
 
 
 def _weighted_draw(registry: dict, weight_fn, beacon: str, slot: int):
@@ -253,21 +277,27 @@ def select_producer_two_lane(open_registry: dict, bonded_registry: dict, beacon:
         The instant ANY stake bonds, bonded slots return to the bonded lane and the ceiling re-applies.
     The winner is credited by ADDRESS, so it need not be online (a relay builds the block for it)."""
     bonded_weight = _bonded_ramped_weight(slot // EPOCH_LENGTH)   # tenure ramp for the sudden-whale brake
+    # the draw registry (mining_ops.bonded_producer_registry: plain stake); the `bonded_registry` argument keeps its
+    # meaning for the empty-lane policy below and for fork weight.
+    draw_registry = bonded_producer_registry(bonded_registry, open_registry, slot)
     def _bonded_draw():
         """Bonded-lane draw with the tenure ramp applied, plus a deterministic un-ramped
         fallback: if EVERY bonded identity is still ramping (total ramped weight 0) the
         ramp has no established set to protect, so redraw un-ramped rather than stall —
         the whale brake must never cost liveness. Same result on every node."""
-        w = _weighted_draw(bonded_registry, bonded_weight, beacon, slot)
+        w = _weighted_draw(draw_registry, bonded_weight, beacon, slot)
         # LIVENESS: the ramp must never STALL the chain. If every bonded identity is still ramping (total
         # ramped weight 0) but the registry is NON-empty, fall back to the un-ramped draw so a block is still
         # produced. Deterministic (same on every node). This only fires when NO aged validator has weight —
         # i.e. all stake is fresh — where there is no established set for the ramp to protect anyway.
-        if w is None and bonded_registry:
-            w = _weighted_draw(bonded_registry, _bonded_shares, beacon, slot)
+        # (Over the same capped/attested registry: the fallback must never re-admit unattested stake.)
+        if w is None and draw_registry:
+            w = _weighted_draw(draw_registry, _bonded_shares, beacon, slot)
         return w
+    # the open draw registry (open_lane_draw_registry: every attested identity, staked or not)
+    open_draw = open_lane_draw_registry(open_registry, slot)
     if lane_of(slot, beacon) == "open":
-        winner = _weighted_draw(open_registry, _open_weight, beacon, slot)
+        winner = _weighted_draw(open_draw, _open_weight(slot // EPOCH_LENGTH), beacon, slot)
         if winner is not None:
             return winner
         return _bonded_draw()                                     # one-directional open->bonded fallback
@@ -278,40 +308,8 @@ def select_producer_two_lane(open_registry: dict, bonded_registry: dict, beacon:
     if not bonded_registry:
         # BOOTSTRAP LIVENESS: zero stake exists -> no capital lane to protect -> let open produce this
         # bonded slot so the chain still advances (halts otherwise). Reverts the moment any stake bonds.
-        return _weighted_draw(open_registry, _open_weight, beacon, slot)
+        # _open_weight is a FACTORY (closure over the epoch, since the probation-aware open_shares); passing
+        # the factory itself made _weighted_draw compare a function with 0 and raise — the very halt this
+        # branch exists to prevent, on a no-premine chain's first bonded slot or an all-withheld RANDAO epoch.
+        return _weighted_draw(open_draw, _open_weight(slot // EPOCH_LENGTH), beacon, slot)
     return None                                                  # stake exists but draw failed -> skip (no leak)
-
-
-# --- open-lane registration proof-of-work (one-time, fee-substitute, phone-doable) -----------
-
-def registration_pow_target() -> int:
-    """Fixed difficulty: a valid hash must be below 2**(256 - REGISTER_POW_BITS)."""
-    return 1 << (256 - REGISTER_POW_BITS)
-
-
-def registration_pow_hash(address: str, nonce) -> int:
-    """Domain-separated (DOMAIN_REGISTER) blake2b of (address, nonce) as an integer, compared
-    against registration_pow_target(). Binding the ADDRESS into the pre-image makes solutions
-    non-transferable — a solved nonce registers exactly one identity."""
-    return int(blake2b_hash([DOMAIN_REGISTER, address, nonce]), 16)
-
-
-def verify_registration_pow(address: str, nonce) -> bool:
-    """A fresh, zero-balance address proves a one-time light PoW INSTEAD of paying the fee it
-    cannot afford. Fixed difficulty (REGISTER_POW_BITS): a few seconds on a phone, ONCE ever. This
-    is NOT an ongoing mining race — the lane cap, not this puzzle, is what bounds Sybils; the PoW
-    only throttles free-registration bursts and substitutes for the unaffordable fee."""
-    return registration_pow_hash(address, nonce) < registration_pow_target()
-
-
-def solve_registration_pow(address: str, start: int = 0, limit: int = 1 << 30):
-    """Helper for the wallet / browser light-miner and tests: find an integer nonce satisfying the
-    registration PoW. Deterministic. Returns the nonce, or None if none found within `limit`."""
-    target = registration_pow_target()
-    nonce = start
-    end = start + limit
-    while nonce < end:
-        if registration_pow_hash(address, nonce) < target:
-            return nonce
-        nonce += 1
-    return None

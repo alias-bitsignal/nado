@@ -1,9 +1,10 @@
 import os, sys, tempfile, traceback
 os.environ["HOME"] = tempfile.mkdtemp(prefix="nado_s42_")
+import atexit, shutil; atexit.register(shutil.rmtree, os.environ["HOME"], ignore_errors=True)   # leave no /tmp home behind (9,600 leaked by 2026-09-22)
 os.makedirs(os.path.expanduser("~/nado/logs"), exist_ok=True)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from protocol import B_MIN, BOND_CAP, MAX_SHARES, FIDELITY_CAP
+from protocol import B_MIN, FIDELITY_CAP
 from ops.mining_ops import (selection_shares, total_shares, select_producer,
                             beacon_commitment, verify_reveal, compute_beacon, epoch_of)
 from hashing import blake2b_hash
@@ -12,21 +13,20 @@ def blake2b_seed(i):
     """deterministic per-index 'random' beacon (no Math.random / time)"""
     return blake2b_hash(["seed", i])
 
-fails = 0
-def check(name, fn):
-    """Run fn; print PASS/FAIL and count failures."""
-    global fails
-    try: fn(); print(f"PASS  {name}")
-    except Exception as e: fails += 1; print(f"FAIL  {name}: {e}"); traceback.print_exc()
+import _harness
+_report = _harness.Report()
+check = _report.run
 
 def t1():
-    """Prove selection_shares gates below B_MIN, scales linearly, and caps at MAX_SHARES (anti-whale)."""
+    """Prove selection_shares gates below B_MIN and scales linearly with NO per-identity cap (removed
+    2026-08-25: the cap was per key and only ever bound honest single-key miners)."""
     assert selection_shares(0) == 0 and selection_shares(B_MIN - 1) == 0          # below min => ineligible
     assert selection_shares(B_MIN) == 1
     assert selection_shares(4 * B_MIN) == 4
-    assert selection_shares(1000 * B_MIN) == MAX_SHARES                            # capped, anti-whale
-    assert selection_shares(BOND_CAP * 10) == MAX_SHARES
-check("selection_shares: min gate, linear, capped at MAX_SHARES", t1)
+    assert selection_shares(1000 * B_MIN) == 1000                                  # linear, uncapped
+    assert selection_shares(10_000 * B_MIN) == 10_000
+    assert selection_shares(10_000 * B_MIN + B_MIN - 1) == 10_000                  # floor division
+check("selection_shares: min gate, linear, uncapped", t1)
 
 def t2():
     """Prove the fidelity ramp scales share weight linearly from 0 to full at FIDELITY_CAP."""
@@ -95,5 +95,5 @@ def t7():
     assert epoch_of(0) == 0 and epoch_of(59) == 0 and epoch_of(60) == 1
 check("epoch_of partitions by EPOCH_LENGTH", t7)
 
-print(f"\n{'ALL S4.2 CHECKS PASSED' if fails==0 else str(fails)+' S4.2 CHECK(S) FAILED'}")
-sys.exit(1 if fails else 0)
+print(f"\n{'ALL S4.2 CHECKS PASSED' if _report.fails==0 else str(_report.fails)+' S4.2 CHECK(S) FAILED'}")
+sys.exit(1 if _report.fails else 0)

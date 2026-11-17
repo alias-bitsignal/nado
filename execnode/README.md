@@ -7,10 +7,11 @@ the deterministic **zkVM** and keeps the resulting contract state. A bug in this
 chain. Phones mine L1 and never run any of this. See `doc/execution-layer.md` for the full design and
 `doc/zk-execution-proofs.md` for the provable-execution stack (issue #85).
 
-> **As of alphanet-5 (v1.0.0-alpha.9), the zkVM is the ONLY runtime.** The old string/BLAKE2b stack VM was
-> deleted — no legacy, no history replay. Contract *execution is provable*: a call is applied by verifying a
-> STARK + replaying its public I/O log instead of re-executing, and a whole epoch of calls settles as one
-> proof (`execnode/settlement_proofs.py`). See `doc/zk-execution-proofs.md`.
+> **As of betanet-5 (v1.0.0-alpha.9), the zkVM is the ONLY runtime.** The old string/BLAKE2b stack VM was
+> deleted — no legacy, no history replay. Contract *execution is provable*: since generation 29 the VM is
+> `execnode/zkvm2.py` (256-bit word, BLAKE2s), and a span of calls can settle on one Stwo proof
+> (`execnode/settle_b2.py`, `native/stwo_settle`) once `STWO_SETTLE_HEIGHT` is set; until then the bonded quorum
+> settles. `doc/zk-execution-proofs.md` is the Goldilocks-era design; doc/stwo-migration.md is the current one.
 
 ```
    ┌────────────────────┐    reads finalized blocks    ┌────────────────────────────┐
@@ -24,12 +25,13 @@ chain. Phones mine L1 and never run any of this. See `doc/execution-layer.md` fo
 
 | file | role |
 |------|------|
-| `zkvm.py` | the field-native, PROVABLE register VM (one step = one STARK row; alghash HASH, byte-limb arithmetic, I/O log) |
+| `zkvm2.py` | the PROVABLE register VM: a 256-bit word wrapping mod 2^256, a BLAKE2s HASH, an ordered I/O log (doc/stwo/g3-vm-word.md). Replaced the Goldilocks-word `zkvm.py` at generation 29; that file was deleted in G9 |
 | `zkvmasm.py` | **zkasm** — the zkVM assembly language + assembler (labels, `slot`/`hash`/`rem`/`gte`/`arg` macros) contracts are written in |
 | `zkvm_examples.py` | starter library (counter / tip-jar / commit-box) served at `/exec/examples` |
-| `stark/vm_circuit.py` | the execution AIR + per-call and epoch (`prove_epoch_calls`) provers |
-| `settlement_proofs.py` | the epoch settlement proof binding pre/post state root into the `ops.settlement_ops` seam |
-| `runtimes.py` | runtime registry — ships one engine, `"zkvm"`; addresses enter as field digests |
+| `settle_b2.py` | the Stwo settlement statement of a span (stateless replay against BLAKE2s openings; the VM run is proved by `native/stwo_settle`), dormant behind `STWO_SETTLE_HEIGHT`. The Goldilocks execution AIR (`stark/vm_circuit.py`) and `settlement_proofs.py` were deleted in G9 |
+| `exec_root_b2.py`, `csmt.py` | the exec state root: BLAKE2s over a compressed sparse Merkle tree |
+| `shielded_stwo.py` | the Stwo shielded pool (BLAKE2s notes, depth-48 tree; proofs verified by `native/stwo_js`) |
+| `runtimes.py` | runtime registry — ships one engine, `"zkvm"`; addresses enter as their 256-bit BLAKE2s digests |
 | `state.py` | contract store; applies blob `deploy`/`call` payloads; canonical `state_root`; `decode_view` |
 | `execnode.py` | tails an L1 node, extracts `blob` txs from **finalized** blocks, applies them, serves queries |
 | `submit_blob.py` | CLI to build + submit a `blob` (deploy/call) to L1 |
@@ -37,9 +39,9 @@ chain. Phones mine L1 and never run any of this. See `doc/execution-layer.md` fo
 
 ## Contract model
 
-A contract is `{ "<method>": [[op, d, s, imm], …], … }` — zkVM bytecode (8 registers r0..r7, flat field-element
-`slots` storage, `alghash` HASH, BLOCKHASH/BEACON chain randomness). Method `constructor` (optional) runs once
-at deploy with `caller = deployer`. Storage is `{"slots": {slot: value}}`; addresses enter as field digests
+A contract is `{ "<method>": [[op, d, s, imm], …], … }` — zkVM bytecode (8 registers r0..r7 of 256-bit words, flat
+`slots` storage, a BLAKE2s HASH, BLOCKHASH/BEACON chain randomness). Method `constructor` (optional) runs once
+at deploy with `caller = deployer`. Storage is `{"slots": {slot: value}}`; addresses enter as 256-bit digests
 (resolved back via the exec node's registry). A contract can carry an `abi._view` schema so the exec node
 presents its flat slots as the named maps a frontend expects (`decode_view`) — so a ported game changes only
 its cid. State is canonical (integers only), so every honest node computes the same `state_root`.
@@ -54,7 +56,7 @@ windows) or proof capacity, never taste (`tests/test_zkvm_args.py` covers the so
 A blob payload is JSON:
 - deploy: `{"op":"deploy","runtime":"zkvm","code":{…}|"codez":…,"abi":{…},"nonce":"…"}` → cid = `blake2b(["deploy",deployer,code,nonce])[:32]`
 - call: `{"op":"call","contract":"<cid>","method":"<m>","args":[…],"value":<raw>}`
-- proven: `/exec/prove_call` returns a STARK; `/exec/verify_call` verifies + applies a call without re-executing it.
+- proven: `/exec/verify_call` verifies a proven call (the prover runs where the caller is; the node's `/exec/prove_call` was removed with the delegated provers, security review 2026-09-23 Z7).
 
 ## Run it
 
@@ -72,7 +74,6 @@ HOME=/root/nado python execnode/submit_blob.py call <cid> open '[12345]'
 # 4) query the execution node (read-only) — /exec/contract returns the decode_view'd named maps
 curl localhost:9273/exec/root
 curl 'localhost:9273/exec/contract?cid=<cid>'
-curl -X POST localhost:9273/exec/prove_call -d '{"cid":"<cid>","method":"open","args":[12345]}'   # STARK a call
 ```
 
 ## Phase 2 — settlement + bridge (built)
@@ -95,16 +96,21 @@ The exec `state_root` is now a **Merkle root** over all state, so any leaf (a wi
 
 ## Status
 
+> The paragraph below is the Goldilocks-era status (proofs, recursion and the alghash sponge it names were deleted in
+> G9). Today: contracts run on `zkvm2.py`; settlement is the bonded quorum until `STWO_SETTLE_HEIGHT`, after which a
+> span may settle on a Stwo proof (`settle_b2.py`, `native/stwo_settle`); the Stwo tests are `tests/test_a_stwo_*`.
+
 Built + tested: `tests/test_blob.py` (DA channel + per-block cap), `tests/test_zkvm*.py` (VM, execution AIR,
 epoch aggregation, runtime + 3-way differential), `tests/test_stark_aux.py` (LogUp), `tests/test_settlement.py`
-(bonded-quorum) + `tests/test_settlement_proof.py` (epoch validity proof), `tests/test_bridge.py` (Merkle +
+(bonded-quorum; the Goldilocks epoch validity proof and its tests were retired in G9 — the Stwo settlement is
+`execnode/settle_b2.py`), `tests/test_bridge.py` (Merkle +
 full deposit→withdraw→settle→release round-trip), `tests/test_zkvm_args.py` (the `ARG` indexed-args bus +
 `DIVMODW`, with soundness negatives). **Provable execution is live** (per-call + epoch proofs,
 `/exec/prove_call`, the settlement seam). Epochs larger than one trace **segment and chain their state
 roots** (`prove_settlement`/`verify_settlement`), so proof coverage is unbounded-epoch-safe. **Still open:**
 **recursion** — folding the per-segment proofs into one O(1)-verify proof (needs an in-VM STARK verifier over
 a wide-sponge alghash), the DA availability/pruning window, and full-state (non-zkVM op families)
-settlement. **Games: all 15 ported + live on alphanet-5** (coinflip/dice/roulette/slots/mines/blackjack +
+settlement. **Games: all 15 ported + live on betanet-5** (coinflip/dice/roulette/slots/mines/blackjack +
 tictactoe/connect4/reversi/chess + farkle + bet + battleship + pets + holdem, in `execnode/games/`, all
 E2E-tested in `tests/test_games_e2e.py`). See `doc/zk-execution-proofs.md`.
 

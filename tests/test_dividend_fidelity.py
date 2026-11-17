@@ -11,6 +11,7 @@ Run: python3 tests/test_dividend_fidelity.py
 """
 import os, sys, tempfile, logging, traceback
 os.environ["HOME"] = tempfile.mkdtemp(prefix="nado_divfid_")
+import atexit, shutil; atexit.register(shutil.rmtree, os.environ["HOME"], ignore_errors=True)   # leave no /tmp home behind (9,600 leaked by 2026-09-22)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 for d in ("index", "blocks", "logs", "peers"):
     os.makedirs(f"{os.environ['HOME']}/nado/{d}", exist_ok=True)
@@ -22,16 +23,17 @@ from protocol import POSW_LEASE_EPOCHS as LEASE
 from ops import kv_ops
 from ops.account_ops import create_account, get_account, apply_register
 from ops.mining_ops import open_shares
+from protocol import dividend_weight
 from ops.dividend_ops import fidelity_at_epoch, present_at_epoch, weights_at_epoch
 from ops.key_ops import generate_keys
 
-fails = 0
-def check(name, fn):
-    """Run fn; print PASS/FAIL and count failures."""
-    global fails
-    try: fn(); print(f"PASS  {name}")
-    except Exception as e:
-        fails += 1; print(f"FAIL  {name}: {e}"); traceback.print_exc()
+import _harness
+# SCALED WEIGHTS: weights_at_epoch scales every weight by REFERRAL_SCALE from block 1 (REFERRAL_HEIGHT, gen 28's gate,
+# inlined in G9; tests/test_sybil_rules.py pins the scale), so each expected weight below is SCALE * dividend_weight.
+# The unscaled (pre-gate) reading is retired in G9: generation 28's rules.
+from protocol import REFERRAL_SCALE as SCALE
+_report = _harness.Report()
+check = _report.run
 
 A = generate_keys()["address"]
 create_account(A, registered=0)
@@ -81,12 +83,12 @@ def t4b_reconstruction_agrees_with_live_get_open_registry():
 def t5_weights_are_open_shares_of_reconstructed_fidelity():
     """Prove weights_at_epoch equals open_shares of the fidelity AS OF that epoch (historical, not current)."""
     e = SEQ[-1]
-    assert weights_at_epoch(e).get(A) == open_shares(fidelity_at_epoch(A, e)), "weight == open_shares(fidelity@e)"
+    assert weights_at_epoch(e).get(A) == (SCALE * dividend_weight(fidelity_at_epoch(A, e), e) or None), "weight == dividend_weight(fidelity@e) (0 = absent)"
     # a mid-history epoch weighs by THAT epoch's fidelity (3), not the current one (2)
-    assert weights_at_epoch(SEQ[2]).get(A) == open_shares(3), "historical weight uses historical fidelity"
+    assert weights_at_epoch(SEQ[2]).get(A) == SCALE * dividend_weight(3, SEQ[2]), "historical weight uses historical fidelity"
 
 for name, fn in sorted(globals().items()):
     if name.startswith("t") and callable(fn) and name[1].isdigit():
         check(name, fn)
-print(f"\n{'ALL PASSED' if not fails else str(fails)+' FAILED'}")
-sys.exit(1 if fails else 0)
+print(f"\n{'ALL PASSED' if not _report.fails else str(_report.fails)+' FAILED'}")
+sys.exit(1 if _report.fails else 0)

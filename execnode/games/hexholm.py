@@ -38,7 +38,6 @@ LIST = 35
 MV_BASE, MH_BASE, MAXMOVES = 1000, 2000, 999
 GAP, MOVE_CLOCK = 2, 14400
 _W = 1 << 32
-INV32 = 18446744065119617026    # field inverse of 2^32 (exact hi-half extraction, from stormhold)
 
 
 def _f(field):              # constant field key base
@@ -418,8 +417,8 @@ REVEAL = f"""{_FULL}{_side()}    movi r4 {_W}
     lo32 r6
     mov r5 r1
     sub r5 r6
-    movi r3 {INV32}
-    mul r5 r3
+    movi r3 4294967296
+    divmod r5 r3            ; r5 = hi (exact: r5 is a multiple of 2^32); the 0 remainder lands in r7, read by nothing after
     movi r3 {_f(RH_BASE)}
     movi r4 {2 * _W}
     mul r4 r2
@@ -478,7 +477,7 @@ LEAVE = f"""    slot r4 {NN} r0
 # cancel(g): the CREATOR — or ANYONE once the lobby deadline lapses — dissolves a not-yet-full table;
 # every seated stake refunds. The permissionless half is what stops a dead lobby from eating stakes:
 # leave(g) only pops the LAST joiner and abort(g) is FULL-gated, so with the creator and the last joiner
-# both gone the middle seats had no exit at all (tests/fund_lock_test.py). Refunds are per seat and
+# both gone the middle seats had no exit at all (tests/test_game_funds_never_lock.py). Refunds are per seat and
 # caller-independent, so opening the gate hands the caller nothing but the gas bill.
 _CANCEL_REFUNDS = ""
 for i in (1, 2, 3, 4):
@@ -630,4 +629,45 @@ ABI = {
 
 
 def build():
-    return zkvmasm.assemble_contract(SRC)
+    # C2 (security review 2026-09-23): every id-taking method refuses an id >= 2^32 before touching a slot;
+    # see _lib.id_guard. The ABI, the field layout and every honest call are unchanged.
+    ID_GUARDS = {m: ["r0"] for m in ("open", "join", "move", "agree", "resign", "reveal", "leave", "cancel", "abort")}
+    return zkvmasm.assemble_contract(_lib.guard_ids(SRC, ID_GUARDS))
+
+
+# ---- the gen-29 reroll carry (tools/carry.py, doc/stwo/g5-carry.md) -------------------------------------------------
+# An unsettled table holds stakes against an old-chain move clock (dl), and its seats' commitments are still to be
+# revealed against the VM hash, which gen 29 changes — so it blocks the carry. A SETTLED table (sd) is history: the pot
+# is paid, every value-moving method refuses it, and its pinned heights (kh, mh) are only the browser's replay seeds.
+# DECISION (2026-10-25): a settled table's UNREVEALED commitment does NOT block. reveal() still accepts it on the old
+# chain, but it moves nothing — it only lets clients audit a game whose pot is already paid — and the usual way a table
+# ends (resignation down to one seat, the move-clock abort) leaves seats that never reveal and that no one else can
+# reveal for; blocking on them would make the contract uncarryable for good. Carried, such a commitment is kept
+# verbatim and a gen-29 reveal of it reverts (the new hash cannot reproduce it): the audit of that one paid game is
+# what is not carried.
+def carry_in_flight(storage):
+    """Why this contract cannot cross a reroll yet ([] = it can), per unsettled table in the index, naming the call that
+    ends it on the old chain."""
+    slots = (storage or {}).get("slots") or {}
+    g = lambda f, k: int(slots.get(str((f << 32) + k), 0))
+    out = []
+    for gid in _lib.carry_ids(slots, 0, LIST):
+        if not g(NN, gid) or g(SD, gid):
+            continue
+        if g(NN, gid) < g(CAP, gid):
+            out.append(f"table {gid} is a lobby ({g(NN, gid)} of {g(CAP, gid)} seats) - cancel({gid}) by its creator, "
+                       "or by anyone once the lobby deadline passes, refunds every seat")
+        else:
+            out.append(f"game {gid} is in play (stakes on an old-chain move clock, seats' commitments unrevealed) - "
+                       f"agree({gid}, w) by every live seat, resign({gid}), or abort({gid}) by any seat once the move "
+                       "clock lapses")
+    return out
+
+
+def carry_rebase(storage, tip):
+    """This contract's storage on a new chain whose block 0 stands where the old chain's `tip` stood: only the daily
+    board's unresolved anchors move (_lib.rebase_daily_anchors); everything else is at rest once carry_in_flight is []."""
+    slots = {str(k): v for k, v in ((storage or {}).get("slots") or {}).items()}
+    out = dict(storage or {})
+    out["slots"] = _lib.rebase_daily_anchors(slots, tip, A_H, A_V, DCNT_SLOT, DLIST)
+    return out

@@ -1,6 +1,6 @@
 # NADO execution layer — design note (programmable contracts without burdening L1)
 
-**Status: BUILT — Phase 1 + Phase 2a are LIVE** (the field-native zkVM runtime settles to L1 under a bonded-stake quorum; Phase 2b validity-proof settlement is built off-path but not yet the live settlement rule). This note records the
+**Status: BUILT — Phase 1 + Phase 2a are LIVE** (the zkVM runtime — `execnode/zkvm2.py`, a 256-bit word and BLAKE2s since generation 29 — settles to L1 under a bonded-stake quorum; Phase 2b validity-proof settlement, now Stwo's, is built and dormant behind `STWO_SETTLE_HEIGHT`). This note records the
 architecture *before* mainnet locks the L1 assumptions, so that adding programmability
 later is a clean extension rather than a retrofit. The L1 described in `protocol.py` and
 `ops/` is authoritative; this document is forward-looking.
@@ -39,8 +39,8 @@ NADO's identity is structural, not marketing:
   can validate and produce in slot time. A general VM on L1 makes *block validation*
   unbounded — every node must re-execute every contract — which silently demotes phones
   from validators to light clients. That is a different project.
-- **Just-hardened security surface.** Objective fork-choice, the `FINALITY_DEPTH = 30`
-  floor, FFG-lite finality, commit-reveal RANDAO, equivocation slashing, and the
+- **Just-hardened security surface.** Objective fork-choice, the `FINALITY_DEPTH = 45`
+  depth floor (and the un-crossable `hard_finality`), FFG-lite finality, commit-reveal RANDAO, equivocation slashing, and the
   Section 7.4 audit fixes are all *base-layer* guarantees. A VM is the single largest
   consensus-critical surface you can add: the interpreter *becomes* consensus, gas
   metering must be bit-identical across nodes, and any nondeterminism (a JIT, a float, an
@@ -84,9 +84,9 @@ programmability immediately with zero L1 risk, and the one later concession (a v
 > **Implementation status (Phase 1 AND Phase 2 built).**
 > - **Phase 1 (sovereign):** the `blob` reserved recipient (`protocol.py`, validated/burned in
 >   `transaction_ops`/`account_ops`, `tests/test_blob.py` incl. the **per-block blob-bytes cap** §3.3), a
->   field-native zkVM (`execnode/zkvm.py`), a contract state store (`execnode/state.py`), a tailing
+>   zkVM (`execnode/zkvm.py`, replaced at generation 29 by `execnode/zkvm2.py`), a contract state store (`execnode/state.py`), a tailing
 >   execution node + query API (`execnode/execnode.py`), submit CLI + example token; determinism tested in
->   `tests/test_execnode_vm.py`. Proven live end-to-end (token deploy + transfer via blobs).
+>   `tests/test_zkvm.py` / `tests/test_zkvm_runtime.py`. Proven live end-to-end (token deploy + transfer via blobs).
 > - **Phase 2 (settled + bridge):** `settle` records a bonded validator's `(exec_cursor, state_root)`;
 >   `ops/settlement_ops.settlement_justified()` (the pluggable verifier seam) settles a root once bonded
 >   shares exceed 2/3 of the ACTIVE settler set (the settlement inactivity leak,
@@ -94,6 +94,15 @@ programmability immediately with zero L1 risk, and the one later concession (a v
 >   `/get_settled` (`tests/test_settlement.py`). The exec `state_root` is a
 >   **Merkle** root, so a `bridge` deposit → exec credit → `bridge_withdraw` burn → **Merkle proof against
 >   the settled root** → L1 escrow release round-trips trust-minimized (`tests/test_bridge.py`).
+> - **Attestation provenance (betanet-3 frozen-quorum fix):** an exec node only VOTES on settlement when
+>   its state is provably complete — `ExecState.state_complete()`: from-genesis floors
+>   (`beacon_floor <= 2`, `blockhash_floor <= 1`), or a checkpoint bootstrap verified against the
+>   L1-settled `(cursor, root)`, and NEVER a recorded `replay_gap` (a body-less finalized block skipped
+>   during replay — on a pruned L1 that block may have carried the contract deploys, so the resulting
+>   state is a guess). A node whose attested root is later contradicted by the justified quorum
+>   self-disqualifies, and a muted node auto-repairs by adopting a peer's settled checkpoint
+>   (quorum-verified, donor-untrusted) once one is servable (`tests/test_exec_state_provenance.py`).
+>   Before this, cold-started nodes attested divergent roots forever and could freeze `/get_settled`.
 > - **Still to do:** the DA availability/pruning window, and **Phase-2b** — replacing the bonded-quorum
 >   settlement verifier with a single succinct STARK validity proof (the seam is in place). Trust today is
 >   the bonded stake (a validator committee), not yet a validity proof.

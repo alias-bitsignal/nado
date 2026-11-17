@@ -2,7 +2,7 @@
 Faucet — the fixed-name PRIZE BANK (doc/faucet.md). Holds donations sent to the L1 reserved address
 `faucet` (the exec node credits them to this contract's balance — its cid IS the literal string
 "faucet", see execnode.state.FIXED_CIDS) plus governance top-ups, and pays DAILY LEADERBOARD PRIZES
-for airdrop play: the operator's distributor (_faucet_rewards.py) tallies each enrolled game's
+for airdrop play: the operator's distributor (scripts/operator/_faucet_rewards.py) tallies each enrolled game's
 scoreboard off-chain (a provable computation anyone can recompute from the game contracts' storage)
 and calls `reward` per top finisher.
 
@@ -10,29 +10,87 @@ There is deliberately NO self-serve claim path — no PoW grind, no per-address 
 registry. Play the free airdrop games, place on the scoreboard, get paid.
 
 Methods: fund()[value] · reward(idx, day, rank, addr, amount) — operator-only, at most once per
-(game, day, rank) via the H(idx, day, rank) idempotency marker; an underfunded payout reverts.
+(game, day, rank) via the H(idx, day, rank) idempotency marker; an underfunded payout reverts ·
+defund(amount) — operator-only, capped at the operator's OWN donations minus what was already taken
+back (slots 7/8), so treasury money in the faucet can never be withdrawn by anyone.
 """
 from execnode import zkvmasm, runtimes
-from ops.address_ops import make_address
 
 # The game-fleet deployer key, identified by its PUBLIC-KEY BODY rather than a pinned address string.
-# This gate was previously a hardcoded "ndo…" address; the alphanet-7 debrand moved the operator to
+# This gate was previously a hardcoded "ndo…" address; the betanet-7 debrand moved the operator to
 # "mldsa44…", so the digest baked into `reward` stopped matching the caller and EVERY prize payout
 # reverted on the operator-only require — the faucet could not pay a single scoreboard winner. Deriving
 # the address through make_address() means a future prefix change follows the one-constant rebrand point
 # automatically instead of silently bricking payouts again. (Re-derivation is deterministic, so the
 # assembled code is stable for a given prefix.)
-OPERATOR_PUBKEY = "ebd27698662f14ee2389e509781d5ff57487f4289a"
-OPERATOR = make_address(OPERATOR_PUBKEY)
+# ADDRESS FORMAT 2 (gen 28): make_address(<42-hex body>) HASHES the body into an address nobody holds — the operator
+# check would have reverted every payout again, exactly as above. The operator is the faucet's sole fixed-cid deployer
+# (code_codec.FIXED_CIDS, remapped with every format switch), so read it from there: on gen 27 that is byte-identical to
+# make_address(OPERATOR_PUBKEY), from gen 28 it is the format-2 address of the same key.
+OPERATOR_PUBKEY = "ebd27698662f14ee2389e509781d5ff57487f4289a"   # the key's leading body (format 1: the address body)
+from execnode.code_codec import FIXED_CIDS as _FIXED_CIDS
+OPERATOR = _FIXED_CIDS["faucet"]
+# The operator's VM digest, baked into SRC as `movi rN <OP_DIG>` operands: the 256-bit digest the call boundary computes
+# for the operator's caller (runtimes.zkvm_addr_digest). Until G9 slice 3b this was the gen-28 FIELD digest and build()
+# swapped it for this one at assembly (so build("v1") stayed the carry's match); with the field VM gone the source holds
+# the gen-29 digest directly and build() assembles it as written — the same code (tests/test_every_contract_builds_
+# byte_identical_for_the_256_bit_vm.py).
 OP_DIG = runtimes.zkvm_addr_digest(OPERATOR)
 
 # fund(): anyone may top the prize bank up exec-side (the call's VALUE is escrowed to this contract by
 # the call machinery itself before the method runs — this body only insists there IS a value).
-FUND = """
+# Slot 7 = DONATED: NADO the OPERATOR put in (exec-side fund() by the operator, and L1 donations the exec
+# node mirrors); slot 8 = DEFUNDED: what defund() has taken back. Treasury top-ups touch neither, which is
+# exactly what makes defund() unable to reach public money. Small integer keys cannot collide with the
+# reward markers, which are VM hash outputs (256-bit BLAKE2s words).
+DONATED, DEFUNDED = 7, 8
+
+# CARRY_STORAGE (tools/alphanet6_carryforward.carry_policy): this contract's storage crosses a reroll as is, pot
+# included. INVARIANT: nothing it stores names an L1 height, a beacon epoch or a block hash of the old chain — slots 7/8
+# are amounts and the reward markers are H(idx, day, rank) with `day` from wall-clock time — so it means the same on the
+# new chain. Re-check before adding any method that reads `cursor`, `timestamp`, BHASH or BEACON.
+CARRY_STORAGE = True
+
+FUND = f"""
     ctx r1 value
     movi r2 0
     lt r2 r1
     require r2              ; value > 0
+    ctx r5 caller
+    movi r6 {OP_DIG}
+    eq r5 r6
+    jnz r5 @rec
+    ret r0
+rec:
+    movi r6 {DONATED}
+    sload r7 r6
+    add r7 r1               ; DONATED += value (operator's own money, take-backable)
+    sstore r6 r7
+    ret r0
+"""
+
+# defund(amount): the OPERATOR takes back some of what the operator put in — never more than
+# DONATED - DEFUNDED, so treasury payouts into the faucet (public money) can never leave through here.
+# Auditable on chain: slot 7 is what went in, slot 8 what came back out.
+DEFUND = f"""
+    ctx r5 caller
+    movi r6 {OP_DIG}
+    eq r5 r6
+    require r5              ; operator only
+    movi r2 0
+    lt r2 r0
+    require r2              ; amount > 0
+    movi r6 {DONATED}
+    sload r3 r6             ; DONATED
+    movi r6 {DEFUNDED}
+    sload r4 r6             ; DEFUNDED
+    add r4 r0               ; DEFUNDED' = DEFUNDED + amount
+    gte r3 r4               ; DONATED >= DEFUNDED'
+    require r3              ; never more than the operator's own donations
+    movi r6 {DEFUNDED}
+    sstore r6 r4
+    movi r1 {OP_DIG}
+    pay r1 r0               ; back to the operator (reverts if the faucet cannot cover it)
     ret r0
 """
 
@@ -52,15 +110,37 @@ REWARD = f"""
     require r5            ; not already paid for this (game, day, rank)
     movi r5 1
     sstore r6 r5          ; mark this placement paid
+    ; PRIZES SPEND THE OPERATOR'S OWN MONEY FIRST (review 2026-09-23, C5): defund's allowance is
+    ; DONATED - DEFUNDED, and reward never reduced DONATED, so after paying prizes out of a mixed balance
+    ; the operator could take back OTHER donors' coins up to the amount already paid. DONATED now shrinks by
+    ; every prize down to the DEFUNDED floor, so the allowance is only ever the operator's unspent share.
+    movi r6 {DONATED}
+    sload r5 r6           ; DONATED
+    movi r6 {DEFUNDED}
+    sload r7 r6           ; DEFUNDED
+    sub r5 r7             ; avail = DONATED - DEFUNDED (>= 0 by defund's own check)
+    mov r6 r4
+    lt r6 r5              ; amount < avail ?
+    jnz r6 @partial
+    mov r5 r7             ; exhausted: DONATED' = DEFUNDED
+    jmp @store
+partial:
+    sub r5 r4
+    add r5 r7             ; DONATED' = DONATED - amount
+store:
+    movi r6 {DONATED}
+    sstore r6 r5
     pay r3 r4            ; pay the winner from the faucet balance (reverts if the faucet can't cover it)
     ret r0
 """
 
-SRC = {"fund": FUND, "reward": REWARD}
+SRC = {"fund": FUND, "reward": REWARD, "defund": DEFUND}
 
 ABI = {
     "fund": {"args": [], "value": True},
     "reward": {"args": ["idx", "day", "rank", "addr", "amount"]},
+    "defund": {"args": ["amount"]},
+    "_view": {"maps": {"donated": DONATED, "defunded": DEFUNDED}, "index": {"cnt": 0, "list": 0}},
 }
 
 

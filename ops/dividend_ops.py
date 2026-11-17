@@ -14,39 +14,169 @@ immutable, revert-safe recert history — so we replay the exact ramp `apply_reg
 `fidelity_at_epoch` MUST stay byte-identical to that ramp (ops/account_ops.apply_register) — a fraud proof
 that miscomputes it would false-slash honest settlers. test_dividend_fidelity.py pins the two together.
 """
-from protocol import POSW_LEASE_EPOCHS, FIDELITY_GAIN
+from protocol import LEASE_EPOCHS_MAX, fidelity_step, dividend_weight
 from ops import kv_ops
-from ops.mining_ops import open_shares
+
+_CARRIED = [None]
+_CARRIED_ABSENT = [None]
+
+
+def carried_identities() -> dict:
+    """{address: carried fidelity} for the identities THIS generation's carry named as present — read once from the
+    REPOSITORY's genesis_data/genesis_carry.dat ("present", only when it names this generation) and
+    genesis_data/genesis_alloc.dat. Static for the life of a chain. {} on a chain without a carry (no carry file, or
+    one for another generation).
+
+    The result reaches committed epoch weights (epochw, in the state root), so it must be the same on every node:
+    INVARIANT: only tracked repository files are read — never a node-local private/ copy — and a carry file that cannot
+    be parsed RAISES instead of being remembered as "no carry" (which would split this node's roots from the fleet's).
+    tests/test_dividend_carried_identities.py pins both files' sha256 for the live generation, so an edit mid-generation
+    fails before it ships. NADO_GENESIS_CARRY / NADO_GENESIS_ALLOC override the paths for tests only."""
+    if _CARRIED[0] is not None:
+        return _CARRIED[0]
+    _load_carry()
+    return _CARRIED[0]
+
+
+def carried_absent_fidelity() -> dict:
+    """{address: carried fidelity > 0} for the identities THIS generation's carry wrote a fidelity for but did NOT name
+    as present (no epoch-0 recert). Same files and the same invariants as carried_identities()."""
+    if _CARRIED_ABSENT[0] is None:
+        _load_carry()
+    return _CARRIED_ABSENT[0]
+
+
+def _load_carry():
+    import json, os
+    from protocol import CHAIN_GENERATION
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    carry_path = os.environ.get("NADO_GENESIS_CARRY") or os.path.join(here, "genesis_data", "genesis_carry.dat")
+    if not os.path.exists(carry_path):
+        _CARRIED[0], _CARRIED_ABSENT[0] = {}, {}
+        return
+    with open(carry_path) as f:
+        carry = json.load(f)
+    out, absent = {}, {}
+    if int(carry.get("generation", -1)) == int(CHAIN_GENERATION):
+        present = set(carry.get("present") or [])
+        alloc_path = os.environ.get("NADO_GENESIS_ALLOC") or os.path.join(here, "genesis_data", "genesis_alloc.dat")
+        fid = {}
+        if os.path.exists(alloc_path):
+            with open(alloc_path) as f:
+                fid = {e["address"]: int(e.get("fidelity") or 0) for e in json.load(f) if isinstance(e, dict)}
+        out = {a: fid.get(a, 0) for a in present}
+        absent = {a: f for a, f in fid.items() if f > 0 and a not in present}
+    _CARRIED_ABSENT[0] = absent
+    _CARRIED[0] = out
 
 
 def fidelity_at_epoch(address: str, epoch: int) -> int:
     """Reconstruct `address`'s raw fidelity AS OF `epoch`, from its recert history (recerts <= epoch), by
-    replaying the exact apply_register ramp. Returns 0 if it had no recert at/behind `epoch` (uncapped —
-    open_shares() applies the FIDELITY_CAP saturation to the weight, matching the live path)."""
+    replaying the exact apply_register ramp (protocol.fidelity_step). Returns 0 if it had no recert at/behind
+    `epoch` (uncapped — dividend_weight() applies the FIDELITY_CAP saturation, matching the live path)."""
     fid = 0
     prev = -1
+    # INVARIANT: an identity the carry wrote a fidelity for but did NOT name present (no epoch-0 recert) starts from that
+    # carried value with no previous recert, so its first recert here is a lapse through fidelity_step — exactly what
+    # account_ops.apply_register did live from the account field the carry wrote. Exact while the identity's first
+    # recert row is retained (RECERT_HISTORY_EPOCHS_V2 = 55,000 epochs); past that horizon a run is capped either way.
+    # CARRY_FIDELITY_ALL_HEIGHT (gen 28's gate, 1 from gen 29, inlined in G9) judged `epoch >= 1 // EPOCH_LENGTH`, i.e.
+    # every epoch >= 0: kept, so a negative epoch still reads 0 rather than the carried value.
+    if epoch >= 0:
+        fid = int(carried_absent_fidelity().get(address, 0))
+    # Every epoch: gen 27's DIVIDEND_CARRY_EPOCH was 0 from gen 28 (deleted). A negative epoch holds no recert, so the
+    # loop below never reads the carry there.
+    carried = carried_identities()
     for r in kv_ops.recert_epochs(address, upto_epoch=epoch):    # ascending, only recerts <= epoch
-        continuous = prev >= 0 and (r - prev) <= POSW_LEASE_EPOCHS
-        fid = (fid + FIDELITY_GAIN) if continuous else FIDELITY_GAIN   # lapse/first -> reset to GAIN
+        if r == 0 and address in carried:
+            # THE CARRY'S LEASE (our reroll commit 302215f2): the epoch-0 recert of a carried identity continues its
+            # previous generation — its fidelity starts at the carried value, exactly as the live apply continued from
+            # the carried account field. Replaying it as a fresh first recert reset every carried veteran to a newcomer.
+            fid, prev = int(carried[address]), 0
+            continue
+        # continuity by the PREVIOUS recert's own grant (kv_ops.lease_of; pre-gate recerts read POSW_LEASE_EPOCHS) —
+        # the same reader and the same rule as the live apply
+        continuous = prev >= 0 and (r - prev) <= kv_ops.lease_of(address, prev)
+        # THE SAME FUNCTION the live apply uses (protocol.fidelity_step) — not a mirror of it. This replay is
+        # what a dividend fraud proof checks against, so the two cannot be allowed to drift.
+        fid = fidelity_step(fid, continuous, r - prev, r)
         prev = r
-    return fid
+    return fid if prev >= 0 else 0        # no recert at/behind `epoch`: 0, never the bare carried seed
 
 
 def present_at_epoch(epoch: int) -> set:
     """The OPEN-lane present set AT `epoch`: addresses whose lease was valid then — a recert in
     (epoch - POSW_LEASE_EPOCHS, epoch]. Reconstructed from the recert history (not the live `registered`
     flag), so it is well-defined for any past epoch, identically on every node."""
-    floor = epoch - POSW_LEASE_EPOCHS
+    floor = epoch - LEASE_EPOCHS_MAX                          # the widest candidate net any class's grant can reach
     present = set()
     for addr in kv_ops.recert_addresses_after(floor):           # a recert in some epoch > floor (may be > epoch)
         recs = kv_ops.recert_epochs(addr, upto_epoch=epoch)
-        if recs and recs[-1] > floor:                           # a recert within (floor, epoch] -> lease valid at epoch
+        # PER-CLASS LEASES: valid at `epoch` iff the latest recert's OWN grant still covers it (kv_ops.lease_of; a pre-gate
+        # recert reads POSW_LEASE_EPOCHS, so every historical epoch reconstructs exactly as before)
+        if recs and epoch - recs[-1] < kv_ops.lease_of(addr, recs[-1]):
+            # EVICTED (an instant device move): a device move at or before `epoch` voided this lease — only a recert
+            # newer than the voided one counts. Eviction rows are epoch-stamped consensus state, so this reconstructs
+            # identically for any past epoch (the same rule get_open_registry applies live).
+            if recs[-1] <= kv_ops.devevict_voided(addr, epoch):
+                continue
             present.add(addr)
     return present
 
 
 def weights_at_epoch(epoch: int) -> dict:
-    """{address: open_shares(fidelity_at_epoch(address, epoch))} for the present set at `epoch` — the
-    fidelity-weighted open-lane weights the dividend distributes by, as of that epoch. Deterministic and
-    reconstructible: this is what the exec node accrues against and what an L1 challenge re-derives."""
-    return {addr: open_shares(fidelity_at_epoch(addr, epoch)) for addr in present_at_epoch(epoch)}
+    """{address: dividend_weight(fidelity_at_epoch(address, epoch))} for the present set at `epoch` — the
+    fidelity-weighted weights the dividend distributes by, as of that epoch (protocol.dividend_weight, one
+    clean line min(fidelity, 30) over every level — fidelity 1 pays from the first lease since gen 25).
+    Deterministic and reconstructible: this is what the exec node accrues against and what an L1 challenge
+    re-derives."""
+    # A 0 weight (no fidelity at all) means ABSENT from the set — the exec accrual floors listed weights to 1, so
+    # listing is the grant. Gen 24 used this omission for probation; gen 25 has none, so only fidelity 0 is absent.
+    out = {}
+    for addr in present_at_epoch(epoch):
+        # DIVIDENDS REQUIRE ATTESTATION: a genesis-seeded identity (only recert at epoch 0, never attested) produces
+        # blocks but takes no dividend. Same recert history the present set is derived from, so every node and the
+        # fraud-proof replay agree. Unconditional: gen 25's DIVIDEND_ATTESTED_EPOCH was 0 from gen 26 (deleted), and a
+        # present address has a recert <= epoch, so `epoch >= 0` always held here.
+        recs = kv_ops.recert_epochs(addr, upto_epoch=epoch)
+        if not recs or recs[-1] <= 0:
+            # ...EXCEPT AN IDENTITY THE CARRY NAMED AS PRESENT (our reroll commit 302215f2): it attested on the previous
+            # chain and was leased at epoch 0 for exactly that reason; the exclusion is for genesis seeds that never did.
+            # Every epoch: gen 27's DIVIDEND_CARRY_EPOCH was 0 from gen 28 (deleted), and `recs[-1] == 0` means epoch >= 0.
+            if not (recs and recs[-1] == 0 and addr in carried_identities()):
+                continue
+        w = dividend_weight(fidelity_at_epoch(addr, epoch), epoch)
+        if w > 0:
+            out[addr] = w
+    return referral_split(out, epoch)
+
+
+def referral_split(weights: dict, epoch: int) -> dict:
+    """The dividend weights of `epoch` with the referral slice applied (protocol.py "REFERRALS") — ONE function for the
+    committed epoch weights, the exec accrual (both via weights_at_epoch) and the live /get_open_weights.
+
+    From epoch 0 every weight is scaled by REFERRAL_SCALE; a newcomer inside its REFERRAL_EPOCHS window whose
+    referrer is itself in this epoch's set pays REFERRAL_SHARE * w of its scaled weight to that referrer. Integer, and
+    the total is exactly REFERRAL_SCALE * the unscaled total, so every identity outside a referral keeps its share.
+    The slice is cut from the newcomer's OWN base weight `w`, never from what another referral moved, so a chain
+    A <- B <- C pays one level each and a ring of identities that all refer each other nets exactly zero.
+    The link is read from state but judged by the epoch it was made in, so a link written after `epoch` never touches
+    it: a past epoch reconstructs identically whenever it is recomputed. A negative epoch: `weights` unchanged."""
+    from protocol import REFERRAL_EPOCHS, REFERRAL_SCALE, REFERRAL_SHARE, EPOCH_LENGTH
+    # REFERRAL_HEIGHT (gen 28's gate, 1 from gen 29, inlined in G9): the gate's epoch was 1 // EPOCH_LENGTH = 0, so every
+    # epoch is scaled; `< 0` keeps the old answer for any caller that asks about an epoch before genesis.
+    if int(epoch) < 0:
+        return weights
+    out = {a: REFERRAL_SCALE * int(w) for a, w in weights.items()}
+    for newcomer in sorted(weights):
+        link = kv_ops.referral_get(newcomer)
+        if link is None:
+            continue
+        referrer, height = link
+        start = int(height) // EPOCH_LENGTH
+        if not (start <= int(epoch) < start + REFERRAL_EPOCHS) or referrer == newcomer or referrer not in weights:
+            continue                                  # outside the window, or the referrer is not present to earn it
+        cut = REFERRAL_SHARE * int(weights[newcomer])
+        out[newcomer] -= cut
+        out[referrer] += cut
+    return out

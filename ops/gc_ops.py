@@ -25,7 +25,7 @@ restores everything byte-identically; records below finality are pruned lazily (
 determinism requirement, since finality bounds every legal rollback).
 """
 from ops import kv_ops
-from protocol import EPOCH_LENGTH, GC_IDLE_EPOCHS, RECERT_HISTORY_EPOCHS, GC_MAX_PER_EPOCH
+from protocol import EPOCH_LENGTH, GC_IDLE_EPOCHS, recert_history_epochs, GC_MAX_PER_EPOCH
 
 # account docs eligible for GC may carry ONLY these zeroed/lease fields — any schemaless extra
 # (public_key pubkey-once binding, kem_pub messaging key, ...) makes the account NOT trivially
@@ -45,7 +45,7 @@ def apply_idle_gc(block_height: int, logger) -> dict:
     if block_height % EPOCH_LENGTH != 0 or block_height == 0:
         return {"accounts": 0, "rows": 0}
     epoch = block_height // EPOCH_LENGTH
-    row_horizon = epoch - RECERT_HISTORY_EPOCHS
+    row_horizon = epoch - recert_history_epochs(epoch)      # the horizon the 7-day leases need (RECERT_HISTORY_EPOCHS_V2)
     acct_horizon = epoch - GC_IDLE_EPOCHS
     record = {"rows": [], "accounts": [], "bond_since": [], "wm_rows": None, "wm_accts": None}
     work = 0
@@ -117,8 +117,9 @@ def revert_idle_gc(block_height: int, logger):
 
 
 def prune_local_revert_records(finalized_height: int):
-    """Lazy NODE-LOCAL cleanup: rollback can never cross the finalized floor, so records below it
-    are dead weight. Called opportunistically (outside any consensus path)."""
+    """Lazy NODE-LOCAL cleanup of idle-GC revert records. Pass HARD finality: rollback crosses the depth floor
+    and stops only at hard_finality, so a record above the hard floor can still be popped (core_loop's prune site).
+    Called opportunistically (outside any consensus path)."""
     try:
         return kv_ops.gc_revert_prune(int(finalized_height))
     except Exception:

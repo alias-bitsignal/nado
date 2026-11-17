@@ -10,7 +10,8 @@ surface — the node validates a CLI tx exactly like a browser one (signature, P
     python3 scripts/nado_cli.py <cmd> ...       # HOME=<node data home> selects private/keys.dat
     python3 scripts/nado_cli.py --node http://127.0.0.1:9173 send ndo… 12.5
 
-Commands: info · send · register · bond · unbond · alias · propose · vote · execute · collect · bridge-deposit
+Commands: info · send · register · bond · unbond · withdraw · alias · propose · vote · execute · collect
+          bridge-deposit
           msig-address · msig-propose · msig-sign · msig-submit   (M-of-N multisig co-signing)
 """
 import argparse, json, os, sys, urllib.error, urllib.request
@@ -19,14 +20,14 @@ from decimal import Decimal
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ops.key_ops import load_keys, keyfile_found
 from ops import transaction_ops as T
-from ops import posw
 from config import get_timestamp_seconds
 from hashing import create_nonce
-from protocol import CHAIN_ID, MIN_TX_FEE, POSW_T, POSW_S, POSW_K, POSW_ANCHOR_OFFSET, TX_TARGET_MARGIN, ALIAS_REGISTRATION_FEE
+import protocol as P
+from protocol import CHAIN_ID, MIN_TX_FEE, TX_TARGET_MARGIN, ALIAS_REGISTRATION_FEE
 
 DEC = 10 ** 10  # NADO has 10 decimals
 # max_block headroom. EXACT-landing txs (bond/unbond/alias/governance — must land at exactly max_block) use a
-# SMALL margin so the wait is short; the register PoSW anchor (max_block-30) must also stay in a settled epoch.
+# SMALL margin so the wait is short.
 # FLEXIBLY-landing txs (value send, blob/collect, bridge, dividend_withdraw — land anywhere in the window) use
 # the GENEROUS TX_TARGET_MARGIN so they don't expire before inclusion and re-gossip-flood "Target block too low".
 MARGIN = 6
@@ -43,7 +44,7 @@ def _get(node, path):
     (e.g. /update answering 403 "disabled" on an opted-out node) is returned as that body — the node's
     verdict IS the answer, not a transport failure worth a traceback."""
     try:
-        with urllib.request.urlopen(node + path, timeout=20) as r:
+        with urllib.request.urlopen(node + path, timeout=20) as r:  # nosec B310 # operator CLI: the operator's own node URL (literal http:// default or their flag), never peer input
             return json.load(r)
     except urllib.error.HTTPError as e:
         return json.load(e)
@@ -55,7 +56,7 @@ def _submit(node, tx):
     data = json.dumps(tx).encode()
     req = urllib.request.Request(node + "/submit_transaction", data=data,
                                  headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=90) as r:
+    with urllib.request.urlopen(req, timeout=90) as r:  # nosec B310 # operator CLI: the operator's own node URL (literal http:// default or their flag), never peer input
         out = json.load(r)
     ok = bool(out.get("result")) if isinstance(out, dict) else False
     print(("✓ " if ok else "✗ ") + json.dumps(out)[:300])
@@ -91,7 +92,7 @@ def c_send(kd, node, a):
     # lowercase: alias recipients are all-lowercase on-chain, and ndo… addresses are lowercase hex
     # anyway — so `send Alice 1` behaves exactly like `send alice 1`.
     tx = T.create_transaction(_draft(kd, a.to.strip().lower(), raw(a.amount), a.memo or "", _tip(node) + FLEX_MARGIN),
-                              kd["private_key"], raw(a.fee) if a.fee else MIN_TX_FEE)
+                              kd["private_key"], raw(a.fee) if a.fee else MIN_TX_FEE, alg=kd.get("alg"))
     _submit(node, tx)
 
 
@@ -101,8 +102,35 @@ def c_bond(kd, node, a):
 
 
 def c_unbond(kd, node, a):
-    """Release `amount` NADO of bonded stake back to spendable balance."""
+    """REQUEST the release of `amount` NADO of bonded stake. The coins do NOT move yet — they stay
+    bonded (and slashable, and selection-weighted) until `withdraw` claims them after the delay."""
     _submit(node, T.construct_unbond_tx(kd, raw(a.amount), _tip(node) + MARGIN))
+
+
+def c_withdraw(kd, node, a):
+    """Claim a MATURED unbond: bonded -> spendable. The second half of leaving savings.
+
+    Nothing headless could build this. `unbond` only records the request, and the only code that ever
+    finished the exit was the browser wallet's refreshUnbond() — so a node operator who unbonded had no
+    way to get their coins back at all. Consensus validated the recipient the whole time; the CLI just
+    had no command for it.
+
+    The pending record (amount + release_block) is read from the node, because validation requires the
+    tx data to match it EXACTLY. max_block is the deterministic landing block the maturity check is made
+    against, so it must be >= release_block."""
+    p = _get(node, "/get_unbond?address=" + kd["address"])
+    pending = p.get("pending")
+    if not pending:
+        sys.exit("no pending unbond on " + kd["address"] + " — run `unbond <amount>` first.")
+    tip, release = int(p["height"]), int(pending["release_block"])
+    max_block = max(release, tip + MARGIN)
+    if max_block - tip > TX_TARGET_MARGIN:
+        sys.exit(f"unbond matures at block {release}, tip is {tip} ({release - tip} blocks / "
+                 f"~{(release - tip) * 6 // 3600}h away). Re-run this once it is within "
+                 f"{TX_TARGET_MARGIN} blocks — a tx targeting further out is refused by the mempool.")
+    print(f"claiming {Decimal(pending['amount']) / DEC} NADO (matured at block {release}) "
+          f"— landing at block {max_block}")
+    _submit(node, T.construct_withdraw_tx(kd, int(pending["amount"]), release, max_block))
 
 
 def c_alias(kd, node, a):
@@ -122,22 +150,13 @@ def c_collect(kd, node, a):
 
 
 def c_register(kd, node, a):
-    """One-time open-lane mining registration: fetch the PoSW anchor block (max_block - 30) and the
-    node's current required T, compute the sequential proof locally (can take a while), then submit.
-    The anchor must be settled by submission time — MARGIN keeps it inside an already-final range."""
-    tb = _tip(node) + MARGIN
-    anchor_num = max(0, tb - POSW_ANCHOR_OFFSET)
-    anchor = _get(node, "/get_block_number?number=%d" % anchor_num).get("block_hash")
-    if not anchor:
-        sys.exit("no anchor block %d yet" % anchor_num)
-    req_t = POSW_T
-    try:
-        req_t = int(_get(node, "/posw_difficulty").get("required_t", POSW_T))
-    except Exception:
-        pass
-    print("proving PoSW (T=%d, ~sequential) …" % req_t)
-    proof = posw.prove(posw.challenge_bytes(kd["address"], anchor), T=req_t, S=POSW_S, k=POSW_K)
-    _submit(node, T.construct_register_tx(kd, tb, proof))
+    """Open-lane mining registration — RETIRED at gen 25: an open-lane identity is a hardware-attested device
+    now, and a node earns in the bonded lane."""
+    # REFUSE FIRST. This command used to fetch the anchor, ask the node for its required T and run the full
+    # sequential PoSW proof (minutes of CPU) — and only THEN raise "retired", so the user waited out a proof
+    # that nothing would ever submit (found by pyflakes as an unused `proof`, 2026-09-30). Nothing may run
+    # before this raise; tests/test_posw_prove_window.py pins that the CLI computes no proof.
+    raise SystemExit("register: retired at gen 25 — open-lane registration needs a hardware-attested device; use the wallet on a phone, a TPM PC or a security key. Nodes earn in the bonded lane.")
 
 
 def c_update(kd, node, a):
@@ -205,11 +224,13 @@ def c_msig_propose(kd, node, a):
     JSON to --out for the co-signers. Fee defaults to the per-signature floor for the full member set."""
     from ops import multisig_ops as M
     members = _msig_members(a)
-    fee = raw(a.fee) if a.fee else MIN_TX_FEE * len(members)
+    # an entry pays its scheme's multiple (SIG_SCHEME_KEYS_HEIGHT): cover a member of the costliest scheme in every seat
+    fee = raw(a.fee) if a.fee else MIN_TX_FEE * len(members) * max(P.SIG_SCHEME_SIZES[x][2] for x in P.SIG_SCHEMES_OFFERED)
     # generous target: co-signing takes real time; the mempool accepts up to tip+360
     tx = M.draft_multisig_spend(int(a.threshold), members, a.to.strip().lower(), raw(a.amount),
                                 fee, _tip(node) + 300, a.memo or "")
-    _, n = M.add_member_signature(tx, kd["private_key"])
+    # a member of another scheme signs in it; --member: the member a PROTECTED account's rotated key signs for
+    _, n = M.add_member_signature(tx, kd["private_key"], alg=kd.get("alg"), member=getattr(a, "member", None))
     with open(a.out, "w") as f:
         json.dump(tx, f)
     print("proposal written:", a.out)
@@ -221,7 +242,8 @@ def c_msig_sign(kd, node, a):
     from ops import multisig_ops as M
     with open(a.file) as f:
         tx = json.load(f)
-    _, n = M.add_member_signature(tx, kd["private_key"])
+    # a member of another scheme signs in it; --member: the member a PROTECTED account's rotated key signs for
+    _, n = M.add_member_signature(tx, kd["private_key"], alg=kd.get("alg"), member=getattr(a, "member", None))
     with open(a.file, "w") as f:
         json.dump(tx, f)
     need = tx["multisig"]["threshold"]
@@ -246,6 +268,7 @@ def main():
     s = sub.add_parser("send"); s.add_argument("to"); s.add_argument("amount"); s.add_argument("--memo"); s.add_argument("--fee")
     s = sub.add_parser("bond"); s.add_argument("amount")
     s = sub.add_parser("unbond"); s.add_argument("amount")
+    sub.add_parser("withdraw")
     s = sub.add_parser("alias"); s.add_argument("op", choices=["register", "transfer", "unregister"]); s.add_argument("name"); s.add_argument("--to")
     sub.add_parser("register")
     sub.add_parser("collect")
@@ -259,7 +282,9 @@ def main():
     s = sub.add_parser("msig-propose"); s.add_argument("to"); s.add_argument("amount")
     s.add_argument("--threshold", required=True); s.add_argument("--members", required=True)
     s.add_argument("--memo", default=""); s.add_argument("--fee"); s.add_argument("--out", default="msig_proposal.json")
+    s.add_argument("--member", help="the member address this key signs for, when it is a protected account's rotated key")
     s = sub.add_parser("msig-sign"); s.add_argument("file")
+    s.add_argument("--member", help="the member address this key signs for, when it is a protected account's rotated key")
     s = sub.add_parser("msig-submit"); s.add_argument("file")
 
     a = p.parse_args()
@@ -270,7 +295,8 @@ def main():
         sys.exit("no keys.dat — start a node once (or pass --keys) to generate one.")
     kd = load_keys(kf) if kf else load_keys()
 
-    cmds = {"info": c_info, "send": c_send, "bond": c_bond, "unbond": c_unbond, "alias": c_alias,
+    cmds = {"info": c_info, "send": c_send, "bond": c_bond, "unbond": c_unbond, "withdraw": c_withdraw,
+            "alias": c_alias,
             "register": c_register, "collect": c_collect, "update": c_update, "propose": c_propose, "vote": c_vote,
             "execute": c_execute, "bridge-deposit": c_bridge_deposit,
             "msig-address": c_msig_address, "msig-propose": c_msig_propose,

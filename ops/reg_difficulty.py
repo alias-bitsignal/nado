@@ -7,7 +7,7 @@ difficulty and REJECTS a registration whose PoSW does not prove it. An attacker 
 skip the client-side work simply produces proofs that every HONEST node rejects — the difficulty is not a
 client courtesy, it is a validity rule.
 
-WHY v2 (2026-07-17 alphanet-6 split postmortem): v1 computed the multiplier from the LIVE recert_by_epoch
+WHY v2 (2026-07-17 betanet-6 split postmortem): v1 computed the multiplier from the LIVE recert_by_epoch
 LMDB index and its window INCLUDED the anchor's own, still-filling epoch. Both silently broke the determinism
 a validity rule requires:
   1. The index is incrementally maintained (insert on apply, delete on rollback) and SURVIVES upgrades — fleet
@@ -29,7 +29,7 @@ posw.verify is EXACT-T, so each side rejects the other's honest registers and ev
 splits them — a freshly re-anchored node re-truncates its own visibility and loops forever, and EVERY new
 node joining by snapshot inherits the incompatibility on arrival.
 
-v3 therefore counts from the recert_by_epoch STATE INDEX, which since the alphanet-6 generation is
+v3 therefore counts from the recert_by_epoch STATE INDEX, which since the betanet-6 generation is
 CONSENSUS STATE, not a node-local convenience:
   · it is snapshot-carried and validated by the snapshot state_root at import (ops/snapshot_ops) — a
     snapshot-booted node holds EXACTLY the counts a from-genesis node derived, with zero bodies retained;
@@ -44,8 +44,8 @@ STRICT, NO COMPATIBILITY (policy): every node computes the identical v3 requirem
 deployed as the PROTOCOL 4 flag day (old-rules nodes are shed at the handshake), never as a compat path
 in consensus code.
 """
-from protocol import (POSW_T, POSW_S, POSW_K, POSW_ANCHOR_OFFSET, POSW_DIFF_WINDOW, POSW_DIFF_TRAIL,
-                      POSW_DIFF_FLOOR, POSW_DIFF_MAX_MULT, EPOCH_LENGTH)
+from protocol import (POSW_ENTRY_MULT, POSW_LEASE_EPOCHS, POSW_T, POSW_DIFF_WINDOW, POSW_DIFF_TRAIL,
+                      POSW_DIFF_FLOOR, POSW_DIFF_MAX_MULT, EPOCH_LENGTH, POSW_DIFF_TRAIL_LONG)
 
 
 def chain_register_count(epoch: int) -> int:
@@ -60,11 +60,58 @@ def chain_register_count(epoch: int) -> int:
     return kv_ops.recert_count_in_window(epoch, epoch)
 
 
+# Per-epoch register counts of epochs strictly below the hard-finality epoch are IMMUTABLE (no rollback may
+# cross that floor), so they are memoised: the 14-day trail (POSW_DIFF_TRAIL_LONG = 3360 epochs) would
+# otherwise cost 3360 index range-counts per register validation, and a block carries many registers.
+# Keyed by env path so tests that switch HOME never read another home's counts; recent epochs recompute.
+_count_memo = {}
+
+
+def chain_entry_count(epoch: int) -> int:
+    """ENTRY registrations recorded in `epoch` — recerts by an address whose lease had LAPSED AT LANDING
+    (no earlier recert within POSW_LEASE_EPOCHS of `epoch`; the same continuity rule apply_register uses).
+    NOT byte-identical to what is_entry_registration prices: that one measures the gap from the PoSW anchor
+    epoch (2-3 epochs before landing), so an address whose previous recert sits 358-360 epochs before the
+    anchor is priced as a renewal and counted here as an entry. Both read the same consensus index, so
+    every node agrees; it is a boundary miscount of the flood counter, not a split. Pure function of the
+    same consensus recert index as chain_register_count.
+    WHY (relay review, 2026-09-01): the flood multiplier counted EVERY register tx, renewals included — an
+    established farm could pre-train the 14-day baseline with redundant renewals, and clustered honest
+    renewals raised everyone's difficulty. Renewals are not the thing the dial exists to price."""
+    from ops import kv_ops
+    if epoch < 0:
+        return 0
+    n = 0
+    for addr in kv_ops.recert_addresses_in_epoch(epoch):
+        prev = kv_ops.recert_epochs(addr, upto_epoch=epoch - 1)
+        if not prev or (epoch - prev[-1]) > POSW_LEASE_EPOCHS:
+            n += 1
+    return n
+
+
+def _memo_count(epoch: int) -> int:
+    from ops import kv_ops
+    from ops.account_ops import get_hard_finality
+    key = (kv_ops.env_path(), epoch)
+    v = _count_memo.get(key)
+    if v is not None:
+        return v
+    v = chain_entry_count(epoch)
+    if epoch < int(get_hard_finality() or 0) // EPOCH_LENGTH - 1:
+        if len(_count_memo) > 100_000:
+            _count_memo.clear()
+        _count_memo[key] = v
+    return v
+
+
 def _window_count(lo_epoch: int, hi_epoch: int) -> int:
-    """Sum of chain_register_count over epochs [lo_epoch, hi_epoch] inclusive (negatives skipped)."""
+    """Sum of chain_entry_count over epochs [lo_epoch, hi_epoch] inclusive (negatives skipped); memoised below
+    the hard-finality epoch (immutable there). Entries only, never renewals: gen 24 counted every register tx
+    below its POSW_ENTRY_COUNT_HEIGHT (1636); that gate, its entries_only switch and the all-registers rule were
+    deleted once no live chain carried pre-rule history (SCHEDULED_CLEANUPS, 2026-09-30)."""
     if hi_epoch < lo_epoch:
         return 0
-    return sum(chain_register_count(e) for e in range(max(0, lo_epoch), hi_epoch + 1))
+    return sum(_memo_count(e) for e in range(max(0, lo_epoch), hi_epoch + 1))
 
 
 def difficulty_multiplier(anchor_epoch: int) -> int:
@@ -79,17 +126,55 @@ def difficulty_multiplier(anchor_epoch: int) -> int:
     recent = _window_count(last - POSW_DIFF_WINDOW + 1, last)
     trail = _window_count(last - POSW_DIFF_TRAIL + 1, last)
     baseline = max(POSW_DIFF_FLOOR, trail * POSW_DIFF_WINDOW // POSW_DIFF_TRAIL)
+    # SLOW-ADAPTING BASELINE (protocol "SYBIL RULES", rule 3; unconditional since gen 24). The 2-day trail alone
+    # let a sustained burst become its own baseline: measured 2026-09-01, 189 registrations per window on day 3
+    # of a burst and a multiplier of 1x. Cap the baseline by the 14-day rate as well, so a burst pays the
+    # multiplier for a fortnight while the honest steady state (2-day rate == 14-day rate) is untouched.
+    trail_long = _window_count(last - POSW_DIFF_TRAIL_LONG + 1, last)
+    baseline = max(POSW_DIFF_FLOOR, min(baseline, trail_long * POSW_DIFF_WINDOW // POSW_DIFF_TRAIL_LONG))
     return min(POSW_DIFF_MAX_MULT, max(1, recent // baseline))
 
 
-def required_posw_t(anchor_epoch: int) -> int:
-    """The CONSENSUS number of sequential PoSW steps a registration anchored in `anchor_epoch` must prove =
-    POSW_T × difficulty_multiplier. Recomputed by every node in validation and enforced against the proof."""
-    return POSW_T * difficulty_multiplier(anchor_epoch)
+def is_entry_registration(sender: str, anchor_epoch: int) -> bool:
+    """True if `sender` held NO valid presence lease as of `anchor_epoch` — a NEW identity (or one that let
+    its lease lapse) ENTERING the open lane, rather than an established one renewing.
+
+    DETERMINISM, which is the whole difficulty of putting this in consensus. Every input is settled chain
+    state that both the prover and every validator read identically:
+      * `anchor_epoch` is derived from the tx's own max_block (minus POSW_ANCHOR_OFFSET), so it is a
+        FINALIZED past epoch, not a moving target;
+      * the recert history is the snapshot-carried, state_root-validated recert index, read only as far
+        back as POSW_LEASE_EPOCHS (360) — far inside any GC horizon, so a snapshot-booted node and a
+        from-genesis node agree (the failure mode that split betanet-6; see the v2/v3 notes above);
+      * it depends ONLY on the sender's own recerts, which only the sender can extend and only once per
+        epoch — so nothing another actor does can change the answer between prove-time and land-time.
+    """
+    if anchor_epoch < 0:
+        return True
+    from ops import kv_ops                              # local, mirroring chain_register_count above
+    hist = kv_ops.recert_epochs(sender, upto_epoch=anchor_epoch)
+    if not hist:
+        return True                                    # never registered -> entry
+    return (anchor_epoch - hist[-1]) > POSW_LEASE_EPOCHS   # lease had lapsed -> re-entry
 
 
-def mint_multiplier(tip_height: int, max_block: int) -> int:
-    """The multiplier OUR OWN prover works at for a registration targeting `max_block` — exactly the
-    strict consensus requirement (there is deliberately no other mode)."""
-    from ops.mining_ops import epoch_of
-    return difficulty_multiplier(epoch_of(max(0, max_block - POSW_ANCHOR_OFFSET)))
+def entry_multiplier(sender, anchor_epoch: int) -> int:
+    """POSW_ENTRY_MULT for a new/lapsed identity, else 1. UNCONDITIONAL: this ships with a genesis reroll,
+    so there are no pre-rule proofs to keep valid and no historical blocks to re-validate."""
+    if sender is None:
+        return 1
+    return POSW_ENTRY_MULT if is_entry_registration(sender, anchor_epoch) else 1
+
+
+def required_posw_t(anchor_epoch: int, sender=None) -> int:
+    """The number of sequential PoSW steps a registration anchored in `anchor_epoch` would owe =
+    POSW_T × rate multiplier × entry multiplier. `sender` is optional so a caller that only wants the rate
+    multiplier can omit it. (No register is validated against this since gen 25 — tests/test_gen25_retirements.)"""
+    return POSW_T * difficulty_multiplier(anchor_epoch) * entry_multiplier(sender, anchor_epoch)
+
+
+# mint_multiplier() lived here: "the multiplier OUR OWN prover works at". It returned the RATE multiplier
+# only, so anything minting from it under-worked an ENTRY registration by POSW_ENTRY_MULT and had the proof
+# rejected by every node. Its last caller (core_loop.maybe_auto_register) had already been moved onto
+# required_posw_t(); leaving the function behind as the obvious-looking thing to reach for is how the same
+# bug gets reintroduced. There is exactly one way to ask what a registration owes: required_posw_t().

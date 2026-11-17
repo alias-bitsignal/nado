@@ -15,12 +15,18 @@
 #
 #   curl -sSfL https://raw.githubusercontent.com/hclivess/nado/main/scripts/install.sh | sudo bash -s -- --service
 #
-# COMPLETE PACKAGE (L1 + shielded pool). --exec also runs the execution / shielded-pool node on :9273, which
-# powers private deposits/withdrawals + shielded transfers and the on-device (in-browser) zk-STARK prover:
+# COMPLETE PACKAGE (L1 + shielded pool), and the exec node is now installed BY DEFAULT. It runs on :9273 and
+# powers private deposits/withdrawals + shielded transfers, the on-device (in-browser) zk-STARK prover, and
+# this node's DA store — which is how a settle publishes a proof too large to inline instead of carrying
+# ~69 MiB inside the transaction for every peer to re-parse. A fleet of L1-only nodes has no DA store
+# anywhere, so that path silently cannot work; that was the live state on 2026-08-08.
 #
-#   scripts/install.sh --exec                    # run the L1 node AND the shielded-pool node
-#   sudo scripts/install.sh --service --exec     # both, unattended, as boot-on-start systemd services
-#   sudo scripts/install.sh --service --exec-settle  # + anchor the shielded state-root to L1 (uses this node's keys)
+# Proving is NOT part of the default: --exec-settle is what anchors the exec state-root to L1, and it stays
+# opt-in. Use --no-exec for a bare L1 node.
+#
+#   sudo scripts/install.sh --service                # L1 + shielded pool + DA store (the default)
+#   sudo scripts/install.sh --service --no-exec      # L1 only — no shielded pool, no contracts, no DA
+#   sudo scripts/install.sh --service --exec-settle  # + anchor the shielded state-root to L1 (this node's keys)
 #
 # Unattended auto-bond: pass a percentage to auto-compound mined rewards into bonded stake. Works with
 # or without --service (it sets NADO_AUTO_BOND_PERCENT for the service, or prints it for manual runs):
@@ -32,6 +38,12 @@
 # branch, refuses a dirty/diverged tree, never touches the gitignored chain data). Default ON; opt out with
 # "auto_update": false in private/config.json. The old nado-update.service/.timer pair is retired — this
 # installer removes it if found. Legacy --auto-update flags are accepted and ignored.
+#
+# Host firewall: when ufw or firewalld is ACTIVE, the installer opens 9173/tcp (and 9273/tcp with the
+# exec node) in it — allow-rules only, idempotent, never installs or enables a firewall, and a raw
+# iptables policy only gets printed instructions. Opt out with --no-firewall. Router/NAT port
+# forwarding still has to be done on the router; nodes behind IPv4 CGNAT stay reachable over IPv6
+# (both listeners are dual-stack).
 #
 # Data directory: the node keeps its chain under $HOME/nado. Pass --home <dir> to put it elsewhere
 # (the services then run with HOME=<dir>, so chain data lands in <dir>/nado). Recommended whenever the
@@ -50,7 +62,7 @@
 # the directory moves into the account home, a compatibility symlink stays at the old path (operator
 # tooling, cron jobs and stale shebangs keep resolving), extra repo-run units (forum, bet-oracle) are
 # re-pointed and de-rooted, and ownership + git safe.directory are fixed up. (The migration is
-# TRANSITIONAL, for alphanet-era root installs — it gets removed at mainnet release, by which point every
+# TRANSITIONAL, for betanet-era root installs — it gets removed at mainnet release, by which point every
 # node is on the account layout; see the SUNSET note at the migration branch below.) Re-runs and the
 # node's self-heal AUTO-ADOPT an existing non-root install, so a later plain `--service` run can never
 # quietly hand the node back to root:
@@ -125,7 +137,17 @@ SERVICE_USER="${SUDO_USER:-$(id -un)}"
 # ---- parse args ----------------------------------------------------------------------------------
 WITH_WALLET=0
 WITH_SERVICE=0
-WITH_EXEC=0
+# ON BY DEFAULT. The exec node is what holds the shielded pool, executes contracts, and — the reason this
+# default changed — runs the node's DA store. Data availability is how a settle publishes a proof too large
+# to inline: the transaction then carries a commitment instead of ~69 MiB of proof that every node re-parses
+# on every candidate build. It has never worked on this fleet, and 2026-08-08 finally showed why: peers
+# answered "Cannot connect to host 127.0.0.1:9273" from their OWN L1, i.e. they simply were not running an
+# exec node, so there was no DaStore anywhere to serve a shard.
+#
+# The cost is modest and, importantly, does NOT include proving: --exec-settle is what anchors the exec
+# state-root to L1, and that stays opt-in. Use --no-exec for an L1-only box.
+WITH_EXEC=1
+EXEC_EXPLICIT_OFF=0        # set only by --no-exec, so the adopt-existing-unit logic below can honour it
 EXEC_SETTLE=0
 DATA_HOME=""
 # native ML-DSA (Rust) backend: 55x faster signature verify — the chain's main CPU cost. Empty = ASK
@@ -137,6 +159,7 @@ PQ_NATIVE=""
 # an unconditional =0 here would silently switch auto-bond off on nodes that rely on the default.
 AUTO_BOND="${NADO_AUTO_BOND_PERCENT:-}"
 SERVICE_ACCOUNT=""   # --user: dedicated non-root system account that owns and runs everything
+OPEN_FIREWALL=1      # --no-firewall: skip opening 9173/9273 in an ACTIVE host firewall
 while [ $# -gt 0 ]; do
   case "$1" in
     --wallet)      WITH_WALLET=1 ;;
@@ -148,7 +171,8 @@ while [ $# -gt 0 ]; do
     --update-interval) shift; echo "note: auto-update is built into the node now — --update-interval ignored" ;;
     --pq-native)   PQ_NATIVE=1 ;;            # build the native Rust ML-DSA verify backend (55x faster)
     --no-pq-native) PQ_NATIVE=0 ;;           # skip it (stay pure-Python)
-    --exec)        WITH_EXEC=1 ;;            # also run the execution / shielded-pool node (:9273)
+    --exec)        WITH_EXEC=1 ;;            # (default) run the execution / shielded-pool node (:9273)
+    --no-exec)     WITH_EXEC=0; EXEC_EXPLICIT_OFF=1 ;;  # L1 only — no shielded pool, no contracts, NO DA store
     --exec-settle) WITH_EXEC=1; EXEC_SETTLE=1 ;;  # + settle the exec state-root to L1 (uses this node's keys)
     --user)        shift; SERVICE_ACCOUNT="${1:?--user needs an account name}" ;;  # run as a dedicated system account
     --user=*)      SERVICE_ACCOUNT="${1#*=}" ;;
@@ -159,6 +183,7 @@ while [ $# -gt 0 ]; do
     # --dir belongs to bootstrap mode (where to clone); inside a checkout the location is already fixed
     --dir)         shift; echo "note: already inside a checkout ($REPO_DIR) — --dir ignored" ;;
     --dir=*)       echo "note: already inside a checkout ($REPO_DIR) — --dir ignored" ;;
+    --no-firewall) OPEN_FIREWALL=0 ;;         # don't touch ufw/firewalld even if active
     -h|--help)
       sed -n '3,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'
       exit 0 ;;
@@ -173,7 +198,11 @@ done
 # --exec-settle would stop L1 settlement, a lost NADO_EXEC_STATE would boot the exec node with EMPTY
 # state, a lost PQ env would quietly cost the 55x native verify. Explicit flags still win.
 if [ -f /etc/systemd/system/nado-exec.service ]; then
-  if [ $WITH_EXEC -ne 1 ]; then
+  # --no-exec is an EXPLICIT flag and must win here, or this block silently re-enables what the operator
+  # just asked to remove. Before the exec node became the default, WITH_EXEC=0 could only mean "not asked
+  # for", so adopting was always right; now it can also mean "asked against", and the two must not be
+  # confused — the comment above already promised explicit flags win.
+  if [ $WITH_EXEC -ne 1 ] && [ $EXEC_EXPLICIT_OFF -eq 0 ]; then
     echo "note: nado-exec.service already installed — keeping the exec node (implies --exec)"
     WITH_EXEC=1
   fi
@@ -238,7 +267,7 @@ if [ -n "$SERVICE_ACCOUNT" ]; then
     # units (forum, bet-oracle) are re-pointed and de-rooted too — they read the same keys/paths.
     #
     # SUNSET AT MAINNET: this whole migration branch (move + symlink + extra-unit rewriting) exists
-    # only to carry alphanet-era root installs over to the service account. By mainnet release every
+    # only to carry betanet-era root installs over to the service account. By mainnet release every
     # node will have been migrated (or freshly installed straight into the account layout), so DELETE
     # the branch then and keep only the fresh-install path: create account -> clone/verify at
     # $SERVICE_HOME/nado -> refuse with a clear error if an old-layout install is detected.
@@ -362,7 +391,7 @@ fi
 
 echo "==> dependencies installed."
 
-# ---- Rust toolchain helper (shared by the native ML-DSA verify backend + the Goldilocks prover) ---
+# ---- Rust toolchain helper (used by the native ML-DSA verify backend build below) ------------------
 # Ensures a C LINKER (`cc`) is present. cargo needs it to link ANY binary, and pure-Rust build scripts
 # (getrandom, libc) compile C stubs — so a minimal box with rustup but no gcc fails with
 # "error: linker `cc` not found". rustup's minimal profile does NOT provide one. Returns 0 if cc is
@@ -462,59 +491,9 @@ if [ "$_pq_want" = "1" ]; then
   fi
 fi
 
-# ---- native STARK-prover libs (optional; speed up shielded proving + the alghash2 recursion hot path) ---
-# Both are cdylibs bound via ctypes and are BIT-IDENTICAL to their pure-Python counterparts (they just run
-# the same field/hash arithmetic faster), so the node stays correct whether or not they build.
-if [ $WITH_EXEC -eq 1 ]; then
-  if ensure_rust "ask"; then
-    echo "==> building the native Goldilocks NTT (faster shielded proving)..."
-    if ( cd "$REPO_DIR/wasm/goldilocks" && cargo build --release >/dev/null 2>&1 ); then
-      echo "    built wasm/goldilocks/target/release/libgoldilocks.so"
-    else
-      echo "    (build failed — the shielded-pool node will use the pure-Python prover; still correct, just slower.)"
-    fi
-    echo "==> building the native alghash2 hash (recursion hot path; ~20x faster)..."
-    if ( cd "$REPO_DIR/native/alghash2" && cargo build --release >/dev/null 2>&1 ); then
-      # confirm the .so loads + initializes (its bit-identity to Python is covered by tests/test_recursion.py)
-      if "$VENV_PY" -c "import sys; sys.path.insert(0,'$REPO_DIR'); from execnode.stark import alghash2 as a; sys.exit(0 if a._try_native() and len(a.hashn([1,2,3]))==a.CAPACITY else 1)" 2>/dev/null; then
-        echo "    built + loaded: native/alghash2/target/release/libnado_alghash2.so"
-      else
-        echo "    (built but the .so did not load — recursion/alghash2 paths use pure Python; still correct.)"
-      fi
-    else
-      echo "    (build failed — recursion/alghash2 paths use pure Python; still correct, just slower.)"
-    fi
-    echo "==> building the native STARK composition (constraint-IR evaluator; ~10x on the composition loop)..."
-    if ( cd "$REPO_DIR/native/starkcompose" && cargo build --release >/dev/null 2>&1 ); then
-      # confirm the .so loads (its bit-identity to stark._composition is covered by tests/test_air_ir.py)
-      if "$VENV_PY" -c "import sys; sys.path.insert(0,'$REPO_DIR'); from execnode.stark import air_ir; sys.exit(0 if air_ir._native() else 1)" 2>/dev/null; then
-        echo "    built + loaded: native/starkcompose/target/release/libnado_starkcompose.so"
-      else
-        echo "    (built but the .so did not load — the prover uses the pure-Python composition; still correct.)"
-      fi
-    else
-      echo "    (build failed — the prover uses the pure-Python composition; still correct, just slower.)"
-    fi
-    echo "==> building the holistic native prover (recursion proving + PARALLEL fold/composition Merkle)..."
-    if ( cd "$REPO_DIR/native/starkprove" && cargo build --release >/dev/null 2>&1 ); then
-      # confirm the .so loads (bit-identity to stark.prove is covered by tests/test_starkprove.py). stark.prove
-      # routes RECURSION/ALGHASH2 proving through this arena; the Merkle commits hash in parallel across all
-      # cores (NADO_NATIVE_THREADS caps the fan-out) — the fold/composition pipeline's dominant cost.
-      if "$VENV_PY" -c "import sys; sys.path.insert(0,'$REPO_DIR'); from execnode.stark import stark_native as s; sys.exit(0 if s.available() else 1)" 2>/dev/null; then
-        echo "    built + loaded: native/starkprove/target/release/libnado_starkprove.so"
-      else
-        echo "    (built but the .so did not load — recursion proving uses pure Python; still correct, much slower.)"
-      fi
-    else
-      echo "    (build failed — recursion proving uses pure Python; still correct, much slower.)"
-    fi
-  else
-    echo "==> Rust not available — the shielded-pool node will use the pure-Python prover (correct, ~2x slower)."
-    echo "    For faster proving: install Rust (https://rustup.rs), then:"
-    echo "      (cd wasm/goldilocks && cargo build --release) && (cd native/alghash2 && cargo build --release) \\"
-    echo "        && (cd native/starkcompose && cargo build --release)"
-  fi
-fi
+# ---- (the native Goldilocks STARK-prover libs this section built — wasm/goldilocks, native/alghash2, starkcompose,
+# starkprove — were deleted with the Goldilocks stack in G9 slice 6; the exec node's required crates are the ones in
+# ops/self_update._CRATES, which the node's updater builds when missing and scripts/build_native_all.sh builds by hand)
 
 # ---- systemd service (unattended) ----------------------------------------------------------------
 # hardening block for service-account installs: no privileges to gain, read-only OS, writable only in
@@ -526,8 +505,14 @@ harden_unit() {
   cat <<HARDEOF
 # hardening (service-account mode)
 NoNewPrivileges=true
-CapabilityBoundingSet=
-AmbientCapabilities=
+# EXACTLY ONE CAPABILITY, AND ONLY FOR THE PORT. The node also answers on 80 (config "relay_port": 80,
+# set 0 to disable) because a prover on a filtered home or office network reaches 80 and not 9173, and an
+# enrolment needs a relay it can actually talk to. Binding a port below 1024 is the only privilege that
+# requires — the service still runs as $SERVICE_USER and gains nothing else. Both lines are needed:
+# an ambient capability must also be in the bounding set, and the empty sets this replaced would have
+# dropped it again.
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=$ph
@@ -564,9 +549,13 @@ Environment=HOME=$DATA_HOME")
 $([ -n "$AUTO_BOND" ] && echo "# Auto-compound this % of mined rewards into bonded stake (0 = off). See README \"Auto-bond\".
 # Written only because --auto-bond was passed; the env var overrides the node's config default (80).
 Environment=NADO_AUTO_BOND_PERCENT=$AUTO_BOND")
-$([ "$PQ_BUILT" = "1" ] && echo "# Native Rust ML-DSA verify backend (55x faster; built + interop-verified by install.sh).
-# signatures.py re-runs the interop self-test at boot and falls back to pure-Python on any mismatch.
-Environment=NADO_PQ_NATIVE_MODULE=nado_pq_native")
+$([ "$PQ_BUILT" = "1" ] && echo "# Native Rust ML-DSA verify backend (the reputable RustCrypto ml-dsa crate;
+# 55x faster; built + interop-verified by install.sh). signatures.py re-runs the interop self-test at boot.
+Environment=NADO_PQ_NATIVE_MODULE=nado_pq_native
+# This node BUILT the native backend, so REQUIRE it: hard-fail at boot rather than silently sign/verify with
+# the educational-origin pure-Python fallback (not constant-time; a side-channel risk for a signing node) if a
+# later self-update rebuild ever breaks it. A node with NO build toolchain gets neither line + the loud fallback.
+Environment=NADO_PQ_REQUIRE_NATIVE=1")
 ExecStart=$VENV_PY $REPO_DIR/nado.py
 Restart=always
 RestartSec=5
@@ -587,6 +576,10 @@ UNITEOF
     # restart bridge: the unprivileged node cannot systemctl-restart itself after a self-update; it
     # writes a flag into /run/nado (its RuntimeDirectory) and this root-owned pair applies the restart.
     # The unit list is FIXED here — root never executes anything from the account-owned checkout.
+    # JOBS (doc/jobs.md): root runs the job reconciler only from this ROOT-OWNED COPY, refreshed by re-running
+    # install.sh as root. It reads deploy/units/ from the checkout as untrusted data and installs only nado-* units
+    # that run as the account, so the account can schedule its own code as itself and nothing more.
+    install -o root -g root -m 0755 "$REPO_DIR/scripts/reconcile_units.py" /usr/local/sbin/nado-reconcile-units
     cat > /etc/systemd/system/nado-restart.service <<BRIDGEEOF
 [Unit]
 Description=NADO restart bridge (applies a self-update restart requested by the unprivileged node)
@@ -595,7 +588,13 @@ Description=NADO restart bridge (applies a self-update restart requested by the 
 Type=oneshot
 # the sleep mirrors the updater's restart delay: the /update HTTP response + peer update wave get out
 # first ($$ because systemd itself expands \$VAR in ExecStart before the shell runs)
-ExecStart=/bin/sh -c 'sleep 5; rm -f /run/nado/restart-request; for u in nado nado-exec forum; do systemctl try-restart "\$\$u.service" 2>/dev/null || true; done'
+# the reconciler first: a job committed to deploy/units/ is installed by the update that brings it (doc/jobs.md)
+# ...then START any of the fixed units that is ENABLED but not running (2026-09-27, 185.100.232.5): nado-exec has
+# Requires=nado.service, so restarting nado stops it, and two restart requests close together (a wave kick plus the
+# queued re-check) left it stopped cleanly — "inactive (dead), result success" — where try-restart, which only restarts
+# RUNNING units, never brought it back. Enabled means the machine is meant to run it; an operator who wants a unit off
+# disables it. INVARIANT: the bridge must never leave an enabled unit down after an update.
+ExecStart=/bin/sh -c 'sleep 5; rm -f /run/nado/restart-request; /usr/bin/python3 /usr/local/sbin/nado-reconcile-units >/dev/null 2>&1 || true; for u in nado nado-exec forum; do systemctl try-restart "\$\$u.service" 2>/dev/null || true; done; sleep 3; for u in nado nado-exec forum; do if systemctl is-enabled --quiet "\$\$u.service" 2>/dev/null && ! systemctl is-active --quiet "\$\$u.service"; then systemctl start "\$\$u.service" 2>/dev/null || true; fi; done'
 BRIDGEEOF
     cat > /etc/systemd/system/nado-restart.path <<BRIDGEEOF
 [Unit]
@@ -623,7 +622,10 @@ BRIDGEEOF
   fi
   systemctl daemon-reload
   systemctl enable nado.service
-  if [ -n "$SERVICE_ACCOUNT" ]; then systemctl enable --now nado-restart.path; fi
+  if [ -n "$SERVICE_ACCOUNT" ]; then
+    systemctl enable --now nado-restart.path
+    /usr/bin/python3 /usr/local/sbin/nado-reconcile-units || true   # this machine's declared jobs, now (doc/jobs.md)
+  fi
   systemctl restart nado.service
   echo "==> service installed, enabled and started."
   echo "    status:  systemctl status nado"
@@ -658,6 +660,10 @@ Environment=NADO_EXEC_PORT=9273
 # unauthenticated but bounded (STARK size cap + in-flight limit); drop this line to keep it loopback-only.
 Environment=NADO_EXEC_BIND=0.0.0.0
 $([ $EXEC_SETTLE -eq 1 ] && echo "Environment=NADO_EXEC_SETTLE=1")
+$([ "$PQ_BUILT" = "1" ] && echo "# The exec node SIGNS settlement attestations, so it needs the native RustCrypto
+# ml-dsa backend too — and REQUIREs it (hard-fail rather than sign with the not-constant-time pure-Python fallback).
+Environment=NADO_PQ_NATIVE_MODULE=nado_pq_native
+Environment=NADO_PQ_REQUIRE_NATIVE=1")
 ExecStart=$VENV_PY $REPO_DIR/execnode/execnode.py
 Restart=always
 RestartSec=5
@@ -710,7 +716,47 @@ else
   echo "    (re-run with sudo and --service to install boot-on-start, restart-on-crash systemd services.)"
 fi
 
+# ---- host firewall: open the node ports in an ACTIVE firewall (best-effort) ----------------------
+# "Ports closed — not accepting inbound" reports kept tracing to a host firewall silently dropping
+# 9173/9273 (2026-08-23: a node fixed its router forwarding and STILL couldn't open :9273 — ufw).
+# Rules: only ever ADD allow rules, only to a firewall that is ALREADY active (never install or enable
+# one), idempotent on re-runs, and a failure only prints — the install itself never dies here.
+# Router/NAT port-forwarding cannot be automated from inside the box; that stays a printed reminder.
+if [ $OPEN_FIREWALL -eq 1 ] && [ "$(id -u)" -eq 0 ]; then
+  # 80 as well as 9173: a prover on a filtered home or office network reaches 80 and not 9173, and an
+  # enrolment needs a relay it can actually talk to. Opening it costs nothing on a node that cannot bind
+  # it — the node logs that and carries on — and makes every node usable as a relay by default.
+  NADO_PORTS="9173 80"; [ $WITH_EXEC -eq 1 ] && NADO_PORTS="9173 9273 80"
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "^Status: active"; then
+    for _p in $NADO_PORTS; do
+      ufw allow "$_p/tcp" comment "NADO node" >/dev/null 2>&1 \
+        && echo "==> ufw: allowed $_p/tcp" \
+        || echo "WARNING: ufw is active but 'ufw allow $_p/tcp' failed — open it by hand"
+    done
+  elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    _fw_changed=0
+    for _p in $NADO_PORTS; do
+      firewall-cmd --query-port="$_p/tcp" >/dev/null 2>&1 && continue
+      firewall-cmd --permanent --add-port="$_p/tcp" >/dev/null 2>&1 \
+        && { echo "==> firewalld: opened $_p/tcp"; _fw_changed=1; } \
+        || echo "WARNING: firewalld is running but opening $_p/tcp failed — open it by hand"
+    done
+    [ $_fw_changed -eq 1 ] && firewall-cmd --reload >/dev/null 2>&1
+  elif command -v iptables >/dev/null 2>&1 && iptables -S INPUT 2>/dev/null | grep -qE "^-P INPUT (DROP|REJECT)|-j (DROP|REJECT)"; then
+    # a raw iptables/nftables policy is somebody's hand-rolled setup — adding rules blind risks breaking
+    # it (wrong chain, wrong position, not persisted). Say exactly what is needed instead of guessing.
+    echo "WARNING: an iptables INPUT policy is filtering traffic on this box; the installer does not"
+    echo "         edit raw iptables. Allow the node ports yourself, e.g.:"
+    for _p in $NADO_PORTS; do echo "           iptables -I INPUT -p tcp --dport $_p -j ACCEPT"; done
+    echo "         (and persist it with your distro's mechanism, e.g. netfilter-persistent)"
+  fi
+elif [ $OPEN_FIREWALL -eq 1 ]; then
+  echo "note: not root — skipped checking the host firewall for ports 9173/9273 (re-run with sudo, or open them yourself)"
+fi
+
 echo "==> The node serves its API + web miner on http://<this-host>:9173  (forward port 9173 for rewards)."
+echo "    It also answers on port 80 where it can bind it, so TPM provers behind networks that filter"
+echo "    9173 can still enrol through this node. Set \"relay_port\": 0 in config.json to turn that off."
 if [ $WITH_EXEC -eq 1 ]; then
   echo "==> The shielded pool (deposits / withdrawals / shielded transfers + on-device prover) runs on :9273."
   echo "    Forward port 9273 too so browsers can reach your shielded-pool node (the Shield tab talks to it)."

@@ -1,4 +1,5 @@
 import asyncio
+import os
 import queue
 import threading
 
@@ -6,7 +7,7 @@ from config import get_protocol, get_timestamp_seconds, get_config
 from hashing import blake2b_hash
 from ops.account_ops import get_account, get_finalized_height
 from ops.block_ops import get_block_ends_info
-from ops.data_ops import sort_list_dict, get_home
+from ops.data_ops import get_home
 from ops.key_ops import load_keys
 from ops.message_pool import MessagePool
 from ops.transaction_ops import (
@@ -61,6 +62,7 @@ class MemServer:
         self.pool_gen = 0                 # bumped on EVERY pool mutation (see transaction_pool property)
         self._txid_set_cache = None        # (pool_gen, {txid}) — O(1) duplicate checks between mutations
         self.transaction_pool = []
+        self.tpm_duty = "idle"   # last outcome of the challenger duty; surfaced by /status
         # GOSSIP REJECT CACHE {txid: retry_after_ts}: bodies fetched during set reconciliation that
         # merge_transaction REFUSED (expired target, cross-fork max_block, invalid). Without it a
         # divergent peer's pool hash never matches ours, so the SAME rejected bodies were re-fetched
@@ -78,6 +80,9 @@ class MemServer:
         except Exception:
             pass   # a corrupt/absent pool file is fine — a fresh empty pool is always valid
         self.peer_buffer = []
+        # ONE of our addresses (the one we advertise), not our identity: this host is dual-stack and
+        # peers list the other family back to us. Any "is this peer us?" check must use
+        # ops.peer_ops.own_ips(), never `== memserver.ip` (ghost self-peer, 2026-09-06).
         self.ip = self.config["ip"]
         self.port = self.config["port"]
         self.terminate = False
@@ -104,6 +109,13 @@ class MemServer:
         self.reported_uptime = self.get_uptime()
 
         self.emergency_mode = False
+        # BORN HERE, AT WHICH TIP. txid -> the tip height when a transaction entered the pool THROUGH THIS
+        # NODE (user_origin: our own duties and tpm_ready, a wallet's submit) rather than through gossip.
+        # Read by core_loop._held_back: such a tx is not eligible for OUR OWN block in the slot it was born,
+        # because in that slot nobody else can have it yet. Pruned with the pool. Local, never consensus.
+        self.own_born = {}
+        self.pool_warmed = False     # production gate: True after the first completed pool reconcile
+                                     # with a peer (or solo/timeout fallback) — see core_loop.normal_mode
 
         self.version = read_version()
         block_ends_info = get_block_ends_info(logger=logger)
@@ -118,8 +130,15 @@ class MemServer:
         #                                always fill) and stay under MAX_PEER_BODY (8 MiB, the /transaction_pool
         #                                fetch cap) so the pool stays transferable between peers. 4 MiB = 16
         #                                full blocks of blobs, well under the 8 MiB wire cap.
+        # RAISED for INLINE SETTLE PROOFS. The stated invariant is "must exceed a full block's blobs, stay
+        # under MAX_PEER_BODY" — both sides moved: a settle proof now rides INSIDE the tx (~120 MiB) rather
+        # than through DA, which cannot deliver it on a fleet where only one node runs a DA store. A 4 MiB
+        # cull budget would evict the one transaction the whole settlement path exists to carry. Keyed to
+        # the same ceiling as the wire caps (protocol.MAX_INLINE_TX_BYTES) and still below MAX_PEER_BODY, so
+        # /transaction_pool stays transferable.
         self.transaction_pool_max_txs = 150000
-        self.transaction_pool_max_bytes = 4 * 1024 * 1024      # 4 MiB (>> 256 KiB block, << 8 MiB peer body)
+        from protocol import MAX_INLINE_TX_BYTES as _MAX_INLINE_TX
+        self.transaction_pool_max_bytes = max(4 * 1024 * 1024, _MAX_INLINE_TX + (4 * 1024 * 1024))
         self.force_sync_ip = None
         self.rollbacks = 0
         self.can_mine = False
@@ -206,6 +225,18 @@ class MemServer:
             v = self.config.get(cfg, default) if v is None else v
             return str(v).strip().lower() not in ("0", "false", "no", "off")
         self.auto_collect_dividend = _flag("NADO_AUTO_COLLECT", "auto_collect_dividend", True)
+        # rolling-mode tx-history window (0 = the protocol floor); read here so the core loop's prune pass
+        # sees an operator override without re-reading config on every block.
+        # `os` was never imported here, so this raised NameError on EVERY boot — swallowed by the bare
+        # `except Exception` below, which quietly pinned the retention to 0. Neither the env var nor the
+        # config key had any effect on any node, and nothing said so. (Found by test_no_undefined_names,
+        # which is exactly the omission that test exists for.)
+        try:
+            self.tx_history_retention_blocks = int(
+                os.environ.get("NADO_TX_HISTORY_RETENTION")
+                or self.config.get("tx_history_retention_blocks", 0) or 0)
+        except Exception:
+            self.tx_history_retention_blocks = 0
         # Latest conservation-invariant reconciliation (ops/invariants.py), refreshed by the core loop's
         # periodic duty and served read-only at /invariants. None until the first check runs. Purely a
         # detector cache — nothing consensus reads it.
@@ -213,12 +244,24 @@ class MemServer:
         # Latest self-update capability diagnosis (ops/self_update.ensure_updatable), refreshed at boot and
         # daily, advertised in /status as update_capable so a lagging/unfixable node is visible fleet-wide.
         self.updatability = None
-        # Optional exec-layer view for the escrow invariants. A node with no exec side leaves this None and
-        # only the L1 supply invariant runs.
-        self.exec_state_view = None
-        # AUTO-REGISTER + renew the open-lane PoSW lease, unattended — DEFAULT OFF (opt-in: a headless node does
-        # not silently join the open lane). NADO_AUTO_REGISTER=1 (or config auto_register:true) turns it on.
-        self.auto_register = _flag("NADO_AUTO_REGISTER", "auto_register", False)
+        # AUTO-VOTE on treasury proposals paying a WHITELISTED recipient — DEFAULT ON, whitelist-restricted.
+        #
+        # WHY THIS EXISTS AT ALL: the browser wallet has auto-voted since the feature shipped, but treasury
+        # quorum is counted in BONDED SHARES, and browser miners hold almost none. Measured on betanet-2:
+        # 108 of 117 open miners have ZERO voting shares, so their auto-vote is a no-op, while all 42 shares
+        # sit with 9 bonded node operators whose software never voted at all. Quorum is 28 of 42 — literally
+        # unreachable, which is why the treasury held 109 NADO with zero proposals ever paid. Whitelisting
+        # was decorative until the side holding the weight also votes.
+        #
+        # The whitelist is the safety property, not the flag: a node will only ever auto-approve a spend to
+        # a listed recipient. The default is the reserved `faucet` escrow — keyless, public-good, and
+        # impossible to redirect — so the shipped behaviour cannot move funds to anyone's address. Operators
+        # widen it deliberately (NADO_AUTO_VOTE_ALLOW="faucet,<addr>") or switch it off entirely.
+        self.auto_vote = _flag("NADO_AUTO_VOTE", "auto_vote", True)
+        _allow = _os.environ.get("NADO_AUTO_VOTE_ALLOW")
+        if _allow is None:
+            _allow = self.config.get("auto_vote_allow", "faucet")
+        self.auto_vote_allow = [a.strip().lower() for a in str(_allow).split(",") if a.strip()]
 
         # ROLLING MODE (non-consensus): archive=True (default) keeps ALL block bodies; False runs a
         # pruned/rolling node that drops bodies older than history_retention_blocks (state + indexes
@@ -228,7 +271,11 @@ class MemServer:
         if _arch is not None:
             self.archive = _arch.strip().lower() not in ("0", "false", "no", "off")
         else:
-            self.archive = bool(self.config.get("archive", True))
+            # ROLLING BY DEFAULT — must match config.py's "archive" default, and it is this fallback (not
+            # the config file) that decides for every node whose config predates the key. Archive costs a
+            # measured ~47.6 GB/year of block bodies; a node that fills its disk stops UPDATING, not just
+            # archiving. Existing configs with an explicit "archive": true keep archiving, untouched.
+            self.archive = bool(self.config.get("archive", False))
         try:
             _hrb = int(_os.environ.get("NADO_HISTORY_RETENTION_BLOCKS")
                        or self.config.get("history_retention_blocks", 0) or 0)
@@ -236,19 +283,7 @@ class MemServer:
             _hrb = 0
         self.history_retention_blocks = _hrb if _hrb > 0 else _HRB
 
-        # IP-DIVERSITY registration cap (non-consensus): max distinct OPEN-lane addresses one source IP
-        # may register through this node per hour (0 = off). See ops/ratelimit.allow_registration.
-        try:
-            self.max_registrations_per_ip = int(_os.environ.get("NADO_MAX_REG_PER_IP")
-                                                 or self.config.get("max_registrations_per_ip", 64))
-        except (TypeError, ValueError):
-            self.max_registrations_per_ip = 64
-        try:
-            self.max_registrations_window = float(_os.environ.get("NADO_MAX_REG_WINDOW")
-                                                  or self.config.get("max_registrations_window", 7200))
-        except (TypeError, ValueError):
-            self.max_registrations_window = 7200.0
-
+        # per-IP registration budget + identity cap RETIRED at gen 25 (device attestation); knobs gone.
     def ban_peer(self, peer):
         """Queue a misbehaving/unreachable peer for purge (deduplicated against both the purge list
         and the already-unreachable set). Seed peers are EXEMPT — never exiled, always retried —
@@ -263,11 +298,11 @@ class MemServer:
         if peer not in self.purge_peers_list and peer not in self.unreachable:
             self.purge_peers_list.append(peer)
 
-    # HASH CACHES for the two per-second consensus signals below. Key = the pool LIST OBJECT itself
-    # (the cache keeps a live reference, so CPython can never recycle its id) + its length: every
-    # pool mutation either REASSIGNS self.transaction_pool (merge_transaction's post-append sort,
-    # purge, drain, cull — a new object) or changes its LENGTH in place (block-inclusion evict), so
-    # (same object, same length) proves the tx set is unchanged and the cached hash is exact. This
+    # HASH CACHES for the two per-second consensus signals below. Key = pool_gen, the counter the
+    # transaction_pool property setter bumps on EVERY reassignment (merge_transaction's post-append
+    # sort, purge, drain, cull) — see core_loop's "ASSIGN ONLY ON CHANGE" note: an earlier key on the
+    # list object + its length never hit under load, because the core loop reassigned the pool every
+    # pass. An unchanged pool_gen proves the tx set is unchanged and the cached hash is exact. This
     # turns the old O(pool)·sort + canonical-serialize EVERY SECOND into O(1) between pool changes —
     # the whole-mempool rehash was the classic hot-loop serialization cost at mempool scale.
     _pool_hash_cache = None            # (pool_gen, hash)
@@ -285,6 +320,9 @@ class MemServer:
     def transaction_pool(self, value):
         self._transaction_pool = value
         self.pool_gen += 1
+
+    _inflight_txids = set()
+    _inflight_lock = threading.Lock()
 
     def _pool_txid_set(self):
         """set of pooled txids at the current pool_gen — rebuilt only after a mutation, so the
@@ -338,8 +376,81 @@ class MemServer:
         if matched is False:                              # a match error -> treat as empty
             matched = []
         upcoming = blake2b_hash([parent["block_hash"], next_height, sort_transaction_pool(matched)])
-        self._upcoming_hash_cache = (*key, upcoming)
+        self._upcoming_hash_cache = (*key, upcoming, [t.get("txid") for t in matched])
         return upcoming
+
+    def get_next_block_txids(self):
+        """(tip_hash, next_height, [txid, ...]) — the exact tx set get_upcoming_block_hash hashes, served
+        by /next_block_txids for the PRE-ASSEMBLY RECONCILE (reconcile_next_block_set). Same cache."""
+        self.get_upcoming_block_hash()
+        c = self._upcoming_hash_cache
+        return c[1], self.latest_block["block_number"] + 1, list(c[4])
+
+    def reconcile_next_block_set(self, peers, timeout=1.5) -> dict:
+        """PRE-ASSEMBLY TX-SET RECONCILE (2026-09-01, leaderless assembly touch-up; doc/leaderless-assembly.md).
+
+        Blocks are a pure function of the mempool and EVERY node assembles every block, so a same-height
+        split needs exactly one thing: a tx that reached one assembler and not another before the slot.
+        The pull reconcile (merge_remote_transactions) converges pools in ~1 s passes, and the status-pool
+        agreement signal is polled every ~10 s — both slower than a 6 s block. This is the direct check,
+        run ONCE per tip right before we build: ask peers what THEY would put in the next block on THIS tip
+        (/next_block_txids, ~64 B per tx, 1.5 s budget), fetch only the bodies we lack from a peer that has
+        them (/transactions_by_id), merge them through the ordinary admission path, and only then assemble.
+        Symmetric: every peer does the same against us, so the whole mesh converges on the UNION of its
+        next-block sets within the slot instead of racing on the differences. Bounded and best-effort: a
+        peer that does not answer in time simply sits out this pass; nothing here is trusted (every
+        fetched tx is fully validated by merge_transaction) and nothing here can stall production beyond
+        the budget. Returns counters for the log/telemetry."""
+        from compounder import compound_get_next_block_txids, post_txs_by_id
+        peers = list(peers)[:16]
+        if not peers:
+            return {"peers": 0}
+        tip = self.latest_block["block_hash"]
+        ours = set(self.get_next_block_txids()[2])
+        answers = asyncio.run(compound_get_next_block_txids(peers, self.port, self.logger,
+                                                            asyncio.Semaphore(16), timeout))
+        same = {p: d for p, d in answers.items() if d.get("tip") == tip}
+        local = self._pool_txid_set()
+        want_by_peer, claimed = {}, set()
+        for p, d in same.items():
+            want = [i for i in d["txids"]
+                    if isinstance(i, str) and len(i) <= 64 and i not in local and i not in claimed
+                    and kv_ops.tx_get(i) is None]
+            if want:
+                want_by_peer[p] = want[:200]
+                claimed.update(want[:200])
+        fetched = 0
+        if want_by_peer:
+            async def _fetch():
+                sem = asyncio.Semaphore(8)
+                coros = [post_txs_by_id(p, self.port, ids, self.logger, [], sem) for p, ids in want_by_peer.items()]
+                try:
+                    res = await asyncio.wait_for(asyncio.gather(*coros, return_exceptions=True), timeout=3.0)
+                except asyncio.TimeoutError:
+                    return []
+                return [tx for r in res if isinstance(r, list) for tx in r]
+            refused = {}
+            got = 0
+            for tx in asyncio.run(_fetch()):
+                if not isinstance(tx, dict) or self._is_proof_settle(tx):
+                    continue
+                got += 1
+                r = self.merge_transaction(tx)
+                if isinstance(r, dict) and r.get("result") and r.get("message") == "Success":
+                    fetched += 1
+                else:
+                    # SAY WHY (2026-09-17): 30 of 56 reconcile passes that found a missing tx fetched nothing, and the
+                    # counters could not tell a peer that did not answer from a body our own admission refused.
+                    m = str((r or {}).get("message") if isinstance(r, dict) else r)[:60]
+                    refused[m] = refused.get(m, 0) + 1
+        agreed = sum(1 for d in same.values() if set(d["txids"]) == ours)
+        out = {"peers": len(answers), "same_tip": len(same), "agreed": agreed,
+               "missing": sum(len(v) for v in want_by_peer.values()), "fetched": fetched}
+        if want_by_peer:
+            out["received"] = got            # bodies that came back at all; missing - received = peers that did not answer
+            if refused:
+                out["refused"] = refused
+        return out
 
     def get_uptime(self) -> int:
         """Whole seconds this node process has been up (NOT system uptime) — refreshed into
@@ -349,6 +460,191 @@ class MemServer:
     # per-peer/per-pass bound on bodies fetched during set reconciliation; the server side caps a
     # /transactions_by_id request at the same figure. The remainder arrives on the next 1s pass.
     _RECONCILE_MAX_IDS = 1000
+
+    @staticmethod
+    def reject_cooldown_s(message, funder_in_pool):
+        """How long a REFUSED gossip tx cools before re-fetch — graded by what the refusal MEANS.
+
+        A flat 60 s cooled every refusal equally, and that was a fork driver: "Empty account" is a spend
+        from a fresh address whose FUNDING tx is still in the mempool — the account exists only once the
+        funding MINES (~TX_INCLUSION_DELAY blocks), so nodes that saw the spend early refused + cooled it
+        for 60 s while nodes that saw it late admitted it. Divergent pools for up to ~10 blocks, and
+        deterministic production turns a divergent pool straight into a split (the 62655/62895 class).
+
+        TERMINAL refusals (the tx can never become valid — bad bytes, bad signature, already mined,
+        superseded, out-of-window target) keep the long cooldown: re-fetching them is pure waste.
+        TRANSIENT refusals (account not funded YET, mempool full) cool briefly — 2 block times — so the
+        pool re-converges within the same window the funding needs to mine. And an "Empty account" whose
+        funder we can SEE in our own pool does not cool at all: the very next reconcile pass after the
+        funding mines admits it, which is the earliest any node can."""
+        TERMINAL = ("Malformed transaction", "Invalid txid", "Invalid signature", "Already mined",
+                    "Superseded", "Target block too high", "Target block too low")
+        if any(t in str(message) for t in TERMINAL):
+            return 60
+        if "Empty account" in str(message) and funder_in_pool:
+            return 0
+        # EXEC-SETTLE SKEW: dividend claims (and their collect blobs) validate at admission against the
+        # receiving node's OWN settled exec root, which lags differently per node — a claim proven
+        # against a root this node has not settled YET was refused + cooled 12s repeatedly, delaying
+        # delivery for minutes (measured: fork seed h68851/h68921 — the majority never held a 3-minute-old
+        # claim). The refusal resolves the moment OUR exec settles; cool 0 so the first reconcile after
+        # that admits it, the earliest any node can.
+        if "not proven against the settled" in str(message) or "no settled execution-layer root" in str(message):
+            return 0
+        return 12
+
+    @staticmethod
+    def _is_proof_settle(tx) -> bool:
+        d = tx.get("data") if isinstance(tx, dict) else None
+        return tx.get("recipient") == "settle" and isinstance(d, dict) and ("proof" in d or "proof_da" in d)
+
+    # BOUNDED (audit 2026-09-25): the queue holds whole proof-bearing txs — each up to the 192 MiB body cap — and was
+    # unbounded, filled before validation from whatever peers advertised. Its callers are the reconcile pass and the
+    # mempool restore; a tx declined here is not in the pool, so a later reconcile pass fetches it again.
+    _PROOF_Q_MAX = 4
+
+    def _queue_proof_merge(self, tx, user_origin):
+        """Hand a proof-bearing settle to the single proof worker (dedup by txid: one verification per tx).
+        Returns False when the worker's queue is full and the tx was declined for now."""
+        import queue, threading
+        if not hasattr(self, "_proof_q"):
+            self._proof_q, self._proof_inflight = queue.Queue(maxsize=self._PROOF_Q_MAX), set()
+            def _worker():
+                while True:
+                    tx, uo = self._proof_q.get()
+                    try:
+                        self.merge_transaction(tx, uo)
+                    except Exception as e:
+                        self.logger.error(f"proof worker: {e}")
+                    finally:
+                        self._proof_inflight.discard(tx.get("txid"))
+            threading.Thread(target=_worker, name="proof_verify", daemon=True).start()
+        txid = tx.get("txid")
+        if txid in self._proof_inflight or txid in self._pool_txid_set():
+            return True
+        self._proof_inflight.add(txid)      # BEFORE the put: the worker discards it when done, and must find it
+        try:
+            self._proof_q.put_nowait((tx, user_origin))
+        except queue.Full:
+            self._proof_inflight.discard(txid)
+            return False                    # declined for now: never blocks the caller, never grows the queue
+        return True
+
+    # ---- MEMPOOL PERSISTENCE ----------------------------------------------------------------------------
+    # A restart used to drop every pooled transaction on the floor: a client had been told "accepted" and
+    # the tx simply never existed again (2026-08-29: an order posted seconds before a self-update restart
+    # vanished). The pool is written to disk on shutdown and every few seconds, and re-merged on boot
+    # through the SAME validation as any gossiped tx — nothing is trusted from disk, only remembered.
+    @property
+    def pool_path(self):
+        from ops.data_ops import get_home
+        return f"{get_home()}/mempool.json"
+
+    # ---- EXPIRY ---------------------------------------------------------------------------------------
+    # A tx whose landing window has closed (max_block at or below the tip, or beyond TX_LANDING_WINDOW)
+    # can never be mined. Until 2026-09-04 it was dropped only on the core loop's PRODUCE path — and a
+    # node that is behind sits inside emergency_mode's internal while-loop and never produces, so the
+    # relay held a 10 MiB dead settle tx for 1,500 blocks, served it to four peers ~1/s through
+    # /transactions_by_id (they cannot admit it, so reconcile never converged), re-dumped it to disk
+    # every 5 s, and spent 67 % of the GIL serialising it — too slow to ever catch up and prune. The pool
+    # OWNER prunes, on the peer loop's 1 s clock (every mode), and the peer-facing reads never see a
+    # dead tx even between prunes.
+    def _tx_can_land(self, tx) -> bool:
+        from protocol import TX_LANDING_WINDOW
+        try:
+            h = self.latest_block["block_number"]
+            return h < tx["max_block"] < h + TX_LANDING_WINDOW
+        except Exception:
+            return True                      # no tip yet / odd shape: never silently hide, admission decides
+
+    def live_pool(self):
+        """The pool minus anything that can no longer land — what peers are served and what is persisted."""
+        return [t for t in self.transaction_pool if self._tx_can_land(t)]
+
+    def prune_expired_pool(self) -> int:
+        """Drop txs whose landing window has closed. Snapshot-filter-reassign under the mempool lock (vs
+        concurrent merge_transaction appends); the pool is reassigned only when something actually went.
+        Returns the number dropped."""
+        try:
+            height = self.latest_block["block_number"]
+        except Exception:
+            return 0
+        with self.mempool_lock:
+            before = self.transaction_pool
+            kept = [t for t in before if self._tx_can_land(t)]
+            dropped = len(before) - len(kept)
+            if dropped:
+                self.transaction_pool = kept
+        if dropped:
+            self.logger.warning(f"Pruned {dropped} expired tx(s) from the pool at height {height}")
+        return dropped
+
+    def save_pool(self, force=False):
+        import time as _t
+        now = _t.time()
+        if not force and now - getattr(self, "_pool_saved_at", 0) < 5:
+            return 0
+        self._pool_saved_at = now
+        import json as _json
+        import threading as _th
+        try:
+            txs = self.live_pool()                 # never persist a tx that can no longer land
+            # UNCHANGED POOL ⇒ NO WRITE, AND NEVER ON THE CALLER'S THREAD. Six pending 10 MiB settle proofs made
+            # this a 60 MiB json.dump every 5 s on the PEER loop (py-spy 2026-09-07 13:29: 7/10 samples here),
+            # which is the loop that syncs blocks — the relay crawled 100+ blocks behind the fleet. The set of
+            # txids is the identity of the pool; serialise only when it moved, and on a daemon thread.
+            sig = tuple(sorted(str(t.get("txid", "")) for t in txs if isinstance(t, dict)))
+            if sig == getattr(self, "_pool_sig", None):
+                return len(txs)
+            w = getattr(self, "_pool_writer", None)
+            if w is not None and w.is_alive():
+                if not force:
+                    return len(txs)                # a write is in flight; the next tick re-checks the signature
+                w.join(timeout=30)                 # shutdown: let it finish, then write the final state synchronously
+            self._pool_sig = sig
+
+            def _write(txs=txs, sig=sig):
+                try:
+                    tmp = self.pool_path + ".tmp"
+                    with open(tmp, "w") as f:
+                        _json.dump(txs, f)
+                    os.replace(tmp, self.pool_path)
+                except Exception as e:
+                    self._pool_sig = None          # retry next tick
+                    self.logger.error(f"mempool persist failed: {e}")
+            if force:
+                _write()
+            else:
+                self._pool_writer = _th.Thread(target=_write, daemon=True, name="mempool-persist")
+                self._pool_writer.start()
+            return len(txs)
+        except Exception as e:
+            self.logger.error(f"mempool persist failed: {e}")
+            return 0
+
+    def load_pool(self):
+        """Re-merge the last persisted pool. Every tx goes through merge_transaction (full validation,
+        min/max_block window, spending) so a stale or forged file can only ever be refused."""
+        import json as _json
+        try:
+            with open(self.pool_path) as f:
+                txs = _json.load(f)
+        except FileNotFoundError:
+            return 0
+        except Exception as e:
+            self.logger.error(f"mempool restore: unreadable file ignored: {e}")
+            return 0
+        kept = 0
+        for tx in txs if isinstance(txs, list) else []:
+            try:
+                if self._is_proof_settle(tx):
+                    self._queue_proof_merge(tx, False); continue
+                r = self.merge_transaction(tx, False)
+                kept += 1 if isinstance(r, dict) and r.get("result") else 0
+            except Exception:
+                pass
+        self.logger.info(f"mempool restored: {kept} of {len(txs) if isinstance(txs, list) else 0} persisted transactions re-admitted")
+        return kept
 
     def merge_remote_transactions(self, user_origin=False, skip_pool_peers=()) -> None:
         """MEMPOOL SET RECONCILIATION (replaces the full-pool download): for each peer whose
@@ -363,12 +659,34 @@ class MemServer:
             missing = asyncio.run(self._fetch_missing_remote_txs(pool_peers))
             now = get_timestamp_seconds()
             for tx in missing:
+                # A PROOF-BEARING SETTLE is verified on its own worker, one at a time, never inline: its
+                # STARK verification runs for minutes in Python, and inline it froze this thread's status
+                # pass (2026-08-29, 70 blocks behind while believing it led the mesh). The worker calls the
+                # very same merge_transaction, so admission rules are unchanged — only the thread differs.
+                if self._is_proof_settle(tx):
+                    self._queue_proof_merge(tx, user_origin)
+                    continue
                 result = self.merge_transaction(tx, user_origin)
                 # REFUSED gossip body -> cool it down (see _tx_reject_cache): don't re-fetch the same
                 # rejected tx from the same divergent peer every second. 60s TTL: a transient reason
                 # (mempool full, account funded later) is retried after the cooldown.
                 if isinstance(result, dict) and not result.get("result") and isinstance(tx.get("txid"), str):
-                    self._tx_reject_cache[tx["txid"]] = now + 60
+                    _funder_seen = any(isinstance(t, dict) and t.get("recipient") == tx.get("sender")
+                                       for t in self.transaction_pool)
+                    _cool = self.reject_cooldown_s(result.get("message"), _funder_seen)
+                    if _cool:
+                        self._tx_reject_cache[tx["txid"]] = now + _cool
+                    # REJECT TELEMETRY (/status recent_tx_rejects): fork seed h68261 was a 4-minute-old
+                    # collect blob our pool simply did not hold — and nothing recorded whether it was
+                    # refused (and why) or never delivered. A refused SYSTEM tx is a future fork; make
+                    # every gossip refusal readable from outside. Ring of the last 20.
+                    try:
+                        self.recent_tx_rejects = ([{"txid": tx["txid"][:16],
+                                                    "recipient": str(tx.get("recipient"))[:24],
+                                                    "why": str(result.get("message"))[:60], "at": now}]
+                                                  + getattr(self, "recent_tx_rejects", []))[:20]
+                    except Exception:
+                        pass
             # bounded: drop expired entries; hard-cap so a flood of unique invalid txids can't grow it
             if len(self._tx_reject_cache) > 20000:
                 self._tx_reject_cache = {i: t for i, t in self._tx_reject_cache.items() if t > now}
@@ -411,9 +729,59 @@ class MemServer:
         return out
 
 
+    def maybe_watchtower_slash(self, transaction):
+        """THE WATCHTOWER: automatic slashing on an OBSERVED FFG double-vote. Slash validation has been
+        complete for a while (resolve_slash: both proof kinds, dedup, penalty) — but nothing ever
+        SUBMITTED one, so punishment existed only if a human noticed and hand-built the proof tx.
+        Accountability that depends on someone watching is not accountability.
+
+        Every gossiped attest-bearing tx passes through here BEFORE admission (the equivocating second
+        vote is typically REFUSED as a duplicate section, so hooking after admission would drop the
+        evidence). We remember the last signed attest tx per (sender, epoch); a second one with a
+        DIFFERENT target_hash is an irrefutable double-vote — build the proof from the two full signed
+        txs and merge the fee-exempt slash tx into our own pool (gossip carries it from there). The
+        memory is one tx per validator per epoch, pruned two epochs back — bounded by the committee size.
+
+        Never raises into admission, and never fires on our own txs re-entering (same target_hash)."""
+        try:
+            if not isinstance(transaction, dict) or transaction.get("recipient") not in ("duty", "attest"):
+                return
+            d = transaction.get("data") or {}
+            att = d.get("attest") if transaction.get("recipient") == "duty" else d
+            if not isinstance(att, dict):
+                return
+            epoch, thash = att.get("target_epoch"), att.get("target_hash")
+            sender = transaction.get("sender")
+            if not isinstance(epoch, int) or isinstance(epoch, bool) or not thash or not sender:
+                return
+            if not hasattr(self, "_attest_watch"):
+                self._attest_watch = {}
+            prev = self._attest_watch.get((sender, epoch))
+            if prev is None:
+                self._attest_watch[(sender, epoch)] = transaction
+                # prune: nothing older than 2 epochs back can still be slashed ahead of its dedup anyway
+                for k in [k for k in self._attest_watch if k[1] < epoch - 2]:
+                    self._attest_watch.pop(k, None)
+                return
+            prev_att = (prev.get("data") or {}).get("attest") if prev.get("recipient") == "duty" \
+                else (prev.get("data") or {})
+            if not isinstance(prev_att, dict) or prev_att.get("target_hash") == thash:
+                return                                    # same vote re-gossiped: honest
+            from protocol import TX_LANDING_WINDOW
+            from ops.transaction_ops import verify_attestation_equivocation_proof, construct_slash_tx
+            proof = {"attest_a": prev, "attest_b": transaction}
+            if not verify_attestation_equivocation_proof(proof):
+                return                                    # would not survive validation — do not spam
+            self.logger.warning(f"WATCHTOWER: FFG double-vote by {sender[:16]}… at epoch {epoch} — "
+                                f"submitting the slash")
+            slash = construct_slash_tx(self.keydict, proof,
+                                       self.latest_block["block_number"] + TX_LANDING_WINDOW - 5)
+            self.merge_transaction(slash, user_origin=True)
+        except Exception as e:
+            self.logger.warning(f"watchtower error (non-fatal): {e}")
+
     def merge_transaction(self, transaction, user_origin=False) -> dict:
         """warning, can get stuck if not efficient"""
-        from protocol import TX_LANDING_WINDOW
         # AUDIT FIX: a malicious peer can serve a /transaction_pool list with a malformed entry; the
         # pre-validation field accesses below (sender, max_block) would KeyError/TypeError and abort
         # the whole merge batch. Reject malformed txs up front so the rest of the batch still merges.
@@ -421,6 +789,9 @@ class MemServer:
                 or not isinstance(transaction.get("max_block"), int)
                 or isinstance(transaction.get("max_block"), bool)):
             return {"result": False, "message": "Malformed transaction"}
+
+        # WATCHTOWER (before any refusal path — a refused duplicate attest section IS the evidence)
+        self.maybe_watchtower_slash(transaction)
 
         # RE-GOSSIP FAST PATH: peers re-serve their whole pool every second, so the overwhelmingly
         # common case is a tx we already hold. O(1) txid-set check BEFORE any validation or DB read —
@@ -430,6 +801,32 @@ class MemServer:
         _txid = transaction.get("txid")
         if isinstance(_txid, str) and _txid in self._pool_txid_set():
             return {"message": "Already present", "result": True}
+        # IN-FLIGHT DEDUPE (2026-09-02): the pool-membership check above is blind to a tx whose FIRST
+        # validation is still running — nine peers pushing the same settle tx within a second put nine
+        # copies through full proof verification at once (the Goldilocks settle verifier, deleted in G9, for what
+        # that cost). The second arrival of an in-flight txid is acknowledged, not re-validated.
+        if isinstance(_txid, str):
+            with self._inflight_lock:
+                if _txid in self._inflight_txids:
+                    return {"message": "Already being validated", "result": True}
+                self._inflight_txids.add(_txid)
+        try:
+            if user_origin:
+                # Remember the slot this tx was born in on THIS node. A refused merge leaves a harmless
+                # entry that the candidate pass prunes along with everything not in the pool.
+                try:
+                    self.own_born[_txid] = int(self.latest_block["block_number"])
+                except Exception:
+                    pass
+            return self._merge_transaction_validated(transaction, user_origin, _txid)
+        finally:
+            if isinstance(_txid, str):
+                with self._inflight_lock:
+                    self._inflight_txids.discard(_txid)
+
+    def _merge_transaction_validated(self, transaction, user_origin, _txid):
+        """The validating half of merge_transaction (runs once per txid at a time — see the in-flight set)."""
+        from protocol import TX_LANDING_WINDOW
 
         # Anti-DoS: hard-cap the mempool so a flood (incl. fee-exempt register/heartbeat spam) cannot
         # grow it unbounded and OOM the node. Pairs with the per-IP HTTP rate limiter. The lane cap
@@ -441,17 +838,94 @@ class MemServer:
         # CHEAP BOUNDS FIRST (audit): the two integer max_block compares run before the LMDB
         # get_account read — a stale re-gossiped tx (the most common reject under load, since peers
         # re-serve their whole pool every second) must not cost a DB hit to reject.
-        # `<=` (was `<`): the drain promotes only max_block STRICTLY greater than the tip
-        # (merge_buffer block_min < target), so a tx targeting the current tip was acknowledged
-        # "Success", could never be mined, and silently aged out — reject it up front instead.
+        # `<=` (was `<`): block selection takes only max_block STRICTLY greater than the tip
+        # (remove_outdated_transactions keeps only `tip < max_block`), so a tx targeting the current
+        # tip was acknowledged "Success", could never be mined, and silently aged out — reject it up
+        # front instead.
         if transaction["max_block"] <= self.latest_block["block_number"]:
             msg = {"result": False,
-                   "message": f"Target block too low"}
+                   "message": "Target block too low"}
             return msg
 
         elif transaction["max_block"] > self.latest_block["block_number"] + TX_LANDING_WINDOW:
             msg = {"result": False,
-                   "message": f"Target block too high"}
+                   "message": "Target block too high"}
+            return msg
+
+        # USER-ORIGIN PROPAGATION GUARD (door-level, so it can never diverge pools: a tx refused at its
+        # OWN entry door never exists anywhere). Browser wallets running a stale cached interface.js
+        # still build dividend claims with no min_block — one seeded the h67961 4v5 split, another
+        # forked h68851 AFTER the JS fix shipped (the fix cannot reach a client that has not refreshed).
+        # Gossip-origin txs are exempt: an already-admitted legacy tx must keep relaying identically on
+        # every node.
+        elif (user_origin and transaction.get("recipient") == "dividend_withdraw"
+                and int(transaction.get("min_block", 0) or 0)
+                        < self.latest_block["block_number"] + 4):
+            msg = {"result": False,
+                   "message": "min_block missing or too near: refresh your wallet — claims must give "
+                              "the network time to propagate before they can be mined"}
+            return msg
+
+        # DUPLICATE unbond-withdraw (door-level, user-origin only — same divergence-safety argument as
+        # the dividend gate above). The wallet poll re-entered its auto-claim every tick for the whole
+        # submit->landing gap and each tick built a fresh withdraw (new nonce -> new txid), so ~20
+        # identical claims piled into the pool at once; every copy after the winner died "no pending
+        # unbond to withdraw" and the wallet displayed the pile as phantom incoming credit (+200 shown
+        # for a 10-coin unbond, 2026-08-19). An account has ONE pending-unbond slot, so one in-flight
+        # claim per sender is complete — a second copy can never release more coins. Gossip is exempt:
+        # already-admitted duplicates must keep relaying identically on every node.
+        elif (user_origin and transaction.get("recipient") == "withdraw"
+                and any(t.get("recipient") == "withdraw"
+                        and t.get("sender") == transaction.get("sender")
+                        for t in self.transaction_pool)):
+            msg = {"result": False,
+                   "message": "unbond withdrawal already pending — the earlier claim is still waiting "
+                              "to land"}
+            return msg
+
+        # DUPLICATE dividend claim (same class, observed live 2026-08-19 13:26: 19 copies of one
+        # exec-nonce from a single wallet pooled at once — the exec node lists a dividend as unclaimed
+        # until the claim LANDS, so wallets re-built it every poll tick). The exec nonce identifies the
+        # claim; a second copy for the same (sender, nonce) can never pay out. User-origin only, gossip
+        # exempt — identical divergence-safety argument as the two gates above.
+        elif (user_origin and transaction.get("recipient") == "dividend_withdraw"
+                and any(t.get("recipient") == "dividend_withdraw"
+                        and t.get("sender") == transaction.get("sender")
+                        and (t.get("data") or {}).get("nonce") == (transaction.get("data") or {}).get("nonce")
+                        for t in self.transaction_pool)):
+            msg = {"result": False,
+                   "message": "dividend claim already pending — the earlier claim is still waiting "
+                              "to land"}
+            return msg
+
+        # COLLECT-BLOB PROPAGATION GUARD (user-origin only): the exact rule the dividend_withdraw gate
+        # enforces, for the collect blob that REQUESTS the dividend. Stale cached wallets still build it
+        # with no min_block, and it seeded the ONLY two organic forks after the duty class was closed
+        # (h79050 #32, h80403 #36 — both "only_ours: blob/collect_dividend"). The match is deliberately
+        # narrow — only op == "collect_dividend", which nothing but the wallet's collect path builds —
+        # so game/SDK blobs are untouched. Gossip exempt, as always: door refusals cannot diverge pools.
+        elif (user_origin and transaction.get("recipient") == "blob"
+                and isinstance(transaction.get("data"), dict)
+                and transaction["data"].get("op") == "collect_dividend"
+                and int(transaction.get("min_block", 0) or 0)
+                        < self.latest_block["block_number"] + 4):
+            msg = {"result": False,
+                   "message": "min_block missing or too near: refresh your wallet — claims must give "
+                              "the network time to propagate before they can be mined"}
+            return msg
+
+        # DUPLICATE registration (user-origin only): register is EXACT-landing, so under head churn a
+        # wallet's registration misses its block and the wallet re-mints — 50 registrations sat pooled
+        # at 16:35 (several senders holding 2-3 copies) while exactly one landed in 40 blocks. A second
+        # copy from the same sender while one is still in flight can never register anything extra;
+        # refuse it at the door (gossip exempt) so the pool carries one attempt per wallet.
+        elif (user_origin and transaction.get("recipient") == "register"
+                and any(t.get("recipient") == "register"
+                        and t.get("sender") == transaction.get("sender")
+                        for t in self.transaction_pool)):
+            msg = {"result": False,
+                   "message": "registration already pending — the earlier attempt is still waiting "
+                              "to land"}
             return msg
 
         # SUPERSEDED single-duty forms (doc/consensus-aggregation.md): attest/commit/reveal stay
@@ -475,15 +949,50 @@ class MemServer:
         # address has no on-chain account YET (registration is what creates it), so they must bypass
         # the empty-account anti-spam gate. (register is PoW-gated and heartbeat requires registered=1
         # in validate_transaction, so this opens no spam hole.) Spending txs still need a funded account.
-        elif transaction.get("recipient") not in ("register", "heartbeat") \
+        # tpm_enrol joins the onboarding bypass for the same reason register did: a machine attesting its
+        # chip for the first time has no on-chain account yet, and requiring one would mean an identity
+        # must be funded before it can prove it owns hardware — which inverts the point of a lane that
+        # exists so a participant with no capital can take part. It opens no spam hole: validation
+        # refuses any enrolment whose endorsement chain does not verify to a pinned silicon-vendor root,
+        # and allows only ONE open enrolment per chip at a time (ops/transaction_ops), so the ceiling is
+        # the number of genuine vendor-signed certificates an attacker holds, once per expiry window.
+        # ALL FOUR ENROLMENT MESSAGES ARE HERE, and the three that were missing cost a completed proof.
+        # An earlier version listed only tpm_enrol, reasoning that tpm_challenge and tpm_reveal come from
+        # drawn challengers who are established producers, and that tpm_commit "comes from the account
+        # that opened the enrolment, which by then exists". That last clause is simply false: opening an
+        # enrolment writes no account, and the opener is a throwaway identity by design — the helper
+        # signs with a key it generates beside itself precisely so nobody pastes a wallet key. So the
+        # first chip to ever open its credentials on real silicon got "Empty account" at the COMMIT, one
+        # recipient further along than the bug this bypass was added to fix.
+        #
+        # Bypassing costs nothing in spam terms because the account check is the WEAKEST gate any of
+        # these messages pass. validate_transaction refuses a challenge or reveal whose sender is not a
+        # drawn challenger for a live record, refuses a commit that is not the state transition the
+        # record is waiting for, and refuses an enrolment whose endorsement chain does not verify to a
+        # pinned silicon-vendor root. An attacker with no account gains the right to have those rules
+        # reject it. Requiring capital before a participant may finish proving it owns hardware inverts
+        # the point of a lane that exists for participants who have none.
+        #
+        # legacy_claim JOINED IT (gen 28): the claimant's format-2 address holds nothing until the claim lands, and the
+        # claim is bounded by consensus — one per old address, only an unkeyed old address with a balance, consumed.
+        # unshield JOINED IT (gen-29 rehearsal, 2026-10-26): a recipient whose money arrived PRIVATELY has no L1 account until
+        # its first withdrawal lands, so its fee-exempt claim was refused "Empty account" and the wallet said "still
+        # settling" for ever. The claim is bounded by consensus like legacy_claim: a valid exit proof against the
+        # SETTLED root, its (addr, nonce) nullifier burned, the claimant the exit's own address — once per exit.
+        # tpm_ready LEFT THIS LIST (audit 2026-09-27): an announcement from a never-funded address was the one free,
+        # unbounded, account-creating message on the chain (protocol.py "NO FREE REPEATABLE TRANSACTIONS"). Its honest
+        # sender is a node that already holds an account, and a bonded one. NOTE: this check is mempool policy only —
+        # consensus never runs it — so it is never the bound that makes a kind safe; validate_transaction is.
+        elif transaction.get("recipient") not in ("register", "heartbeat", "tpm_enrol",
+                                                  "tpm_challenge", "tpm_commit", "tpm_reveal", "legacy_claim", "unshield") \
                 and not get_account(transaction["sender"], create_on_error=False):
             msg = {"result": False,
-                   "message": f"Empty account"}
+                   "message": "Empty account"}
             return msg
 
         elif not validate_txid(transaction, logger=self.logger):  # always enforced (compat gate gone)
             msg = {"result": False,
-                   "message": f"Invalid txid"}
+                   "message": "Invalid txid"}
             return msg
         # NOTE: the old byte-size validate_base_fee gate is removed: get_byte_size is
         # sys.getsizeof(repr(...)) and is non-deterministic, so it is unsafe as a fee rule.
@@ -496,14 +1005,27 @@ class MemServer:
             # whole pool doing full-dict __eq__ on every genuinely NEW tx (the one case the fast path
             # at the top of this method cannot short-circuit). Kept rather than deleted because another
             # thread can have added this txid since that fast path ran.
+            # NOT THE CONVERSE: one txid is not one body — the signature/public_key are outside the txid, so a second
+            # spelling of a pooled tx lands here as "Already present" and the first-seen copy stays, on each node its
+            # own (audit 2026-09-25; excluded_witness_check pins the hex spelling, the "KNOWN OPEN" variants remain).
             if transaction.get("txid") in self._pool_txid_set():
                 # Idempotent: already pooled (e.g. a re-gossiped heartbeat) — a benign success, not an
                 # error (matches the "already present" handling clients now expect).
                 return {"message": "Already present", "result": True}
+            # THE ENROLMENT MESSAGES ARE JUDGED WHERE THEY CAN FIRST LAND (2026-10-06, found by the wallet-challenger walk).
+            # tpm_challenge / tpm_commit / tpm_reveal each "must land in a later block" than the message they answer, and
+            # none can land before tip + 1 (nor before its own min_block). Judged at the tip, a commit sent while the last
+            # challenge was still the tip was REFUSED — the shipped TPM helper exits on that refusal — although it could
+            # only ever land after it. Judging at the earliest landing height admits exactly what the block will accept;
+            # every block still re-validates each tx at its real height, so this is mempool policy, not consensus.
+            # INVARIANT: only these three — never widen it to a recipient whose rules read "the current state at tip".
+            _vh = self.latest_block["block_number"]
+            if transaction.get("recipient") in ("tpm_challenge", "tpm_commit", "tpm_reveal"):
+                _vh = max(int(_vh) + 1, int(transaction.get("min_block") or 0))
             try:
                 validate_transaction(transaction=transaction,
                                      logger=self.logger,
-                                     block_height=self.latest_block["block_number"])
+                                     block_height=_vh)
             except Exception as e:
                 msg = {"result": False,
                        "message": f"Could not merge remote transaction: {e}"}
@@ -517,24 +1039,52 @@ class MemServer:
                     # merge_transaction calls on other threads (double-accept / lost-append races).
                     with self.mempool_lock:
                         if _txid not in self._pool_txid_set():
+                            ok, victim = self._free_pool_admit(transaction)
+                            if not ok:
+                                return {"result": False,
+                                        "message": "Too many pending fee-exempt transactions from this sender"}
+                            if victim is not None:
+                                self._transaction_pool.remove(victim)
                             self._transaction_pool.append(transaction)
                             self.pool_gen += 1   # in-place append — bump the content signal by hand
 
                 except Exception as e:
                     msg = f"Remote transaction failed to validate: {e}"
                     self.logger.info(msg)
-                    self.purge_txs_of_sender(transaction["sender"])
+                    # NO sender-wide purge (2026-09-01). This used to drop EVERY pooled tx of the sender on
+                    # an aggregate-spend refusal — but an "Overspending balance" here is routinely
+                    # branch/timing skew (a dividend credit or funding that one node has applied and
+                    # another has not yet), not a double-spend attempt; purging made THIS node's pool
+                    # diverge from every peer that kept the sender's other txs, and deterministic
+                    # production turned that into the 08-31 splits. Double-spends cannot land anyway:
+                    # verify_block enforces whole-block spending, and _candidate_pool keeps our own
+                    # candidate within balance. Refuse just this tx; it cools briefly and is re-tried.
                     return {"message": msg,
                             "result": False}
 
             return {"message": "Success", "result": True}
 
-    def merge_transactions(self, transactions, user_origin=False) -> None:
-        """Merge a whole remote batch one tx at a time through merge_transaction, which contains its
-        own failures — so a single malformed/invalid entry from a malicious peer can never abort the
-        rest of the batch. Per-tx results are deliberately discarded (gossip is best-effort)."""
-        for transaction in transactions:
-            self.merge_transaction(transaction, user_origin)
+    def _free_pool_admit(self, transaction):
+        """(admit?, tx to evict) under protocol.FREE_POOL_PER_SENDER — MEMPOOL POLICY, not consensus (audit 2026-09-27).
+        Consensus bounds how many fee-exempt txs of a sender LAND (per-block uniqueness keys, nullifiers), but nothing
+        bounded how many sat in the pool: one account could pool thousands of distinct-nonce copies (only one lands per
+        block, the rest wait out their landing window), and the byte cull never evicts several free kinds, so the flood
+        pushed paid transactions out instead. A sender now holds at most FREE_POOL_PER_SENDER fee-exempt txs (an honest
+        node pools a handful: its duties, a settle, an announcement). Over the cap the LOWEST txids win — the new tx
+        replaces the sender's highest if it sorts below it — so every node converges on the same subset whatever order
+        the copies arrived in (a pool that differed by arrival order would build different blocks). Only the sender's own
+        key can fill its slots. Caller holds mempool_lock. INVARIANT: keep the choice a pure function of the tx set."""
+        from protocol import FREE_POOL_PER_SENDER
+        if transaction.get("fee") != 0:
+            return True, None
+        s = transaction.get("sender")
+        mine = [t for t in self._transaction_pool if t.get("sender") == s and t.get("fee") == 0]
+        if len(mine) < FREE_POOL_PER_SENDER:
+            return True, None
+        worst = max(mine, key=lambda t: str(t.get("txid")))
+        if str(transaction.get("txid")) < str(worst.get("txid")):
+            return True, worst
+        return False, None
 
     def enqueue_gossip(self, transaction, exclude_ip=None) -> None:
         """Queue a NEWLY-accepted tx for push-fan-out to peers (nado._gossip_worker), skipping the
@@ -546,13 +1096,3 @@ class MemServer:
             self.gossip_queue.put_nowait((transaction, exclude_ip))
         except queue.Full:
             pass
-
-    def purge_txs_of_sender(self, sender) -> None:
-        """remove all transactions of sender to prevent possible double spending attempt"""
-        """of sender sending different txs to different nodes both exhausting balance"""
-        # AUDIT FIX: was `for tx in pool: pool.remove(tx)` — removing while iterating shifts the
-        # index and SKIPS the element after every hit, so adjacent same-sender txs (the exact
-        # double-spend shape this guard exists for) half-survived the purge. Rebuild the pool under
-        # the mempool lock instead.
-        with self.mempool_lock:
-            self.transaction_pool = [t for t in self.transaction_pool if t["sender"] != sender]

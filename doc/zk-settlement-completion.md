@@ -1,5 +1,7 @@
 # Trustless STARK settlement — completion checklist
 
+> **HISTORICAL (G9, 2026-10-28):** a checklist for the Goldilocks settlement prover (`execnode/stark/`, `vm_circuit`, `settlement_proofs`, recursion), retired at the generation-29 reroll and deleted in G9. Trustless settlement is now the Stwo statement of a span (`execnode/settle_b2.py`, `native/stwo_settle`; doc/stwo/g4-settlement-statement.md), built and dormant behind `STWO_SETTLE_HEIGHT`; until it is set the bonded quorum settles.
+
 Status as of the 2026-07-27 code sweep (8-agent survey + manual verification of the load-bearing claims).
 This is the *code-grounded* companion to `zk-recursion.md` / `zk-execution-proofs.md`: what is actually
 built and wired **today**, and the exact ordered steps left to make a STARK validity proof — not the
@@ -7,16 +9,33 @@ bonded quorum — the settlement authority.
 
 ## TL;DR
 
-The **verifier / acceptance side is done and hardened**, and as of commit `<this change>` the acceptance
-branch + its one remaining safety dependency are **implemented and gated behind
-`protocol.SETTLE_PROOF_TRUSTLESS` (default False)** — so live behaviour is byte-identical to the
-quorum-only chain, the flag flips on at a reroll, and the trustless path is proven by test with the flag
-forced True. The one thing that still does **not** exist is a **live prover** that emits conforming proofs.
-Turning trustless settlement on is now: build the prover loop → flip the flag at a reroll — *no new
-cryptography*. The O(1) recursion fold is a separate, optional performance layer (built, not wired); native
-per-segment verify is already trustless, just not succinct.
+**UPDATE 2026-07-27 (post-reroll):** Track 1 is **DONE and LIVE** on `betanet-11`. `SETTLE_PROOF_TRUSTLESS`
+is **True**; the self-checking prover loop ships in `execnode.py` (now unconditional: `SETTLE_PROVE = True`, the
+old `NADO_EXEC_SETTLE_PROVE` opt-in is gone); the
+acceptance branch is enabled and proven e2e (`tests/test_settle_trustless_flag.py`,
+`tests/test_settle_prover_sim.py`). A STARK validity proof — not the bonded quorum — can now justify the exec
+root, with quorum retained as the fallback for non-conforming spans.
 
-### Status of the acceptance side (implemented in this change)
+**And Track 2.1 (the O(1) recursion fold) is now WIRED into the live sparse path.**
+`settlement_sparse.prove/verify_settlement_sparse` gained a `recursive` mode: the span's K exec proofs fold
+into ONE recursion bundle (`recursive_verify` — fold + row-mode composition) that the verifier checks in place
+of K per-segment `stark.verify` calls, at pinned protocol strength — the same wiring already proven by
+`verify_settlement_o1`. It is **backward-compatible** (a folded proof's segments still verify the classic
+K-segment way, and the fold is authoritative, so mixed-version nodes agree). On the prover it is now
+**unconditional** (`execnode.py` `SETTLE_FOLD = True`; it was the opt-in `NADO_EXEC_SETTLE_FOLD` when written), and a
+folded proof is self-verified before broadcast. Honouring the `recursive` field in consensus is
+`protocol.SETTLE_PROOF_RECURSIVE`, enabled at a reroll. Proven by `tests/test_settle_sparse_fold.py` (fast: segmentation + sparse binding + K-path;
+`NADO_HEAVY=1`: the real W=106 K→1 bundle + tamper/weak-policy rejections). The settled root (kv_pre/kv_post)
+is byte-identical folded vs unfolded — folding changes HOW the proof is verified, never WHAT root it settles.
+
+*Original (pre-reroll) status, retained for the record:* The **verifier / acceptance side is done and
+hardened**, the acceptance branch + its one remaining safety dependency are **implemented and gated behind
+`protocol.SETTLE_PROOF_TRUSTLESS` (default False)** — live behaviour byte-identical to the quorum-only chain,
+the flag flips on at a reroll, the trustless path proven by test with the flag forced True. The one thing
+still missing was a **live prover** emitting conforming proofs. Turning trustless settlement on was: build the
+prover loop → flip the flag at a reroll — *no new cryptography*.
+
+### Status of the acceptance side (implemented in this change) — HISTORICAL (2026-07-27, pre-flip)
 
 - `protocol.SETTLE_PROOF_TRUSTLESS` (default **False**) is the master switch. False ⇒ a proof still verifies
   and records its marker, but `settlement_justified` ignores it (quorum-only, no behaviour change).
@@ -29,7 +48,7 @@ per-segment verify is already trustless, just not succinct.
   instead of fail-swallow, so a non-deterministic (OOM) failure can never leave one node honouring a proof
   its peers reject. Off, the forgiving swallow is retained (the summary is inert).
 
-## What is DONE and WIRED (verified)
+## What is DONE and WIRED (verified) — HISTORICAL (2026-07-27 sweep; line numbers are of that tree)
 
 - **Settle-with-proof validation** — `ops/transaction_ops.py:981-1079`. When a `settle` tx carries a
   `proof`, **every node verifies it deterministically at block-validation** and it is comprehensively
@@ -47,7 +66,7 @@ per-segment verify is already trustless, just not succinct.
     chain* (`:1024-1048`), so a prover cannot settle a state built on attacker-chosen dice/beacon values.
   - **DA-bound** — `calls_commit.verify_calls_bound_to_summaries(proof, ns, tip_cursor, cursor,
     exec_summary_get, SETTLE_PROOF_MAX_SPAN)` (`:1076-1079`); span fence `SETTLE_PROOF_MAX_SPAN = 240`
-    (`protocol.py:521`) enforced.
+    (now `4 * EPOCH_LENGTH` in `protocol.py`) enforced.
   - **Protocol-parameter verify** — `SS.verify_settlement_sparse(proof, depth=EXEC_TREE_DEPTH)` at the
     protocol query strength, never the bundle's own word (`:1015-1018`).
 - **Apply side** — the proven marker is written at apply (`kv_ops.settlement_proven` set via
@@ -57,7 +76,10 @@ per-segment verify is already trustless, just not succinct.
   stack, and the native Rust prover (`libnado_starkprove`, ~5× faster / 4.5× less memory) all exist and are
   unit-tested.
 
-## What is NOT wired (the actual remaining work)
+## What is NOT wired (the actual remaining work) — HISTORICAL (2026-07-27)
+
+> Superseded: items 1-3 are done — the prover runs unconditionally (`execnode.py` `SETTLE_PROVE`) and the proof
+> branch is live in `ops/settlement_ops.settlement_justified` behind `SETTLE_PROOF_TRUSTLESS = True`.
 
 1. **No prover runs in production.** `execnode/execnode.py:239` posts `construct_settle_tx(keys, st.cursor,
    st.state_root(), target, ns=ns)` — **no `proof=` argument** — so every settlement today is a bare bonded
@@ -76,7 +98,7 @@ per-segment verify is already trustless, just not succinct.
 
 ---
 
-## Track 1 — turn trustless settlement ON (the "minor steps")
+## Track 1 — turn trustless settlement ON (the "minor steps") — HISTORICAL (done; see the TL;DR)
 
 Ordered. Each step names files, effort, whether it blocks trustless settlement, and a go/no-go test.
 
@@ -142,11 +164,17 @@ lands "present but active" at the reroll; the quorum path stays as the fallback 
 Not required for *trustless* settlement — native per-segment verify is already trustless. This is what
 shrinks the on-chain verify from O(K) to O(1) and the proof small enough to sit inside a normal tx.
 
-- **2.1 Wire the built fold** · moderate · Replace the native segment loop (`transaction_ops.py:1017 →
-  settlement_sparse.py:250`) with `verify_settlement_o1` (RV.verify), and have the prover emit
-  `prove_settlement_o1` bundles. Both exist + are tested (`tests/test_settlement_o1.py`) with no non-test
-  caller. Bind the FRI roots to the segment trace / state root first (`settlement_proofs.py:240-247` SCOPE
-  note) so the per-segment verify can actually be dropped.
+- **2.1 Wire the built fold** · ✅ **DONE (2026-07-27)** · `settlement_sparse.verify_settlement_sparse` now
+  verifies ONE `recursive_verify` bundle in place of the per-segment `verify_bound_epoch` exec check when a
+  `recursive` bundle is present (the sparse transition binding + kv chain still run per segment), and
+  `prove_settlement_sparse(recursive=True)` emits it by segmenting the span (reusing `prove_settlement`'s
+  proven segmentation) + folding the K exec proofs. The prover loop emits it under `NADO_EXEC_SETTLE_FOLD`.
+  The row-mode composition **already binds** the Merkle-authenticated trace rows to the AIR composition at
+  verifier-derived FS positions (`recursive_verify.py` module docstring), so the per-segment exec `stark.verify`
+  is genuinely dropped — the SCOPE caveat in `settlement_proofs.py:240-247` applied to the *FRI-only*
+  `prove_settlement_recursive` (deleted 2026-09-30, never called), not to `verify_settlement_o1`/this K→1 path. Proven: `test_settle_sparse_fold.py`.
+  Remaining fold increment (separate): also fold the K sparse **state-transition** proofs (a second bundle over
+  the transition AIR) — today they stay per-segment (the lighter half).
 - **2.2 In-circuit Fiat–Shamir keystone** · major (real crypto) · Move FS challenge/position derivation
   inside the proof (`fs_step`/`fs_chain`/`fs_incircuit` exist but are test-only) so inner roots collapse to
   one committed public input — `recursive_verify.py:53/103` derive FS natively today.

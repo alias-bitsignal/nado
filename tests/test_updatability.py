@@ -16,17 +16,17 @@ healthy would have passed on all 21.
 Run: python3 tests/test_updatability.py
 """
 import os, sys, tempfile, traceback, subprocess
-os.environ.setdefault("HOME", tempfile.mkdtemp(prefix="nado_upd_"))
+os.environ["HOME"] = tempfile.mkdtemp(prefix="nado_upd_")
+import atexit, shutil; atexit.register(shutil.rmtree, os.environ["HOME"], ignore_errors=True)   # leave no /tmp home behind (9,600 leaked by 2026-09-22)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ops import self_update as SU
+# THIS TEST MODELS A PRODUCTION NODE (Popen and geteuid are faked below). The suite runs every test under NADO_TESTNET,
+# and a testnet node never runs the installer (heal(), 2026-09-28 — tests/test_testnet_never_runs_the_installer.py).
+os.environ.pop("NADO_TESTNET", None)
 
-fails = 0
-def check(name, fn):
-    """Run fn; print PASS/FAIL and count failures."""
-    global fails
-    try: fn(); print(f"PASS  {name}")
-    except Exception as e:
-        fails += 1; print(f"FAIL  {name}: {e}"); traceback.print_exc()
+import _harness
+_report = _harness.Report()
+check = _report.run
 
 
 class patched:
@@ -55,7 +55,12 @@ def t_healthy_node_is_capable():
     """This repo is a real checkout with a unit — the baseline must be clean, or every other result is noise."""
     r = SU.updatability(probe_remote=False)
     assert r["checks"]["git_checkout"], f"this repo should be a checkout: {r}"
-    assert r["capable"], f"a healthy node must be capable: {r['blocking']}"
+    # Run from a review WORKTREE on another branch, "checkout is on '<branch>', not 'main'" is true and correct — that
+    # checkout could not fast-forward main — and says nothing about the node. Only that one reason is excused, and only
+    # when the branch really is not main.
+    other = [b for b in r["blocking"]
+             if not (r["checks"].get("branch") not in (None, "main") and b.startswith("checkout is on '"))]
+    assert not other, f"a healthy node must be capable: {other}"
 
 
 def t_gitless_node_is_detected():
@@ -148,7 +153,9 @@ def t_peer_hint_unknown_commit_kicks_a_check_once():
     calls = []
     def fake_check(trigger):
         calls.append(trigger); fired.set()
-    with patched(_hints={}, check_and_update=fake_check):
+    # wave_delay -> 0: the hint's check waits a random UPDATE_WAVE_JITTER delay (up to minutes) before it runs, and
+    # this test only asks WHETHER it runs — with the real delay it waited 5 s for a thread sleeping up to 180 s
+    with patched(_hints={}, check_and_update=fake_check, wave_delay=lambda _t: 0):
         assert SU.peer_hint("deadbeefcafe"), "unknown commit must kick a check"
         assert fired.wait(5), "the check thread must actually run"
         assert calls == ["peer-hint"], calls
@@ -244,5 +251,5 @@ for name, fn in [
 ]:
     check(name, fn)
 
-print("ALL PASSED" if not fails else f"{fails} FAILED")
-sys.exit(1 if fails else 0)
+print("ALL PASSED" if not _report.fails else f"{_report.fails} FAILED")
+sys.exit(1 if _report.fails else 0)

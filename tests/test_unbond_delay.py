@@ -8,6 +8,7 @@ Unbond-delay unit checks (BOND_UNLOCK_DELAY enforcement).
 """
 import os, sys, tempfile, traceback
 os.environ["HOME"] = tempfile.mkdtemp(prefix="nado_unbond_")
+import atexit, shutil; atexit.register(shutil.rmtree, os.environ["HOME"], ignore_errors=True)   # leave no /tmp home behind (9,600 leaked by 2026-09-22)
 os.environ["NADO_TESTNET"] = "1"
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 for d in ("index", "blocks", "logs", "peers"):
@@ -25,14 +26,9 @@ from ops.transaction_ops import create_txid, validate_transaction
 from signatures import generate_keydict, sign, unhex
 from protocol import B_MIN, BOND_UNLOCK_DELAY, CHAIN_ID
 
-fails = 0
-def check(name, fn):
-    """Run fn; print PASS/FAIL and count failures."""
-    global fails
-    try:
-        fn(); print(f"PASS  {name}")
-    except Exception as e:
-        fails += 1; print(f"FAIL  {name}: {e}"); traceback.print_exc()
+import _harness
+_report = _harness.Report()
+check = _report.run
 
 val = generate_keydict()
 create_account(val["address"], bonded=5 * B_MIN)
@@ -118,5 +114,5 @@ def t5_revert_symmetric():
 check("unbond is revert-symmetric (pending cleared, bonded unchanged)", t5_revert_symmetric)
 
 
-print(f"\n{'ALL UNBOND-DELAY CHECKS PASSED' if not fails else str(fails) + ' FAILURE(S)'}")
-sys.exit(1 if fails else 0)
+print(f"\n{'ALL UNBOND-DELAY CHECKS PASSED' if not _report.fails else str(_report.fails) + ' FAILURE(S)'}")
+sys.exit(1 if _report.fails else 0)

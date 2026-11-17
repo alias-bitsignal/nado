@@ -7,6 +7,7 @@ Pubkey-once unit checks (#19, security step 5).
 """
 import os, sys, tempfile, traceback
 os.environ["HOME"] = tempfile.mkdtemp(prefix="nado_pk1_")
+import atexit, shutil; atexit.register(shutil.rmtree, os.environ["HOME"], ignore_errors=True)   # leave no /tmp home behind (9,600 leaked by 2026-09-22)
 os.environ["NADO_TESTNET"] = "1"
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 for d in ("index", "blocks", "logs", "peers"):
@@ -24,14 +25,9 @@ from ops.transaction_ops import index_transactions, unindex_transactions, create
 from signatures import generate_keydict
 from protocol import CHAIN_ID
 
-fails = 0
-def check(name, fn):
-    """Run fn; print PASS/FAIL and count failures."""
-    global fails
-    try:
-        fn(); print(f"PASS  {name}")
-    except Exception as e:
-        fails += 1; print(f"FAIL  {name}: {e}"); traceback.print_exc()
+import _harness
+_report = _harness.Report()
+check = _report.run
 
 
 def dump_env():
@@ -79,5 +75,5 @@ def t2_and_t3():
 check("pubkey stored on first use + revert returns env BYTE-IDENTICAL", t2_and_t3)
 
 
-print(f"\n{'ALL PUBKEY-ONCE CHECKS PASSED' if not fails else str(fails) + ' FAILURE(S)'}")
-sys.exit(1 if fails else 0)
+print(f"\n{'ALL PUBKEY-ONCE CHECKS PASSED' if not _report.fails else str(_report.fails) + ' FAILURE(S)'}")
+sys.exit(1 if _report.fails else 0)

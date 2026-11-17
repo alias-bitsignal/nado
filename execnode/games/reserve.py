@@ -24,6 +24,7 @@ Slot model: slot(field, vid) = field*2^32 + vid, vid a frontend int < 2^32.
 Fields: 1 own · 2 ast · 3 res(UNITs) · 4 out · 5 ntc · 6 pnd(UNITs) · 7 rdy · 9 list; slot 0 = count.
 """
 from execnode import zkpy
+from execnode.games import _lib
 
 OWN, AST, RES, OUT, NTC, PND, RDY, LIST = 1, 2, 3, 4, 5, 6, 7, 9
 
@@ -46,6 +47,27 @@ def _c(m, field, vid):
     return m.slot(field, vid)
 
 
+# ---- the carry (tools/carry.py, doc/stwo/g5-carry.md) ------------------------------------------------------------
+# Nothing a vault holds is in flight: redeem and back have no clock, and a pending release is a NOTICE, not a race —
+# holders keep redeeming through it on either chain. The one old-chain value is `rdy`, the HEIGHT at which an announced
+# release unlocks (cursor + notice), which carry_rebase moves onto the new chain.
+def carry_rebase(storage, tip):
+    """This contract's storage on a new chain whose block 0 stands where the old chain's `tip` stood: every announced
+    release keeps EXACTLY the notice it had left (rdy - tip blocks), so the holders' redemption window is neither cut
+    short nor stretched; one whose notice already ran out unlocks at block 1 (rdy must stay non-zero — release reads 0 as
+    "nothing announced"). Heights do not advance while the chain is down, so blocks-left is the honest measure.
+    INVARIANT: written as an INT (exec_root commits only int-valued slots; _lib.rebase_daily_anchors)."""
+    slots = {str(k): v for k, v in ((storage or {}).get("slots") or {}).items()}
+    for vid in _lib.carry_ids(slots, 0, LIST):
+        k = str((RDY << 32) + vid)
+        rdy = int(slots.get(k, 0))
+        if rdy:
+            slots[k] = int(max(1, rdy - int(tip)))
+    out = dict(storage or {})
+    out["slots"] = slots
+    return out
+
+
 def build():
     c = zkpy.Contract()
 
@@ -53,20 +75,24 @@ def build():
     with c.method("open") as m:
         vid = m.arg(0)
         m.require(vid > 0)
+        m.require(vid < (1 << 32))                      # id is a slot key: field*2^32+vid. Without the
+        # upper bound a vid >= 2^32 aliases onto another field's slots (cross-entity storage aliasing —
+        # a permissionless permanent lock). The `lt` macro is exact over the 256-bit word, so every vid >= 2^32 fails it.
         m.require(_c(m, OWN, vid).get() == 0)          # vid unused
         m.require(m.in_asset() == 0)                   # the SEED is native; the asset is named, not sent
 
         # Args and ctx are LEAVES — re-materializing one costs an instruction, while parking it in a named
         # temp costs a register for the whole method. There are only six, so validate straight off the leaf.
-        # `!= 0`, NOT `> 0`. An asset id is a full field element, uniform in [0, P) with P ~ 2^64, but the
-        # `lt` macro RANGE-checks both operands and RANGE reverts at 2^62 (`_decomp62` — that bound is what
-        # makes a comparison unforgeable). So `arg(1) > 0` REVERTS for roughly three of every four assets,
-        # and the vault would have refused most of the tokens it exists to back. EQ carries no range gate.
+        # `!= 0`, NOT `> 0`. An asset id is a full hash word. On the gen-28 field VM the `lt` macro RANGE-checked
+        # both operands and RANGE reverts at 2^62, so `arg(1) > 0` REVERTED for roughly three of every four assets
+        # and the vault would have refused most of the tokens it exists to back. zkvm2's LT is exact over the
+        # 256-bit word, so that trap is gone, but EQ is the same test and keeps the deployed bytecode.
         # Rule: never order-compare a hash-derived value; only test it for equality.
         m.require(m.arg(1) != 0)                       # asset id
         m.require(m.arg(2) > 0)                        # supply
         m.require(m.arg(2) < BOUND)
         m.require(m.arg(3) + 1 > MIN_NOTICE)           # notice >= MIN_NOTICE, without a `ge`
+        m.require(m.arg(3) < (1 << 32))                # ...and bounded: an unbounded notice made release RANGE-revert forever
 
         # The caller STATES the reserve in UNITs and the contract checks it by MULTIPLYING. Deriving it
         # instead — `value // UNIT` — was wrong twice over: `//` is DIVMOD, whose divisor must be < 2^15
@@ -92,6 +118,7 @@ def build():
 
     # back(vid)[native] — anyone may add reserve. This is the ONLY way the floor goes up.
     with c.method("back") as m:
+        m.require(m.arg(0) < (1 << 32))                # C2 (2026-09-23): a vault id is a slot key
         vid = m.arg(0)
         m.require(_c(m, OWN, vid).get() != 0)
         m.require(m.in_asset() == 0)
@@ -105,6 +132,7 @@ def build():
 
     # redeem(vid)[asset] — burn what you sent, take amt*res//out. Floor-NEUTRAL: both terms fall together.
     with c.method("redeem") as m:
+        m.require(m.arg(0) < (1 << 32))                # C2 (2026-09-23): a vault id is a slot key
         vid = m.arg(0)
         m.require(_c(m, AST, vid).get() != 0)
         m.require(m.in_asset() == _c(m, AST, vid).get())   # the right token, and not native
@@ -129,6 +157,7 @@ def build():
     # announce(vid, amt) — owner starts the clock. Re-announcing RESTARTS it, so a pending small amount can
     # never be swapped for the whole reserve at the last second.
     with c.method("announce") as m:
+        m.require(m.arg(0) < (1 << 32))                # C2 (2026-09-23): a vault id is a slot key
         vid = m.arg(0)
         m.require(_c(m, OWN, vid).get() == m.caller())
         amt = m.set(m.arg(1), "amt")
@@ -139,6 +168,7 @@ def build():
         m.ret(amt)
 
     with c.method("cancel") as m:
+        m.require(m.arg(0) < (1 << 32))                # C2 (2026-09-23): a vault id is a slot key
         vid = m.arg(0)
         m.require(_c(m, OWN, vid).get() == m.caller())
         m.require(_c(m, PND, vid).get() > 0)
@@ -150,6 +180,7 @@ def build():
     # have taken the reserve below what was announced, and making the creator restart the wait for that would
     # punish them for the exits the notice is designed to enable.
     with c.method("release") as m:
+        m.require(m.arg(0) < (1 << 32))                # C2 (2026-09-23): a vault id is a slot key
         vid = m.arg(0)
         m.require(_c(m, OWN, vid).get() == m.caller())
         pnd = m.set(_c(m, PND, vid).get(), "pnd")

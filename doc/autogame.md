@@ -217,11 +217,11 @@ never reverts. **You cannot react to all 16 tiles.** Choosing which three or fou
 
 ## 4. The world
 
-Each step derives two 32-bit windows and slices them with small divisors (inside the DIVMOD soundness
-window):
+Each step derives two 32-bit windows and slices them with small divisors (`hash` is the VM's BLAKE2s word hash
+since generation 29; it was alghash on the Goldilocks VM, along with a DIVMOD window that no longer exists):
 
-    tw = lo32(alghash(H(lh), runId, i))     tile word
-    rw = lo32(alghash(H(nh), runId, i))     roll word
+    tw = lo32(hash(H(lh), runId, i))     tile word
+    rw = lo32(hash(H(nh), runId, i))     roll word
 
     tw:  a = tw % 100   tile class        rw:  x = rw % 100   variance
          tw //= 100                            rw //= 100
@@ -411,7 +411,7 @@ function the march animates and the contract is diff-tested against; it never re
 two methods (`post`, `anchor`) are the shared `_lib` routines mounted on the contract verbatim via
 `zkpy.Contract.asm()`. Files: `autogame-daily.js` (rules), `autogame-dailyui.js` (SDK panel),
 `tests/autogame_daily_verify.mjs` (the faucet oracle), `tests/autogame_daily_play.mjs`,
-`_autogame_daily_e2e.py` (the whole rail live: anchor → play → post → the distributor ranks it → a stolen
+`scripts/live/_autogame_daily_e2e.py` (the whole rail live: anchor → play → post → the distributor ranks it → a stolen
 claim does not).
 
 > One subtlety worth carrying: a day anchor is a field element up to 2^64, and JSON has no integers, so a
@@ -432,15 +432,16 @@ Deployed contract id: **`ba8bebc9693f5aaec0e338a13d5812c4`** (`autogame.nadochai
 | JS engine | `static/autogame-engine.js` | client prediction, animation, independent verification |
 | balance sim | `tests/autogame_balance.py` | economy harness (see its header) |
 | generated rules | `static/autogame-rules.js` | emitted from the contract; the browser's copy of every constant |
-| pixel art | `static/autogame-art.js` | the whole sprite world, ground-up: the wayfarer (gear composes the silhouette), 36 realm creatures, 18 animated props, gore, six fatalities — one primitive (fillRect), deterministic, verified by `tests/autogame_art_verify.mjs` |
-| live e2e | `_autogame_e2e.py` | the whole loop against the running node |
+| pixel art | `static/autogame-art.js` | the whole sprite world, ground-up: the wayfarer (gear composes the silhouette), 36 realm creatures, 18 animated props, gore, six fatalities — one primitive (fillRect), deterministic, verified by `tests/test_autogame_art_renders_inside_its_cell.mjs` |
+| live e2e | `scripts/live/_autogame_e2e.py` | the whole loop against the running node |
 
-`tests/autogame_contract_test.py` runs the contract and the Python model over the same hashes and asserts
+`tests/test_autogame_contract_matches_the_reference_model.py` runs the contract and the Python model over the same hashes and asserts
 step-for-step equality. A divergence in any of the three is a bug in the other two until proven otherwise.
 
-### Field-wrap discipline
+### Word-wrap discipline
 
-Goldilocks subtraction wraps, and a wrapped `hp` is a ~2^64 hit-point pool. **Every subtraction of a
+VM subtraction wraps (mod 2^256 since generation 29, mod the Goldilocks prime before), and a wrapped `hp` is an
+astronomically large hit-point pool. **Every subtraction of a
 player- or roll-controlled quantity goes through a clamped helper** — `select(a < b, 0, a - b)` — never a
 bare `sub`. This is the class of bug that produced the banked-table drain; it is the first thing to check in
 any diff to the step function.

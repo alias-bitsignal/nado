@@ -12,9 +12,10 @@ created on first credit like any other. SPENDING is where multisig differs from 
   * the tx body carries "multisig": descriptor (inside the SIGNED body, committed by the txid), and
     NO top-level public_key (there is none — the descriptor hash plays that role, so PUBKEY-ONCE
     never stores anything for a multisig account and every spend re-carries its full descriptor);
-  * the "signature" field is a LIST of {"public_key", "signature"} entries — each a normal ML-DSA-44
-    signature over unhex(txid) by a DISTINCT descriptor member (bound member->key by make_address,
-    exactly like proof_sender). At least `threshold` valid entries are required, and every entry
+  * the "signature" field is a LIST of {"public_key", "signature"} entries — each a normal signature
+    over unhex(txid) by a DISTINCT descriptor member (bound member->key by make_address, exactly like
+    proof_sender). ML-DSA-44 unless the entry names its scheme in "alg" (protocol.SIG_SCHEME_KEYS_HEIGHT):
+    a member address commits to its scheme, so a key under the wrong alg derives a non-member. At least `threshold` valid entries are required, and every entry
     must be valid (garbage/non-member/duplicate entries hard-fail rather than merely not counting,
     so acceptance is deterministic and verification work is bounded by len(members)).
 
@@ -74,7 +75,23 @@ def validate_descriptor(descriptor) -> tuple:
     return threshold, members
 
 
-def verify_multisig_origin(transaction) -> bool:
+def member_signs(member: str, public_key: str, alg, block_height) -> bool:
+    """May this key sign as `member` (MSIG_MEMBER_AUTH_HEIGHT)? A member with an auth config signs with a key that ALONE
+    satisfies its current signing policy (ops/auth_ops, the same rule key_authorized applies, under the entry's scheme)
+    — so a rotated-away key, possibly the stolen one the owner rotated away from, no longer signs as the member, and the
+    owner's current key does. A member without a config signs with the key its address derives from, as always."""
+    from protocol import AUTH_ACTIVE
+    from ops import auth_ops
+    from ops.kv_ops import get_account
+    acc = get_account(member) if AUTH_ACTIVE else None
+    if acc is not None and auth_ops.is_configured(acc):
+        cfg = auth_ops.effective_config(member, acc, block_height)
+        i = auth_ops.signer_index(public_key, member, cfg, alg)
+        return i is not None and auth_ops.policy_satisfied(cfg["sign"], {i})
+    return make_address(public_key, alg=alg) == member
+
+
+def verify_multisig_origin(transaction, block_height=None) -> bool:
     """The multisig counterpart of validate_origin: prove the spend was authorized by the account's
     policy. Checks (raising on the first failure): descriptor is canonical, the SENDER is exactly
     the descriptor's derived address (the binding that makes the descriptor unforgeable — a wrong
@@ -94,15 +111,31 @@ def verify_multisig_origin(transaction) -> bool:
     message = unhex(transaction["txid"])
     signed_by = set()
     for entry in entries:
+        # the entry list is outside the txid: its keys and hex spelling are pinned by
+        # transaction_ops.excluded_witness_check (audit 2026-09-25) — make_address lowercases a format-2 key, so a
+        # re-cased member key verified here unchanged; a new entry field must be added THERE too
         assert isinstance(entry, dict), "each multisig signature entry must be an object"
         public_key = entry.get("public_key")
         signature = entry.get("signature")
+        alg = entry.get("alg")                 # absent = ML-DSA-44; its shape and gate are excluded_witness_check's
         assert isinstance(public_key, str) and isinstance(signature, str), \
             "multisig signature entry needs public_key + signature hex"
-        member = make_address(public_key)
-        assert member in members, "signature by a non-member key"
+        from protocol import MSIG_MEMBER_AUTH_HEIGHT
+        derived = make_address(public_key, alg=alg)
+        if block_height is not None and int(block_height) >= MSIG_MEMBER_AUTH_HEIGHT:
+            # A PROTECTED MEMBER SIGNS WITH ITS CURRENT KEY (2026-11-04): an entry names its `member` when its key does
+            # not derive that address (a rotated key; one spelling, so never when it does), and every entry must be a
+            # key the member's own auth config accepts alone (member_signs). Before the height a member was only ever
+            # the address its key derives — a protected member's current key could not sign, its old one still could.
+            member = entry.get("member", derived)
+            assert "member" not in entry or member != derived, "an entry names its member only when its key does not derive it"
+            assert member in members, "signature by a non-member key"
+            assert member_signs(member, public_key, alg, block_height), f"this key does not sign for member {member}"
+        else:
+            member = derived
+            assert member in members, "signature by a non-member key"
         assert member not in signed_by, "duplicate signature by the same member"
-        assert verify(signed=signature, public_key=public_key, message=message), \
+        assert verify(signed=signature, public_key=public_key, message=message, alg=alg), \
             f"invalid multisig signature from {member}"
         signed_by.add(member)
 
@@ -145,7 +178,7 @@ def draft_multisig_spend(threshold, members, recipient, amount, fee, max_block, 
     return body
 
 
-def add_member_signature(transaction, private_key):
+def add_member_signature(transaction, private_key, alg=None, member=None):
     """Append one member's signature entry to a proposal (verifying the txid first, so a member can
     never be tricked into signing a body that doesn't match the id they're shown). Idempotent per
     member; raises if the key isn't a descriptor member. Returns (transaction, signatures_present)."""
@@ -154,12 +187,17 @@ def add_member_signature(transaction, private_key):
     threshold, members = validate_descriptor(transaction["multisig"])
     body = {k: v for k, v in transaction.items() if k not in ("signature", "txid")}
     assert create_txid(body) == transaction["txid"], "proposal txid does not match its contents"
-    keydict = from_private_key(private_key)
-    assert keydict["address"] in members, "this key is not a member of the multisig"
+    keydict = from_private_key(private_key, alg=alg)
+    # `member`: the member a PROTECTED account's current (rotated) key signs for — its key derives another address
+    as_member = member or keydict["address"]
+    assert as_member in members, "this key is not a member of the multisig"
     entries = transaction.setdefault("signature", [])
-    if not any(make_address(e.get("public_key", "")) == keydict["address"] for e in entries):
-        entries.append({
-            "public_key": keydict["public_key"],
-            "signature": sign(private_key=private_key, message=unhex(transaction["txid"])),
-        })
+    if not any(e.get("member", make_address(e.get("public_key", ""), alg=e.get("alg"))) == as_member for e in entries):
+        entry = {"public_key": keydict["public_key"],
+                 "signature": sign(private_key=private_key, message=unhex(transaction["txid"]), alg=alg)}
+        if alg:
+            entry["alg"] = alg
+        if as_member != keydict["address"]:
+            entry["member"] = as_member
+        entries.append(entry)
     return transaction, len(entries)

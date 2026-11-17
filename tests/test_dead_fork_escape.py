@@ -19,17 +19,14 @@ positive one.
 Run: python3 tests/test_dead_fork_escape.py
 """
 import os, sys, tempfile, traceback
-os.environ.setdefault("HOME", tempfile.mkdtemp(prefix="nado_fork_"))
+os.environ["HOME"] = tempfile.mkdtemp(prefix="nado_fork_")
+import atexit, shutil; atexit.register(shutil.rmtree, os.environ["HOME"], ignore_errors=True)   # leave no /tmp home behind (9,600 leaked by 2026-09-22)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ops import peer_ops as P
 
-fails = 0
-def check(name, fn):
-    """Run fn; print PASS/FAIL and count failures."""
-    global fails
-    try: fn(); print(f"PASS  {name}")
-    except Exception as e:
-        fails += 1; print(f"FAIL  {name}: {e}"); traceback.print_exc()
+import _harness
+_report = _harness.Report()
+check = _report.run
 
 OURS   = "7c7a7c08c5a77164c7a6ebed" + "0" * 40      # the real wedged hash, padded to 64
 THEIRS = "eb9d6de853b94c47f79335a1" + "0" * 40      # what the network actually had at 19988
@@ -119,5 +116,5 @@ for name, fn in [
 ]:
     check(name, fn)
 
-print("ALL PASSED" if not fails else f"{fails} FAILED")
-sys.exit(1 if fails else 0)
+print("ALL PASSED" if not _report.fails else f"{_report.fails} FAILED")
+sys.exit(1 if _report.fails else 0)

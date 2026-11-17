@@ -5,7 +5,7 @@
 // cursor, amounts, commit-reveal secrets, QR, alias resolution, and Share. See dice.js / roulette.js.
 //
 // Usage:
-//   import { NadoDapp, rawToNado, nadoToRaw, randId, randSecret, commitHashOf, _m, $ } from "./nadodapp.js";
+//   import { NadoDapp, rawToNado, nadoToRaw, randId, randSecret, algHashn, _m, $ } from "./nadodapp.js";
 //   const dapp = new NadoDapp({ cid: "…", app: "Dice" });
 //   dapp.onReturn((pend, ok, err) => { /* update your #status, mark local pending state */ });
 //   await dapp.init();                       // loads crypto + processes any wallet return
@@ -13,11 +13,16 @@
 //   dapp.call("bet", [g, t, ...args], stakeRaw, "human label", { table: t, phase: "bet" });
 //   await dapp.refresh();                    // dapp.me, dapp.exec, dapp.l1, dapp.cursor
 //   const sto = await dapp.storage();        // the contract's storage maps
-import { loadCrypto, blake2bHash } from "./nadotx.js?v=6d199166";
-import * as alghash from "./alghash.js?v=849f345a";
-export { loadCrypto, blake2bHash };
+import { loadCrypto, blake2bHash } from "./nadotx.js";
+// PROTOCOL CONSTANTS come from the serving relay's /protocol.js (protocol.CLIENT_EXPORTS rendered by nado.py from the
+// protocol.py it runs) — never copied here. Every game page is served by a relay, so this adds no trust the page did
+// not already place in it. Re-exported so a game imports them from the SDK like everything else (BLOCK_TIME for its
+// countdowns, EPOCH_LENGTH for beacon seats); tests/test_constant_mirrors.py refuses a literal copy anywhere in static/.
+import { EPOCH_LENGTH, BLOCK_TIME, DENOMINATION, ADDRESS_PREFIX, ADDRESS_BODY, ADDRESS_CHECKSUM, CHAIN_ID } from "/protocol.js";
+import { hashWords } from "./blake2s.js";
+export { loadCrypto, blake2bHash, EPOCH_LENGTH, BLOCK_TIME };
 
-export const RAW = 10n ** 10n;                 // 1 NADO = 1e10 raw units
+export const RAW = BigInt(DENOMINATION);       // 1 NADO = 1e10 raw units (protocol.DENOMINATION)
 const WALLET = "https://get.nadochain.com";
 const STICKY_GRACE_MS = 20000;   // how long a provisional state REGRESSION is treated as flicker (ignored) before it's accepted as a real reorg — see dapp.accept()
 const PEND_TTL_MS = 120000;      // how long a CLICKED action stays "pending" with no on-chain confirmation before its gate self-expires (a lost tx must re-enable retry — never brick a button); matches the proven pets hatch stamp
@@ -29,35 +34,32 @@ const PEND_TTL_MS = 120000;      // how long a CLICKED action stays "pending" wi
 const PEND_TIP_TTL = 4;
 const STALL_MS = 45000;          // exec cursor frozen this long = the chain isn't advancing (node catching up / partition), not "your tx is slow" — see chainStalled()
 // ---- address format (ONE constant — see the rebrand-proofing rule) --------------------------------
-// An address is ADDR_PREFIX + 42 hex of the pubkey + a 4-hex blake2b checksum over prefix+body.
-export const ADDR_PREFIX = "mldsa44";
-const ADDR_BODY = 42;
-const ADDR_RE = new RegExp("^" + ADDR_PREFIX + "[0-9a-f]{" + (ADDR_BODY + 4) + "}$");
+// An address is a 42-hex hash of the pubkey (format 2, gen 28) + an 8-hex blake2b checksum over it. No prefix (betanet-14).
+export const ADDR_PREFIX = ADDRESS_PREFIX;    // "" since betanet-14; NO backwards compatibility
+// A format-2 address cannot be derived from a format-1 one (it hashes the whole key), so the signed-in session is kept
+// under a key of its own (LS_ME below): the pre-format-2 session is simply not read, and the next sign-in returns the
+// new address.
+// a 4-byte checksum (protocol.ADDRESS_CHECKSUM; format 1 had 2): an old 46-char address is not an address here
+const ADDR_CK = ADDRESS_CHECKSUM;
+const ADDR_BODY = ADDRESS_BODY;
+export const ADDR_LEN = ADDR_PREFIX.length + ADDR_BODY + ADDR_CK * 2;
+const ADDR_RE = new RegExp("^" + ADDR_PREFIX + "[0-9a-f]{" + (ADDR_BODY + ADDR_CK * 2) + "}$");
+export const isAddress = (a) => typeof a === "string" && ADDR_RE.test(a);
 
 /**
- * SELF-HEAL a signed-in session address across an address-format change (the alphanet-7 debrand:
- * ndo… → mldsa44…). Games persist only the ADDRESS from the wallet handshake, so a session established
- * before the change keeps the OLD string in localStorage forever — the game then reads balances/state for
- * an address that owns nothing and shows the player an empty account ("0 NADO", "Playing as ndo…") while
- * their funds sit under the new-format address for the very same key. A hard refresh can't fix it.
+ * NORMALISE a persisted session address. Games persist only the ADDRESS from the wallet handshake, so a session
+ * established before an address-format change keeps the OLD string in localStorage forever — the game then reads
+ * balances/state for an address that owns nothing and shows the player an empty account while their funds sit under
+ * the new-format address for the very same key. A hard refresh can't fix it.
  *
- * The pubkey body is always the 42 chars before the 4-hex checksum, so the new address is recoverable
- * from the old one WITHOUT the pubkey and without knowing the old prefix — which keeps this correct for
- * any future rename too. The old checksum is verified first; anything that isn't a well-formed address of
- * SOME generation is dropped (null) rather than guessed at, forcing a clean re-sign-in.
+ * The prefix-change debrands (ndo… → mldsa44… → prefixless) were healed here from the old string alone, because the
+ * body was the key's leading hex. A FORMAT-2 ADDRESS (gen 28) CANNOT BE HEALED FROM A FORMAT-1 ONE — it hashes the
+ * whole key — so that heal is gone: anything that is not a current address is dropped (null), forcing a clean sign-in.
  */
 export function healAddress(a) {
   if (!a || typeof a !== "string") return null;
   a = a.trim().toLowerCase();
-  if (ADDR_RE.test(a)) return a;                                  // already current — the common path
-  if (!/^[a-z][a-z0-9]*[0-9a-f]{46}$/.test(a)) return null;       // not an address of any generation
-  try {
-    const tail = a.slice(0, -4);                                  // prefix + body
-    if (blake2bHash(tail, 2) !== a.slice(-4)) return null;         // failed its own checksum → junk
-    const body = tail.slice(-ADDR_BODY);                          // the pubkey body, prefix-agnostic
-    const fresh = ADDR_PREFIX + body;
-    return fresh + blake2bHash(fresh, 2);
-  } catch (e) { return null; }                                     // crypto not bound yet → retry in init()
+  return ADDR_RE.test(a) ? a : null;
 }
 
 export const base = () => location.origin.replace(/\/+$/, "");
@@ -89,11 +91,95 @@ export function orderCards(ids) {
 // click no longer navigates away — without it a submitted bet/spin/buy-in feels like nothing happened. Injected
 // once (dapp.init calls it); a capturing document listener flashes the clicked button, forcing a reflow so rapid
 // re-clicks re-trigger the animation. Purely cosmetic; ignores disabled buttons.
+/* THEME, on every dapp page. Game pages carry inline <style> and load no shared stylesheet, so the SDK
+ * brings the palette with it: link static/theme.css (the generated single source of truth) and mirror the
+ * wallet's stored choice onto <html>. Without this the SDK's own chrome — toggles, mode tabs, modals,
+ * toasts — rendered its hardcoded fallbacks, so the wallet themed and every game stayed brand teal.
+ *
+ * Runs before first paint where it can (the SDK is loaded in <head> by the game pages) and is idempotent,
+ * so a page that loads the SDK twice does not stack link elements. The stored value is validated rather
+ * than trusted: an unknown id leaves the :root defaults in charge instead of half-styling the page. */
+let _themeOn = false;
+function applyDappTheme() {
+  if (_themeOn || typeof document === "undefined") return; _themeOn = true;
+  try {
+    if (!document.getElementById("nadoThemeCSS")) {
+      const l = document.createElement("link");
+      l.id = "nadoThemeCSS"; l.rel = "stylesheet"; l.href = "/static/theme.css";
+      document.head.appendChild(l);
+    }
+    const t = localStorage.getItem("nado_theme");
+    if (t && /^[a-z]{3,10}$/.test(t) && t !== "teal") document.documentElement.setAttribute("data-theme", t);
+    else document.documentElement.removeAttribute("data-theme");
+  } catch (e) { /* storage disabled — the default palette is correct */ }
+}
+try { applyDappTheme(); } catch (e) {}
+
+/* POLISH, on every dapp page — the parts of a page's chrome that should read the same everywhere:
+ *  - the intro paragraph keeps ONE lead sentence; the rest opens under "How this works ›"
+ *  - emoji glyphs leave headings, labels, the hub link and the mode bar (they are not icons, and they
+ *    render as boxes wherever the system has no emoji font)
+ *  - the wallet card's balances and bank controls are hidden until someone is signed in
+ * Idempotent, and re-run on "nado-lang" because i18n rewrites the very nodes it touches. */
+const _EMO = /[\p{Extended_Pictographic}\u{FE0F}\u{200D}\u{20E3}]+\s*/gu;
+function _stripEmoji(el) {
+  const w = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  for (let n = w.nextNode(); n; n = w.nextNode()) if (_EMO.test(n.nodeValue)) { _EMO.lastIndex = 0; n.nodeValue = n.nodeValue.replace(_EMO, ""); }
+  _EMO.lastIndex = 0;
+}
+let _polishCssOn = false;
+export function polishPage() {
+  if (typeof document === "undefined") return;
+  if (!_polishCssOn) {
+    _polishCssOn = true;
+    const st = document.createElement("style");
+    st.textContent = "details.more{margin:0 0 6px}details.more summary{cursor:pointer;list-style:none;color:var(--accent2,#00c9a7);font-size:12px;font-weight:600;display:inline-block;padding:2px 0}"
+      + "details.more summary::-webkit-details-marker{display:none}details.more summary::after{content:' ›';color:var(--faint,#5d6b7a)}details.more[open] summary::after{content:' ‹'}"
+      + "details.more>div{margin-top:6px;color:var(--dim,#93a1b0);font-size:12.5px}"
+      + "#walletcard:not(.signed) .needsig{display:none}"
+      + ":is(button,a,input,select,summary):focus-visible{outline:2px solid var(--accent2,#00c9a7);outline-offset:2px}";
+    document.head.appendChild(st);
+  }
+  try {
+    // intro: one sentence stays, the rest folds
+    const sub = document.querySelector("header + p.sub, header ~ p.sub, p.sub");
+    // i18n rewrites the paragraph's innerHTML on every language apply, which puts the folded text back;
+    // a long paragraph next to an existing fold means exactly that — redo it from scratch
+    if (sub && sub.nextElementSibling?.classList?.contains("more") && (sub.textContent || "").trim().length > 170) sub.nextElementSibling.remove();
+    if (sub && !sub.nextElementSibling?.classList?.contains("more") && (sub.textContent || "").trim().length > 170) {
+      const w = document.createTreeWalker(sub, NodeFilter.SHOW_TEXT);
+      let seen = 0, cut = null;
+      for (let n = w.nextNode(); n && !cut; n = w.nextNode()) {
+        const m = /[.!?](\s)/.exec(n.nodeValue);
+        if (m && seen + m.index > 50) cut = [n, m.index + 1];
+        seen += n.nodeValue.length;
+      }
+      if (cut) {
+        const r = document.createRange(); r.setStart(cut[0], cut[1]); r.setEndAfter(sub.lastChild);
+        const rest = r.extractContents();
+        if ((rest.textContent || "").trim().length > 40) {
+          const d = document.createElement("details"); d.className = "more";
+          d.innerHTML = "<summary>" + (typeof _t === "function" ? _t("howThisWorks", "How this works") : "How this works") + "</summary><div></div>";
+          d.lastChild.appendChild(rest);
+          sub.after(d);
+        } else sub.append(rest);
+      }
+    }
+    // glyphs out of chrome text
+    document.querySelectorAll(".hub, #walletcard .k, .card h2, #modeBar, .seg button, #walletcard button").forEach(_stripEmoji);
+    // the wallet card: rows that only mean something once signed in
+    for (const id of ["l1bal", "bal"]) { const e = document.getElementById(id); const row = e && e.closest(".kv"); if (row) row.classList.add("needsig"); }
+    for (const id of ["buyinSlider", "cashoutSlider"]) { const e = document.getElementById(id); const box = e && e.parentElement && e.parentElement.parentElement; if (box) box.classList.add("needsig"); }
+    const ba = document.getElementById("bankAmt"); const brow = ba && ba.closest(".row"); if (brow) brow.classList.add("needsig");
+  } catch (e) { /* cosmetic — never let the polish pass break a page */ }
+}
+if (typeof window !== "undefined") window.addEventListener("nado-lang", () => setTimeout(polishPage, 0));
+
 let _clickFxOn = false;
 function enableClickFeedback() {
   if (_clickFxOn || typeof document === "undefined") return; _clickFxOn = true;
   const s = document.createElement("style");
-  s.textContent = "@keyframes nadoClickFx{0%{box-shadow:0 0 0 0 rgba(0,201,167,.6);transform:scale(.96)}100%{box-shadow:0 0 0 16px rgba(0,201,167,0);transform:scale(1)}}button.nado-fx{animation:nadoClickFx .5s ease-out}";
+  s.textContent = "@keyframes nadoClickFx{0%{box-shadow:0 0 0 0 rgba(var(--accent-rgb),.6);transform:scale(.96)}100%{box-shadow:0 0 0 16px rgba(var(--accent-rgb),0);transform:scale(1)}}button.nado-fx{animation:nadoClickFx .5s ease-out}";
   document.head.appendChild(s);
   document.addEventListener("click", (e) => {
     const b = e.target && e.target.closest && e.target.closest("button");
@@ -105,7 +191,18 @@ function enableClickFeedback() {
 
 // ---- amounts -------------------------------------------------------------------------------------
 export function nadoToRaw(s) {
-  s = String(s || "").trim().replace(",", ".");   // Czech/EU keyboards type "0,20" — accept it as 0.20
+  // Same decimal-separator rules as the wallet (interface.js nadoToRaw) — the two MUST agree, or an amount
+  // a game accepts is one the wallet then rejects at signing. Spaces/apostrophes are grouping; with BOTH
+  // separators present the LAST is the decimal; a lone separator is the decimal (under-states rather than
+  // over-sends). The old `replace(",", ".")` only replaced the FIRST comma, so "1.234,56" fell through.
+  s = String(s || "").trim().replace(/[\s  ']/g, "");
+  const lastDot = s.lastIndexOf("."), lastCom = s.lastIndexOf(",");
+  if (lastDot >= 0 && lastCom >= 0) {
+    const dec = Math.max(lastDot, lastCom);
+    s = s.slice(0, dec).replace(/[.,]/g, "") + "." + s.slice(dec + 1);
+  } else {
+    s = s.replace(",", ".");
+  }
   if (!/^\d+(\.\d+)?$/.test(s)) return null;
   const [w, f = ""] = s.split("."); const raw = BigInt(w) * RAW + BigInt((f + "0000000000").slice(0, 10));
   return raw > 0n ? raw : null;
@@ -122,38 +219,46 @@ export const randId = () => globalThis.crypto.getRandomValues(new Uint32Array(1)
 // reconvene at one new game/table instead of scattering to random ids. (LCG mix -> uniform over 0..1e9)
 export const rematchId = (oldId) => Number((BigInt(oldId) * 6364136223846793005n + 1442695040888963407n) % 1000000000n);
 export const randSecret = () => { let h = "0x"; for (const b of globalThis.crypto.getRandomValues(new Uint8Array(32))) h += b.toString(16).padStart(2, "0"); return BigInt(h); };
-export const commitHashOf = (secret) => BigInt("0x" + blake2bHash(secret));   // 256-bit; == VM HASH(secret)
-// chainResult(shHex, sh1Hex, salt, mod): the ONE beacon-game result formula, shared by every game so it can
-// never drift from the contract — result = HASH(bh(sh) + bh(sh+1) + salt) % mod. Passes a BigInt to blake2bHash
-// so canonicalize emits bare digits, EXACTLY matching the VM's HASH(<int>). Returns null if a hash is missing.
-export function chainResult(shHex, sh1Hex, salt, mod) {
-  if (!shHex || !sh1Hex) return null;
-  const seed = BigInt("0x" + shHex) + BigInt("0x" + sh1Hex) + BigInt(salt);
-  return Number(BigInt("0x" + blake2bHash(seed)) % BigInt(mod));
-}
-// chainResultAlg: the zkVM-era beacon result, byte-matching the ported contracts' in-VM alghash HASH +
-// LO32 window. The contract computes ws = alghash.hashn([(BLOCKHASH(sh)+BLOCKHASH(sh+1)+salt) mod P])'s low
-// 32 bits % mod. BLOCKHASH enters the VM reduced mod P, so the client reduces each block hash mod P too.
-let _algReady = false;
-function _ensureAlg() { if (!_algReady) { alghash.initAlghash(blake2bHash); _algReady = true; } }
+// No blake2b "chain result" / commit helper lives here any more (chainResult, commitHashOf — deleted 2026-10-10):
+// both were commented "== VM HASH" but hashed with blake2b, which the zkVM contracts do not use, so any page that
+// picked them up previewed a result the contract would not pay. The contract-matching forms are chainResultAlg
+// (beacon / block-hash results) and algHashn (commits, structures hashed in the VM word). Do not reintroduce a blake2b one.
+// EPOCH_LENGTH (imported from /protocol.js and re-exported above): the beacon epoch. A beacon seat bound to epoch gb
+// settles once the exec cursor reaches gb * EPOCH_LENGTH (its gh is that height minus one).
+// chainResultAlg (the name is gen 28's; it is BLAKE2s now): the beacon result, byte-matching the contracts' in-VM HASH + LO32 window: the contract computes
+// ws = HASH([(BLOCKHASH(sh)+BLOCKHASH(sh+1)+salt) mod 2^256])'s low 32 bits % mod.
+// THE GENERATION'S VM (Goldilocks retirement G3). The gen-29 contracts run on the 256-bit zkvm2: their HASH is a BLAKE2s
+// word chain (static/blake2s.js hashWords == execnode/zkvm2.hash_words), their word wraps at 2^256, and a block hash
+// enters the VM whole, at every height (BLAKE_EXEC_HEIGHT, gen 28's gate, inlined in G9; the assembler's field-VM ISA
+// went in slice 3b — the gen-28 alghash branches here went with them; a game page that reintroduces one
+// previews a roll the chain will not settle). INVARIANT: a game page never hashes on its own — only through these
+// helpers. The last Goldilocks hash in the browser (alghash.js, behind a gen-28-pinned algHashnV1 for the Daily
+// Gauntlet's road) was deleted with G9: nothing on gen 29 had ever been scored with it (measured 2026-10-28, see
+// static/autogame-daily.js). Do not bring back a pinned second hash — every structure follows the VM's.
+const WORD = 1n << 256n;
 export function chainResultAlg(shHex, sh1Hex, salt, mod) {
   if (!shHex || !sh1Hex) return null;
-  _ensureAlg();
-  const P = alghash.P;
-  const seed = ((BigInt("0x" + shHex) % P) + (BigInt("0x" + sh1Hex) % P) + (BigInt(salt) % P)) % P;
-  const h = alghash.hashn([seed]);
-  return Number((h & 0xFFFFFFFFn) % BigInt(mod));   // LO32 window, then % mod (matches DIVMOD in the contract)
+  const seed = (BigInt("0x" + shHex) + BigInt("0x" + sh1Hex) + BigInt(salt)) % WORD;
+  return Number((hashWords([seed]) & 0xFFFFFFFFn) % BigInt(mod));   // LO32 window, then % mod (DIVMOD in the contract)
 }
-// algHashn(elements): the raw in-VM alghash HASH for games that build their own field-native structures
-// (e.g. battleship's merkle-sum board). Accepts BigInt/Number/string, reduces mod P, matches hashn exactly.
+// algHashn(elements): the raw in-VM HASH (the BLAKE2s word hash, despite the gen-28 name) for games that build their
+// own structures (e.g. battleship's merkle-sum board). Accepts BigInt/Number/string, reduces into the generation's word, matches the contract's `hash` exactly.
 export function algHashn(elements) {
-  _ensureAlg();
-  const P = alghash.P;
-  return alghash.hashn(elements.map((x) => ((BigInt(x) % P) + P) % P));
+  return hashWords(elements.map((x) => ((BigInt(x) % WORD) + WORD) % WORD));
 }
-export const ALG_P = () => alghash.P;
-// blocksToTime(blocks): render a block count as m:ss at the given block time (default 6s) — shared countdown fmt.
-export const blocksToTime = (blocks, secs = 6) => { const b = Math.max(0, blocks) * secs, m = Math.floor(b / 60), s = b % 60; return m + ":" + String(s).padStart(2, "0"); };
+// ALG_P: the modulus a page reduces by — 2^256, the gen-29 VM's wrapping word, despite the name (the Goldilocks prime
+// was gen 28's; G9)
+export const ALG_P = () => WORD;
+// blocksToTime(blocks): a block count as elapsed time at the given block time (default 6s). A few minutes
+// reads best as m:ss, but a swap window of two days does NOT read as "3809:18" — above an hour it switches
+// to the units people actually use. Short game countdowns are unchanged.
+export const blocksToTime = (blocks, secs = 6) => {
+  const t = Math.max(0, blocks) * secs;
+  if (t >= 86400) { const d = Math.floor(t / 86400), h = Math.round((t % 86400) / 3600); return h ? `${d}d ${h}h` : `${d}d`; }
+  if (t >= 3600) { const h = Math.floor(t / 3600), m = Math.round((t % 3600) / 60); return m ? `${h}h ${m}m` : `${h}h`; }
+  const m = Math.floor(t / 60), sec = t % 60;
+  return m + ":" + String(sec).padStart(2, "0");
+};
 // fmtWhen(ts, day): the shared "when was this scored" stamp for a leaderboard entry. `ts` is chain-minted
 // UTC seconds (0 = the entry predates the timestamp field); `day` is the UTC day index (floor(unix/86400)).
 // A real ts renders day + HH:MM UTC ("Jul 22 · 14:30"); with only a day we can show the date but not the
@@ -180,14 +285,14 @@ export function modalDialog({ title, body, okLabel = _t("ok", "OK"), cancelLabel
   ov.id = "nadoModal";
   ov.style.cssText = "position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;background:rgba(4,8,12,.72);padding:16px";
   const card = document.createElement("div");
-  card.style.cssText = "background:#131a23;border:1px solid #243140;border-radius:16px;max-width:420px;width:100%;padding:20px;box-shadow:0 20px 60px rgba(0,0,0,.6)";
-  card.innerHTML = '<div style="font-size:17px;font-weight:800;color:#e6edf3;margin-bottom:8px">' + title + "</div>"
-    + '<div style="font-size:13.5px;color:#93a1b0;line-height:1.55;margin-bottom:16px">' + body + "</div>";
+  card.style.cssText = "background:var(--bg-elev);border:1px solid var(--border);border-radius:16px;max-width:420px;width:100%;padding:20px;box-shadow:0 20px 60px rgba(0,0,0,.6)";
+  card.innerHTML = '<div style="font-size:17px;font-weight:800;color:var(--txt);margin-bottom:8px">' + title + "</div>"
+    + '<div style="font-size:13.5px;color:var(--txt-dim);line-height:1.55;margin-bottom:16px">' + body + "</div>";
   const row = document.createElement("div");
   row.style.cssText = "display:flex;gap:10px";
   const mk = (txt, primary) => { const b = document.createElement("button"); b.textContent = txt;
-    b.style.cssText = "flex:1;font:inherit;font-weight:800;border-radius:11px;padding:12px;cursor:pointer;border:1px solid #243140;"
-      + (primary ? "background:linear-gradient(135deg,#00ad93,#00c9a7);color:#04110a;border-color:transparent" : "background:#1a232e;color:#e6edf3"); return b; };
+    b.style.cssText = "flex:1;font:inherit;font-weight:800;border-radius:11px;padding:12px;cursor:pointer;border:1px solid var(--border);"
+      + (primary ? "background:linear-gradient(135deg,var(--accent),var(--accent-2));color:var(--bg);border-color:transparent" : "background:var(--bg-elev2);color:var(--txt)"); return b; };
   const cancel = mk(cancelLabel, false), ok = mk(okLabel, true);
   cancel.onclick = () => ov.remove();
   ok.onclick = () => { ov.remove(); onOk && onOk(); };
@@ -218,9 +323,9 @@ export function inviteGate(dapp, { kind, id, title, body, joinLabel, onJoin }) {
 // should send anything a player needs to NOTICE here instead of #status; #status stays for the in-place
 // "confirming…" lifecycle. `notify`/`toast`/`ok` below are thin helpers over this.
 const _ALERT_TONES = {
-  warn: { bg: "#2a1214", bd: "rgba(248,81,73,.65)", fg: "#ffb4ae", icon: "⚠ " },
-  info: { bg: "#0e2027", bd: "rgba(0,201,167,.5)", fg: "#7fe9d3", icon: "" },
-  ok:   { bg: "#0f2417", bd: "rgba(0,201,167,.55)", fg: "#8ff0c6", icon: "" },   // messages carry their own ✓
+  warn: { bg: "#2a1214", bd: "rgba(248,81,73,.65)", fg: "#ffb4ae", icon: "" },
+  info: { bg: "#0e2027", bd: "rgba(var(--accent-rgb),.5)", fg: "#7fe9d3", icon: "" },
+  ok:   { bg: "#0f2417", bd: "rgba(var(--accent-rgb),.55)", fg: "#8ff0c6", icon: "" },   // messages carry their own ✓
 };
 // ---- SDK modal dialogs (uiConfirm / uiPrompt / uiAlert) -------------------------------------------------
 // A self-contained replacement for the browser's blocking alert()/confirm()/prompt() — themed, i18n-aware,
@@ -234,13 +339,13 @@ function _modalCSS() {
   s.textContent =
     ".sdk-modal-bg{position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(3,6,10,.66);backdrop-filter:blur(3px);animation:sdkFade .14s ease}"
     + ".sdk-modal-bg.hidden{display:none}"
-    + ".sdk-modal{max-width:400px;width:100%;background:var(--card,var(--panel,#141a24));color:var(--txt,var(--fg,#e8eef6));border:1px solid var(--border,rgba(255,255,255,.12));border-radius:14px;padding:20px;box-shadow:0 18px 50px rgba(0,0,0,.5);animation:sdkPop .16s cubic-bezier(.2,.9,.3,1.15)}"
+    + ".sdk-modal{max-width:400px;width:100%;background:var(--card,var(--bg-elev,#141a24));color:var(--txt,#e8eef6);border:1px solid var(--border,rgba(255,255,255,.12));border-radius:14px;padding:20px;box-shadow:0 18px 50px rgba(0,0,0,.5);animation:sdkPop .16s cubic-bezier(.2,.9,.3,1.15)}"
     + ".sdk-modal h3{margin:0 0 12px;font-size:16px;font-weight:700}"
-    + ".sdk-modal-body{color:var(--dim,var(--txt-dim,#9fb0c3));font-size:14px;margin-bottom:14px;white-space:pre-line}.sdk-modal-body.hidden{display:none}"
+    + ".sdk-modal-body{color:var(--txt-dim);font-size:14px;margin-bottom:14px;white-space:pre-line}.sdk-modal-body.hidden{display:none}"
     + ".sdk-modal-warn{color:var(--warn,#e3b341);font-size:13px;font-weight:600;margin-bottom:14px}.sdk-modal-warn.hidden{display:none}"
     + ".sdk-modal-input{width:100%;box-sizing:border-box;margin-bottom:16px;padding:10px 12px;font-size:15px;border-radius:9px;border:1px solid var(--border,rgba(255,255,255,.14));background:var(--bg,#0b0f16);color:inherit}.sdk-modal-input.hidden{display:none}"
     + ".sdk-modal-actions{display:flex;gap:10px}.sdk-modal-actions button{flex:1;padding:11px;font-size:14px;font-weight:600;border-radius:9px;cursor:pointer;border:1px solid var(--border,rgba(255,255,255,.14))}"
-    + ".sdk-modal-actions .ok{background:var(--accent,var(--accent2,#4f8cff));color:#04101f;border-color:transparent}"
+    + ".sdk-modal-actions .ok{background:linear-gradient(135deg,var(--accent),var(--accent-2));color:var(--bg);border-color:transparent}"
     + ".sdk-modal-actions .ok.danger{background:var(--danger,#e5484d);color:#fff}"
     + ".sdk-modal-actions .cancel{background:transparent;color:inherit}.sdk-modal-actions .cancel.hidden{display:none}"
     + "@keyframes sdkFade{from{opacity:0}to{opacity:1}}@keyframes sdkPop{from{opacity:0;transform:translateY(10px) scale(.97)}to{opacity:1;transform:none}}";
@@ -289,6 +394,14 @@ function _openModal(spec) {
   setTimeout(() => { (isPrompt ? inp : ok).focus(); }, 30);
   return new Promise((res) => { _modalResolve = res; });
 }
+// NOTHING FAILS SILENTLY: an error that escapes a click handler or a background task lands in the alert bar
+// with its message, instead of dying in the console where the user cannot see it.
+try {
+  window.addEventListener("unhandledrejection", (ev) => {
+    const e = ev && ev.reason; const m = (e && e.message) || (typeof e === "string" ? e : "");
+    if (m) { try { alertBar(m); } catch (_) {} }
+  });
+} catch (_) {}
 export function uiConfirm(spec) { return _openModal(Object.assign({}, spec, { kind: "confirm" })); }
 export function uiPrompt(spec) { return _openModal(Object.assign({}, spec, { kind: "prompt" })); }
 export function uiAlert(spec) { return _openModal(Object.assign({}, typeof spec === "string" ? { title: spec } : spec, { kind: "alert" })); }
@@ -310,7 +423,7 @@ export function alertBar(msg, actionLabel, actionFn, opts) {
     const b = document.createElement("button");
     b.textContent = actionLabel;
     b.style.cssText = "display:block;margin-top:9px;font:inherit;font-weight:800;border:0;border-radius:9px;"
-      + "padding:9px 14px;background:linear-gradient(135deg,#00ad93,#00c9a7);color:#04110a;cursor:pointer";
+      + "padding:9px 14px;background:linear-gradient(135deg,var(--accent),var(--accent-2));color:var(--bg);cursor:pointer";
     b.onclick = () => { el.remove(); actionFn(); };
     el.appendChild(b);
   }
@@ -412,13 +525,64 @@ export async function resolveAliases(addrs) {
 }
 // esc(s): minimal HTML-escaper for user-influenced strings interpolated into innerHTML
 export const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-export const disp = (addr) => !addr ? "—" : (_aliasCache[addr] ? "@" + _aliasCache[addr] : addr.slice(0, 8) + "…" + addr.slice(-4));
+// shortAddr(addr): a truncation that actually distinguishes addresses.
+//
+// EVERY address begins with the same 7-character key-type discriminator (protocol.ADDRESS_PREFIX =
+// ""), so a head-slice spends almost all of its budget on characters that are identical for every
+// account on the chain. The old `addr.slice(0, 8)` showed "e" — SEVEN constant characters and ONE
+// distinguishing one — and in any list of players, seats or leaderboard rows the entries looked the same.
+// A user reported exactly that, and they were right.
+//
+// Dropping the prefix costs no information (it is constant, therefore it carries none) and buys back the
+// whole budget: "ebd276…afd34" distinguishes on 10 characters instead of 5. The ellipsis still marks the
+// value as truncated, and aliases are unaffected — they render as "@name" and never reach this path.
+// NO BACKWARDS COMPATIBILITY on the prefix. Every address on this chain carries it, there is no legacy
+// format, and there will not be one — so the prefix is stripped unconditionally and no "maybe it's an older
+// address" branch exists to rot.
+//
+// The one check below is NOT that branch: game UIs pass non-address sentinels through disp() — hexholm
+// renders `disp(seats[n] || "?")` and pool seats a literal "cpu" for practice — and those are returned
+// verbatim. That also removes a workaround: pool.js carried a comment explaining that disp() mangles "cpu"
+// into "cpu…cpu", which no longer happens.
+export const shortAddr = (addr, head = 6, tail = 5) => {
+  if (!addr) return "—";
+  const s = String(addr);
+  // Length is the discriminator now that there is no prefix. Game UIs render sentinels through disp()
+  // (hexholm passes "?", pool passes "cpu"), and those must come back verbatim rather than truncated.
+  if (s.length !== ADDR_LEN) return s;
+  return s.slice(0, head) + "…" + s.slice(-tail);
+};
+export const disp = (addr) => !addr ? "—" : (_aliasCache[addr] ? "@" + _aliasCache[addr] : shortAddr(addr));
 
 // ---- shared UI blocks (every game has these exact elements — keep them in ONE place) --------------
 // wireWallet(dapp): the sign-in / deposit / withdraw buttons ("bankAmt" input) — identical in every game.
 const _L1_FEE_RESERVE = RAW / 1000n;   // leave ~0.001 NADO of L1 for the deposit tx fee when buying in 100%
+// The header wallet button every exchange has, top-right: "Connect wallet" until you sign in, then your
+// address and usable balance (a click goes to the wallet card). Mounted into the page's <header> by the
+// SDK so every dApp gets the same one; renderWallet keeps it current.
+function mountHeaderWallet(dapp) {
+  const hdr = document.querySelector("header");
+  if (!hdr || document.getElementById("hdrWallet")) return;
+  if (!document.getElementById("hdrWalletCss")) {
+    const css = document.createElement("style"); css.id = "hdrWalletCss";
+    css.textContent = `#hdrWallet{margin-left:8px;font:inherit;font-size:12px;font-weight:800;white-space:nowrap;border-radius:999px;padding:7px 13px;cursor:pointer;
+      border:1px solid var(--accent,#00ad93);background:linear-gradient(135deg,var(--accent,#00ad93),var(--accent2,#00c9a7));color:#04110a}
+      #hdrWallet.in{background:var(--elev,#111823);color:var(--txt,#e6edf3);border-color:var(--border,#1c2530);font-family:var(--mono,monospace);font-weight:700}
+      #hdrWallet.in:hover{border-color:var(--accent2,#00c9a7)} #hdrWallet .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--accent2,#00c9a7);margin-right:6px;vertical-align:1px}
+      header:has(#hdrWallet) .hub{margin-left:auto} @media (max-width:620px){#hdrWallet{padding:7px 10px} #hdrWallet .bal{display:none}}`;
+    document.head.appendChild(css);
+  }
+  const b = document.createElement("button"); b.id = "hdrWallet"; b.type = "button";
+  if (!hdr.querySelector(".hub")) b.style.marginLeft = "auto";
+  b.onclick = () => {
+    if (!dapp.me) return dapp.signIn();
+    const wc = $("walletcard"); if (wc) { wc.scrollIntoView({ behavior: "smooth", block: "start" }); wc.classList.add("flash"); setTimeout(() => wc.classList.remove("flash"), 1200); }
+  };
+  hdr.appendChild(b);
+}
 export function wireWallet(dapp) {
   const st = (m) => alertBar(m);   // deposit/withdraw input errors → the prominent toast, not the quiet #status
+  try { mountHeaderWallet(dapp); } catch (e) {}
   if ($("btnSignIn")) $("btnSignIn").onclick = () => dapp.signIn();
   if ($("btnDeposit")) $("btnDeposit").onclick = () => { const raw = nadoToRaw($("bankAmt").value); if (!raw) return st(_t("depositEnter", "Enter an amount to deposit.")); if (raw + 1000n > dapp.l1) return st(_t("depositShort", "Not enough in your L1 wallet ({bal} NADO).", { bal: rawToNado(dapp.l1) })); dapp.deposit(raw); };
   if ($("btnWithdraw")) $("btnWithdraw").onclick = () => { const raw = nadoToRaw($("bankAmt").value); if (!raw) return st(_t("withdrawEnter", "Enter an amount to withdraw.")); if (dapp.exec < raw) return st(_t("withdrawShort", "You only have {bal} NADO in the exec layer.", { bal: rawToNado(dapp.exec) })); dapp.withdraw(raw); };
@@ -432,7 +596,7 @@ export function wireWallet(dapp) {
     const buyMax = () => dapp.l1 > _L1_FEE_RESERVE ? dapp.l1 - _L1_FEE_RESERVE : 0n;
     const pctOf = (slId, maxRaw) => { const p = Math.max(0, Math.min(100, parseFloat(document.getElementById(slId).value) || 0)); return p >= 100 ? maxRaw : (BigInt(Math.round(p * 100)) * maxRaw) / 10000n; };
     const mkRow = (slId, label, btn) => {
-      const box = document.createElement("div"); box.style.margin = "14px 0 0";
+      const box = document.createElement("div"); box.className = "needsig"; box.style.margin = "14px 0 0";   // bank controls: signed-in only
       // header: the action verb (left) + the resolved % · amount (right) — well ABOVE the slider so the knob never covers it
       const head = document.createElement("div"); head.className = "small"; head.style.cssText = "display:flex;justify-content:space-between;gap:8px;margin-bottom:2px;font-weight:700;color:var(--txt)";
       head.innerHTML = '<span>' + label + '</span><span class="mono dim" id="' + slId + 'P">0% · 0 NADO</span>';
@@ -444,9 +608,13 @@ export function wireWallet(dapp) {
       box.appendChild(head); box.appendChild(r); box.appendChild(hint);
       return { box, sl };
     };
-    if (dep) dep.textContent = _t("buyIn", "Buy in"); if (wd) wd.textContent = _t("cashOut", "Cash out");
-    const bi = mkRow("buyinSlider", "⬆ " + _t("buyIn", "Buy in"), dep);
-    const co = mkRow("cashoutSlider", "⬇ " + _t("cashOut", "Cash out"), wd);
+    // WORDING follows the app: games buy in / cash out a PLAYABLE balance; an exchange deposits / withdraws a
+    // USABLE one. A page sets dapp.walletLabels = {buyIn, cashOut, ofPlayable(n)} before wireWallet.
+    const WL = Object.assign({ buyIn: _t("buyIn", "Buy in"), cashOut: _t("cashOut", "Cash out"),
+                               ofPlayable: (n) => _t("ofPlayable", "of {n} playable", { n }) }, dapp.walletLabels || {});
+    if (dep) dep.textContent = WL.buyIn; if (wd) wd.textContent = WL.cashOut;
+    const bi = mkRow("buyinSlider", WL.buyIn, dep);
+    const co = mkRow("cashoutSlider", WL.cashOut, wd);
     oldRow.insertAdjacentElement("afterend", co.box);
     oldRow.insertAdjacentElement("afterend", bi.box);
     oldRow.classList.add("hidden");   // the old amount+buttons row (buttons were moved into the slider rows)
@@ -457,18 +625,32 @@ export function wireWallet(dapp) {
     if (wd) wd.onclick = () => { const raw = pctOf("cashoutSlider", dapp.exec); if (raw <= 0n) return st(_t("slideCashOut", "Slide how much to cash out.")); if (dapp.exec < raw) return st(_t("cashOutShort", "You only have {bal} NADO playable.", { bal: rawToNado(dapp.exec) })); dapp.withdraw(raw); };
   }
 }
+// financeLabels(): the wallet row's words for an app that is NOT a game (DEX, Lend, NFT). "Buy in" / "Cash out" / "playable"
+// tell a trader or a lender they are at a casino; these deposit to and withdraw from a USABLE balance. One translated set
+// for every finance page (the DEX carried English-only literals until 2026-11-02). Set before wireWallet:
+//   dapp.walletLabels = financeLabels();
+export const financeLabels = () => ({ buyIn: _t("depositBtn", "Deposit"), cashOut: _t("withdrawBtn", "Withdraw"),
+  ofPlayable: (n) => _t("ofUsable", "of {n} usable", { n }) });
 // renderWallet(dapp): the who/bal/l1bal header row; returns signedIn so render() can gate on it.
 export function renderWallet(dapp) {
   const signedIn = !!dapp.me;
+  const wc = $("walletcard"); if (wc) wc.classList.toggle("signed", signedIn);   // balances and bank controls show only once they mean something
   if ($("btnSignIn")) $("btnSignIn").classList.toggle("hidden", signedIn);
   if ($("who")) $("who").textContent = signedIn ? disp(dapp.me) : "not signed in";
+  const hw = document.getElementById("hdrWallet");
+  if (hw) {
+    hw.classList.toggle("in", signedIn);
+    hw.innerHTML = signedIn ? `<span class="dot"></span>${esc(disp(dapp.me))}<span class="bal"> · ${esc(rawToNado(dapp.exec))} NADO</span>` : esc(_t("connectWallet", "Connect wallet"));
+    hw.title = signedIn ? _t("hdrWalletIn", "Your wallet — click for balances, buy in and cash out") : _t("hdrWalletOut", "Sign in with your NADO wallet");
+    hw.setAttribute("aria-label", hw.title);
+  }
   if ($("bal")) $("bal").textContent = rawToNado(dapp.exec) + " NADO";
   if ($("l1bal")) $("l1bal").textContent = rawToNado(dapp.l1) + " NADO";
-  const bm = document.getElementById("buyinSliderM"); if (bm) bm.textContent = _t("sdk.ofWallet", "of {n} wallet", { n: rawToNado(dapp.l1) });
-  const cm = document.getElementById("cashoutSliderM"); if (cm) cm.textContent = _t("sdk.ofPlayable", "of {n} playable", { n: rawToNado(dapp.exec) });
+  const bm = document.getElementById("buyinSliderM"); if (bm) bm.textContent = _t("ofWallet", "of {n} wallet", { n: rawToNado(dapp.l1) });
+  const cm = document.getElementById("cashoutSliderM"); if (cm) cm.textContent = (dapp.walletLabels && dapp.walletLabels.ofPlayable ? dapp.walletLabels.ofPlayable : (n) => _t("ofPlayable", "of {n} playable", { n }))(rawToNado(dapp.exec));
   return signedIn;
 }
-// The faucet PRIZE TAPER — rank 1..5 shares of a game's daily faucet budget. MIRRORS _faucet_rewards.py
+// The faucet PRIZE TAPER — rank 1..5 shares of a game's daily faucet budget. MIRRORS scripts/operator/_faucet_rewards.py
 // (SHARES + BUDGET); keep the two in sync so the displayed prize equals what the distributor actually pays.
 export const FAUCET_TAPER = [0.40, 0.25, 0.15, 0.12, 0.08];
 export const FAUCET_DAILY_RAW = 1_000_000_000;                       // per-game daily prize pool, raw (0.1 NADO)
@@ -504,14 +686,14 @@ function _modeCss() {
   const s = document.createElement("style");
   s.textContent = `
 .modebar{display:flex;gap:8px;margin:0 0 12px;flex-wrap:wrap}
-.modebar .modetab{flex:1 1 0;min-width:118px;background:var(--elev,#131a23);border:1px solid var(--border,#243140);
-  border-radius:11px;padding:10px;font-weight:800;color:var(--dim,#93a1b0);font-family:inherit;font-size:14px;
+.modebar .modetab{flex:1 1 0;min-width:118px;background:var(--bg-elev);border:1px solid var(--border);
+  border-radius:11px;padding:10px;font-weight:800;color:var(--txt-dim);font-family:inherit;font-size:14px;
   cursor:pointer;line-height:1.25;transition:background .15s ease,color .15s ease,border-color .15s ease}
-.modebar .modetab:hover{color:var(--txt,#e6edf3)}
+.modebar .modetab:hover{color:var(--txt)}
 /* the tab you are already on is not a button that does nothing — say so with the cursor too, or it reads
    as broken ("clicking Play for stakes does nothing") */
 .modebar .modetab.on{cursor:default}
-.modebar .modetab.on{background:linear-gradient(135deg,var(--accent,#00ad93),var(--accent2,#00c9a7));
+.modebar .modetab.on{background:linear-gradient(135deg,var(--accent),var(--accent-2));
   color:#04110a;border-color:transparent}
 .modebar .mbadge{display:inline-block;margin-left:4px;padding:0 6px;border-radius:999px;font-size:10px;
   font-weight:800;background:rgba(0,0,0,.18);vertical-align:middle}
@@ -532,7 +714,7 @@ export function modeBar(el, modes, active, onChange) {
     '<button type="button" class="modetab' + (m.key === active ? " on" : "") + '" data-mode="' + esc(m.key) + '"'
     + ' aria-pressed="' + (m.key === active ? "true" : "false") + '"'
     + (m.hint ? ' title="' + esc(m.hint) + '"' : "") + ">"
-    + (m.icon ? '<span class="mi" aria-hidden="true">' + m.icon + "</span> " : "") + esc(m.label)
+    + esc(m.label)                                    // labels only: emoji icons render as boxes without an emoji font
     + (m.badge ? ' <span class="mbadge">' + esc(m.badge) + "</span>" : "") + "</button>").join("");
   el.querySelectorAll("[data-mode]").forEach((b) => {
     b.onclick = () => { if (b.dataset.mode !== active) onChange(b.dataset.mode); };
@@ -735,7 +917,7 @@ export function recentChips(el, items, onSelect, emptyMsg) {
   if (!el) return;
   el.innerHTML = items.length ? items.map((x) => '<button class="chip' + (x.live ? "" : " pending") + '" data-t="' + x.id + '"'
       + (x.live ? "" : ' title="' + _t("chipConfirmingTitle", "still confirming on-chain — your entry hasn't vanished") + '"') + ">" + (x.icon || "🎯") + " #" + x.id
-      + (x.live ? (x.tag ? " · " + x.tag : "") : " · " + _t("chipConfirming", "confirming ⏳")) + "</button>").join(" ")
+      + (x.live ? (x.tag ? " · " + x.tag : "") : " · " + _t("chipConfirming", "confirming…")) + "</button>").join(" ")
     : '<span class="dim">' + (emptyMsg || _t("noGamesYet", "No games yet.")) + "</span>";
   el.querySelectorAll(".chip").forEach((b) => b.onclick = () => onSelect(parseInt(b.dataset.t, 10)));
 }
@@ -744,13 +926,14 @@ export function statusLabel(pend, ok, err, extra) {
   const labels = Object.assign({ connect: _t("connect", "Signed in."), deposit: _t("deposit", "Buy-in submitted — confirming…"),
     open: _t("open", "Table opening — confirming…"), bet: _t("bet", "Bet placed — confirming…"), join: _t("join", "Joining — confirming…"),
     settle: _t("settle", "Collecting — confirming on-chain (~1 min)…"), fund: _t("fund", "Topping up…"), close: _t("close", "Closing…"),
-    resolve: _t("resolve", "Rolling out — confirming…"), cancel: _t("cancel", "Cancelling…"), withdraw: _t("withdraw", "Cash-out submitted.") }, extra || {});
+    resolve: _t("resolve", "Rolling out — confirming…"), cancel: _t("cancel", "Cancelling…"), withdraw: _t("withdraw", "Cash-out submitted."),
+    bridge_claim: _t("cashClaimSent", "Cash-out claim sent — confirming…") }, extra || {});
   return ok ? (labels[pend && pend.phase] || _t("submitted", "Submitted.")) : _t("rejected", "Rejected") + (err ? ": " + err : ".");
 }
 // confirmingLabel(): the ONE ⏳ label for a button whose action is click-pending/confirming on-chain, so
 // every game's disabled state reads identically. Pattern: btn.disabled = dapp.busy(phase, k, v); if so,
 // btn.textContent = confirmingLabel() (optionally confirmingLabel(origLabel) to keep the verb visible).
-export const confirmingLabel = (verb) => (verb ? verb + " — " : "") + _t("confirmingBtn", "⏳ confirming on-chain…");
+export const confirmingLabel = (verb) => (verb ? verb + " — " : "") + _t("confirmingBtn", "confirming on-chain…");
 
 // ---- the shared auto-rolling table schema (roulette / dice / video-table games) -------------------
 // NOTE: the banked-table reader lives in ONE place — BankedGame (static/bankedgame.js): `bg.read(sto, t)` and
@@ -800,11 +983,336 @@ export function shareInvite(kind, id, text, qrpx = 200) {
 }
 
 // ---- the wallet-backed dApp session --------------------------------------------------------------
+// ---- searchable picker: a modern token/market selector that ENHANCES a native <select> ----------------
+// The <select> stays in the DOM and remains the single source of truth (every existing .value read and
+// .onchange keeps working, and with no JS the page still functions). It is hidden visually and driven by a
+// button + panel with type-to-search, arrow-key navigation and click-away — what a trader expects, and
+// what a bare dropdown cannot do once there are more than a handful of tokens.
+const _pickers = [];
+let _pickCssDone = false;
+// Injected at module load, not on first use: the point is to be in place BEFORE the first paint, so a
+// select never flashes as an operating-system control while the page is still starting up.
+if (typeof document !== "undefined") queueMicrotask(() => { try { _pickCss(); } catch (e) {} });
+export function enhanceSelect(sel, { searchPlaceholder = "Search", icon = true } = {}) {
+  if (!sel || sel.dataset.enhanced || sel.classList.contains("plain")) return null;
+  _pickCss();
+  if (!sel.options.length) return null;
+  sel.dataset.enhanced = "1";
+  sel.classList.add("enhanced");
+  const wrap = document.createElement("div");
+  wrap.className = "pick";
+  // inherit only the LAYOUT the page gave the select (width, flex, margins) — never its border, background,
+  // padding or radius: the .pickbtn inside draws those, and copying them drew a second outline around it
+  for (const k of ["width", "maxWidth", "minWidth", "flex", "flexBasis", "flexGrow", "flexShrink", "margin", "marginTop", "marginBottom", "marginLeft", "marginRight", "alignSelf"])
+    if (sel.style[k]) wrap.style[k] = sel.style[k];
+  sel.parentNode.insertBefore(wrap, sel);
+  wrap.appendChild(sel);
+  const btn = document.createElement("button");
+  btn.className = "pickbtn"; btn.type = "button";
+  btn.innerHTML = `<span class="lab"></span><span class="car">▼</span>`;
+  const panel = document.createElement("div");
+  panel.className = "pickpanel pickhidden";
+  panel.innerHTML = `<input type="text" placeholder="${esc(searchPlaceholder)}" autocomplete="off"><div class="picklist"></div>`;
+  wrap.appendChild(btn); wrap.appendChild(panel);
+  const search = panel.querySelector("input"), list = panel.querySelector(".picklist");
+  let cursor = -1;
+  const label = () => { const o = sel.options[sel.selectedIndex];
+    btn.querySelector(".lab").textContent = o ? o.text : "—"; };
+  const rows = () => [...list.querySelectorAll(".pickrow")];
+  function draw() {
+    const q = search.value.trim().toLowerCase();
+    const opts = [...sel.options].filter((o) => !q || o.text.toLowerCase().includes(q) || String(o.value).toLowerCase().includes(q));
+    list.innerHTML = opts.length ? opts.map((o) => {
+      const [head, ...rest] = o.text.split(" — ");
+      // initials are UNICODE letters: "Čeština" is "ČE", not "ET" (the old ASCII-only strip dropped the Č)
+      const badge = icon ? `<span class="dot">${esc([...(head || "?")].filter((c) => /[\p{L}\p{M}\p{N}]/u.test(c)).slice(0, 2).join("").toUpperCase() || "?")}</span>` : "";
+      return `<div class="pickrow${o.value === sel.value ? " sel" : ""}" data-v="${esc(o.value)}">${badge}
+        <span class="txt"><span class="t1">${esc(head)}</span>${rest.length ? `<span class="t2">${esc(rest.join(" — "))}</span>` : ""}</span>
+        ${o.value === sel.value ? '<span class="tick">✓</span>' : ""}</div>`;
+    }).join("") : `<div class="pickempty">nothing matches “${esc(search.value)}”</div>`;
+    cursor = rows().findIndex((r) => r.classList.contains("sel"));
+    rows().forEach((r) => { r.onclick = () => choose(r.getAttribute("data-v")); });
+  }
+  function choose(v) { sel.value = v; label(); close(); sel.dispatchEvent(new Event("change", { bubbles: true })); }
+  function open() {
+    _pickers.forEach((p) => p !== api && p.close());
+    // open toward the side that has room: a picker at the right edge of a header must not run off-screen
+    // and drag the whole page into a horizontal scroll
+    const rw = wrap.getBoundingClientRect(), pw = Math.min(320, window.innerWidth * 0.86);
+    if (rw.left + pw > window.innerWidth - 8) { panel.style.left = "auto"; panel.style.right = "0"; } else { panel.style.left = "0"; panel.style.right = "auto"; }
+    panel.classList.remove("pickhidden"); search.value = ""; draw();
+    setTimeout(() => search.focus(), 0);
+  }
+  function close() { panel.classList.add("pickhidden"); }
+  function move(d) {
+    const rs = rows(); if (!rs.length) return;
+    cursor = (cursor + d + rs.length) % rs.length;
+    rs.forEach((r, i) => r.classList.toggle("on", i === cursor));
+    rs[cursor].scrollIntoView({ block: "nearest" });
+  }
+  btn.onclick = (e) => { e.preventDefault(); panel.classList.contains("pickhidden") ? open() : close(); };
+  search.oninput = draw;
+  search.onkeydown = (e) => {
+    if (e.key === "ArrowDown") { e.preventDefault(); move(1); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); move(-1); }
+    else if (e.key === "Enter") { e.preventDefault(); const r = rows()[cursor] || rows()[0]; if (r) choose(r.getAttribute("data-v")); }
+    else if (e.key === "Escape") { e.preventDefault(); close(); btn.focus(); }
+  };
+  const api = { refresh: label, close, el: wrap };
+  _pickers.push(api); label();
+  return api;
+}
+// INVARIANT: the SDK imports without a DOM (node tests import it), so page-only wiring is guarded like _pickCss
+if (typeof document !== "undefined") document.addEventListener("click", (e) => {   // click-away closes whichever panel is open
+  _pickers.forEach((p) => { if (!p.el.contains(e.target)) p.close(); });
+});
+
+// The picker's own stylesheet, injected once per page. It lives here rather than in every game's inline
+// <style> for the same reason the theme does: one definition, and a page gets it by loading the SDK.
+function _pickCss() {
+  if (_pickCssDone || typeof document === "undefined") return;
+  _pickCssDone = true;
+  const s = document.createElement("style");
+  s.id = "nadoPickCSS";
+  s.textContent = `
+  .pick{position:relative;display:inline-block;min-width:0;max-width:100%}
+  /* A PHONE-WIDTH HEADER WRAPS (2026-09-29 page walk: 8 game pages 7-66 px wider than a 412 px screen). Every game
+     docks the language picker and the wallet button into one non-wrapping flex header beside the logo, title and
+     "All apps"; at phone width they ran off the right edge. They take a second row instead. */
+  header:has(.pick),header:has(#hdrWallet){flex-wrap:wrap;row-gap:8px}
+  .seg{position:relative}
+  select.enhanced{position:absolute!important;opacity:0!important;pointer-events:none!important;
+    width:100%;height:100%;left:0;top:0;margin:0;padding:0;border:0}
+  .pickbtn{display:flex;align-items:center;gap:8px;width:100%;justify-content:space-between;font:inherit;
+    background:var(--bg,#0b0f14);border:1px solid var(--border,#243140);color:var(--txt,#e6edf3);
+    border-radius:11px;padding:10px 12px;font-weight:700;font-size:13.5px;cursor:pointer;text-align:left}
+  .pickbtn:hover{border-color:var(--accent,#00ad93)}
+  .pickbtn .car{color:var(--faint,#5d6b7a);font-size:10px;flex:0 0 auto}
+  .pickbtn .lab{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+  .pickpanel{position:absolute;z-index:60;top:calc(100% + 6px);left:0;min-width:min(320px,86vw);max-width:calc(100vw - 24px);
+    background:var(--elev2,#1a232e);border:1px solid var(--border,#243140);border-radius:12px;
+    box-shadow:0 16px 40px rgba(0,0,0,.55);padding:8px}
+  .pickpanel input{width:100%;font:inherit;font-size:13px;padding:9px 10px;margin-bottom:6px;border-radius:9px;
+    background:var(--bg,#0b0f14);color:var(--txt,#e6edf3);border:1px solid var(--border,#243140)}
+  .pickpanel input:focus{outline:none;border-color:var(--accent2,#00c9a7)}
+  .picklist{max-height:290px;overflow:auto}
+  .pickrow{display:flex;align-items:center;gap:10px;padding:9px 10px;border-radius:9px;cursor:pointer;font-size:13.5px}
+  .pickrow{position:relative;transition:background .1s}
+  .pickrow:hover{background:rgba(255,255,255,.05)}
+  .pickrow.on{background:rgba(0,173,147,.16);box-shadow:inset 0 0 0 1px rgba(0,201,167,.45)}
+  .pickrow.sel{background:rgba(0,173,147,.22)}
+  .pickrow.sel .t1{color:var(--accent2,#00c9a7)}
+  .pickrow.sel::before{content:"";position:absolute;left:0;top:6px;bottom:6px;width:3px;border-radius:3px;
+    background:var(--accent2,#00c9a7)}
+  .pickrow.sel .dot{border-color:var(--accent,#00ad93);color:var(--accent2,#00c9a7)}
+  .pickrow .tick{margin-left:auto;color:var(--accent2,#00c9a7);font-weight:800;flex:0 0 auto}
+  .pickrow .dot{width:26px;height:26px;border-radius:50%;flex:0 0 auto;display:grid;place-items:center;
+    background:var(--elev,#131a23);border:1px solid var(--border,#243140);font-size:11px;font-weight:800;color:var(--accent2,#00c9a7)}
+  .pickrow .txt{min-width:0;flex:1 1 auto}
+  .pickrow .t1{display:block;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .pickrow .t2{display:block;margin-top:1px;font-size:11.5px;color:var(--faint,#5d6b7a);overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap}
+  .pickempty{padding:14px 10px;color:var(--faint,#5d6b7a);font-size:12.5px;text-align:center}
+  .seg{display:flex;border:1px solid var(--border,#243140);border-radius:11px;overflow:hidden}
+  .seg button{flex:1 1 0;border:0;border-radius:0;font:inherit;background:var(--bg,#0b0f14);
+    color:var(--dim,#93a1b0);font-size:13px;padding:10px 12px;cursor:pointer}
+  .seg button.on{background:linear-gradient(135deg,var(--accent,#00ad93),var(--accent2,#00c9a7));color:#04110a;font-weight:800}
+  .pickhidden{display:none!important}
+  /* Until a select is enhanced (and if JS never runs at all) it should still look like the rest of the
+     app rather than an OS control — same surface, same border, same caret. */
+  select:not(.enhanced):not(.plain){-webkit-appearance:none;appearance:none;font:inherit;font-size:13.5px;
+    font-weight:700;color:var(--txt,#e6edf3);background-color:var(--bg,#0b0f14);
+    border:1px solid var(--border,#243140);border-radius:11px;padding:10px 34px 10px 12px;cursor:pointer;
+    background-image:linear-gradient(45deg,transparent 50%,var(--faint,#5d6b7a) 50%),
+      linear-gradient(135deg,var(--faint,#5d6b7a) 50%,transparent 50%);
+    background-position:calc(100% - 18px) 50%,calc(100% - 12px) 50%;
+    background-size:6px 6px,6px 6px;background-repeat:no-repeat}
+  select:not(.enhanced):not(.plain) option{background:var(--elev2,#1a232e);color:var(--txt,#e6edf3)}`;
+  document.head.appendChild(s);
+}
+
+// enhanceSelects(root): upgrade every <select> under `root`. A two-option select becomes a segmented
+// switch, anything longer becomes a searchable panel; add class="plain" to opt a select out. Idempotent,
+// so it is safe to call again after a render adds more.
+export function enhanceSelects(root = document) {
+  if (typeof document === "undefined") return;
+  root.querySelectorAll("select:not([data-enhanced])").forEach((sel) => {
+    if (sel.multiple || sel.size > 1) return;
+    if (sel.options.length === 2 && !sel.classList.contains("searchable")) enhanceToggle(sel);
+    else enhanceSelect(sel);
+  });
+  refreshPickers();
+}
+// Keep every picker's button label in step with its select, including lists that are refilled by a poll.
+export function refreshPickers() { _pickers.forEach((p) => { try { p.refresh(); } catch (e) {} }); }
+// Most option lists on these pages arrive from a fetch, so one pass at load would miss them. The sweep is
+// idempotent (each select is marked once) and only touches selects that are still unenhanced.
+let _pickSweep = null;
+export function autoEnhanceSelects() {
+  if (typeof document === "undefined" || _pickSweep) return;
+  _pickCss();
+  const run = () => { try { enhanceSelects(); } catch (e) {} };
+  run();
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", run);
+  // NO NATIVE FLASH (operator 2026-09-29: the wallet's account selector "switching basic to advanced style, very
+  // distracting"). A select built after load showed its operating-system look until the 1.2 s sweep below caught it —
+  // and the account bar is rebuilt on every wallet refresh, so it flickered basic -> styled each time. A
+  // MutationObserver callback runs before the next paint, so a select (or the options a fetch fills in) is enhanced
+  // before anyone sees it. The sweep stays as the fallback for anything the observer cannot see.
+  try {
+    const touchesSelect = (n) => n && n.nodeType === 1 && (n.tagName === "SELECT" || n.tagName === "OPTION" || (n.querySelector && n.querySelector("select")));
+    new MutationObserver((muts) => {
+      for (const m of muts) {
+        if (m.target && (m.target.tagName === "SELECT" || [...m.addedNodes].some(touchesSelect))) { run(); return; }
+      }
+    }).observe(document.documentElement, { childList: true, subtree: true });
+  } catch (e) {}
+  _pickSweep = setInterval(run, 1200);
+}
+
+// a two-choice dropdown reads better as a segmented switch
+export function enhanceToggle(sel) {
+  if (!sel || sel.dataset.enhanced || sel.classList.contains("plain") || sel.options.length !== 2) return;
+  _pickCss();
+  sel.dataset.enhanced = "1"; sel.classList.add("enhanced");
+  const wrap = document.createElement("div");
+  wrap.className = "seg"; wrap.style.cssText = sel.style.cssText;
+  sel.parentNode.insertBefore(wrap, sel); wrap.appendChild(sel);
+  const btns = [...sel.options].map((o) => {
+    const b = document.createElement("button"); b.type = "button"; b.textContent = o.text;
+    b.onclick = (e) => { e.preventDefault(); sel.value = o.value; sync(); sel.dispatchEvent(new Event("change", { bubbles: true })); };
+    wrap.appendChild(b); return b;
+  });
+  function sync() { btns.forEach((b, i) => b.classList.toggle("on", sel.options[i].value === sel.value)); }
+  sync();
+}
+
+// ---- file drop: an upload zone that ENHANCES a native <input type="file"> ----------------------------
+// The operating-system file button ("Choose file · No file chosen", in the OS language, not the page's) is
+// what the NFT page first shipped, and an objkt-style mint page needs a drop target with a preview instead
+// (operator 2026-11-01: "did you really have to use a system default picker?"). Same shape as enhanceSelect:
+// the input stays in the DOM, hidden, so a page with no JS still has a working control. Click, Enter/Space,
+// drag-and-drop and paste all end in onFile(file, api). A drop or a paste bypasses the input's `accept`, so
+// the zone re-checks accept itself.
+// api: busy(pct, text) shows progress (pct null = indeterminate), done(html, name) shows the result with
+// Replace/Remove, reset() returns to the empty zone. opts.onRemove runs when the user removes the file.
+export function enhanceFile(input, { onFile, onRemove, hint = "" } = {}) {
+  if (!input || input.dataset.enhanced) return null;
+  _fileCss();
+  input.dataset.enhanced = "1";
+  input.classList.add("enhanced");
+  const wrap = document.createElement("div");
+  wrap.className = "fdrop"; wrap.tabIndex = 0; wrap.setAttribute("role", "button");
+  input.parentNode.insertBefore(wrap, input);
+  wrap.appendChild(input);
+  const box = document.createElement("div");
+  wrap.appendChild(box);
+  const empty = () => `<div class="fdicon">⬆</div>
+    <div class="fdt1">${esc(_t("fileDrop", "Drag and drop a file here, or click to browse"))}</div>
+    ${hint ? `<div class="fdt2">${esc(hint)}</div>` : ""}`;
+  let state = "empty";
+  const api = {
+    el: wrap,
+    reset() { state = "empty"; wrap.classList.remove("busy", "has"); box.innerHTML = empty(); input.value = ""; },
+    busy(pct, text) {
+      state = "busy"; wrap.classList.add("busy"); wrap.classList.remove("has");
+      const w = pct == null ? "" : `style="width:${Math.max(2, Math.min(100, Math.round(pct)))}%"`;
+      box.innerHTML = `<div class="fdt1">${esc(text || "")}</div>
+        <div class="fdbar${pct == null ? " ind" : ""}"><i ${w}></i></div>`;
+    },
+    done(html, name) {
+      state = "done"; wrap.classList.remove("busy"); wrap.classList.add("has");
+      box.innerHTML = `<div class="fdprev">${html || ""}</div>
+        <div class="fdrow"><span class="fdname">${esc(name || "")}</span>
+        <button type="button" class="fdbtn" data-fd="replace">${esc(_t("fileReplace", "Replace"))}</button>
+        <button type="button" class="fdbtn" data-fd="remove">${esc(_t("fileRemove", "Remove"))}</button></div>`;
+    },
+  };
+  // a drop or a paste skips the browser's accept filter: "image/*", "image/png" and ".glb" forms all count
+  const accepted = (f) => {
+    const acc = (input.accept || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+    if (!acc.length) return true;
+    const type = (f.type || "").toLowerCase(), name = (f.name || "").toLowerCase();
+    return acc.some((a) => a.startsWith(".") ? name.endsWith(a) : a.endsWith("/*") ? type.startsWith(a.slice(0, -1)) : type === a);
+  };
+  const take = (f) => {
+    if (!f || state === "busy") return;
+    if (!accepted(f)) return notify(_t("fileType", "This kind of file is not accepted here."));
+    if (onFile) onFile(f, api);
+  };
+  input.onchange = () => { take(input.files && input.files[0]); input.value = ""; };
+  wrap.onclick = (e) => {
+    const b = e.target.closest && e.target.closest("[data-fd]");
+    if (b) { e.preventDefault(); e.stopPropagation();
+      if (b.dataset.fd === "remove") { api.reset(); if (onRemove) onRemove(); return; } }
+    // with a result showing, only Replace opens the browser: a click on the preview (a video's controls) must not
+    if (state === "done" && !b) return;
+    if (state !== "busy" && e.target !== input) input.click();
+  };
+  wrap.onkeydown = (e) => { if ((e.key === "Enter" || e.key === " ") && e.target === wrap) { e.preventDefault(); if (state !== "busy") input.click(); } };
+  // dragleave fires when the pointer crosses into a child, so the highlight counts enters and leaves
+  let depth = 0;
+  wrap.ondragenter = (e) => { e.preventDefault(); depth++; wrap.classList.add("over"); };
+  wrap.ondragover = (e) => { e.preventDefault(); if (e.dataTransfer) e.dataTransfer.dropEffect = "copy"; };
+  wrap.ondragleave = () => { if (--depth <= 0) { depth = 0; wrap.classList.remove("over"); } };
+  wrap.ondrop = (e) => { e.preventDefault(); depth = 0; wrap.classList.remove("over");
+    take(e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0]); };
+  // paste anywhere on the page while the zone is on screen (a screenshot straight from the clipboard); the
+  // listener removes itself once a re-render has detached the zone
+  const onPaste = (e) => {
+    if (!wrap.isConnected) return document.removeEventListener("paste", onPaste);
+    const f = e.clipboardData && e.clipboardData.files && e.clipboardData.files[0];
+    if (f) { e.preventDefault(); take(f); }
+  };
+  document.addEventListener("paste", onPaste);
+  api.reset();
+  return api;
+}
+let _fileCssDone = false;
+function _fileCss() {
+  if (_fileCssDone || typeof document === "undefined") return;
+  _fileCssDone = true;
+  const s = document.createElement("style");
+  s.id = "nadoFileCSS";
+  s.textContent = `
+  input.enhanced[type=file]{position:absolute!important;width:1px!important;height:1px!important;opacity:0!important;pointer-events:none!important}
+  .fdrop{position:relative;border:1.5px dashed var(--border,#243140);border-radius:14px;background:var(--bg,#0b0f14);
+    padding:26px 16px;text-align:center;cursor:pointer;transition:border-color .15s,background .15s;outline:none}
+  .fdrop:hover,.fdrop:focus-visible{border-color:var(--accent,#00ad93)}
+  .fdrop.over{border-color:var(--accent2,#00c9a7);background:rgba(0,173,147,.10)}
+  .fdrop.busy{cursor:progress}
+  .fdrop.has{border-style:solid;padding:12px;cursor:default}
+  .fdicon{width:44px;height:44px;margin:0 auto 10px;border-radius:50%;display:grid;place-items:center;font-size:20px;
+    color:var(--accent2,#00c9a7);background:var(--elev2,#1a232e);border:1px solid var(--border,#243140)}
+  .fdt1{font-weight:700;font-size:14px;color:var(--txt,#e6edf3)}
+  .fdt2{margin-top:4px;font-size:12px;color:var(--faint,#5d6b7a)}
+  .fdbar{height:6px;margin:12px auto 0;max-width:320px;border-radius:6px;background:var(--elev2,#1a232e);overflow:hidden}
+  .fdbar i{display:block;height:100%;width:2%;border-radius:6px;transition:width .2s;
+    background:linear-gradient(90deg,var(--accent,#00ad93),var(--accent2,#00c9a7))}
+  .fdbar.ind i{width:35%;animation:fdInd 1.1s ease-in-out infinite}
+  @keyframes fdInd{0%{transform:translateX(-100%)}100%{transform:translateX(300%)}}
+  .fdprev img,.fdprev video{display:block;max-width:100%;max-height:360px;margin:0 auto;border-radius:10px;background:var(--elev2,#1a232e)}
+  .fdprev audio{width:100%}
+  .fdrow{display:flex;align-items:center;gap:8px;margin-top:10px;flex-wrap:wrap}
+  .fdname{flex:1 1 auto;min-width:0;text-align:left;font-size:12.5px;color:var(--dim,#93a1b0);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .fdbtn{font:inherit;font-size:12.5px;font-weight:700;padding:6px 12px;border-radius:9px;cursor:pointer;
+    background:var(--elev2,#1a232e);color:var(--txt,#e6edf3);border:1px solid var(--border,#243140)}
+  .fdbtn:hover{border-color:var(--accent2,#00c9a7)}`;
+  document.head.appendChild(s);
+}
+
+
+// The sweep starts as soon as this module runs. dapp.init() also calls it, but init awaits the crypto
+// bundle first, which is long after the user can see (and click) the page.
+if (typeof document !== "undefined") queueMicrotask(() => { try { autoEnhanceSelects(); } catch (e) {} });
+
 export class NadoDapp {
   constructor({ cid, app, ns = "default" }) {
     this.cid = cid; this.app = app; this.ns = ns;
     const slug = app.replace(/\W+/g, "").toLowerCase();
-    this.LS_ME = "nado_" + slug + "_me"; this.LS_P = "nado_" + slug + "_pending"; this.LS_INVITE = "nado_" + slug + "_invite";
+    // "_v2": the format-2 session key (gen 28). A LITERAL now that the format is not a switch — changing it signs every
+    // player out of every game. INVARIANT: keep it byte-identical.
+    this.LS_ME = "nado_" + slug + "_me_v2"; this.LS_P = "nado_" + slug + "_pending"; this.LS_INVITE = "nado_" + slug + "_invite";
     this.LS_CLICK = "nado_" + slug + "_clickpend";   // the click-time pending registry (see busy/pending)
     this.LS_AUTOCOLLECT = "nado_" + slug + "_autocollect";   // opt-out flag for auto-collect (default ON)
     this._autoTried = new Map();   // settle key -> last attempt ms (stops a rejected settle machine-gunning,
@@ -830,6 +1338,7 @@ export class NadoDapp {
     this._onReturn = null;
     this._bh = {};        // height -> block hash hex (BLOCKHASH randomness cache; provisional or finalized)
     this._bhFinal = {};   // height -> 1 once its FINALIZED hash is cached (a frozen value; provisional stays re-checkable)
+    this._bc = {};        // epoch -> exec BEACON hex (finalized only; frozen once cached)
     this.inflight = null;   // a submitted-but-not-yet-confirmed action (see busy())
     // Sign-in must work the INSTANT the page shows the button — it's a pure wallet redirect, no crypto
     // needed. Games wire the rest post-init(); if this ran only there, the button is dead for the whole
@@ -861,6 +1370,65 @@ export class NadoDapp {
     return this._bh;
   }
   bh(h) { return this._bh[h]; }
+  // beacons(epochs): fetch + CACHE the exec BEACON of these epochs (from /exec/beacon, finalized only — a beacon
+  // never changes once final), so a banked game derives the outcome its contract will: a seat bound to beacon epoch
+  // gb resolves from chainResultAlg(dapp.bc(gb), "0", salt, mod) == the VM's HASH(BEACON(gb) + salt). bc(e) reads
+  // the cache (hex|undefined).
+  async beacons(epochs) {
+    const need = [...new Set(epochs)].filter((e) => e && this._bc[e] === undefined);
+    if (need.length) {
+      try {
+        const url = base() + "/exec/beacon?ns=" + this.ns + "&epochs=" + need.slice(0, 64).join(",");
+        const j = await (await fetch(url, { cache: "no-store" })).json();
+        for (const e of need) { const v = j.beacons && j.beacons[String(e)]; if (v) this._bc[e] = v; }
+      } catch {}
+    }
+    return this._bc;
+  }
+  bc(e) { return this._bc[e]; }
+  /**
+   * horizonVerdict(pin, horizon) -> "settle" | "refund" | "wait" — for a stake whose outcome is pinned to
+   * block `pin`, in a contract that accepts a permissionless refund once `pin + horizon < cursor`.
+   *
+   * WHY THIS IS SHARED. The outcome resolves from BHASH(pin), and the node keeps only the most recent
+   * ~20000 finalized hashes. Once `pin` falls out of that ring the outcome can never be derived again and
+   * the stake would be locked forever — which is why every banked contract carries a refund op
+   * (reclaim / claim / reap), legal at `pin + horizon`.
+   *
+   * THE TRAP THIS EXISTS TO CLOSE: the contract's horizon (18000) is SMALLER than the node's retention
+   * (~20000). For those ~2000 blocks — about three hours — the refund is already legal while the hash is
+   * still readable and the bet still SETTLES NORMALLY. A client that decides on "the contract would accept
+   * a refund" therefore converts a WINNING bet into a stake refund, and does it automatically wherever
+   * auto-collect is on. Four games hand-rolled this rule and all four got it wrong the same way, so it is
+   * not a per-game decision any more.
+   *
+   * The only safe question is "can this still be settled?" — never "is the refund legal yet?":
+   *   hash readable                              -> "settle", ALWAYS, however far past the horizon
+   *   hash provably gone AND past the horizon    -> "refund"
+   *   anything else, including a failed lookup   -> "wait"
+   *
+   * A lookup that fails, or a node that is merely behind, is NOT evidence of pruning — those return
+   * "wait", so no transient condition can ever produce a refund. Callers must treat "wait" as "leave it
+   * alone", never as a reason to hide the settle path.
+   */
+  async horizonVerdict(pin, horizon) {
+    pin = Number(pin || 0);
+    if (!pin || this.cursor == null || this.cursor < pin) return "wait";   // pin not mined: nothing to say
+    if (this._bh[pin]) return "settle";                                    // cached hash: still derivable
+    let answered = false;
+    try {
+      const url = base() + "/exec/blockhash?ns=" + this.ns + "&heights=" + pin;
+      const j = await (await fetch(url, { cache: "no-store" })).json();
+      const v = j && j.hashes && j.hashes[String(pin)];
+      if (v) { this._bh[pin] = v; return "settle"; }
+      answered = true;                              // the node replied, and it does not hold this height
+    } catch { return "wait"; }                      // network failure proves nothing about the ring
+    // The miss is deliberately NOT cached. A node that is behind, restarting, or rebuilding its provisional
+    // tail answers "no hash" for a height it will serve again a minute later, and remembering that as
+    // "pruned forever" is exactly how a settleable stake gets refunded. Only stakes already past the
+    // horizon reach this line, so re-asking costs one small request on a rare seat.
+    return (answered && this.cursor - pin > horizon) ? "refund" : "wait";
+  }
   /**
    * Read the persisted session address, migrating it if it predates an address-format change (see
    * healAddress). Runs at construction AND again in init() after loadCrypto(), because the checksum needs
@@ -887,11 +1455,11 @@ export class NadoDapp {
   }
 
   async init() {
-    enableClickFeedback(); await loadCrypto();
+    enableClickFeedback(); autoEnhanceSelects(); polishPage(); await loadCrypto();
     if (!this._healedMe) this.me = this._healMe();   // crypto is bound now — finish any deferred session heal
     this._handleReturn(); if (this.me) await this.refresh();
   }
-  onReturn(fn) { this._onReturn = fn; }        // fn(pend, ok, err) — game marks its own local state + status
+  onReturn(fn) { this._onReturn = fn; }        // fn(pend, ok, err, err2) — game marks its own local state + status; err2 = a failed `then` step (signBlob opts.then)
 
   // --- delegated signing (the wallet holds the key; the game NEVER sees it) -------------------------
   // Two transports. (1) REDIRECT: navigate the whole tab to the wallet, which signs + submits + bounces
@@ -901,8 +1469,12 @@ export class NadoDapp {
   // auto-collect doesn't yank the tab to the wallet and back. The iframe falls back to the redirect the
   // instant the wallet says it needs UI (locked / not autosigned / untrusted) or doesn't answer in time,
   // so the worst case is exactly today's behaviour.
+  // EVERY SIGNING REQUEST NAMES THE CHAIN THIS PAGE'S /protocol.js IS FOR (G6): the wallet refuses one built for another
+  // chain — a tab kept open across a reroll hashes its commitments with the old VM's hash (interface.js PAGE_CHAIN).
+  // INVARIANT: both transports (redirect and the background frame) encode through _payloadOf.
+  _payloadOf(obj) { return btoa(unescape(encodeURIComponent(JSON.stringify({ ...obj, chain: CHAIN_ID })))); }
   _goRedirect(obj, pend) {
-    const payload = btoa(unescape(encodeURIComponent(JSON.stringify(obj))));
+    const payload = this._payloadOf(obj);
     this._redirecting = true;   // a navigation is committed — a later bg-flush must not clobber it (see _bgFlushToRedirect)
     localStorage.setItem(this.LS_P, JSON.stringify(pend || {}));
     // preserve the CURRENT url (path + query) as the return target, so a share-link's ?game=/?table= survives the
@@ -935,8 +1507,12 @@ export class NadoDapp {
   }
   _bgFlushToRedirect() {
     const svc = this._bgSvc; if (!svc) return;
-    const jobs = svc.queue.splice(0); if (svc.cur) { svc.cur = null; }
+    const all = svc.queue.splice(0); if (svc.cur) { svc.cur = null; }
     this._bgBusy(false);
+    // an AUTOMATIC request (onNeedUI set — the cash-out claim) never navigates the tab away from the game: it is told
+    // the background path failed and offers its own button. Only what the player clicked can redirect.
+    for (const j of all) if (j.onNeedUI) { try { j.onNeedUI("off"); } catch (e) {} }
+    const jobs = all.filter((j) => !j.onNeedUI);
     // ONE navigation only. location.href assignments don't stack — the old per-job loop overwrote LS_P and
     // the nav target once per job, so with N queued actions the LAST one silently replaced every earlier one
     // (the user's FIRST click was the one that died, unretried and unreported). Redirect the first job in
@@ -945,13 +1521,13 @@ export class NadoDapp {
     // _bgPump timeout path redirects its timed-out job right before flushing the rest).
     if (jobs.length && !this._redirecting) this._goRedirect(jobs[0].obj, jobs[0].pend);
   }
-  _goBackground(obj, pend, isValue) {
+  _goBackground(obj, pend, isValue, onNeedUI, onResult) {
     const svc = this._ensureBgSvc();
-    if (!svc || svc.dead) return this._goRedirect(obj, pend);
+    if (!svc || svc.dead) return onNeedUI ? onNeedUI("off") : this._goRedirect(obj, pend);
     // sub-second SPECIFIC feedback: name the action the instant it's queued (the 🔏 pill only says
     // "Signing…"). Auto-dismisses; showReturn's "…confirming…" replaces it — a readable progression.
     if (obj.label) notify(_t("submitting", "Submitting: {label}…", { label: obj.label }), 2500);
-    svc.queue.push({ obj, pend, isValue });
+    svc.queue.push({ obj, pend, isValue, onNeedUI, onResult });
     this._bgPump();
     this._bgSyncBusy();
   }
@@ -962,8 +1538,8 @@ export class NadoDapp {
     let el = (typeof document !== "undefined") && document.getElementById("nadoBgBusy");
     if (on) {
       if (!el) { el = document.createElement("div"); el.id = "nadoBgBusy";
-        el.style.cssText = "position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:9998;background:#131a23;border:1px solid #00c9a7;color:#00c9a7;font:600 12px/1.4 system-ui,sans-serif;padding:7px 14px;border-radius:999px;box-shadow:0 6px 20px rgba(0,0,0,.5);pointer-events:none";
-        el.textContent = _t("sdk.signing", "🔏 Signing…"); (document.body || document.documentElement).appendChild(el); }
+        el.style.cssText = "position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:9998;background:var(--bg-elev);border:1px solid var(--accent-2);color:var(--accent-2);font:600 12px/1.4 system-ui,sans-serif;padding:7px 14px;border-radius:999px;box-shadow:0 6px 20px rgba(0,0,0,.5);pointer-events:none";
+        el.textContent = _t("signing", "🔏 Signing…"); (document.body || document.documentElement).appendChild(el); }
     } else if (el) el.remove();
   }
   _bgPump() {
@@ -974,10 +1550,13 @@ export class NadoDapp {
       if (d.needui) {
         if (d.reason === "off" || d.reason === "locked" || d.reason === "untrusted") this._bgOff = true;   // global block
         else if (job.isValue) this._bgValueUI = true;                                                      // staked call needs a confirm
-        this._goRedirect(job.obj, job.pend);
+        if (job.onNeedUI) job.onNeedUI(d.reason || "confirm");                                            // automatic: never navigate
+        else this._goRedirect(job.obj, job.pend);
+      } else if (job.onResult) {
+        job.onResult(d.ok === 1 || d.ok === true || d.ok === "1", d);
       } else {
         const ok = d.ok === 1 || d.ok === true || d.ok === "1";   // the "ok=1" param rides as a STRING
-        this._applyReturn(job.pend, ok, d.addr || null, d.err ? String(d.err) : "");
+        this._applyReturn(job.pend, ok, d.addr || null, d.err ? String(d.err) : "", d.err2 ? String(d.err2) : "");
         try { this.refresh(); } catch (e) {}                      // pull the freshly-landed state, no reload
       }
       this._bgPump();                                             // serve the next queued request
@@ -985,11 +1564,12 @@ export class NadoDapp {
     };
     svc.timer = setTimeout(() => {                                // the loaded wallet went silent → treat service as dead, redirect
       if (!svc.cur) return; svc.cur = null; svc.dead = true;
-      this._goRedirect(job.obj, job.pend); this._bgFlushToRedirect();
+      if (job.onNeedUI) job.onNeedUI("timeout"); else this._goRedirect(job.obj, job.pend);
+      this._bgFlushToRedirect();
     }, 9000);
-    const payload = btoa(unescape(encodeURIComponent(JSON.stringify(job.obj))));
+    const payload = this._payloadOf(job.obj);
     try { svc.frame.contentWindow.postMessage({ nadoExecSignReq: 1, payload, ret: base() + "/", app: this.app }, svc.walletOrigin); }
-    catch (e) { svc.cur = null; clearTimeout(svc.timer); this._goRedirect(job.obj, job.pend); }
+    catch (e) { svc.cur = null; clearTimeout(svc.timer); if (job.onNeedUI) job.onNeedUI("post"); else this._goRedirect(job.obj, job.pend); }
   }
   _go(obj, pend, bg, isValue) {
     if (bg && !obj.confirm) this._goBackground(obj, pend, isValue);
@@ -998,10 +1578,39 @@ export class NadoDapp {
   signIn() { this._goRedirect({ connect: true, label: "sign in" }, { phase: "connect" }); }
   deposit(raw) { this._goRedirect({ deposit: { amount: raw.toString() }, label: "buy in " + rawToNado(raw) + " NADO" }, { phase: "deposit" }); }
   withdraw(raw, pend) { this.signBlob({ op: "bridge_withdraw", amount: raw }, "cash out " + rawToNado(raw) + " NADO", pend || { phase: "withdraw" }); }
+  // htlcLock: the NADO leg of a cross-chain atomic swap — an L1 escrow under a SHA-256 hashlock that only
+  // the named claimant can take, and only with the secret, before `blocks` have passed. It is an L1 tx (not
+  // a contract call) because L1 verifies SHA-256 natively, so this lock and the foreign chain's lock share
+  // ONE hashlock. Always shown for explicit confirmation by the wallet; never auto-signed.
+  htlcLock({ claimant, hashlock, amount, blocks }, pend) {
+    this._goRedirect({ htlc_lock: { claimant, hashlock, amount: amount.toString(), blocks },
+                       label: "lock " + rawToNado(amount) + " NADO for an atomic swap" },
+                     pend || { phase: "htlc_lock" });
+  }
+  // htlcClaim: take the NADO leg of a swap with the secret. The L1 tx is fee-exempt, so a claimant holding
+  // no NADO at all can still claim. Publishing the preimage is what lets the counterparty claim the
+  // mirrored lock on the other chain — the wallet shows it before signing.
+  htlcClaim({ htlcId, preimage }, pend) {
+    // BACKGROUND first: a claim can only ever pay the wallet that signs it (the wallet checks claimant ==
+    // itself and the preimage against the lock's hashlock), so a wallet with auto-sign on signs it silently
+    // and the swap completes without a tap. A wallet that wants a confirm answers needui → redirect.
+    this._go({ htlc_claim: { htlc_id: htlcId, preimage }, label: "claim the NADO of an atomic swap" },
+             pend || { phase: "htlc_claim" }, true, false);
+  }
+  // htlcRefund: take back an expired L1 swap lock. Visible confirm in the wallet — it is the user's own
+  // money coming home, but a refund is still a signature that moves funds.
+  htlcRefund({ htlcId }, pend) {
+    this._goRedirect({ htlc_refund: { htlc_id: htlcId }, label: "reclaim an expired atomic-swap lock" }, pend || { phase: "htlc_refund" });
+  }
   signBlob(blob, label, pend, opts) {
     // CLICK-TIME: gates/panels flip NOW — before any signing, submitting or landing
     this._pendAdd(pend, !!(opts && opts.stakes), !!(opts && opts.tipExpire));
-    this._go(Object.assign({ blob: encBig(blob), label }, (opts && opts.confirm) ? { confirm: 1 } : {}), pend, !!(opts && opts.bg), !!(opts && opts.isValue));
+    // opts.then: ONE value-free contract call the wallet signs and submits right after `blob`, under the SAME confirm —
+    // one approval for a two-step action (the NFT mint + its royalty, as objkt/fxhash configure everything before the
+    // mint; a second popup minutes later lost royalties, 2026-11-04). Always the visible confirm, never background.
+    const then = opts && opts.then ? { then: encBig(opts.then), confirm: 1 } : {};
+    this._go(Object.assign({ blob: encBig(blob), label }, (opts && opts.confirm) ? { confirm: 1 } : {}, then), pend,
+             !!(opts && opts.bg) && !opts.then, !!(opts && opts.isValue));
   }
   // generic contract call; valueRaw (raw NADO) is ESCROWED from the caller's bridge balance into the contract.
   // opts.confirm forces the wallet's manual confirm (e.g. a poker bet that moves chips you already escrowed) —
@@ -1016,6 +1625,12 @@ export class NadoDapp {
     const p = { op: "call", contract: (opts && opts.cid) || this.cid, method, args };
     const isValue = valueRaw != null;
     if (isValue) p.value = valueRaw;
+    // ASSET-DENOMINATED CALL VALUE (doc/assets.md): `value` is an amount, `asset` names WHAT it is — 0 or
+    // absent is native NADO. A call carries exactly one asset, which is why this is a single field and not
+    // a list. Without it the SDK could only ever escrow NADO, so no page could deposit a token into a
+    // contract (the DEX's fundt/swapt, and every asset dApp after it). The exec layer reads the same field
+    // name off the blob, so this is the whole plumbing.
+    if (opts && opts.asset) p.asset = opts.asset;
     // "carries a value field" is NOT "moves value". Games pass 0n for their FREE calls, and 0n != null is
     // true in JS — so isValue is true for them, and any policy keyed on it silently treats a free call as a
     // staked one. That is exactly how the tip-based pend expiry below ended up excluding autogame (its nine
@@ -1028,7 +1643,7 @@ export class NadoDapp {
     this.signBlob(p, label, pend, Object.assign({}, opts, { bg, isValue, stakes }));
   }
   // apply a signing RESULT (from either transport) — set the address / inflight / balance-watch and fire onReturn
-  _applyReturn(pend, ok, addr, err) {
+  _applyReturn(pend, ok, addr, err, err2 = "") {
     // heal here too: an older wallet build (or a stale wallet tab) can hand back a pre-debrand address,
     // which would re-poison the session we just cleaned up at load.
     if (ok && addr) { const a = healAddress(addr) || addr; this.me = a; localStorage.setItem(this.LS_ME, a); }
@@ -1038,13 +1653,13 @@ export class NadoDapp {
     if (!ok && pend) this._pendSettle(pend);   // rejected → release the click-guard immediately (no TTL lockout)
     // remember a just-submitted action so games can show "confirming…" and NEVER re-offer the button the
     // user already clicked (e.g. coinflip "Join this game" reappearing before the join confirms on-chain).
-    if (ok && pend && pend.phase && !["connect", "deposit", "withdraw"].includes(pend.phase)) {
+    if (ok && pend && pend.phase && !["connect", "deposit", "withdraw", "bridge_claim"].includes(pend.phase)) {
       this.inflight = Object.assign({ ts: Date.now(), cur0: this.cursor }, pend);   // cur0: tip at submit (settleInflight fallback)
     }
     // deposit/withdraw confirmations are watched by the SDK itself: their optimistic status line clears the
     // moment the balances MOVE (or after 3 min).
     if (ok && pend && (pend.phase === "deposit" || pend.phase === "withdraw")) this._balWatch = { phase: pend.phase, exec: null };
-    if (this._onReturn) this._onReturn(pend, ok, err);
+    if (this._onReturn) this._onReturn(pend, ok, err, err2);
   }
   // Read + STRIP the wallet return params right now (constructor time), so a later reflectUrl() can't clobber
   // them. Returns {ok, addr, err} or null. The hash is preserved (only the query is canonicalised away).
@@ -1052,10 +1667,11 @@ export class NadoDapp {
     try {
       const p = new URLSearchParams(location.search);
       if (!p.has("ok")) return null;   // not a return — leave ?game=/?table= invite links untouched
-      const r = { ok: p.get("ok") === "1", addr: p.get("addr") || null, err: p.get("err") ? decodeURIComponent(p.get("err")) : "" };
+      const r = { ok: p.get("ok") === "1", addr: p.get("addr") || null, err: p.get("err") ? decodeURIComponent(p.get("err")) : "",
+                  err2: p.get("err2") ? decodeURIComponent(p.get("err2")) : "" };
       // strip ONLY the wallet-return params; KEEP any app params (?game=/?table=/?market=) so a signed-in-from-invite
       // visitor still lands on the shared game rather than a blank slate.
-      p.delete("ok"); p.delete("addr"); p.delete("err");
+      p.delete("ok"); p.delete("addr"); p.delete("err"); p.delete("err2"); p.delete("txid2");
       const qs = p.toString();
       try { history.replaceState(null, "", location.pathname + (qs ? "?" + qs : "") + location.hash); } catch (e) {}
       return r;
@@ -1066,7 +1682,7 @@ export class NadoDapp {
     if (!r) return;
     let pend = null; try { pend = JSON.parse(localStorage.getItem(this.LS_P) || "null"); } catch {}
     localStorage.removeItem(this.LS_P);
-    this._applyReturn(pend, r.ok, r.addr, r.err);
+    this._applyReturn(pend, r.ok, r.addr, r.err, r.err2);
   }
   // ── CLICK-TIME PENDING (the instant-feedback registry) ──────────────────────────────────────────
   // The gap this closes: between CLICKING an action and its effect being visible on-chain there are three
@@ -1089,7 +1705,7 @@ export class NadoDapp {
   }
   _pendSave(a) { try { localStorage.setItem(this.LS_CLICK, JSON.stringify(a)); } catch (e) {} }
   _pendAdd(pend, stakes, tipExpire) {
-    if (!pend || !pend.phase || ["connect", "deposit", "withdraw"].includes(pend.phase)) return;
+    if (!pend || !pend.phase || ["connect", "deposit", "withdraw", "bridge_claim"].includes(pend.phase)) return;
     const j = JSON.stringify(pend);
     const a = this._pendLoad().filter((e) => JSON.stringify(e.p) !== j);   // a re-submit refreshes its entry, never duplicates
     // cur0/nv ride on the ENTRY, not the pend — pend identity (the JSON above) must not change per submit
@@ -1172,7 +1788,17 @@ export class NadoDapp {
     if (seen || expired) this._pendSettle(f);
     const phase = f.phase;
     this.inflight = null;   // NOT clearInflight(): a tipMoved-only retire keeps the click registry gating
-    if (this._stActive === phase) { const d = this._stDone && this._stDone[phase]; if (d) okBar(d); this._stActive = null; }
+    // The "✓ done" toast is a CLAIM ABOUT THE CHAIN, so only the game's own on-chain check may raise it.
+    // It used to fire on this line unconditionally — including on the tipMoved fallback, which is two
+    // blocks of elapsed time and no evidence at all. Any action that took longer than two tips, or was
+    // dropped from the pool outright, still announced "✓ Recorded on-chain" to a player whose order had
+    // not happened; under the churn this chain has seen, that was the common case rather than the edge.
+    // A tipMoved/expired retire now just closes the optimistic line silently: the status goes away, and
+    // the game's own render keeps telling the truth about what is actually on-chain.
+    if (this._stActive === phase) {
+      if (seen) { const d = this._stDone && this._stDone[phase]; if (d) okBar(d); }
+      this._stActive = null;
+    }
   }
   // ── ANTI-ROLLBACK (good-faith real-time state) ────────────────────────────────────────────────────
   // The client reads PROVISIONAL (pre-finality) state, which the exec node rebuilds every poll — so a poll
@@ -1359,7 +1985,7 @@ export class NadoDapp {
   clearInvite() { try { localStorage.removeItem(this.LS_INVITE); } catch (e) {} this._inviteFn = null; this._inviteExec = null; }
 
   // --- reads ---
-  async refresh() { await Promise.all([this._balances(), this._cursor()]); }
+  async refresh() { await Promise.all([this._balances(), this._cursor()]); this._cashOuts().catch(() => {}); }
   async _balances() {
     if (!this.me) { this.exec = 0n; this.l1 = 0n; return; }
     try { const b = await (await fetch(base() + "/exec/bridge?ns=" + this.ns + "&provisional=1", { cache: "no-store" })).json(); this.exec = BigInt((b.balances || {})[this.me] || 0); } catch { this.exec = 0n; }
@@ -1372,8 +1998,55 @@ export class NadoDapp {
       if (w.exec == null) { w.exec = this.exec; w.l1 = this.l1; w.ts = Date.now(); }   // baseline: first read after return
       else if (this.exec !== w.exec || this.l1 !== w.l1 || Date.now() - w.ts > 180000) {
         this._balWatch = null;   // balances moved (or timed out) → the buy-in / cash-out landed
-        okBar(w.phase === "deposit" ? _t("boughtOk", "✓ Tokens bought — your playable balance is updated.") : _t("cashedOk", "✓ Cashed out — back in your main-chain wallet."));
+        // A cash-out moving the PLAYABLE balance is only its first half: the exec layer recorded a withdrawal, and the
+        // coins are not in the main-chain wallet until the L1 claim lands (_cashOuts). This used to say "✓ Cashed out —
+        // back in your main-chain wallet" right here, while nothing ever claimed it (four cash-outs stuck, 2026-10-10).
+        // INVARIANT: "cashedOk" is raised only by _cashOuts, when the record is gone after its claim finalized.
+        if (w.phase === "deposit") okBar(_t("boughtOk", "✓ Tokens bought — your playable balance is updated."));
+        else { this._cashAt = 0; notify(_t("cashRecorded", "Cash-out recorded — it reaches your main-chain wallet after the next settlement (a few minutes). This page finishes it automatically."), 9000); }
       }
+    }
+  }
+  // CASH-OUT, SECOND HALF (static/interface.js "CASH-OUT CLAIM" is the other end). withdraw() only records a withdrawal on
+  // the exec layer; the coins reach the main-chain wallet when an L1 claim proves that record against a SETTLED root.
+  // Nothing built that claim, so every cash-out from every game stopped halfway. The game cannot sign it (the key never
+  // touches this origin), so once /exec/withdrawals shows a record as provable this asks the WALLET to claim it, through
+  // the hidden background signer — the wallet reads the record and proof itself and signs a fee-exempt, self-paying claim
+  // with no confirm. AUTOMATIC, so it never navigates the tab: a wallet that cannot sign in the background (locked,
+  // background signing off) gets ONE bar with a "Finish in wallet" button instead. Received = the record is gone (the exec
+  // node drops it only when the claim finalizes on L1), and only that raises "✓ Cashed out".
+  async _cashOuts() {
+    if (!this.me || typeof fetch === "undefined") return;
+    const now = this._nowMs ? this._nowMs() : Date.now();
+    if (this._cashAt && now - this._cashAt < (this._cashSeen && this._cashSeen.size ? 10000 : 60000)) return;
+    this._cashAt = now;
+    let d = null;
+    try { const r = await fetch(base() + "/exec/withdrawals?address=" + encodeURIComponent(this.me), { cache: "no-store" }); if (r.ok) d = await r.json(); } catch (e) {}
+    if (!d || !Array.isArray(d.pending)) return;               // exec blip / an exec node without the route: try later
+    if (!this._cashSeen) this._cashSeen = new Map();
+    if (!this._cashGate) this._cashGate = {};
+    const listed = new Map(d.pending.map((p) => [String(p.nonce), String(p.amount)]));
+    for (const [n, amt] of this._cashSeen) {
+      if (listed.has(n)) continue;
+      okBar(_t("cashedOk", "✓ Cashed out — back in your main-chain wallet.") + " (+" + rawToNado(BigInt(amt || 0)) + " NADO)");
+      delete this._cashGate[n];
+    }
+    this._cashSeen = listed;
+    for (const p of d.pending) {
+      const n = String(p.nonce);
+      if (!p.proof) continue;                                   // not covered by a settled root yet — next settle
+      const g = this._cashGate[n];
+      if (g && now < g.until) continue;                         // a claim for it is on its way
+      const amt = rawToNado(BigInt(p.amount || 0));
+      const label = _t("cashClaimLabel", "receive your cash-out of {a} NADO", { a: amt });
+      const finish = () => alertBar(_t("cashFinish", "Your cash-out of {a} NADO is ready — finish it in your wallet.", { a: amt }),
+        _t("cashFinishBtn", "Finish in wallet"), () => this._goRedirect({ bridge_claim: { nonce: n }, label }, { phase: "bridge_claim" }));
+      this._cashGate[n] = { until: now + 120000 };
+      if (this._bgOff) { this._cashGate[n].until = now + 600000; finish(); break; }   // known: no silent signing here
+      this._goBackground({ bridge_claim: { nonce: n }, label }, null, false,
+        () => { this._cashGate[n] = { until: now + 600000 }; finish(); },
+        (ok) => { if (!ok) this._cashGate[n] = { until: now + 30000 }; });   // refused (e.g. relay blip): retry soon
+      break;                                                    // one claim per pass — the queue stays shallow
     }
   }
   async _cursor() {
@@ -1430,9 +2103,14 @@ export class NadoDapp {
   // error. A non-numeric RET falls back to the raw value. Args may be ints or address strings.
   async view(method, args) {
     try {
-      const r = await (await fetch(base() + "/exec/view?ns=" + this.ns + "&cid=" + this.cid
-        + "&method=" + encodeURIComponent(method) + "&args=" + encodeURIComponent(JSON.stringify(args || [])),
-        { cache: "no-store" })).json();
+      // a BUSY exec node answers 429 (its view slots are full: execnode.h_view) — retry briefly, never read a busy
+      // answer as "no value" (a claimable amount would show as nothing)
+      const url = base() + "/exec/view?ns=" + this.ns + "&cid=" + this.cid
+        + "&method=" + encodeURIComponent(method) + "&args=" + encodeURIComponent(JSON.stringify(args || []));
+      let res = await fetch(url, { cache: "no-store" });
+      for (let i = 0; res.status === 429 && i < 2; i++) { await new Promise((ok) => setTimeout(ok, 300 * (i + 1))); res = await fetch(url, { cache: "no-store" }); }
+      if (res.status === 429) return null;
+      const r = await res.json();
       const v = r && (r.result !== undefined ? r.result : r.ret);
       if (v == null) return null;
       try { return BigInt(v); } catch { return v; }

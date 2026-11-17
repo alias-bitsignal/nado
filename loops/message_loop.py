@@ -9,6 +9,91 @@ from config import get_timestamp_seconds
 from ops import self_update
 
 
+def key_collision(status_pool, our_address, our_height, our_hash, local_addresses=()):
+    """Which reporting endpoints claim OUR validator address, and which of them PROVE a duplicated key.
+
+    Returns (twins, proven): both lists of endpoint keys, proven ⊆ twins ∪ local_addresses.
+
+    A twin is an endpoint reporting our address that we cannot already explain. That alone is still not
+    evidence — the status pool is keyed by ENDPOINT, so this node reached via its own public IP reports our
+    address and is a twin of ITSELF. `local_addresses` is the set of addresses that are known to be this
+    box (configured public IP, loopback, bound interface addresses); those are dropped from `twins`
+    entirely, because reporting them is the expected behaviour of a correctly configured node and a health
+    check that fires on every correct configuration teaches the operator to ignore it.
+
+    `proven` is unaffected by that filtering and flags EQUIVOCATION: the same address holding a different
+    block hash at the SAME height. It stands even for an own address (there it would mean a second process
+    on this box, which is worth screaming about too).
+
+    IT IS A CANDIDATE, NOT A VERDICT. The comparison is CROSS-TIME — `st` is the snapshot from when that
+    endpoint was last polled, against our tip right now — and a REORG makes one honest process hold two
+    different hashes at the same height at two different moments. The caller therefore requires the
+    appearance to PERSIST across consecutive checks before reporting a duplicated key; see _EQUIV_MIN_TICKS
+    and the 2026-08-04 false positive recorded there.
+
+    Pure so the distinction can be tested without a fleet — see tests/test_key_collision.py.
+    """
+    mine = {str(a) for a in (local_addresses or ())}
+    twins, proven = [], []
+    for endpoint, st in (status_pool or {}).items():
+        if not isinstance(st, dict) or st.get("address") != our_address:
+            continue
+        # endpoints may carry a :port suffix; compare on the host part as well as the raw key
+        host = str(endpoint).rsplit(":", 1)[0] if str(endpoint).count(":") == 1 else str(endpoint)
+        is_self = str(endpoint) in mine or host in mine
+        if not is_self:
+            twins.append(endpoint)
+        their_hash = st.get("latest_block_hash")
+        if st.get("latest_block_height") == our_height and their_hash and their_hash != our_hash:
+            proven.append(endpoint)
+    return sorted(twins), sorted(proven)
+
+
+# Consecutive health checks an endpoint must look equivocating on before it counts as PROOF of a duplicated
+# key. The health loop runs every ~10 s, so 3 is ~30 s — far longer than a reorg takes to settle, and far
+# shorter than an operator would take to notice a genuinely cloned validator.
+_EQUIV_MIN_TICKS = 3
+
+def sustained_equivocation(streak: dict, proven, min_ticks=None):
+    """Advance the per-endpoint equivocation streak and return the endpoints that have PERSISTED.
+
+    `streak` is mutated: endpoints absent from this round's `proven` are dropped (the streak must be
+    CONSECUTIVE — a reorg race clears as soon as the snapshots line up again), the rest are incremented.
+
+    Pure apart from that mutation, so the reorg-vs-clone distinction is testable without a fleet — see
+    tests/test_key_collision.py.
+    """
+    if min_ticks is None:
+        min_ticks = _EQUIV_MIN_TICKS
+    for ep in list(streak):
+        if ep not in proven:
+            del streak[ep]
+    for ep in proven:
+        streak[ep] = streak.get(ep, 0) + 1
+    return sorted(e for e in proven if streak.get(e, 0) >= min_ticks)
+
+
+_own_addresses_cache = {"v": None}
+
+
+def own_addresses(configured_ip=None):
+    """Every address by which this box can legitimately be reached, so an endpoint that is really US is
+    never reported as a suspected key clone. Cached: this is a syscall on a 10s health-report path, and
+    bound interfaces do not change on a running node."""
+    if _own_addresses_cache["v"] is None:
+        found = {"127.0.0.1", "localhost", "::1"}
+        try:
+            import socket
+            for _iface, entries in psutil.net_if_addrs().items():
+                for entry in entries:
+                    if entry.family in (socket.AF_INET, socket.AF_INET6) and entry.address:
+                        found.add(entry.address.split("%")[0])
+        except Exception:
+            pass
+        _own_addresses_cache["v"] = found
+    return _own_addresses_cache["v"] | ({str(configured_ip)} if configured_ip else set())
+
+
 class MessageClient(threading.Thread):
     """thread which displays output messages and logs them"""
 
@@ -17,11 +102,14 @@ class MessageClient(threading.Thread):
         .duration fields and pools feed the periodic health/status lines; nothing is mutated."""
         threading.Thread.__init__(self)
         self.logger = logger
-        self.logger.info(f"Starting Message Client")
+        self.logger.info("Starting Message Client")
         self.memserver = memserver
         self.consensus = consensus
         self.core = core
         self.peers = peers
+        # Consecutive health ticks on which each endpoint has looked like it equivocates. A SINGLE
+        # observation is not evidence: see _EQUIV_MIN_TICKS.
+        self._equiv_streak = {}
 
     # Per-component health. Each check returns (level, detail):
     #   "ok"   — healthy
@@ -38,7 +126,10 @@ class MessageClient(threading.Thread):
         try:
             from loops.core_loop import majority_on_our_canonical
             from ops.block_ops import get_block, get_block_hash_by_number
-            if not majority_on_our_canonical(majority_hash, get_block, get_block_hash_by_number):
+            from ops import kv_ops
+            # number_by_hash_fn: height only — never load a block BODY every 10 s for a health line
+            if not majority_on_our_canonical(majority_hash, get_block, get_block_hash_by_number,
+                                             number_by_hash_fn=kv_ops.number_by_hash):
                 # NOT a lag. Deliberately no "we don't hold their block -> assume we're just behind"
                 # fallback: not holding their block is the FORK signature, not the lag signature — it is
                 # the same predicate _depth_floor_corroborated uses to refuse advancing finality. Treating
@@ -114,6 +205,71 @@ class MessageClient(threading.Thread):
             cons_detail = f"OUTSIDE majority ({agree_pct}% / {members} peers)"
         components["Consensus"] = (cons_level, cons_detail)
 
+        # --- Identity: is another node running OUR key? ---------------------
+        # A duplicated validator key is invisible to every consensus rule, because nothing either copy does
+        # is individually illegal: both are entitled to the same slots, so each builds its OWN block for that
+        # slot and signs it validly. The fleet then sees one creator emitting two different blocks at the
+        # same height, and the halves that accept different copies diverge on state while agreeing on the
+        # block body — which reads exactly like a non-block-derived write and sends you hunting for a stray
+        # writer that does not exist.
+        #
+        # A peer reporting our address is NOT by itself proof, and this distinction is the whole point of the
+        # component. The status pool is keyed by ENDPOINT, so this node reached via its own public IP reports
+        # our address and is a twin of ITSELF. On 2026-08-03 an investigation concluded from an address match
+        # alone that 38.242.201.206 was a cloned node; it was simply this box's own public IP, routing over
+        # `lo`, with identical uptime and identical tip. The address match carried no information at all.
+        #
+        # So the only admissible evidence is EQUIVOCATION — the same address holding a DIFFERENT block hash
+        # at the SAME height, which a single process cannot do.
+        #
+        # And an endpoint that is demonstrably THIS box is not even a suspicion: own_addresses() supplies
+        # the configured public IP, loopback and every bound interface address, and those are filtered out
+        # before anything is reported. The first cut of this component warned on the bare address match,
+        # which meant a permanent WARN on every correctly configured node with a public IP — a health line
+        # that is always red is a health line the operator learns to skip.
+        try:
+            our_h = self.memserver.latest_block["block_number"]
+            twins, proven = key_collision(self.consensus.status_pool.copy(), self.memserver.address, our_h,
+                                          self.memserver.latest_block["block_hash"],
+                                          local_addresses=own_addresses(getattr(self.memserver, "ip", None)))
+            # ONE OBSERVATION IS NOT EQUIVOCATION. The comparison is CROSS-TIME: `st` is a status snapshot
+            # taken when that endpoint was last polled, while our_hash is our tip right now. A REORG makes a
+            # single honest process hold two different hashes at the same height at two different moments,
+            # so "same height, different hash" across those two instants is exactly what an ordinary reorg
+            # looks like — no second process required.
+            #
+            # OBSERVED 2026-08-04 21:33:34, and it fired on the HEALTHY case: "ANOTHER NODE IS RUNNING OUR
+            # KEY (38.242.201.206) — proven by a rival block at height 24364", while all four nodes in fact
+            # agreed on a single hash below every finality floor AND held byte-identical block 24364 with
+            # the same creator. The fleet was mid-reorg after an update restart. 38.242.201.206 is this
+            # box's own public IP, so the "rival" was this node's own slightly-stale snapshot of itself.
+            # That address had already caused three wrong conclusions on 2026-08-03; the address filter
+            # fixed the bare-match case, but the proof path is cross-time and stayed vulnerable.
+            #
+            # A reorg race clears within a poll or two; a genuinely duplicated key keeps producing rivals.
+            # So require the appearance to PERSIST before calling it proof. Below that it is a warning, and
+            # the streak is reported so the operator can see it climbing rather than a single red flash.
+            sustained = sustained_equivocation(self._equiv_streak, proven)
+            if sustained:
+                components["Identity"] = (
+                    "down", f"ANOTHER NODE IS RUNNING OUR KEY ({', '.join(sustained)}) — a rival block at "
+                            f"height {our_h} has persisted for {_EQUIV_MIN_TICKS} consecutive checks, which "
+                            f"a reorg does not do. Both copies mine the same slots, so the fleet will keep "
+                            f"forking until one of them is given a fresh key.")
+            elif proven:
+                components["Identity"] = (
+                    "warn", f"{', '.join(sorted(proven))} reports a different hash at our height {our_h} "
+                            f"({max(self._equiv_streak.get(e, 0) for e in proven)}/{_EQUIV_MIN_TICKS} "
+                            f"consecutive) — ordinary during a reorg; only a sustained streak is proof")
+            elif twins:
+                components["Identity"] = (
+                    "warn", f"{len(twins)} endpoint(s) report our address ({', '.join(sorted(twins))}) and "
+                            f"are not this box — a duplicated key if they ever hold a rival block")
+            else:
+                components["Identity"] = ("ok", "key is unique among reporting peers")
+        except Exception:
+            pass
+
         # --- Quorum depth -------------------------------------------------
         # DISTINCT peers, not endpoints: a node reached by several addresses (loopback + its own public IP)
         # must not be counted twice, or a 2-node fleet reads as 3 and the operator never learns the quorum is
@@ -121,7 +277,7 @@ class MessageClient(threading.Thread):
         # stake, so below that the network is one outage from being unable to onboard a fresh node.
         try:
             from ops.snapshot_ops import SNAPSHOT_MIN_PEERS
-            distinct = len({st.get("address") for st in self.consensus.status_pool.values()
+            distinct = len({st.get("address") for st in self.consensus.status_pool.copy().values()
                             if isinstance(st, dict) and st.get("address")} - {self.memserver.address})
             fleet = distinct + 1
             # What a JOINER actually needs: agree_snapshot counts RESPONDING PEERS (self excluded), so a
@@ -183,14 +339,107 @@ class MessageClient(threading.Thread):
             + (" — syncing" if self.memserver.emergency_mode else ""),
         )
 
+        # --- Tip watchdog ----------------------------------------------------
+        # 2026-08-21: the tip sat at 13206 for 73 minutes while peers advertised 13208. Finality above
+        # screamed FROZEN the whole time — but it says WHAT stopped, not WHY, and nothing acted. The
+        # "why" was in two places nobody reads: a per-iteration ERROR from native_guard (a STALE .so),
+        # and the sync loop's treadmill guard handing off to a fast-forward that could not rebuild the
+        # block. This line measures the tip itself against what the mesh advertises, and the one below
+        # names a stale crate as its own component AND repairs it when it safely can.
+        try:
+            best_peer = 0
+            for _st in self.consensus.status_pool.copy().values():
+                if isinstance(_st, dict) and isinstance(_st.get("latest_block_height"), int):
+                    best_peer = max(best_peer, _st["latest_block_height"])
+            if getattr(self, "_tip_last", None) is None or tip > self._tip_last:
+                self._tip_last, self._tip_moved_at = tip, now
+            tip_frozen = now - getattr(self, "_tip_moved_at", now)
+            peers_ahead = best_peer - tip
+            if tip_frozen >= 300 and peers_ahead > 0:
+                tip_level = "down"
+            elif tip_frozen >= 120 and peers_ahead > 0:
+                tip_level = "warn"
+            else:
+                tip_level = "ok"
+            components["Tip"] = (
+                tip_level,
+                f"#{tip}" + (f" · peers ahead by {peers_ahead}" if peers_ahead > 0 else " · at the mesh tip")
+                + (f" · FROZEN {int(tip_frozen)}s" if tip_frozen >= 120 else "")
+                + (f" · last reject: {str(self.memserver.last_block_reject)[:80]}"
+                   if tip_level != "ok" and getattr(self.memserver, "last_block_reject", None) else ""),
+            )
+        except Exception:
+            pass
+
+        # --- Native crates ----------------------------------------------------
+        # A stale .so fail-stops every validation that touches it, and the node then looks like a sync
+        # problem. Check it here every pass (cheap: a few stat calls), name the crate, and rebuild when
+        # the tree is clean — the updater's own path, which otherwise runs only on an explicit /update.
+        # A DIRTY tree (someone mid-edit on this box) is reported, not rebuilt: the updater refuses for
+        # the same reason, and this is exactly the state the 2026-08-21 stall was in.
+        try:
+            if now - getattr(self, "_native_checked_at", 0.0) >= 60:
+                self._native_checked_at = now
+                # A MISSING REQUIRED LIBRARY IS BUILT HERE TOO, not only by an explicit /update (review 2026-10-12): the
+                # push host restarts through apply_stale_checkout, so when native/stwo_js became required nothing ever
+                # built it there and the node would have stalled at the first Stwo spend. Retried at most every 30 min
+                # (a build on a loaded host can fail on its timeout); a missing library is loaded on first use, so no
+                # restart is needed for it.
+                if now - getattr(self, "_native_missing_tried_at", 0.0) >= 1800:
+                    miss = self_update._missing_required_libs()
+                    if miss:
+                        self._native_missing_tried_at = now
+                        built = self_update._build_crates(miss)
+                        self.logger.warning(f"Native: built missing required libraries {built}")
+                stale = self_update._stale_required_libs()
+                if stale:
+                    try:
+                        self_update._git("diff", "--quiet"); self_update._git("diff", "--cached", "--quiet")
+                        clean = True
+                    except Exception:
+                        clean = False
+                    if clean:
+                        self_update._build_crates(stale)
+                        still = self_update._stale_required_libs()
+                        self._native_state = ("warn", f"STALE {stale} — rebuilt; "
+                                              + ("still stale, needs a manual cargo build" if still
+                                                 else "the node must RESTART to load it"))
+                    else:
+                        self._native_state = ("down", f"STALE {stale} — working tree has uncommitted edits, "
+                                                      f"refusing to auto-rebuild: run `cargo build --release` "
+                                                      f"in native/<crate> and restart")
+                else:
+                    self._native_state = ("ok", "all required libraries current")
+            if getattr(self, "_native_state", None):
+                components["Native"] = self._native_state
+        except Exception:
+            pass
+
         # --- Running code --------------------------------------------------
         # A fix that is committed but not RUNNING is not a fix. `update_available` in /status compares
         # against origin as of the last fetch, so it stays silent when the repair was committed locally —
         # which is exactly how the finality stall above survived 34 minutes past its own fix landing.
         try:
             if self_update.code_is_stale():
-                components["Code"] = ("warn", f"running {self_update.running_head()}, checkout at "
-                                              f"{self_update.repo_head()} — RESTART to apply")
+                # AND ACT ON IT. Warning that a fix is not running does not make it run: this reported
+                # "RESTART to apply" for 34 minutes while a finality stall its own fix had already repaired
+                # kept going, and again while nado-exec ran an hour behind the row-commit fix. The updater's
+                # restart only ever fired after IT applied a fast-forward, so a locally-committed-and-pushed
+                # fix — how this fleet is developed — restarted nothing. apply_stale_checkout refuses on a
+                # dirty tree, acts at most once per head, and waits out a settle period first.
+                act = self_update.apply_stale_checkout()
+                st = act.get("status")
+                if st == "restarting":
+                    components["Code"] = ("warn", f"running {act['running']}, checkout at {act['repo']} — "
+                                                  f"RESTARTING {', '.join(act.get('services') or ['?'])}")
+                    self.logger.warning(f"code is stale (running {act['running']}, checkout {act['repo']}) "
+                                        f"— restarting {', '.join(act.get('services') or ['?'])} to apply")
+                elif st == "dirty":
+                    components["Code"] = ("warn", f"running {act['running']}, checkout at {act['repo']} — "
+                                                  f"uncommitted changes, RESTART BY HAND to apply")
+                else:
+                    components["Code"] = ("warn", f"running {self_update.running_head()}, checkout at "
+                                                  f"{self_update.repo_head()} — RESTART to apply ({st})")
             else:
                 components["Code"] = ("ok", f"{self_update.running_head() or 'no git metadata'}")
         except Exception as e:                       # observability must never be able to break the loop

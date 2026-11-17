@@ -1,9 +1,9 @@
 // pets-genes.js — the PURE derivation core of NADO Pets, shared by the dapp (pets.js). Every formula here
 // MUST stay byte-identical to the zkVM contract bytecode and its Python reference (execnode/games/pets.py:
-// ref_gene / ref_tier / ref_si / ref_stat / ref_train_* / ref_battle_turns) — this module decides what
+// ref_gene / ref_tier / ref_si / ref_stat / ref_train_* / ref_battle_turns / ref_battle_seed) — this module decides what
 // animal a player sees, its stats, training odds and battle outcomes, so it is differentially verified
-// against that reference. Field-native: every roll is roll32(x) = LO32(alghash(x)). No DOM, no fetch.
-import { algHashn, ALG_P } from "./nadodapp.js?v=db1a59d7";
+// against that reference. Every roll is roll32(x) = LO32(HASH(x)), HASH = the VM's BLAKE2s word hash. No DOM, no fetch.
+import { algHashn, ALG_P } from "./nadodapp.js";
 
 // ---- constants (mirror tests/test_pets_contract.py) ------------------------------------------------
 export const MINT_FEE    = 10n ** 10n;        // 1 NADO adopts an egg
@@ -40,12 +40,26 @@ export const STAT_ROLES = [
   "regeneration (heals every turn)", "critical hits (double damage)",
   "turn share (attacks more often)", "bulk & bite (+HP, +damage). Food cost is fixed by the HATCHED appetite — training this is free muscle, it never raises your food bill"];
 
-// ---- the contract's roll window: roll32(x) = LO32(alghash HASH(x)) — every derived roll uses it ----
+// ---- the contract's roll window: roll32(x) = LO32(HASH(x)) — every derived roll uses it ----
 export const roll32 = (x) => Number(algHashn([x]) & 0xFFFFFFFFn);
+// THE ROLL TABLE (execnode/games/pets.py RT_BASE): from generation 29 the contract STORES every trait roll of a pet's
+// gene — roll32(gene + c) for c in ROLL_OFFSETS — and the view shows them as r<c>. A pet carried from gen 28 keeps its
+// gen-28 rolls there, which the gen-29 hash could not reproduce, and v2 exposes only 64 of the gene's 256 bits. So a
+// trait reads the stored roll whenever the pet has one, and computes it from the gene only when it has none (gen 28).
+export const ROLL_OFFSETS = [555, 777, 1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 7000, 9000];
+export const rollOf = (gene, c, rolls) => (rolls && rolls[c] != null ? Number(rolls[c]) : roll32(gene + BigInt(c)));
+export function rollsFrom(view, pid) {      // {c: roll} from the contract view's r<c> maps, or null on a gen-28 pet
+  let out = null;
+  for (const c of ROLL_OFFSETS) {
+    const v = ((view || {})["r" + c] || {})[pid];
+    if (v != null) (out = out || {})[c] = Number(v);
+  }
+  return out;
+}
 const hexInt = (h) => BigInt("0x" + h);
 
-// gene = HASH( (BLOCKHASH(b) + BLOCKHASH(b+1) + petId) mod P ) — hashes (hex) from /exec/blockhash.
-// The full field element; the chain stores its 32-bit halves as gl/gh (JS floats can't carry it in JSON).
+// gene = HASH( (BLOCKHASH(b) + BLOCKHASH(b+1) + petId) mod 2^256 ) — hashes (hex) from /exec/blockhash.
+// The full 256-bit word; the chain stores its 32-bit halves as gl/gh (JS floats can't carry it in JSON).
 export function geneOf(bh0Hex, bh1Hex, pid) {
   if (!bh0Hex || !bh1Hex) return null;
   const p = ALG_P();
@@ -53,10 +67,10 @@ export function geneOf(bh0Hex, bh1Hex, pid) {
 }
 export const geneFromHalves = (gl, gh) => (BigInt(gh) << 32n) | BigInt(gl);   // exact chain -> JS round-trip
 // TIER (sp, 1..6) from a fresh 100000-wide gene slice — geometric odds 78/17/3.9/0.85/0.21/0.04 %.
-export function speciesOf(gene) { const rt = roll32(gene + 555n) % 100000; return 1 + TIER_CUM.filter((t) => rt >= t).length; }
+export function speciesOf(gene, rolls) { const rt = rollOf(gene, 555, rolls) % 100000; return 1 + TIER_CUM.filter((t) => rt >= t).length; }
 // species id si — the animal WITHIN the tier's roster band (independent gene slice). Matches ref_si.
-export function speciesIdOf(gene, sp) { return TIER_BASE[sp] + roll32(gene + 777n) % TIER_COUNT[sp]; }
-// combine(): which of the 10 stats gets +1 when two same-species pets are merged (mirrors ref_combine_stat)
+export function speciesIdOf(gene, sp, rolls) { return TIER_BASE[sp] + rollOf(gene, 777, rolls) % TIER_COUNT[sp]; }
+// combine(): which of the 10 stats gets +1 when two same-species pets are merged (mirrors the contract's combine(), execnode/games/pets.py _combine)
 export const COMBINE_SALT = 888888n;
 export function combineStatOf(geneKeep, geneConsume) { return roll32((geneKeep + geneConsume + COMBINE_SALT) % ALG_P()) % 10; }
 
@@ -1201,10 +1215,10 @@ export const PALS = {
     { name: "Storm",    body: "#6c7684", shade: "#4f5762", line: "#333941" },
   ],
 };
-export function coatOf(gene, animal) {
+export function coatOf(gene, animal, rolls) {
   const palette = PALS[animal && animal.pal] || PALS.poodle;
-  const idx = roll32(gene + 7000n) % palette.length;
-  const shiny = roll32(gene + 9000n) % 16 === 0;   // ~6.25% shiny (extra shimmer, cosmetic)
+  const idx = rollOf(gene, 7000, rolls) % palette.length;
+  const shiny = rollOf(gene, 9000, rolls) % 16 === 0;   // ~6.25% shiny (extra shimmer, cosmetic)
   return { ...palette[idx], idx, shiny };
 }
 // rarity visual tier: 1 subtle, 2 rare glow, 3 legend aura, 4 epic, 5 mythic, 6 omega (+shiny stacks on top)
@@ -1212,9 +1226,9 @@ export const auraOf = (sp, shiny) => {
   const base = { 1: "", 2: "rare", 3: "legend", 4: "epic", 5: "mythic", 6: "omega" }[sp] || "";
   return shiny ? (base ? base + " shiny" : "shiny") : base;
 };
-export function statOf(gene, sp, i) { return roll32(gene + 1000n + BigInt(i)) % 60 + 1 + (sp - 1) * 6; }
-export function baseStats(gene, sp) { return STAT_NAMES.map((_n, i) => statOf(gene, sp, i)); }
-export function powerOf(gene, sp) { return baseStats(gene, sp).reduce((a, b) => a + b, 0); }
+export function statOf(gene, sp, i, rolls) { return rollOf(gene, 1000 + i, rolls) % 60 + 1 + (sp - 1) * 6; }
+export function baseStats(gene, sp, rolls) { return STAT_NAMES.map((_n, i) => statOf(gene, sp, i, rolls)); }
+export function powerOf(gene, sp, rolls) { return baseStats(gene, sp, rolls).reduce((a, b) => a + b, 0); }
 
 // ---- training: the rarity-scaled limit function ----------------------------------------------------
 export const trainK = (sp) => 10 + 30 * sp;                        // Poodle 40, Parrot 70, Dragon 100
@@ -1231,10 +1245,24 @@ export const trainOk = (roll, cur, sp) => roll * (trainK(sp) + cur) < 100 * trai
 // str damage, agi dodge, vit HP(x3), int accuracy, wis mitigation, cha intimidation, loy regen,
 // luck crit(x2), spd turn-share, app bulk+bite. Winner = higher remaining FRACTION of HP (tie -> defender).
 export const CAP_BATTLE = 12;   // MUST equal CAP_BATTLE in the contract + pets_ref.py
+// battleOf: a battle issued before the commit-reveal upgrade (wm == 0) — q = bh(wh) + bh(wh+1) + bid*8.
 export function battleOf(bh0Hex, bh1Hex, bid, effA, effB) {
   if (!bh0Hex || !bh1Hex) return null;
   const p = ALG_P();
-  const q = (hexInt(bh0Hex) % p + hexInt(bh1Hex) % p + BigInt(bid) * 8n) % p;
+  return _duel((hexInt(bh0Hex) % p + hexInt(bh1Hex) % p + BigInt(bid) * 8n) % p, effA, effB);
+}
+// Commit-reveal battle (wm == 1): seed = HASH(s1 + s2 + bid) from the two revealed secrets, and the duel runs
+// over q = seed + bid*8 — the block-hash pair replaced by the seed (pets.py ref_battle_seed / resolve_battle).
+export const battleSeedOf = (s1, s2, bid) => algHashn([BigInt(s1) + BigInt(s2) + BigInt(bid)]);
+export function battleOfSeed(seed, bid, effA, effB) {
+  if (seed == null) return null;
+  const p = ALG_P();
+  return _duel((BigInt(seed) % p + BigInt(bid) * 8n) % p, effA, effB);
+}
+export const REVEAL_WINDOW = 1200;   // blocks after acceptance to reveal (MUST equal pets.py REVEAL_WINDOW)
+export const REBIRTH_FEE = 10n ** 9n;   // 0.1 NADO per rebirth (MUST equal pets.py REBIRTH_FEE)
+const HP_OFF = 1024;                 // the contract caps one hit at its +HP_OFF shift (pets.py HP_OFF)
+function _duel(q, effA, effB) {
   const hA = 20 + effA[2] * 3 + effA[9], hB = 20 + effB[2] * 3 + effB[9];
   let h0 = hA, h1 = hB;
   const span = effA[8] + effB[8] + 120, thrA = effA[8] + 60;
@@ -1250,6 +1278,7 @@ export function battleOf(bh0Hex, bh1Hex, bid, effA, effB) {
     dmg += crit * dmg;
     dmg = Math.floor(dmg * 90 / (90 + B[4]));
     dmg = Math.max(1, dmg - Math.floor(B[5] / 2));
+    dmg = Math.min(HP_OFF, dmg);        // the contract's cap (a lethal hit never underflows its shifted HP)
     dmg = dmg * hit * alive;
     if (cur === 0) h1 -= dmg; else h0 -= dmg;
     h0 = Math.min(hA, h0 + alive * Math.floor(effA[6] / 4));

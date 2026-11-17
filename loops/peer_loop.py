@@ -4,13 +4,20 @@ import time
 import traceback
 
 from compounder import compound_get_status_pool
-from config import get_timestamp_seconds
+from config import get_timestamp_seconds, get_config
 from config import test_self_port
-from ops.peer_ops import announce_me, get_list_of_peers, load_ips, check_save_peers
-from ops.peer_ops import get_public_ip, update_local_ip, check_ip, subnet_diversity_ok
+from ops.peer_ops import announce_me, get_list_of_peers, load_ips, check_save_peers, pool_warm_ready
+from ops.peer_ops import get_public_ips, pick_reachable_ip, update_local_ip, check_ip, subnet_diversity_ok, own_ips
 from ops.peer_ops import seed_default_peers, seed_peers, status_fields_well_typed
 from ops import self_update
-from protocol import CHAIN_ID
+from protocol import CHAIN_ID, GENESIS_TIMESTAMP, BLOCK_TIME
+
+
+def _our_genesis():
+    """Our block 0 hash — the shared per-process memo in ops.block_ops (immutable while running)."""
+    from ops.block_ops import genesis_hash_cached
+    return genesis_hash_cached()
+
 
 # How often (seconds) a node BELOW min_peers re-seeds + reloads peers from drive. The peer loop still spins
 # ~1/s for status/tx work, but the "No peers, reloading from drive" retry is throttled to this so a peerless
@@ -21,6 +28,8 @@ PEERLESS_RELOAD_INTERVAL = 15
 # exempt (retried every cycle). Was 3600 — a single blip exiled a peer for an hour, which on a small mesh
 # could strand a node with no dialable peers; 5 min still throttles a genuinely dead peer cheaply.
 UNREACHABLE_COOLDOWN = 300
+BOOT_GRACE_S = 180         # for this long after start a failed dial is retried after BOOT_COOLDOWN, not the full bench
+BOOT_COOLDOWN = 15
 
 
 class PeerClient(threading.Thread):
@@ -31,12 +40,52 @@ class PeerClient(threading.Thread):
         pass immediately runs a heavy refresh and (if peerless) a seed/drive reload."""
         threading.Thread.__init__(self)
         self.logger = logger
-        self.logger.info(f"Starting Peer Client")
+        self.logger.info("Starting Peer Client")
         self.memserver = memserver
         self.consensus = consensus
         self.duration = 0
         self.heavy_refresh_timer = 0
         self._last_peerless_reload = 0   # backoff timer for the "no peers, reload from drive" retry (anti-spam)
+
+    def _refresh_own_ip(self):
+        """Heavy-refresh step: pick the public address that ANSWERS, write it, and probe it for can_mine.
+
+        Which of our addresses to advertise is decided by which one ANSWERS, not by which family it belongs to: a
+        CGNAT'd v4 is globally routable and completely undialable (#86). Probing before writing is also what makes
+        a hand-pinned address stick.
+
+        memserver.ip FOLLOWS THE CONFIG. update_local_ip rewrites private/config.json, but memserver.ip was read
+        once at boot and never again, so after the switch the can_mine probe, announce_me and the /relays self row
+        kept using the DEAD address until a restart — exactly the #86 node, reported "ports closed" and announcing
+        an address nobody can dial. Re-read it from the config (which honours a pinned "auto_ip": false)."""
+        _cands = asyncio.run(get_public_ips(logger=self.logger))
+        _best = pick_reachable_ip(_cands, self.memserver.port, self.logger, current=self.memserver.ip)
+        update_local_ip(ip=_best, logger=self.logger)
+        _ip = get_config().get("ip")
+        if _ip and _ip != self.memserver.ip:
+            self.logger.info(f"Advertising {_ip} from now on (was {self.memserver.ip})")
+            self.memserver.ip = _ip
+        self.memserver.can_mine = test_self_port(self.memserver.ip, self.memserver.port)
+
+    def _announce_self_to_new_peers(self):
+        """GET /announce_peer?ip=<us> on every linked peer we have not told about ourselves yet (one attempt
+        per peer per process; the receiver validates and rate-limits, see nado.announce_peer)."""
+        me = getattr(self.memserver, "ip", None)
+        if not me:
+            return
+        done = getattr(self, "_announced_to", None)
+        if done is None:
+            done = self._announced_to = set()
+        import urllib.request as _rq
+        for peer in list(self.memserver.peers)[:20]:
+            if peer in done or peer == me:
+                continue
+            done.add(peer)
+            try:
+                with _rq.urlopen(f"http://{peer}:{self.memserver.port}/announce_peer?ip={me}", timeout=3) as r:  # nosec B310 # literal http:// to a peer/loopback host; redirects guarded process-wide (ops/outbound_guard.py)
+                    r.read(4096)
+            except Exception:
+                pass                                   # best effort; the next dial or gossip round retries
 
     def sniff_buffered_peers(self):
         """gets peers from buffer and adds them to routine"""
@@ -45,10 +94,15 @@ class PeerClient(threading.Thread):
                                   fails=self.memserver.purge_peers_list,
                                   unreachable=self.memserver.unreachable)
 
+        # SELF-PEER INVARIANT (do not weaken): every path that appends to memserver.peers goes through
+        # check_ip(), which rejects EVERY address that is ours (peer_ops.own_ips: config ip + detected ip +
+        # all global interface addresses). A `!= self.memserver.ip` alone is NOT enough — this host is
+        # dual-stack and an operator seed, so its v4 came back as a ghost self-peer through this very
+        # merge after every restart while the v6 was the configured ip (2026-09-06, three landings).
         for entry in result["success"]:
             if entry in self.memserver.peer_buffer:
                 self.memserver.peer_buffer.remove(entry)
-            if (entry not in self.memserver.peers
+            if (entry not in self.memserver.peers and entry != self.memserver.ip and check_ip(entry)
                     and len(self.memserver.peers) < self.memserver.peer_limit
                     and subnet_diversity_ok(entry, self.memserver.peers)):  # eclipse cap (#18 step 8)
                 self.memserver.peers.append(entry)
@@ -66,8 +120,25 @@ class PeerClient(threading.Thread):
                          fails=self.memserver.purge_peers_list,
                          unreachable=self.memserver.unreachable)
 
+        # NEVER our own ip: peers' /peers lists carry it (we announce to them) and load_ips/seed paths
+        # filter it, but this merge did not — the relay dialed ITSELF for /status, /transaction_ids
+        # and /peers every pass (~9 req/s of self-load, 2026-09-06 tcpdump). Also evict a ghost that
+        # slipped in before this guard, so a running node heals without a restart.
+        _mine = own_ips() | {self.memserver.ip}
+        for _my_ip in [p for p in self.memserver.peers if p in _mine]:
+            self.memserver.peers.remove(_my_ip)
+            self.logger.warning(f"Dropped our own ip {_my_ip} from the peer list (ghost self-peer)")
+        # the consensus pools are append-only (an entry leaves only with a purge), so a status admitted
+        # for our own address in the boot window would otherwise make the fork verdict, _extends_us and
+        # the donor pick dial OURSELVES for the rest of the process lifetime (33 self /hash_attest per
+        # 12 s measured 2026-09-06 after the peer list itself was already clean)
+        for _my_ip in [p for p in list(self.consensus.status_pool) if p in _mine]:
+            for _pool in (self.consensus.status_pool, self.consensus.transaction_hash_pool,
+                          self.consensus.block_hash_pool):
+                _pool.pop(_my_ip, None)
+            self.logger.warning(f"Dropped our own ip {_my_ip} from the consensus pools")
         for peer in candidates:
-            if check_ip(peer):
+            if peer not in _mine and check_ip(peer):
                 if peer not in self.memserver.unreachable:
                     if (peer not in self.memserver.peers
                             and len(self.memserver.peers) < self.memserver.peer_limit
@@ -145,17 +216,16 @@ class PeerClient(threading.Thread):
                 # (Was `if 0 or 1 in periods`, itself a bug parsing to `if 1 in periods`.)
                 # PREFILTER (audit): a peer advertising the SAME transaction_pool_hash as ours has
                 # nothing new in its pool — skip that full-pool download (buffers still fetched).
-                _our_pool_hash = self.memserver.transaction_pool_hash
-                _same_pool = {p for p, h in self.consensus.transaction_hash_pool.copy().items()
-                              if h == _our_pool_hash}
-                self.memserver.merge_remote_transactions(user_origin=False, skip_pool_peers=_same_pool)
-
                 _seeds = set(seed_peers())
                 for peer, ban_time in self.memserver.unreachable.copy().items():
                     # operator seeds are the anchor: never keep them benched — retry immediately. Ordinary
                     # peers cool down for UNREACHABLE_COOLDOWN (was 3600s: a single blip benched a peer for a
                     # WHOLE HOUR, brutal on a small mesh; 5 min still throttles a truly dead peer cheaply).
-                    if peer in _seeds or (get_timestamp_seconds() - ban_time) > UNREACHABLE_COOLDOWN:
+                    # BOOT GRACE: a fleet that (re)starts together dials peers that are not up yet; benching
+                    # them for the full cooldown left a node with ZERO peers for 5 minutes while its peers
+                    # linked each other (loopback testnet, 2026-09-02: two of four nodes never left genesis).
+                    _cool = UNREACHABLE_COOLDOWN if self.memserver.get_uptime() >= BOOT_GRACE_S else BOOT_COOLDOWN
+                    if peer in _seeds or (get_timestamp_seconds() - ban_time) > _cool:
                         self.memserver.unreachable.pop(peer)
                         self.logger.info(f"Restored {peer} to the dial set")
                 # SEEDS ARE ALWAYS DIALED: "restored" above only clears the bench — purge_peers had also
@@ -163,12 +233,32 @@ class PeerClient(threading.Thread):
                 # announced (~its 5-min heavy-refresh). Measured live: a seed restarting for an update
                 # wave stayed out of our pools for 351s despite the cooldown exemption. Re-adding here
                 # closes the loop: the next status pass re-links the anchor within seconds of its boot.
-                _my_ip = getattr(self.memserver, "ip", None)
+                # own_ips(), never a single ip: this box IS one of the seeds, and comparing the seed list
+                # against memserver.ip alone re-added our v4 every pass right after the eviction above
+                _mine_seed = own_ips() | {getattr(self.memserver, "ip", None)}
                 for _s in _seeds:
-                    if (_s != _my_ip and _s not in self.memserver.peers
+                    if (_s not in _mine_seed and _s not in self.memserver.peers
                             and _s not in self.memserver.unreachable):
                         self.memserver.peers.append(_s)
                         self.logger.info(f"Re-dialing operator seed {_s}")
+
+                # SELF-ANNOUNCE, once per linked peer: linking was one-directional — we learn peers by dialling
+                # and by their /peers gossip, but a peer that never dials US never learns we exist (nothing in
+                # the node called /announce_peer; only the testnet harness did). Tell each newly linked peer
+                # about us so the mesh is symmetric within one pass.
+                self._announce_self_to_new_peers()
+
+                # NODE ATTESTATION (gen 25, ops/node_attest): when this node wants an open-lane lease, look for an
+                # attestation its operator dropped for its address (local store, then peers) and register from it.
+                # Lives HERE, on the peer thread, because it polls peers — a blocking probe on the core loop stalls
+                # block application (2026-09-06, 61 % of core wall time). Throttled to one poll per POLL_EVERY s.
+                if not hasattr(self, "_node_attest"):
+                    from ops.node_attest import NodeAttestPoller
+                    self._node_attest = NodeAttestPoller(self.memserver, self.logger, self.memserver.port)
+                try:
+                    self._node_attest.tick()
+                except Exception as e:
+                    self.logger.debug(f"node attest poll: {e}")
 
                 if get_timestamp_seconds() > self.heavy_refresh_timer + self.memserver.heavy_refresh_interval:
                     """heavy refresh triggered"""
@@ -189,10 +279,7 @@ class PeerClient(threading.Thread):
                                      fails=self.memserver.purge_peers_list,
                                      unreachable=self.memserver.unreachable)
 
-                    update_local_ip(ip=asyncio.run(get_public_ip(logger=self.logger)),
-                                    logger=self.logger)
-
-                    self.memserver.can_mine = test_self_port(self.memserver.ip, self.memserver.port)
+                    self._refresh_own_ip()
 
                 candidates = asyncio.run(
                     compound_get_status_pool(
@@ -210,8 +297,22 @@ class PeerClient(threading.Thread):
                     # node) must be treated as protocol -1 and banned, NOT crash the whole pass. The old
                     # hard `value['protocol']` raised KeyError, which propagated to the outer handler and
                     # skipped status admission AND purge_peers() for every remaining peer that pass.
-                    if not isinstance(value, dict) or value.get('protocol', -1) < self.memserver.protocol:
-                        self.logger.error(f"Protocol of {key} too low: {value.get('protocol') if isinstance(value, dict) else value}")
+                    # TYPE-CHECK FIRST. `protocol: null` or `"11"` made the `< self.memserver.protocol`
+                    # comparison below raise TypeError BEFORE the well-typed check (which sat last in this
+                    # chain) could refuse it — one malformed status aborted admission, mempool reconcile,
+                    # save_pool and purge_peers for every remaining peer, every pass, and the sender was
+                    # never banned because the crash preceded ban_peer.
+                    if not isinstance(value, dict) or not status_fields_well_typed(value):
+                        # MALFORMED-TYPE status: a numeric field (esp. latest_block_weight) that is
+                        # present but not an int would crash the fork-choice comparison (`str > int`
+                        # TypeError) on EVERY consensus pass and freeze the heaviest-tip refresh
+                        # node-wide — the same halt-class as an unvalidated tx field. Refuse it here so
+                        # no mistyped value ever reaches a comparison.
+                        self.logger.error(f"Status of {key} has malformed field types; refusing")
+                        self.memserver.ban_peer(key)
+                    elif not isinstance(value.get('protocol'), int) or value['protocol'] < self.memserver.protocol:
+                        # absent (old/broken/hostile node) counts as too low: banned, never crashed on
+                        self.logger.error(f"Protocol of {key} too low: {value.get('protocol')}")
                         self.memserver.ban_peer(key)
                     elif value.get('chain_id') != CHAIN_ID:
                         # WRONG CHAIN (or a pre-chain_id node that doesn't advertise one): NEVER admit
@@ -220,14 +321,38 @@ class PeerClient(threading.Thread):
                         # looping emergency sync against blocks verify_block can only reject.
                         self.logger.error(f"Chain of {key} is not {CHAIN_ID}: {value.get('chain_id')}")
                         self.memserver.ban_peer(key)
-                    elif not status_fields_well_typed(value):
-                        # MALFORMED-TYPE status: a numeric field (esp. latest_block_weight) that is
-                        # present but not an int would crash the fork-choice comparison (`str > int`
-                        # TypeError) on EVERY consensus pass and freeze the heaviest-tip refresh
-                        # node-wide — the same halt-class as an unvalidated tx field. Refuse it here so
-                        # no mistyped value ever reaches a comparison.
-                        self.logger.error(f"Status of {key} has malformed field types; refusing")
+                    elif (isinstance(value.get('latest_block_height'), int)
+                          and value['latest_block_height'] >
+                          (get_timestamp_seconds() - GENESIS_TIMESTAMP) // BLOCK_TIME * 2 + 600):
+                        # IMPLAUSIBLE HEIGHT = FOREIGN GENERATION (rolling-proof identity): production
+                        # paces at BLOCK_TIME, so no chain of OUR genesis can be taller than ~2x the
+                        # wallclock elapsed since GENESIS_TIMESTAMP (+slack). An old-generation chain
+                        # under the new CHAIN_ID always fails this — including on snapshot-booted
+                        # rolling peers that hold no block 0 for the genesis_hash check below. This is
+                        # what stops the reroll re-infection: no old-chain status ever enters the pools,
+                        # so no snapshot, weight claim, or verdict from it is ever considered.
+                        self.logger.error(f"Height of {key} ({value['latest_block_height']}) is impossible "
+                                          f"for this genesis — foreign-generation chain; refusing status")
                         self.memserver.ban_peer(key)
+                    elif (value.get('genesis_hash') is not None and _our_genesis() is not None
+                          and value.get('genesis_hash') != _our_genesis()):
+                        # FOREIGN GENERATION (2026-08-20, the betanet-4 cutover): same CHAIN_ID string,
+                        # different block 0 — un-purged reroll stragglers ran the new code over the OLD
+                        # chain and their ~9M-weight tips poisoned every pool at once: the depth-floor
+                        # veto froze finality at 0 from block 1, and the stake-signed fork verdicts
+                        # pushed REORG adoptions toward a chain that can never link to our genesis.
+                        # Block 0 is unforgeable chain identity; refuse the status like a wrong chain.
+                        # A missing field (old code) admits — the fleet self-updates within minutes and
+                        # then advertises honestly.
+                        self.logger.error(f"Genesis of {key} is not ours ({str(value.get('genesis_hash'))[:16]}…) "
+                                          f"— foreign-generation chain; refusing status admission")
+                        self.memserver.ban_peer(key)
+                    elif key in own_ips() or key == self.memserver.ip:
+                        # OUR OWN STATUS IS NOT A PEER'S OPINION. The pools below are append-only, so one
+                        # admission here would make every pool consumer (fork verdict, _extends_us, donor
+                        # pick, key-collision check) treat us as an independent witness and dial us for
+                        # the rest of the process lifetime. Keep this guard however the peer list is built.
+                        pass
                     else:
                         self.consensus.status_pool[key]=value
                         # NEAR-REAL-TIME UPDATE CASCADE: a peer advertising a commit we do not recognize
@@ -237,6 +362,30 @@ class PeerClient(threading.Thread):
                         # against the pinned official repo; recognized/old/cooled-down values are no-ops.
                         self_update.peer_hint(value.get("latest_main") or value.get("running_commit"))
 
+                # MEMPOOL RECONCILE runs AFTER status admission, never before it. 2026-08-29: a restarted
+                # node pulled a settle-proof tx from a peer's pool and spent 20+ minutes verifying it
+                # inline right here — and because the status pass sat BEHIND the merge, status_pool
+                # stayed empty the whole time: the node saw "no peer ahead", stayed in produce mode,
+                # never synced, and sat 70 blocks behind a mesh it believed it was leading. Statuses are
+                # cheap and are what every other loop steers by; they go first. (The proof itself is now
+                # verified on its own worker — see memserver.merge_remote_transactions.)
+                _our_pool_hash = self.memserver.transaction_pool_hash
+                _same_pool = {p for p, h in self.consensus.transaction_hash_pool.copy().items()
+                              if h == _our_pool_hash}
+                self.memserver.prune_expired_pool()   # every pass, every mode — see memserver.prune_expired_pool
+                self.memserver.merge_remote_transactions(user_origin=False, skip_pool_peers=_same_pool)
+                # first completed reconcile pass against a live peer set -> the pool reflects the
+                # network's, so production is safe (core_loop pool warm-up gate). Peers whose hash
+                # already matches ours count as reconciled-by-equality.
+                # ...against an ELDER (2026-09-22). Any peer's hash used to do, and in an update wave the first
+                # peer to answer had just restarted too: two empty pools agreed, both warmed, both built the
+                # block without the five announcements the rest of the mesh held (h191043, 7 of 9 nodes).
+                # ops.peer_ops.pool_warm_ready; the 60 s liveness cap in core_loop is unchanged.
+                if not self.memserver.pool_warmed and pool_warm_ready(self.consensus.status_pool,
+                                                                       self.consensus.transaction_hash_pool):
+                    self.memserver.pool_warmed = True
+
+                self.memserver.save_pool()          # every few seconds: a restart must not lose accepted txs
                 self.purge_peers()
                 self.duration = get_timestamp_seconds() - start
                 time.sleep(1)

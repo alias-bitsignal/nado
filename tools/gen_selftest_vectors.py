@@ -12,24 +12,19 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from hashing import blake2b_hash, canonical_bytes
 from ops.address_ops import make_address, make_checksum
-from ops.mining_ops import registration_pow_target, registration_pow_hash
 from ops.transaction_ops import create_txid
 from protocol import ADDRESS_PREFIX, CHAIN_ID, DOMAIN_REGISTER
 
 PUB = "96381e3725f85cfe0ab8de17623957b4565ca9b04d37b903075f2723600c21e3"
 FIXPUB = "1e9f9f319a9ee0f98b3147a67dca40e7296d5e847b34ad683692f39264379f38"
-CK_BODY = "18c3afa286439e7ebcb284710dbd4ae42bdaf21b80"     # 42-hex checksum-vector body
+CK_BODY = "18c3afa286439e7ebcb284710dbd4ae42bdaf21b80"     # 42-hex body of the 2-byte blake2b vector (a pure hash vector:
+                                                          # make_checksum is 4 bytes on format 2 and the page checks size 2)
 RCPT_BODY = "6a7a7a6d26040d8d53ce66343a47347c9b79e814c6"   # 42-hex transfer-recipient body
 
 addr = make_address(PUB)
 faddr = make_address(FIXPUB)
 rcpt = ADDRESS_PREFIX + RCPT_BODY
 rcpt = rcpt + make_checksum(rcpt)
-
-target = registration_pow_target()
-nonce = 0
-while registration_pow_hash(addr, nonce) >= target:
-    nonce += 1
 
 def tx_vec(extra):
     body = dict(sender=faddr, amount=extra.pop("amount", 0), timestamp=1700000000, data=extra.pop("data", ""),
@@ -39,7 +34,7 @@ def tx_vec(extra):
     canon = canonical_bytes(body).decode()
     return dict(body, txid=txid), canon
 
-reg, reg_c = tx_vec(dict(recipient="register", pow_nonce=2108331))
+reg, reg_c = tx_vec(dict(recipient="register"))
 hb, hb_c = tx_vec(dict(recipient="heartbeat", epoch=205))
 tr, tr_c = tx_vec(dict(recipient=rcpt, amount=123456, data="hello world", fee=1000))
 
@@ -47,7 +42,7 @@ def js(v):
     return json.dumps(v, ensure_ascii=True, separators=(", ", ": "))
 
 print(f"""  hash_register_list: {js(blake2b_hash([DOMAIN_REGISTER, ADDRESS_PREFIX + "TEST", 5]))},
-  checksum_string_size2: {js(make_checksum(ADDRESS_PREFIX + CK_BODY))},
+  checksum_string_size2: {js(blake2b_hash(ADDRESS_PREFIX + CK_BODY, 2))},
   checksum_body: {js(CK_BODY)},
   make_address_pub: {js(PUB)},
   make_address_out: {js(addr)},
@@ -56,10 +51,6 @@ print(f"""  hash_register_list: {js(blake2b_hash([DOMAIN_REGISTER, ADDRESS_PREFI
   torture_hash: "69029840259d7c85d5c3e61f09abc352d0554c9b4320ef7d59bb6942647b840c",
   bigobj_canonical: "{{\\"amount\\":99999999999999999999,\\"x\\":9007199254740993}}",
   bigobj_hash: "8a09e2d0782c39dd1522f8a83c5338d2960d1b9710ec5c18e66d6cc20354de20",
-  pow_address: {js(addr)},
-  pow_nonce: {nonce},
-  pow_target_str: {js(str(registration_pow_target()))},
-  pow_hash_int_str: {js(str(registration_pow_hash(addr, nonce)))},
   fixed_priv: "4d3c2b1a4d3c2b1a4d3c2b1a4d3c2b1a4d3c2b1a4d3c2b1a4d3c2b1a4d3c2b1a", // 32-byte ML-DSA-44 seed
   // Tx vectors carry NO signature (ML-DSA is hedged); only txid/canonical are comparable.
   // REGENERATE via tools/gen_selftest_vectors.py after ANY field/format/tag/chain_id change.

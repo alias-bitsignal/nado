@@ -1,0 +1,111 @@
+"""NO PRODUCTION MODULE MAY REFERENCE A NAME IT NEVER BOUND.
+
+WHY THIS IS A TEST AND NOT A STYLE CHECK. The alphanet-14 prefix removal replaced a dozen
+`x.startswith(ADDRESS_PREFIX)` sniffs with `is_address(x)` — and in three places forgot to import it. Each
+one is a NameError that fires only when that branch is reached:
+
+  * nado.py:792          — every incoming-transfer alias lookup in account_mempool
+  * forum/server.py:59   — address normalisation
+  * execnode/settlement_proofs.py:392,399 — `_bk` in verify_settlement_o1, the O(1) FOLDED settlement
+                           verifier, i.e. THE code path SETTLE_PROOF_RECURSIVE switches on for this release
+
+The third is the one that makes this file necessary. tests/test_settlement_o1.py already exists and covers
+that function, but its full-recursion branch is opt-in behind NADO_HEAVY=1 (~15 GB, minutes), so a normal
+suite run executes the fast segment path and never reaches the NameError. No amount of ordinary testing was
+going to find it: the defect lives specifically in the code that is too expensive to run by default.
+
+A static check has no such blind spot. It costs about a second and reads every branch whether or not anything
+can afford to execute it — which is exactly the property the heavy-gated paths need.
+
+Scope is deliberately narrow: ONLY pyflakes' "undefined name" class, which is a real bug in every instance
+and never a matter of taste. Unused imports, shadowing and line length are not checked and are not this
+file's business — tests/test_pyflakes_clean.py holds the tree to ZERO pyflakes findings of every class (from
+2026-09-30), so this file's failure message stays the specific one for the class that is always a crash.
+"""
+import os
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+
+fails = []
+
+
+def check(cond, label):
+    print(("PASS  " if cond else "FAIL  ") + label)
+    if not cond:
+        fails.append(label)
+
+
+try:
+    import pyflakes  # noqa: F401
+except ImportError:
+    print("FAIL  pyflakes is not installed — `pip install pyflakes` (it is in requirements.txt)")
+    print()
+    print("This check is not optional: it is the only thing that reads NADO_HEAVY-gated code paths on an")
+    print("ordinary run, and it has already caught a NameError in the O(1) settlement verifier.")
+    sys.exit(1)
+
+# safe.directory: the pre-push hook runs this with a blank HOME (env -i), and as root on a checkout owned by the node's
+# account git then refuses "dubious ownership" and lists NOTHING (2026-11-03: "0 files", a refused push). Say why if so.
+listed = subprocess.run(["git", "-c", "safe.directory=*", "ls-files", "*.py"], cwd=ROOT, capture_output=True, text=True)
+files = [f for f in listed.stdout.split() if not f.startswith("tests/")]
+check(len(files) > 50, f"found the production sources to scan ({len(files)} files)" + (f" — git: {listed.stderr.strip()[:300]}" if len(files) <= 50 else ""))
+
+proc = subprocess.run([sys.executable, "-m", "pyflakes"] + files,
+                      cwd=ROOT, capture_output=True, text=True)
+undefined = [ln for ln in (proc.stdout + proc.stderr).splitlines() if "undefined name" in ln]
+
+check(not undefined,
+      f"no production module references an unbound name ({len(undefined)} found)")
+for ln in undefined:
+    print("     " + ln)
+
+# A FILE THAT DOES NOT PARSE HAS NO UNDEFINED NAMES. pyflakes reports it as a syntax error and checks nothing else in
+# it, so the filter above passed a production module that could not even be imported (2026-09-24: an import line
+# spliced into the middle of a parenthesised import). Any file pyflakes could not parse fails here.
+_syntax = [ln for ln in (proc.stdout + proc.stderr).splitlines()
+           if "invalid syntax" in ln or "SyntaxError" in ln or "problem decoding source" in ln
+           or ("unexpected" in ln and ":" in ln and "undefined name" not in ln)]
+check(not _syntax, f"every production module parses ({len(_syntax)} did not)")
+
+# SELF-CHECK: the filter must recognise pyflakes' own syntax-error wording, or the check above is green by accident.
+import tempfile as _tf
+with _tf.TemporaryDirectory() as _d:
+    _bad = os.path.join(_d, "bad.py")
+    with open(_bad, "w") as _fh:
+        _fh.write("from x import (a,\nfrom y import z\n b)\n")      # the 2026-09-24 splice, exactly
+    _p = subprocess.run([sys.executable, "-m", "pyflakes", _bad], capture_output=True, text=True)
+    _seen = [ln for ln in (_p.stdout + _p.stderr).splitlines()
+             if "invalid syntax" in ln or "SyntaxError" in ln or "problem decoding source" in ln
+             or ("unexpected" in ln and ":" in ln and "undefined name" not in ln)]
+    check(bool(_seen), "the syntax check recognises pyflakes' report of an unparsable file")
+for ln in _syntax:
+    print("     " + ln)
+
+# The sites that motivated this file (the third was deleted in G9), pinned by import rather than by grep — a grep for the call would
+# pass just as happily against a file that still cannot resolve it.
+import importlib
+
+for mod, name in (("ops.address_ops", "is_address"),):
+    sys.path.insert(0, ROOT)
+    m = importlib.import_module(mod)
+    check(hasattr(m, name), f"{mod}.{name} exists to be imported in the first place")
+
+for path, name in (("nado.py", "is_address"),
+                   ("forum/server.py", "is_address")):    # (settlement_proofs.py and its `_bk` were deleted in G9)
+    src = open(os.path.join(ROOT, path)).read()
+    uses = name + "(" in src or name + "." in src
+    imported = (f"import {name}" in src or f", {name}" in src
+                or f"{name} =" in src or f"as {name}" in src)
+    check((not uses) or imported,
+          f"{path} imports {name!r} that it uses (the exact omission this file exists for)")
+
+print()
+if fails:
+    print(f"{len(fails)} CHECK(S) FAILED:")
+    for f in fails:
+        print("  - " + f)
+    sys.exit(1)
+print("ALL UNDEFINED-NAME CHECKS PASSED")

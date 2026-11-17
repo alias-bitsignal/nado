@@ -12,13 +12,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from execnode.state import ExecState
 from hashing import dividend_leaf, verify_merkle_proof
 
-fails = 0
-def check(name, fn):
-    """Run fn; print PASS/FAIL and count failures."""
-    global fails
-    try: fn(); print(f"PASS  {name}")
-    except Exception as e:
-        fails += 1; print(f"FAIL  {name}: {e}"); traceback.print_exc()
+import _harness
+_report = _harness.Report()
+check = _report.run
 
 def fresh():
     """Return a blank ExecState backed by a throwaway temp file."""
@@ -54,9 +50,9 @@ def t3_collect_burns_and_proves():
     assert "collect_dividend" in res and st.dividend.get("A", 0) == 0, "collect burns the balance"
     w = st.dividend_withdrawals["1"]
     assert w["addr"] == "A" and w["amount"] == 1000, "records the provable withdrawal"
-    p = st.dividend_withdrawal_proof("1")
-    from execnode import exec_root as ER
-    assert ER.verify_dividend(st.state_root(), "A", 1000, "1", p["proof"]), \
+    ER = _harness.exit_module(st.cursor)       # L1's verifier for this root (exit_root_module)
+    proof, root = st.record_proof_at(None, ER.T_DIV_WD, "A", "1", value=1000)
+    assert root == st.state_root() and ER.verify_dividend(root, "A", 1000, "1", proof), \
         "the collection proves against the state_root (== what L1 checks vs the settled root)"
 
 def t4_collect_nothing_is_noop():
@@ -92,5 +88,5 @@ def t7_deterministic_across_dict_order():
 for name, fn in sorted(globals().items()):
     if name.startswith("t") and callable(fn) and name[1].isdigit():
         check(name, fn)
-print(f"\n{'ALL PASSED' if not fails else str(fails)+' FAILED'}")
-sys.exit(1 if fails else 0)
+print(f"\n{'ALL PASSED' if not _report.fails else str(_report.fails)+' FAILED'}")
+sys.exit(1 if _report.fails else 0)

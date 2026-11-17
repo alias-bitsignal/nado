@@ -9,43 +9,89 @@ so anything can import it without a cycle).
 """
 from hashing import blake2b_hash  # leaf module (stdlib only) -> no import cycle
 
+# FAIL-CLOSED under `python -O` / PYTHONOPTIMIZE. The consensus signature/txid verification spine
+# (validate_origin, validate_txid, verify_multisig_origin) signals rejection by raising AssertionError;
+# with asserts stripped those checks fall through to `return True`, accepting UNSIGNED, malleable txs =
+# universal forgery. Refuse to run rather than run silently unverified. protocol is imported by every
+# consensus process, so this gate covers the node, the exec node, and the tools. (Set NADO_ALLOW_NO_ASSERT=1
+# only for a deliberate non-consensus utility run.)
+if not __debug__:
+    import os as _os
+    if _os.environ.get("NADO_ALLOW_NO_ASSERT") != "1":
+        raise RuntimeError(
+            "NADO refuses to start with assertions disabled (python -O / PYTHONOPTIMIZE): the consensus "
+            "signature-verification spine rejects via `assert`, which -O strips, turning every rejection "
+            "into a silent accept. Run without -O.")
+
 # Bound into every signed transaction and block body so a transaction/block from another
 # chain (or the pre-relaunch chain) can never replay here (closes audit item M3).
 # relaunch-2: hardfork that removed the vestigial IP block_producers system (block_producers_hash +
 # block_ip fields) from the block body — a block-format change, so the chain resets from a fresh genesis.
-CHAIN_ID = "alphanet-11"  # TRUSTLESS-SETTLEMENT reroll (2026-07-27): activates SETTLE_PROOF_TRUSTLESS, gen 12
+CHAIN_ID = "betanet-10"  # BETANET (gen 29): the Stwo reroll — the exec layer moves from Goldilocks to BLAKE2s/M31 (doc/stwo-migration.md), every contract carried and re-encoded, user-selectable signature schemes, 128-bit private sends. Was "betanet-9"  # BETANET (gen 28): the ACCOUNT-SECURITY reroll — address format 2 (the hash of the whole key), every account re-keyed to it, keyless ones claimable by their key (legacy_claim). Was "betanet-8"  # BETANET (gen 26): the carry-everything reroll — balances, bonded stake, identities, device bindings, aliases and auth history carried. Was "betanet-7"  # BETANET (gen 25): the REAL-DEVICE reroll — every open-lane identity is attested hardware; PoSW, per-IP budgets and probation retired. Was "betanet-6"  # BETANET (gen 24): the SYBIL-RULES + ACCOUNT-AUTH reroll — balances, bonded stake,
+                        # dividends and bridged coins fold forward from betanet-4
+                        # (genesis_data/genesis_alloc.dat). Every 2026-08-25 rule is live from block 0
+                        # with NO gate: linear bonded weight (no per-identity cap), the dividend's own
+                        # convex 1..25 weight curve, a halving (not resetting) lapse, and the 40% bonded
+                        # levy into the presence dividend. The gen-22 activation gate is deleted.
 
 # 1 NADO in raw (smallest) units. All on-chain amounts are integers in raw units.
 DENOMINATION = 10_000_000_000  # 1e10
 
 # ---- ADDRESS FORMAT (single source of truth — doc/address-format.md) -------------------------------
-# address = ADDRESS_PREFIX + first ADDRESS_BODY hex chars of the pubkey + 4-hex blake2b checksum.
-# The prefix is deliberately a ONE-CONSTANT rebrand point: no other Python spells it (the JS mirrors
-# are static/nadotx.js ADDR_PREFIX and static/interface.js ADDR_PREFIX — three lines total).
+# address = first ADDRESS_BODY hex chars of the pubkey + 4-hex blake2b checksum. NO PREFIX.
 # Changing ANY of these orphans every existing address string, so a change ships only with a
 # CHAIN_GENERATION reroll whose genesis alloc is re-keyed by scripts/rekey_alloc.py.
-ADDRESS_PREFIX = "mldsa44"      # key-type discriminator: the FIPS-204 scheme whose pubkey the body hashes
+#
+# THE PREFIX IS GONE (alphanet-14), with no backwards compatibility. It never verified anything:
+# validate_address() has always checked ONLY the 4-hex blake2b checksum over the rest, and never referenced
+# the prefix at all. So "does this string belong to NADO" is still answered exactly as before — right length,
+# valid checksum — and a random 46-hex string still passes with probability 2^-16, unchanged.
+# What it DID do was serve as a cheap discriminator in a dozen `startswith(ADDRESS_PREFIX)` sniffs meaning
+# "an address rather than a reserved name or an alias". Those are now address_ops.is_address(), a real check,
+# because an empty prefix makes startswith() true for EVERY string — which would have silently reclassified
+# every timing-critical reserved tx as flexibly-landing.
+# MSIG_PREFIX survives and is what still distinguishes policy accounts from keyed ones.
+ADDRESS_PREFIX = ""             # removed at alphanet-14; kept as a constant so the derivation stays one place
 MSIG_PREFIX = "msig"           # policy accounts (M-of-N multisig) — the 1-vs-3 split; see doc/address-format.md
-ADDRESS_BODY = 42              # hex chars of the pubkey carried in the address
-ADDRESS_CHECKSUM = 2           # checksum bytes (4 hex chars), blake2b over prefix+body
-ADDRESS_LENGTH = len(ADDRESS_PREFIX) + ADDRESS_BODY + ADDRESS_CHECKSUM * 2   # 49 today
+ADDRESS_BODY = 42              # hex chars of the address body (a hash of the key since format 2, below)
+# ADDRESS FORMAT 2 (gen 28): the body is a HASH of the whole public key, not its first 21 bytes. An ML-DSA public key
+# begins with rho, a public seed the key generator CHOOSES, so format 1 let anyone build a valid keypair whose first
+# 21 bytes equal any address and spend from it — every account that had not yet published its key (audit 2026-09-25;
+# measured 2026-09-27: ~817 NADO in never-sent accounts). Format 2 needs a second preimage of a 168-bit hash
+# (ops/address_ops.make_address). Multisig addresses are already a descriptor hash and keep format 1's body rule
+# (their first ADDRESS_BODY hex) with this checksum. The format-1 name of a key survives only as
+# address_ops.legacy_address, for the legacy_claim of accounts carried at their old address. Gen 27 ran format 1;
+# the generation gate (ADDRESS_FORMAT) was deleted after the betanet-9 reroll — format 2 is unconditional.
+DOMAIN_ADDRESS_V2 = "nado-address-v2"
+# THE OLD FORMAT IS REJECTED BY SHAPE (operator, 2026-09-27: "i expect nado to reject the old address format"). A format-2
+# address carries a 4-byte checksum, so it is 50 characters and every format-1 address (46) fails validation everywhere —
+# a payment to an address copied from the old chain cannot silently burn coins. It also makes a typo slip through one
+# time in 2^32 instead of 2^16.
+ADDRESS_CHECKSUM = 4                                                          # checksum bytes, blake2b over prefix+body
+ADDRESS_LENGTH = len(ADDRESS_PREFIX) + ADDRESS_BODY + ADDRESS_CHECKSUM * 2   # 50
 
 # ---- DOMAIN-SEPARATION TAGS (consensus; brand-carrying) --------------------------------------------
 # Renamed ONLY at a CHAIN_GENERATION reroll — everything re-derives from genesis there (see
 # doc/address-format.md "Domain-separation tags"). One constant per tag; no other Python spells
-# them. JS mirrors: static/interface.js DOMAIN_* block, static/stark/transcript.js DOMAIN_STARK.
+# them. JS mirrors: static/interface.js DOMAIN_* block (static/stark/transcript.js DOMAIN_STARK went with G9 slice 6).
 DOMAIN_MSIG = "msig-v2"                       # multisig virtual-pubkey derivation (ops/multisig_ops)
 DOMAIN_REGISTER = "register-v1"               # open-lane registration PoW binding (ops/mining_ops)
 DOMAIN_RANDAO_COMMIT = "randao-commit-v1"     # RANDAO commitment preimage tag (ops/mining_ops)
 DOMAIN_RANDAO_BEACON = "randao-beacon-v1"     # RANDAO beacon-fold preimage tag (ops/mining_ops)
+DOMAIN_BLOCKSIG = "blocksig-v2"               # chain-bound block-authorship signature (ops/block_ops._block_sig_message_fields)
 
-GENESIS_TIMESTAMP = 1785145680  # alphanet-11 — trustless-settlement reroll (DISTINCT genesis hash so the
-                                # new chain cannot share fork choice with any prior-generation node; gen 7-9
-                                # reused alphanet-8's genesis, which stranded old-code nodes kept winning)
-                                # balances/stake carried forward). Set ~1 min in the PAST at cutover so block
-                                # production starts immediately. The root scheme is final: depth 256 saturates
-                                # the hash's collision resistance and every future proof extension rides the
-                                # SAME tree — no further genesis reroll or hard fork is needed for vision.md.
+GENESIS_TIMESTAMP = 1793077097  # betanet-10 (gen 29): the Stwo reroll (2026-10-27T04:58:17Z). Was 1790668583 = betanet-9 (gen 28): the account-security reroll (2026-09-29T07:56:23Z). Was 1790328896 = betanet-8 (gen 26): the carry-everything reroll (2026-09-25T09:34:56Z). Was 1788772790 = betanet-7 (gen 25): the REAL-DEVICE reroll (2026-09-07T09:19:50Z). Was 1788269732 = betanet-6 (gen 24): the sybil-rules + account-auth reroll (2026-09-01T13:35:32Z). New DISTINCT
+                                # timestamp so no prior-generation block links in.
+                                # Block 0's hash is blake2b_hash_link(timestamp, []), so a DISTINCT
+                                # timestamp is what actually makes this a different chain — no
+                                # prior-generation block can link in, and old-code nodes cannot keep
+                                # winning fork choice against it (gens 7-9 reused alphanet-8's genesis
+                                # and stranded exactly that way). Stamped ~1 min in the PAST so block
+                                # production starts immediately at cutover.
+                                # The tree DEPTH is frozen at 256 (saturates the hash's collision resistance),
+                                # so no future change needs a deeper tree. But ADDING a committed leaf TYPE —
+                                # gen 18 added a per-contract code leaf to the KV half — still changes every
+                                # existing root, so it rides a generation bump like any other root change.
 
 # Clock-skew allowance for block timestamps: a block may be stamped up to this many seconds in the
 # FUTURE of the local clock and still validate. Zero tolerance rejected honest blocks whenever the
@@ -66,13 +112,14 @@ BLOCK_TIMESTAMP_DRIFT = 30
 BLOCK_TIME = 6
 
 
+
 def chain_clock(block_number: int) -> int:
     """The DETERMINISTIC chain clock the execution layer exposes as TIME: a pure function of block height,
     so every node computes the identical value for a block and a contract reading TIME cannot fork exec
-    state. Monotonic and approximately wall-clock (it tracks real time exactly while blocks land on
-    schedule, and lags if they do not). Deliberately NOT block_timestamp, which is uncommitted and skews
-    by up to BLOCK_TIMESTAMP_DRIFT between honest nodes."""
-    return GENESIS_TIMESTAMP + int(block_number) * BLOCK_TIME
+    state. Monotonic and approximately wall-clock (it tracks real time while blocks land at the assumed
+    cadence, and drifts by the difference otherwise). Deliberately NOT block_timestamp, which is uncommitted
+    and skews by up to BLOCK_TIMESTAMP_DRIFT between honest nodes."""
+    return GENESIS_TIMESTAMP + (int(block_number) * CHAIN_CLOCK_CADENCE_DS) // 10
 
 # INCLUSION DELAY (blocks): a flexibly-landing tx sets min_block = submit_tip + this, so no producer may
 # include it until it has had this many blocks (~this * block_time seconds) to gossip to EVERY producer.
@@ -80,7 +127,23 @@ def chain_clock(block_number: int) -> int:
 # deterministic fast-forward (loops/core_loop) always hits and block time tracks block_time instead of
 # lagging on transient mempool divergence. Enforced in block_ops (producer + verifier); absent min_block
 # defaults to 0 (immediate), so historical blocks stay valid.
-TX_INCLUSION_DELAY = 2
+#
+# RAISED 2->8 after the alphanet-13 h5924 split (2026-07-29). Three nodes built the winner's block with blob
+# tx f2f8f14066 (min_block=5924, i.e. eligible at exactly that height); .131 built the same winner's block,
+# same parent, same creator, same state_root, same weight, 4 seconds earlier and WITHOUT the tx. One block
+# apart in eligibility is a coin flip on whether every producer holds the tx yet, and the two honest blocks
+# then differ in nothing but their tx set. That is the same too-tight-window failure RESERVED_TX_MARGIN and
+# DUTY_TX_MARGIN were raised for; this was the one remaining instance, on the ordinary flexibly-landing path.
+#
+# SUBMITTER-SIDE, so no reroll: the verifier enforces `block_number >= tx["min_block"]` against the tx's OWN
+# committed field, and this constant only decides what a newly constructed tx stamps there. Old and new nodes
+# interoperate; they just pick different earliest-landing heights for the txs they create.
+#
+# 8 blocks is ~48s at 6s/block — enough for several gossip rounds without pushing blob latency past a minute.
+# HONEST RESIDUAL: a margin helps only if the tx eventually arrives. If .131 never received it at all, this
+# buys more retry opportunities but is not a cure; the mempool-propagation path is the thing to instrument if
+# a split recurs at a wider margin.
+TX_INCLUSION_DELAY = 8
 
 # TX LANDING (max_block is an EXPIRY DEADLINE, not a target). A flexibly-landing tx (value transfer, blob,
 # bridge in/out, dividend_withdraw — see block_ops._lands_flexibly) may be mined in ANY block in
@@ -93,13 +156,51 @@ TX_INCLUSION_DELAY = 2
 TX_LANDING_WINDOW = 360
 TX_TARGET_MARGIN = 300
 
+# RESERVED-TX LANDING MARGIN — how far ahead the node aims max_block for the EXACT-LANDING txs it mints
+# itself (bond, register, duty). These get no min_block inclusion delay (_lands_flexibly is False for them,
+# by design: their timing invariants are tied to the landing height), so max_block IS their only
+# propagation window: the tx must reach EVERY producer before the block it lands in is built. Blocks are
+# deterministic, so a producer holding the tx assembles a different block than one that does not — and the
+# chain forks on the spot.
+#
+# The old values were tip+2 (bond), tip+4 (register) and tip+5 (duty): ~12-30s at 6s/block. That forked
+# alphanet-12 three times on 2026-07-28 — h12506 on an auto-bond emitted after a node restart, h12605 on a
+# duty tx — splitting a 4-node fleet into three chains and collapsing FFG to 0. Every restart mints a bond
+# and every epoch mints a duty, so this fires as a matter of course, not as an edge case.
+#
+# SUBMITTER-SIDE ONLY: max_block is chosen by the sender and consensus only checks max_block ==
+# block_number, so raising these needs no reroll and old and new nodes interoperate (they just pick
+# different landing heights for their own txs). Kept well under TX_LANDING_WINDOW so a tx admitted against
+# a slightly-behind peer still fits.
+RESERVED_TX_MARGIN = 30      # bond/register: ~3 min at 6s/block
+FLEX_TX_MIN_MARGIN = 30      # flexibly-landing system txs (collect blob, dividend claim): min_block =
+                             # tip + this. TX_INCLUSION_DELAY (8) assumed the submitter's tip is CURRENT;
+                             # a relay a few blocks stale ate the whole margin and forked h67761 on a
+                             # sweep that became eligible ~6s after submit. These txs are per-epoch —
+                             # 3 min of patience is free, and 30 absorbs any realistic tip staleness.
+
+# GATE HYGIENE: a consensus change ships either at a reroll (ungated) or with a gate keyed on the CURRENT
+# CHAIN_GENERATION, written `H if CHAIN_GENERATION == <this> else 1` — on the next chain the rule is live from block 1,
+# so a reroll needs no gate edit (see the GATE LEDGER below and doc/reroll.md). `else 0` means "never" and marks dead
+# code for the cleanup pass. Never a bare height that outlives its chain. A gate that has fired stays until the reroll
+# (blocks below it still replay under the old rule) and is deleted there.
+                             # from this height (a boundary, 60*1370; 0 = genesis on any future chain),
+                             # every epoch-boundary block COMMITS the just-completed epoch's open-lane
+                             # weights into L1 state (kv_ops.epoch_weights_commit) — the presence-
+                             # dividend's input becomes an immutable state row instead of a query-time
+                             # reconstruction. The 2026-08-19 frozen-quorum post-mortem proved
+                             # weights_at_epoch drifts across code versions (three historical replays
+                             # missed the justified root). Committed rows enter the state ROOT, so a
+                             # wrong answer is a root split, not a silent divergence. Retention:
+                             # ~10 KB/epoch, unpruned for now — a windowed journaled prune is future work.
+
 # --- Reserved, keyless protocol pseudo-addresses (no private key) ---
 # "bond"/"unbond": pseudo-recipients used by the bonding transactions (see S4).
 # (The "burn" mechanic was removed entirely: no burn address, no burned counter, no
 #  burn-to-bribe. Fees are still destroyed — that is the separate fee mechanic, not "burn".)
 # "bond"/"unbond": bonded-lane stake txs. "register": the OPEN-lane (no-coin) mining lease tx
 # (see the two-lane mining design in doc/mining.md). All are keyless protocol pseudo-recipients.
-RESERVED_RECIPIENTS = frozenset({"bond", "unbond", "withdraw", "register", "slash", "attest", "commit", "reveal", "duty", "alias", "blob", "settle", "bridge", "bridge_withdraw", "dividend", "dividend_withdraw", "htlc", "htlc_lock", "htlc_claim", "htlc_refund", "shield", "unshield", "treasury", "treasury_vote", "treasury_execute", "msgkey", "xmsg", "faucet"})
+RESERVED_RECIPIENTS = frozenset({"auth", "bond", "unbond", "withdraw", "register", "pool", "delegate", "undelegate", "slash", "attest", "commit", "reveal", "duty", "alias", "blob", "settle", "bridge", "bridge_withdraw", "dividend", "dividend_withdraw", "htlc", "htlc_lock", "htlc_claim", "htlc_refund", "invite", "invite_lock", "invite_claim", "invite_refund", "shield", "unshield", "treasury", "treasury_vote", "treasury_execute", "msgkey", "xmsg", "faucet", "tpm_enrol", "tpm_challenge", "tpm_commit", "tpm_reveal", "tpm_ready", "legacy_claim"})
 
 # --- SHIELDED POOL (post-quantum zk-STARK privacy, doc/privacy.md) — L1 side of an EXECUTION-LAYER feature ---
 # L1 never sees a note or verifies a proof; it only escrows the transparent coins that enter/leave the pool
@@ -163,27 +264,20 @@ SETTLE_DEN = 3
 # a withdrawal record (funds stuck, not lost). Same trust trade FFG accepted: going dark forfeits
 # your say, and a hostile LONE settler only controls the root if every honest settler has been dark
 # for the whole window (~2.4h at 6s blocks; systemd restarts make that an outage, not an accident).
+# That sentence did not hold where the window is EMPTY — a fresh chain, a fresh namespace, or every other settler silent
+# past SETTLE_ANCHOR_LONG_CURSORS — where one B_MIN bond was the whole quorum (audit 2026-09-25, the lone-settler drain).
+# The stake floor (SETTLE_FLOOR_NUM/SETTLE_FLOOR_DEN below, settlement_ops.settlement_justified) adds a floor of ALL bonded
+# stake that no silence can shrink. INVARIANT: never let the denominator shrink without that floor behind it.
 # The optimistic fraud proof (doc/dividend-fraud-proof.md) is the planned trust upgrade on top.
 SETTLE_ACTIVITY_CURSORS = 1440
 
-# The exec-layer GENESIS state root every namespace's settled chain extends from. A settle-with-proof for a
-# namespace with no prior settled tip must carry a proof whose pre_root is EXACTLY this — so the very first
-# settlement cannot start from a fabricated pre-state (the same strict chaining every later settlement gets
-# by extending the committed tip). It is the root of an EMPTY execution state
-# (execnode/exec_root.state_root_hex({}, empty ExecState): rnode(empty KV half, records half holding only the
-# empty shielded/field-pool digest records) over the two depth-256 sparse alghash2 trees).
-# Hardcoded (protocol.py stays a leaf: no execnode import), so it is a SCHEME CANARY: if the exec-root
-# scheme ever changes, this stops matching the recomputed empty-state root and the assertion in
-# tests/test_exec_root.py fails loudly. That is exactly how the 2026-07-20 drift was found — the value below
-# had silently desynced when alghash2 went 8 -> 54 rounds (db03a1f) and again at the alphanet-7 debrand,
-# because the guard the comment PROMISED did not exist: test_exec_root only PRINTED the value. It asserts now.
-# (The settle path no longer consumes this: a first settlement must come from the bonded quorum, so a proof
-# always extends a real committed tip. Kept because the canary is worth more than the one call site was.)
-EXEC_GENESIS_ROOT = "076885ee6a32444b8f3aeb99829c7f8994e6436ce69be7080af1ebaa4726a4a8"
+# EXEC_GENESIS_ROOT (the empty Goldilocks exec root, alghash2 over depth-256 sparse trees) and EXEC_TREE_DEPTH went with
+# execnode/exec_root.py in G9 slice 4: generation 29's exec root is exec_root_b2's at every cursor, and only that
+# module's tests read them.
+# The genesis canary for the BLAKE2s exec root (gen 29's, at every cursor): execnode/exec_root_b2.state_root_hex({}, empty
+# ExecState). tests/test_the_blake2s_exec_root_is_dormant_now_and_whole_from_its_gate.py recomputes it; a change to the gen-29 scheme fails there before a reroll.
+EXEC_GENESIS_ROOT_B2 = "ea3f3636c2d399b4c011456f8a6158a915d7fd50391e141abe6bccf68877500d"
 
-# The FROZEN depth of the two sparse halves of the settled root (see exec_root.DEPTH — kept equal by test).
-# 256 = the full alghash2 digest: position security saturates the hash itself, so this never changes.
-EXEC_TREE_DEPTH = 256
 
 # --- CONSENSUS-LOAD AGGREGATION (doc/consensus-aggregation.md — the O(N)-messages scaling fix) ---
 # 1. MERGED DUTY TX: a bonded validator's whole per-epoch consensus participation — FFG attest(X) +
@@ -237,14 +331,42 @@ def valid_namespace(ns) -> bool:
 POSW_T = 1_000_000           # total sequential hash steps (~1 s on a phone; single-core spam < ~1M/day)
 POSW_S = 2_000               # steps per checkpoint segment -> C = T // S = 500 segments
 POSW_K = 20                  # Fiat-Shamir spot-checks (soundness); verify ~ (K+1)·S hashes
-POSW_ANCHOR_OFFSET = 30      # anchor block = max_block − this (>= FINALITY_DEPTH: finalized & stable)
+POSW_ANCHOR_OFFSET = 150     # anchor block = max_block − this (>= FINALITY_DEPTH: finalized & stable)
+# HOW LONG A PROVER ACTUALLY HAS. A `register` lands at EXACTLY max_block, and its anchor
+# (max_block − POSW_ANCHOR_OFFSET) must already exist when proving STARTS — so a client targeting
+# tip+M can only choose M <= POSW_ANCHOR_OFFSET, and M blocks is its entire proving budget.
+#
+# With the offset at 30 the budget was 30 blocks (180 s) and the anchor was the TIP itself (depth 0 at
+# prove time — below FINALITY_DEPTH, contrary to the note above). That budget is not a function of the
+# WORK the difficulty demands, and the two had drifted badly apart: an entry registration owes
+# POSW_ENTRY_MULT × the rate multiplier = up to 512 × POSW_T = 512M sequential hashes. Measured with the
+# hasher the browser miner actually ships (WASM blake2b, ~3.2M h/s on a desktop, ~4-10x slower on a
+# phone), a mid-range phone needed ~121 s of a 180 s window at 96x and simply could not finish at all
+# above that. It produced a VALID proof for a block the chain had already passed, and the submit came
+# back as a flat rejection — reported by users as "the relay rejected the registration".
+#
+# Widening the offset fixes the binding constraint without touching the anti-Sybil COST by one hash.
+# At offset 150 a client targets tip+90: the anchor is tip−60, which is 60 blocks deep at prove time
+# (past FINALITY_DEPTH=45, so the note above becomes true) and 150 deep at landing. Budget: 90 blocks
+# = 540 s, enough for the worst case on a slow phone.
+#
+# CONSENSUS. validate_transaction re-derives the anchor from max_block, so a node on a different offset
+# computes a different challenge and rejects every honest registration. Flag day, no compat path.
+POSW_TARGET_MARGIN = 90      # blocks a client may target ahead of the tip = its proving budget (540 s)
 
 # PERIODIC PRESENCE: registration is a renewable LEASE. A `register` (with a fresh PoSW) grants OPEN-lane
 # eligibility for POSW_LEASE_EPOCHS; to stay present you renew (another PoSW) each period, else you lapse
 # out of the open registry. This turns "pay once, farm forever" into "pay continuously to keep each
 # identity alive" — a Sybil farm's cost scales with size × time. At ~8 min/epoch, ~180 epochs ≈ 1 day, so
 # an honest phone spends ~1 s of PoSW per day; a renewal is due once the lease is RENEW_FRACTION spent.
-POSW_LEASE_EPOCHS = 240      # a registration/recert keeps you eligible this many epochs (~1 day: 240×60×6s = 24h)
+POSW_LEASE_EPOCHS = 360      # a registration/recert keeps you eligible this many epochs (36 h: 360×60×6s). Was 240
+                             # (24 h) until 2026-09-01: with FIDELITY_MIN_GAP_EPOCHS = 192 the window in which a
+                             # renewal both counts (+1) and lands before expiry was only 19.2-24 h — 4.8 h wide —
+                             # which punished intermittent phone users (a lapse halves fidelity and restarts
+                             # probation) far harder than an automated farm. 36 h opens it to 19.2-36 h: once a
+                             # day, any time of day. A lapsed/disposable identity stays present 12 h longer, on
+                             # probation (weight 1, no dividend) — negligible. Changed while the chain was <19 h
+                             # old, so no committed epoch differs; protocol handshake 10 -> 11 sheds stragglers.
 
 # --- Registration-rate PoSW difficulty (doc/ip-spoofing-and-sybil.md): the required PoSW work SCALES with
 # recent registration volume, so a sudden identity FLOOD gets progressively more expensive. CONSENSUS-BOUND —
@@ -257,6 +379,34 @@ POSW_DIFF_WINDOW = 20        # recent-registration window (epochs) whose rate se
 POSW_DIFF_TRAIL = 400        # longer trailing window defining the "normal" rate baseline (~2 days)
 POSW_DIFF_FLOOR = 20         # min baseline registrations/window (prevents tiny-network over-sensitivity + div-by-0)
 POSW_DIFF_MAX_MULT = 16      # cap: never require more than 16x the base PoSW (bounds honest-user cost)
+
+# ENTRY COST — the consensus-enforceable half of "one device may not onboard thousands of identities".
+#
+# The 64-per-IP cap (ops.ratelimit.allow_registration) is called from ONE place: nado.py's HTTP submission
+# handler. It is admission policy on one door, not a rule of the chain — a registration submitted to a
+# different node, from a different IP, or gossiped straight to peers is fully valid and every node accepts
+# it. IT CANNOT BE MADE CONSENSUS: a transaction carries no IP (sender/pubkey/posw/signature only), and
+# transactions arrive by GOSSIP, so the address a node observes is the RELAYING PEER, not the originator.
+# Different nodes would compute different answers for the same block — the exact non-determinism class that
+# has wedged this chain before. A self-declared IP field would be forgeable and free to vary.
+#
+# What IS consensus-checkable is the sender's OWN recert history. So the cost is moved to identity
+# CREATION: a register from an address with no valid lease as of the anchor epoch (a new identity, or one
+# that let its lease lapse) pays POSW_ENTRY_MULT x the base sequential work; an established identity
+# RENEWING pays the base. That is the right shape for anti-Sybil — creation dear, presence cheap — and it
+# leaves the open lane capital-free, which is the point of the lane.
+#
+# Sizing: at the measured honest weight (266 across 117 miners), 133 identities take half the open lane and
+# half the presence dividend. At 32x that is ~71 core-minutes of one-time work instead of ~2, and it
+# COMPOSES with the rate multiplier (up to 16x), so a burst pays up to 512x base each.
+# It depends only on the sender's own history, which only the sender can extend and only once per epoch,
+# so prover and validator cannot disagree between prove-time and land-time.
+POSW_ENTRY_MULT = 32
+
+# UNCONDITIONAL — this ships WITH a genesis reroll, so there are no pre-rule proofs to keep valid and no
+# historical blocks to re-validate. It was briefly height-gated (epoch 862) while the plan was to activate
+# on the running chain; a reroll makes that gate pure dead weight, and re-dating it would have left the
+# hole open for the first ~3.5 days of the new chain.
 # CHAIN GENERATION (genesis-reroll flag, ops/data_ops.py): each generation is ONE GENESIS LINEAGE —
 # bump this in the SAME commit as a genesis reroll (nothing to do with the 60-block consensus epochs).
 # Every node stamps the generation its on-disk data was built under; on boot after an update, a mismatch
@@ -338,7 +488,138 @@ POSW_DIFF_MAX_MULT = 16      # cap: never require more than 16x the base PoSW (b
 #   they are redeemed; apply_slash books its burn; the snapshot payload is canonicalized and re-anchor +
 #   fresh-bootstrap require a quorum with seed anchoring; strike attribution no longer benches honest
 #   peers. Exec state semantics change (TIME), so exec state is rebuilt from the new genesis too.
-CHAIN_GENERATION = 12
+# 12 (2026-07-27): RECURSIVE-FOLD reroll — activated the K->1 settlement fold. Since RE-GATED
+#   (SETTLE_PROOF_RECURSIVE=False): the recursion path is still base-field (~47 bits) while the main path
+#   reached 112, so accepting folds would have made the fold the weakest link in consensus.
+# 13 (2026-07-28): AUX-EXT reroll — the aux (LogUp) Fiat-Shamir challenges beta/gamma move from the BASE
+#   field to GF(p^2), taking that term from ~44 bits to 109. It was the LAST base-field draw and therefore
+#   the one that actually bound the system: every aux_spec circuit (vm_circuit — the exec/settlement path —
+#   and logup_bind) inherited it, so an attacker would have targeted 44 bits, not 112.
+#   WHY A REROLL: settle proofs are re-verified on block APPLY (ops/transaction_ops.verify_settlement_sparse),
+#   not only when first accepted. Every settlement already on chain was proven under base-field challenges,
+#   so after this change a fresh sync would reject those blocks and no new node could ever bootstrap. The
+#   proof format is not backward compatible and cannot be made so — the challenge field is what changed.
+#   The extension-valued aux columns also widen the exec trace (each logical aux column becomes a base-column
+#   PAIR), so the AIR geometry differs too.
+# 16 (2026-08-03): RECORDS-BOUND SETTLEMENT reroll — new CHAIN_ID + GENESIS_TIMESTAMP, SETTLE_PROOF_RECORDS
+#   on. Until now settle-with-proof covered only the KV half: the L1 composition pinned the SAME records
+#   half into the pre and post root, so ANY span carrying a bridge deposit, faucet donation or treasury
+#   payout fell back to the bonded quorum however good its proof was.
+#   WHY A REROLL, and why this one is not a hot toggle even by the usual standard: it changes what is
+#   WRITTEN, not merely what is checked. incorporate_block now commits each block's records EFFECTS into
+#   its exec summary — the only prune-safe source the settle branch may read, since reading block BODIES
+#   made one tx validate differently on a pruned node than an archive node and forked the fleet. Those
+#   summaries live in the `meta` sub-DB, which FEEDS THE L1 STATE ROOT, so an upgraded node with the flag
+#   on computes a different root than an unupgraded peer applying the identical block. Flipping it live
+#   would not risk a fork, it would guarantee one.
+#   DISTINCT GENESIS on purpose (the generation-10 lesson): bumping CHAIN_GENERATION alone leaves the
+#   genesis hash shared, and stranded old-code nodes then keep out-weighing the fresh chain in fork choice.
+#   Coverage fails closed: bridge deposit, faucet donation, treasury->faucet mirror. A value>0 call escrows
+#   sender->cid BEFORE the VM runs and is refunded on revert, so its net effect is not a function of the
+#   calldata; such a block is marked non-derivable and keeps riding the quorum.
+# 17 (2026-08-06): VALUE-CALL ESCROW reroll — new CHAIN_ID + GENESIS_TIMESTAMP,
+#   SETTLE_PROOF_RECORDS_VALUE_CALLS on. Generation 16 made the RECORDS half provable but excluded the one
+#   family that matters in practice: a contract call carrying value>0. MEASURED over a full day on
+#   alphanet-15, that exclusion was 91 of 146 settle refusals — "the RECORDS half moved" (36) and "crosses a
+#   dividend epoch boundary" (55), which are ONE gate, because a dividend accrues at every boundary block
+#   and moves records for exactly the reason the records gate names. Every call on that chain carried value
+#   (all 25 game contracts; zero zero-value calls), so proof-carrying settlement could only ever cover
+#   CALL-FREE spans — a couple of windows a day.
+#   WHAT CHANGES: records_bind now derives a native value call's escrow (sender -v, cid +v as two
+#   T_BRIDGE_BAL positions) instead of returning non-derivable. THE PROOF IS THE VERDICT — zkvm2.ZkVMRevert
+#   states that the interpreter reverts exactly where the AIR would have no satisfying witness, so a VALID
+#   PROOF over a span already establishes every call in it succeeded, hence every escrow stuck, which IS a
+#   pure function of the calldata.
+#   WHY A REROLL, same reason as 16 and not a hot toggle: the derived effects are committed into each
+#   block's exec summary in the `meta` sub-DB, which FEEDS THE L1 STATE ROOT. An upgraded node emitting
+#   effects where an unupgraded peer wrote derivable=0 computes a different root from the identical block.
+#   Flipping it live would not risk a fork, it would guarantee one.
+#   DISTINCT GENESIS again (the generation-10 lesson): a CHAIN_GENERATION bump alone leaves the genesis hash
+#   shared and stranded old-code nodes keep out-weighing the fresh chain in fork choice.
+#   PREREQUISITE, already in (1fbf4c35): the argument needs "provable => what the chain actually did", and
+#   that did NOT hold — settlement_proofs._run_call credited the contract without debiting the sender or
+#   checking affordability, so it would prove a call the chain had SKIPPED. L1 never recomputes the exec
+#   root, so its only check is post_full == root against the tx's OWN claim, which a proof over the wrong
+#   state satisfies self-consistently. _run_call now mirrors the live escrow on both the native and asset
+#   paths.
+#   STILL NOT COVERED: a call the VM REVERTS or the chain SKIPS gets its escrow derived anyway and is
+#   marked derivable, which is WRONG for that block — sound only because no valid proof can exist over such
+#   a span, so it fails closed (see the flag's own comment). Presence-dividend accrual also moves records on
+#   an epoch boundary with NO transaction at all, so a span crossing one is still refused.
+# 18 (2026-08-09): KV CODE + PER-CALL ASSET BINDING reroll — new CHAIN_ID + GENESIS_TIMESTAMP. Closes a
+#   settle-with-proof soundness hole: the KV half bound contract STORAGE but never the contract CODE, though a
+#   cid is H(deployer, code, nonce). A settle-with-proof supplies its own pre_contracts code and the exec proof
+#   runs it, so a bonded settler could prove an ARBITRARY storage transition over COUNTERFEIT code for a real
+#   cid — real cid + real storage (matching sparse_pre_root) + fake code — and settle a KV root every honest
+#   node disagrees with, self-consistently. FIX: exec_root.kv_projection AND settlement_sparse.sparse_projection
+#   now commit a code leaf per contract (exec_state_bind.code_key -> code_commitment), so the pre-state pin
+#   (sparse_root(pre_contracts) == the settled tip's KV half) authenticates the prover-supplied code — fabricated
+#   code changes the KV root and fails to extend the tip. Same class also closed for the per-call `asset`
+#   context: it was a public input the exec proof runs over but was absent from calls_commit.call_leaf, so a
+#   value==0 asset call (records-inert, proof-settleable) could be proven under a SWAPPED asset with the DA
+#   commitment still matching; call_leaf now binds it.
+#   WHY A REROLL: both change the L1 STATE ROOT — kv_projection feeds it directly, and call_leaf feeds the exec
+#   summaries in the `meta` sub-DB which also feeds the root. An upgraded node computes a different root than an
+#   unupgraded peer applying the identical block, so this MUST ride a generation bump, never a hot toggle.
+#   DISTINCT GENESIS (the generation-10 lesson): a CHAIN_GENERATION bump alone leaves the genesis hash shared and
+#   stranded old-code nodes keep out-weighing the fresh chain in fork choice.
+#   OPERATIONAL: a reroll wipes exec state — redeploy the game-contract fleet in the SAME session
+#   (execnode.games.redeploy), or the games silently vanish.
+# 19 (2026-08-11): BETANET LAUNCH reroll — new CHAIN_ID ("betanet-1") + new GENESIS_TIMESTAMP, so the
+#   genesis hash is DISTINCT (the generation-10 lesson). The project leaves alpha: this genesis resets
+#   EVERY balance and bonded stake to ZERO (genesis_data/genesis_alloc.dat emptied to [], TREASURY_GENESIS
+#   still 0) — a clean fair relaunch, no premine, no carry-forward. Betanet behaves like mainnet (balances
+#   persist across ordinary /update waves) but MAY still be rerolled while consensus hardens. Ships the
+#   pre-launch security remediation (pubkey-once revert journal, settle query-count pinning, contract id
+#   bounds, DoS scoping, ML-DSA negative-vector self-test). OPERATIONAL: redeploy the game-contract fleet
+#   in the SAME session (execnode.games.redeploy) — the reroll wipes exec state and their old cids.
+# 20 (2026-08-11): RE-CUT after the gen-19 launch SPLIT. betanet-1 forked 3 ways within 13 blocks
+#   (h13 / h12 / h94, one identical genesis) because GENESIS_QUIET_MIN_PEERS was 2: two nodes reached each
+#   other, released the first-block gate and started the chain while the other three were still on the old
+#   generation. Each minority then finalized its own fork, and a finality floor on a minority fork cannot
+#   roll back — unrecoverable without a wipe. FIX (the reason this reroll exists): the gate now requires a
+#   MAJORITY of the fleet (GENESIS_QUIET_MIN_PEERS 2 -> 4) and waits 30 min (GENESIS_QUIET_S 600 -> 1800),
+#   so a minority can never start the chain. New CHAIN_ID + GENESIS_TIMESTAMP so the split gen-19 chains
+#   cannot linger in fork choice. Balances remain ZERO (empty alloc); prefixless producer set unchanged.
+#   OPERATIONAL: redeploy the game contracts after regenesis (the gen-19 deploys died with that chain).
+# 21 (2026-08-20): betanet-3, the carry-forward reroll. 22 (2026-08-20): betanet-4, the convergence
+#   reroll — every 2026-08-20 rule ungated from block 0.
+# 23 (2026-08-25): betanet-5, the DIVIDEND-RULES reroll. Carry-forward (tools/alphanet6_carryforward.py,
+#   supply conserved exactly): balances, bonded, uncollected + pending dividends, user bridge balances,
+#   pending exits. Live from block 0 with NO gate: linear bonded weight (BOND_CAP/MAX_SHARES removed), the
+#   dividend's own convex 1..25 weight curve (dividend_weight), a lapse HALVES fidelity (fidelity_step),
+#   and bonded blocks send 40% to the presence dividend (BONDED_DIVIDEND_BPS). The generation-keyed gate
+#   that carried these rules for the last hours of gen 22 is deleted — it existed for replay of gen-22
+#   history, which no longer exists. OPERATIONAL: redeploy the game contracts in the SAME session
+#   (execnode.games.redeploy — pinned nonce => identical cids, upgradable) and re-fund the faucet.
+CHAIN_GENERATION = 29   # betanet-10: the Stwo reroll (BLAKE2s/M31 exec layer, carried contracts re-encoded, signature schemes, 128-bit private sends); every gen-28 gate live from block 1. Was 28 (betanet-9: address format 2 (hash of the whole key; the old 46-char format rejected by shape), every gen-27 dormant/reroll gate live from block 1. Was 27 (betanet-8)
+# CHAIN CLOCK CADENCE (deciseconds per block), RE-ANCHORED AT EVERY REROLL (security review 2026-09-23, C3).
+# The clock assumed 6 s/block while the chain produced one every 6.69 s on average over gen 25 (block 1 at
+# 1788774422, block 209400 at 1790175705) and ~6.5 s over its last 10,000, so TIME fell 40.7 h behind wall
+# time and the gap grew ~2.5 h a day. That mattered: OTC compared a chain-time expiry with a wall-clock
+# foreign deadline. The wallet now judges those by its own clock (static/dex.js), and the clock itself can
+# only ever be a height-keyed ESTIMATE — block_timestamp is uncommitted, so no committed wall time exists —
+# but the estimate should be the measured cadence and the accumulated lag resets with the new genesis.
+# Gen 25 ran at 60 ds (GENESIS + h*6 exactly); the reroll re-anchored it to the cadence measured there, and the
+# gen-25 branch was collapsed after the betanet-8 reroll. Re-measure at every reroll (doc/reroll.md).
+CHAIN_CLOCK_CADENCE_DS = 65   # 65: gen 27 measured 6.50 s over its last 10,000 blocks (7.55 s overall, 1..37216); was 64 (gen 25: 6.41 s)
+
+# METERED DIVIDEND CARRY (a gen-24 gate, cleaned up after the betanet-8 reroll). While every identity was on probation (epochs 0-193
+# of betanet-6) the accrual found an empty weight set and carried the WHOLE inflow forward; at epoch 194 the one
+# identity that had just left probation received the entire backlog — 113.29 NADO against 0.587 NADO per epoch
+# (reported by fazer, 2026-09-02). From this epoch the carry is released at most one epoch's inflow per epoch
+# (never less than DIV_CARRY_RELEASE_FLOOR, so a backlog drains even if inflow stops), so a backlog flows to
+# everyone leaving probation over the following hours instead of to whoever is first. Both accrual paths read
+# ONE function (records_bind.dividend_accrual_effects). On gen 25+ the meter applied from epoch 0; the constant
+# (DIV_CARRY_METER_EPOCH = 0) and the unmetered branch were deleted after the betanet-8 reroll: the meter is unconditional.
+# DIVIDENDS REQUIRE ATTESTATION (2026-09-07, operator: "dividends must require attestation"). The 12 genesis_open.dat
+# identities are seeded with a recert at epoch 0 so the open lane can PRODUCE from block 0 — they never attested, and
+# through the lease they were also PRESENT for the dividend. From this epoch an identity whose only recert is the genesis
+# seed (latest recert epoch == 0 as of the epoch) is excluded from the dividend weight set; a seed that renews with a real
+# attested register (epoch >= 1) earns like anyone else. Gen 25 gated it at epoch 30 (DIVIDEND_ATTESTED_EPOCH); from gen 26
+# it held from epoch 0, and the constant was deleted after the betanet-8 reroll (dividend_ops.weights_at_epoch).
+DIV_CARRY_RELEASE_FLOOR = 5 * 10 ** 9           # 0.5 NADO per epoch, raw
+
 
 # --- Data-availability blobs for the separate execution layer (doc/execution-layer.md, Phase 1) ---
 # "blob": a keyless reserved recipient whose tx carries an OPAQUE payload in tx["data"]. L1 ORDERS and
@@ -371,9 +652,15 @@ ALIAS_REGISTRATION_FEE = 10_000_000     # 0.001 NADO (10,000x MIN_TX_FEE): deter
 # here. It is a normal KEY-CONTROLLED address (the founder holds its key), derived here under the
 # canonical (new) checksum from the genesis public-key body so it validates. It starts EMPTY —
 # there is NO genesis allocation (TREASURY_GENESIS = 0 below); it only fills from the per-block cut.
-_GENESIS_BODY = "mldsa4427f2870bb2969a4d2b9d4eea303bedea996b9ccc93"  # genesis producer address (ML-DSA addr minus 4-hex checksum)
-# ^ ADDRESS LITERAL: re-derived at any address-format switch (doc/address-format.md cutover step 4)
-GENESIS_ADDRESS = _GENESIS_BODY + blake2b_hash(_GENESIS_BODY, size=2)
+_GENESIS_BODY = "27f2870bb2969a4d2b9d4eea303bedea996b9ccc93"  # genesis producer address (ML-DSA addr minus 4-hex checksum)
+# ^ ADDRESS LITERAL: re-derived at any address-format switch (doc/address-format.md cutover step 4).
+# DE-PREFIXED at alphanet-14. The pubkey BODY is unchanged, so the same key still owns this account — only
+# the string changed (49+4 -> 42+4). Leaving the "mldsa44" on here would have been silent and total: the
+# founder's key derives make_address(pk) = 42 hex + checksum, which can never equal a 53-char literal, so
+# the treasury's own genesis address would have belonged to nobody.
+# FORMAT 2 (gen 28): the address of the same key is a hash of the WHOLE key, so it cannot be derived from _GENESIS_BODY
+# (which is now only that key's format-1 body); pinned as the literal make_address(founder key) returns.
+GENESIS_ADDRESS = "b7a08de8351e3af97f6f2bbcb19f2a8c722abad81c3460caf9"
 # The TREASURY is a RESERVED, KEYLESS account (like "dividend"/"bridge") — NOT the founder's genesis address.
 # No private key exists for it, so the ONLY way coins leave it is a quorum-approved treasury_execute
 # (doc/treasury.md §3.3). This is what makes "spendable only through the bonded-stake quorum" actually true.
@@ -391,7 +678,10 @@ BPS_DENOM = 10000
 # use of capital (i.e. the security budget is preserved). This only changes how emission is PAID OUT — a
 # jackpot becomes a stream — it does not enlarge any lane's share.
 OPEN_TIP_BPS = 2000          # open producer's cut of an open-lane block (20%); treasury 10%; dividend = rest (70%)
-BONDED_DIVIDEND_BPS = 2000   # bonded block's contribution to the dividend pool (20%); producer keeps 70%, treasury 10%
+BONDED_DIVIDEND_BPS = 4000   # bonded block's contribution to the dividend pool (40%); producer keeps 50%, treasury 10%.
+                             # 20% until the betanet-5 (gen 23) reroll. This is the ONLY enforceable "tax the
+                             # rich": levied on the BLOCK, not the key, so no key-splitting escapes it — every
+                             # per-identity progressive rule is void because keys are free (doc/progressive-levy.md).
 DIVIDEND_POOL = "dividend"   # reserved L1 account the dividend accrues to (O(1) on L1)
 
 # --- Treasury governance (doc/treasury.md): stake-quorum spending. No multisig — the bonded lane IS the
@@ -421,9 +711,9 @@ REWARD_WINDOW = 100          # retained as the prune/rollback safety window (blo
 # doc/bond-elastic-emission.md). There is NO fee-weighted upside and NO ceiling: fees are DESTROYED, so
 # raising emission with fees would mint more exactly when more is burned — softening the deflation. Because
 # the multiplier m(r) <= 1, the block reward is BASE_SUBSIDY at most (the MAX emission/block) and
-# m_min*BASE_SUBSIDY (~0.024 NADO) at least — the perpetual tail, so production is never unincentivised (no
+# m_min*BASE_SUBSIDY (~0.0166 NADO) at least — the perpetual tail, so production is never unincentivised (no
 # hard cap, no security cliff). The base also lets a zero-coin OPEN-lane miner earn from block 1 (fair launch).
-BASE_SUBSIDY = 1_000_000_000  # 0.1 NADO/block raw = MAX emission/block (~144 NADO/day at 60s blocks: 1440*0.1)
+BASE_SUBSIDY = 1_000_000_000  # 0.1 NADO/block raw = MAX emission/block (~1,440 NADO/day at 6s blocks)
 
 # --- BOND-ELASTIC EMISSION (super hard money — see doc/bond-elastic-emission.md) ---
 # The block reward is scaled by a multiplier m(r) that shrinks as the bonded ratio r rises: the more the
@@ -431,7 +721,7 @@ BASE_SUBSIDY = 1_000_000_000  # 0.1 NADO/block raw = MAX emission/block (~144 NA
 # net-deflationary under real usage, while a perpetual tail (m never reaches 0) means block production is
 # ALWAYS incentivised — no hard cap, no security cliff (Monero reasoning).
 #   m(r) = M_MIN + (1-M_MIN)*exp(-k*r),  M_MIN=0.15, k=4,  applied uniformly to BOTH lanes.
-# TUNED (final): M_MIN=0.15 gives a credible perpetual security tail (~0.0166 NADO/block ≈ 8,700 NADO/yr
+# TUNED (final): M_MIN=0.15 gives a credible perpetual security tail (~0.0166 NADO/block ≈ 87,000 NADO/yr at 6 s blocks
 # forever, never zero) while k=4 makes emission at the ~40% self-limiting equilibrium ~0.033/block (hard),
 # with a responsive-but-not-violent early curve (10% bonded -> ~28% emission cut). MAX emission = BASE (m=1
 # at r=0). CONSENSUS-SAFE: hardcoded INTEGER table in basis points, indexed by the bonded ratio in whole
@@ -485,11 +775,37 @@ AUTO_BOND_MIN_RAW = AUTO_MIN_FEE_MULTIPLE * MIN_TX_FEE     # 0.001 NADO at defau
 # only sweeps once its accrued dividend (read from the local exec node) reaches this — below it, the
 # accrual just keeps growing fee-free until it's worth a tx.
 AUTO_COLLECT_MIN_RAW = AUTO_MIN_FEE_MULTIPLE * MIN_TX_FEE  # 0.001 NADO at defaults: smallest sweep-worthy dividend
+
+# POOL WARM-UP ELDER (2026-09-22, non-consensus pacing). A freshly restarted node counts its pool as
+# reconciled only after it has merged with (or matched) a peer that has itself been up this long. The
+# 2026-08 warm-up gate accepted ANY peer's pool hash, so in an update wave two nodes that had both just
+# restarted warmed each other from empty pools, and the whole fleet split on the announcements that landed
+# during the wave — h191043, seven of nine nodes, the same five tpm_ready each. An elder is a node the wave
+# has not reached yet or one that finished restarting a while ago: either way it holds the network's pool.
+# Paired with UPDATE_WAVE_JITTER_S so that an elder exists at every moment of a wave.
+POOL_WARM_ELDER_S = 120
+# UPDATE WAVE JITTER (2026-09-22, non-consensus). A node acting on a PEER HINT — the cascade — waits a
+# uniform 0..this many seconds before pulling and restarting. Cascading "within seconds" restarted the
+# whole fleet at once, so nobody came back to a mesh with an elder to warm from. The operator's own
+# /update and the 15-minute timer are not a cascade and wait nothing; the initiating node still restarts
+# at once, so the head is visible immediately and the rest of the fleet follows inside ~3 minutes.
+UPDATE_WAVE_JITTER_S = 180
 # Default auto-bond percentage applied when the operator/user has NOT chosen one (fresh node config,
-# a browser with no saved preference, a new desktop wallet). 80 = route 80% of newly-mined spendable
+# a browser with no saved preference, a new desktop wallet). Route this % of newly-mined spendable
 # earnings into bonded stake out of the box, so miners join the capital-gated bonded lane hands-free
 # without ever touching a setting. Still fully overridable (config / env / UI), and 0 explicitly = off.
-AUTO_BOND_DEFAULT_PERCENT = 80
+#
+# WHY 99 AND NOT 80 — bonded weight is linear in stake (no per-identity cap since 2026-08-25), so the
+# percentage decides how fast a miner's share of the lane tracks what it mines. The leader out-earns the
+# field many times over at ANY setting; what the dial controls is how quickly everyone ELSE compounds
+# toward their proportional share instead of leaving mined coins idle. So the setting that least
+# disadvantages a small miner is the highest one that still leaves a node able to pay its fees — hence
+# 99, with the liquidity reserve in core_loop.maybe_auto_bond holding back what a node needs to keep
+# transacting. (The old rationale cited a 1,000 NADO cap as "the equaliser"; that cap was per key and
+# bound only honest single-key miners — see the note above B_MIN.)
+#
+# Note this is a CLIENT DEFAULT, not consensus: wallets and operators override it freely.
+AUTO_BOND_DEFAULT_PERCENT = 99
 
 # --- Rolling mode / history retention (NON-CONSENSUS node-local policy; see doc/rolling-mode-and-da.md) ---
 # A "rolling" (pruned) node keeps STATE + a window of recent block BODIES and drops older bodies, so the
@@ -502,7 +818,56 @@ AUTO_BOND_DEFAULT_PERCENT = 80
 # retention at REWARD_WINDOW+FINALITY_DEPTH+1 so even a misconfigured tiny value cannot break rollback. This is a per-node choice (archive nodes keep everything); it changes NO block/hash.
 # 100_800 blocks ~= 1 week of history at 6s blocks (7×14,400) — generous recent-body window while still
 # bounding a rolling node's disk (the unbounded->bounded win); archive nodes keep everything.
+# TX-HISTORY PRUNING FLOOR (rolling mode, non-consensus). The at-most-once replay guard reads the tx
+# index, and a tx mined at height H can never be replayed past H + TX_LANDING_WINDOW, because its
+# max_block cannot reach further (memserver admits only max_block <= tip + TX_LANDING_WINDOW). So the
+# retained window has to clear TX_LANDING_WINDOW, plus FINALITY_DEPTH for a reorg that re-applies blocks,
+# plus generous margin. 5000 blocks (~8 h at 6 s) is ~12x the strict requirement — cheap insurance on the
+# one index whose loss could allow a replay, while still cutting the term that dominates disk at scale.
+TX_HISTORY_MIN_RETENTION = 5000
+
 HISTORY_RETENTION_BLOCKS = 100_800
+
+# --- NUMBER<->HASH INDEX RETENTION (doc/index-pruning.md) — a PROTOCOL rule, not a node policy ---
+#
+# block_by_num (height -> hash) and block_by_hash (hash -> height) are the only stores that grow forever in
+# EVERY mode: 144 B/block combined, ~7 GiB at ten years of 6 s blocks, and on a fully pruned node they are
+# the dominant term. Bodies plateau once rolling prunes them; these did not.
+#
+# They cannot be pruned as a node POLICY. Both live in kv_ops.SNAPSHOT_DBS and every carried row feeds
+# state_digest, so two nodes that retained different depths emit different snapshot_hash values for the SAME
+# checkpoint and fail quorum agreement — a consensus split produced by a disk-space setting. The rule
+# therefore has to be one every node computes identically, and the only height they all already agree on is
+# the checkpoint height C the snapshot is OF. So: the payload carries [C - N, C], nothing else, for both
+# indexes. Because the window is a pure function of C, every honest node builds a byte-identical payload.
+#
+# Once the PAYLOAD is bounded, pruning the local rows below the window is unobservable to consensus and
+# becomes a node policy again (rolling nodes prune; an archive node keeps everything, which is its job).
+#
+# THE TWO WINDOWS ARE DELIBERATELY DIFFERENT, and that asymmetry is where most of the saving comes from:
+#
+#   block_by_num  — ~20 consumers, and every one of them wants the HASH ITSELF, not a body: the epoch
+#     beacon anchor, FFG epoch-boundary targets, the recert target_hash check, the PoSW anchor at
+#     max_block-POSW_ANCHOR_OFFSET, checkpoint hashes, fork-resolution's height->hash binary search, the
+#     peer hash-at-height service, snapshot manifest verification, and the exec layer's BHASH opcode.
+#     Deepest real consumer: POSW_DIFF_TRAIL (400) * EPOCH_LENGTH = 24 000 blocks, and exec's blockhash
+#     ring is 20 000. 50 000 is ~2x the deepest, with the margin on the side that breaks loudly.
+#
+#   block_by_hash — exactly ONE non-test reader in the tree: block_already_indexed(), the idempotence
+#     guard on incorporate_block ("did we already apply this exact block?"). That question is only ever
+#     asked about a block arriving NOW, so its useful depth is the reorg horizon, FINALITY_DEPTH = 45. A
+#     block offered from 40 000 heights back fails height and parent checks long before the guard is
+#     consulted. 10 000 is ~200x FINALITY_DEPTH — half the permanent index bought back for a tip-local
+#     dedupe check.
+#
+# Changing either value changes snapshot_hash, so it is a coordinated cut-over across the fleet (no reroll:
+# both stores are ROOT_EXCLUDED, so the state root and every balance are untouched).
+INDEX_RETENTION_NUM = 50_000       # heights of height->hash carried/kept (~3.5 days at 6 s)
+INDEX_RETENTION_HASH = 10_000      # heights of hash->height carried/kept (~17 h, ~200x FINALITY_DEPTH)
+
+# (The betanet-3 h10047-16000 STATE-ROOT REPAIR WINDOW was deleted at the gen-22 reroll: those
+# polluted roots exist only on the dead betanet-3 chain, which nothing replays. Root equality is
+# enforced at EVERY height of this generation.)
 
 # --- Mining: TWO-LANE diligence selection (PROVISIONAL — simulate before lock-in) ---
 # Each epoch's slots split into an OPEN lane (anyone, zero coins) and a BONDED lane (locked stake).
@@ -533,6 +898,222 @@ SETTLE_PROOF_MAX_SPAN = 4 * EPOCH_LENGTH
 # reroll turns the capability ON without forcing the (heavy) proving on anyone.
 SETTLE_PROOF_TRUSTLESS = True
 
+# RECURSIVE (K→1) settle-with-proof acceptance. When ON, verify_settlement_sparse verifies ONE recursion bundle
+# (recursive_verify) in place of the K per-segment exec stark.verify calls when a proof carries a `recursive`
+# field. This is a CONSENSUS RULE and MUST ride a CHAIN_GENERATION reroll, NOT a hot toggle: a node honouring
+# `recursive` SKIPS the classic per-segment exec check, so if it were live while unupgraded peers still ignore
+# the field, an attacker could staple a bogus `recursive` blob onto an otherwise-valid settle tx and split the
+# fleet (a new node REJECTS it via recursive_verify, an old node ACCEPTS it via the K-path — deep-audit finding
+# 2026-07-27). FALSE ⇒ the `recursive` field is IGNORED and every node verifies segments the classic K-way, so
+# a folded proof is accepted identically by folded- and unfolded-code nodes (no version-skew fork). Flip to True
+# only at a reroll, once the whole fleet runs the recursion-aware verifier from genesis.
+SETTLE_PROOF_RECURSIVE = True    # ENABLED at the alphanet-14 reroll: the in-circuit recursion AIRs
+                                 # (fri_verify, comp_verify, rowcomp_verify) now carry GF(p^3)
+                                 # arithmetic, so a folded proof no longer carries the old ~47-bit
+                                 # commit bound while the rest of the system claims far more. This is
+                                 # a CONSENSUS RULE and rides the reroll rather than a hot toggle: a
+                                 # node honouring `recursive` skips the classic per-segment check, so
+                                 # flipping it while unupgraded peers ignore the field would let an
+                                 # attacker staple a bogus blob onto a valid settle tx and split the
+                                 # fleet.
+
+# ---- SETTLEMENT FOLD FAN-IN (execnode/stark/recursive_verify_hetero.prove_hetero) -------------------
+# How many inner FRI proofs ONE recursion node may fold. 0/None = the old single bundle: one prove_fold
+# over ALL of them.
+#
+# WHY THIS EXISTS. The single bundle's PROVER trace is LINEAR IN K. Measured 2026-08-05 on the settlement
+# aggregation path (depth 4, 4 inner queries): the recursion AIR spends ~65,536 rows per folded proof —
+# 96 segments x 1088 rows at K=2 — because it re-hashes every Merkle path of every FRI query of every
+# inner proof in-circuit:
+#     K=2 -> T=131,072    K=4 -> T=262,144    K=8 -> T=524,288    (only 20.3% of that is 2^n padding)
+# The "O(1) settlement crypto" in doc/zk-recursion.md is the VERIFIER's cost — one bundle instead of K
+# proofs. The PROVER's trace was never O(1), and in production that is fatal: once the game contracts were
+# deployed, 48 exec calls put K in the dozens and T in the millions, and the settle prove blew
+# SETTLE_PROVE_TIMEOUT=1200s at 2.8 GB RSS and still climbing, so NO proof was produced at all.
+#
+# Folding through recursion_depth.fold_tree bounds each node's trace by the FAN-IN instead of by K, keeps
+# memory bounded, and leaves the nodes within a level independent. The root is still ONE proof, so the
+# verifier's cost is unchanged.
+#
+# CONSENSUS RULE: it changes the SHAPE of the bundle (a "tree" instead of a "fold"), so a node that folds
+# as a tree while its peers expect a single fold produces a settle those peers cannot verify. The whole
+# fleet must therefore carry this before it is used.
+#
+# BUT IT DOES NOT NEED A REROLL, unlike SETTLE_PROOF_RECURSIVE. That one rode a reroll because settle
+# proofs are re-verified on block APPLY (ops/transaction_ops.verify_settlement_sparse), so a chain already
+# CONTAINING proofs judged under the old rule would fail to resync under the new one. Here there is no such
+# history: when this was written no settle proof had ever landed, so nothing on chain needed re-verifying
+# under the new shape and a coordinated /update wave was sufficient.
+# *** THAT ARGUMENT HAS NOW EXPIRED — IT SAID SO ITSELF, AND THE CONDITION IT NAMED HAS HAPPENED. ***
+# alphanet-15 went on to carry proof-carrying settles (blocks 43153, 46766, 47078), so the chain DOES hold
+# bundles of a given shape. From here, changing the fold/proof shape REQUIRES a reroll like any other
+# apply-time verification rule. alphanet-16 starts clean, so the same clock restarts at its genesis.
+SETTLE_FOLD_FAN_IN = 2
+
+# ---- INLINE PROOF CEILING ---------------------------------------------------------------------------
+# The largest transaction the network will accept, and therefore the largest settle proof that can ride
+# INSIDE the tx instead of going through DA.
+#
+# WHY THIS EXISTS. A settle proof went to DA purely because it did not fit in a transaction, and the DA
+# route then could not deliver it: measured 2026-08-05/06, a peer must pull the whole ~120 MiB from the
+# ONLY node in the fleet that runs a DA store (the three peers run just `nado`, not `nado-exec`, so
+# :9273 is dead on all of them) inside _fetch_da_proof's 8 s budget. It never arrived, every peer raised
+# ProofUnavailable, and for the whole life of the DA route not one proof-carrying settle ever landed.
+# Erasure coding k=4/n=8 cannot help when there is exactly one provider.
+# INLINING FIXED IT, and then the proof stopped being large at all: row-committing the trace (1affffac)
+# took it from 120.31 MiB to 8.92 MiB, so blocks 46766 and 47078 carried proofs in ~9.74 MiB blocks. The
+# ceiling below is now enormous headroom rather than a binding limit — keep it, because the thing that made
+# it necessary (a producer-side default) could return, and a cap that is never hit costs nothing.
+#
+# Inlining removes that entire failure mode: the proof travels with the tx over the gossip the fleet
+# already runs, so there is no fetch, no budget, and no dependency on peers running a DA node.
+#
+# THE OLD CAPS WERE NOT A PROTOCOL FACT, despite the comment on SETTLE_INLINE_MAX saying so. The binding
+# limit was MAX_TX_BODY = 1 MiB in ops/net_ops.py — aiohttp's default, chosen as a DoS bound — and it was
+# already INCONSISTENT with SETTLE_INLINE_MAX = 7 MiB, which could never have been submitted. Nothing in
+# consensus constrains transaction size; block_ops has no size rule at all.
+#
+# COST, stated plainly: blocks carrying a proof get large, so sync and gossip move real bytes. That is a
+# deliberate alphanet trade — a proof that lands beats a smaller one that cannot. The fold (see
+# SETTLE_FOLD_FAN_IN) is what brings the size back down; this ceiling is what stops size from being the
+# thing that blocks settlement in the meantime.
+MAX_INLINE_TX_BYTES = 192 << 20          # 192 MiB — comfortably over the ~120 MiB an UNFOLDED proof measures
+
+# ---- RECORDS-BOUND SETTLEMENT (execnode/records_effects.py) --------------------------------------
+# A settle-with-proof has always covered only the KV half of the exec root; the L1 composition pins the
+# SAME records half into the pre and post root, so a proven span REQUIRES records to be unchanged
+# (calls_commit.block_records_inert enforces it). That is why any span carrying a bridge deposit, a
+# faucet donation or a treasury payout falls back to the bonded quorum however good its proof is.
+#
+# TRUE ⇒ (a) incorporate_block commits each block's RECORDS-HALF EFFECTS into its exec summary, so a
+# verifier can derive them WITHOUT reading a prunable body (the whole reason records_bind was unreachable
+# — bodies made one tx validate differently on a pruned node than an archive node and forked the fleet);
+# and (b) the settle branch accepts a proof whose records half MOVED, provided it carries a records
+# transition proving exactly those committed effects (records_bind.bind_and_verify_records).
+#
+# THIS RIDES A REROLL, and unlike SETTLE_PROOF_RECURSIVE it is not merely a rule change — it changes what
+# is WRITTEN. exec summaries live in the `meta` sub-DB, which FEEDS THE L1 STATE ROOT, so an upgraded node
+# with the flag on computes a different root than an unupgraded peer applying the identical block. Flipping
+# it on a live chain does not risk a fork, it GUARANTEES one. Every node must start from a fresh genesis
+# with the same setting, which is what a CHAIN_GENERATION bump provides.
+#
+# Coverage is deliberately partial and FAILS CLOSED: only effects derivable from committed block data
+# alone (bridge deposit, faucet donation, treasury->faucet mirror). A value>0 call escrows sender->cid
+# BEFORE the VM runs and is refunded on revert, so its net effect is not a function of the calldata; that
+# block is marked non-derivable and keeps riding the quorum, exactly as an unknown blob op does.
+SETTLE_PROOF_RECORDS = True     # ENABLED at the alphanet-15 reroll — see generation 16 in the log below.
+
+# ---- VALUE-CALL ESCROW DERIVATION (records_bind.block_records_effects) ------------------------------
+# Extends the coverage above to the one family that actually matters in practice: a contract call carrying
+# value>0.
+#
+# WHY IT WAS EXCLUDED, and why that is now solvable. The escrow (sender -> cid, two T_BRIDGE_BAL positions)
+# happens BEFORE the VM runs and is REFUNDED if the call reverts, so its NET effect is not a function of
+# the calldata — you need to know whether the call succeeded. records_bind says exactly this: "deriving it
+# needs the exec proof's own verdict".
+#
+# THE PROOF *IS* THE VERDICT. zkvm2.ZkVMRevert states the invariant: "the interpreter reverts exactly where
+# the AIR constraints would have no satisfying witness, so 'provable' and 'executes successfully' are the
+# same set of calls." So a VALID PROOF over a span already establishes that every call in it succeeded —
+# hence every escrow stuck, with no refund, which IS a pure function of the calldata. And `derivable` is
+# only ever CONSULTED while a settle proof is being validated (calls_commit.verify_calls_bound_to_summaries,
+# guarded by `records_out is not None`), so a span that never gets a proof rides the bonded quorum exactly
+# as before.
+#
+# THE PREREQUISITE IS ALREADY IN (1fbf4c35). The argument needs "provable => what the chain actually did",
+# and that did NOT hold: settlement_proofs._run_call credited the contract without debiting the sender or
+# checking affordability, so it would prove a call the chain had SKIPPED. L1 never recomputes the exec root
+# (verifying the proof is what replaces re-execution), so its only check is `post_full == root` against the
+# tx's OWN claim — a proof over the wrong state satisfies that self-consistently. _run_call now mirrors the
+# live escrow rule for both the native and asset paths.
+#
+# WHY IT COSTS A REROLL, not a flag flip: exec summaries live in the `meta` sub-DB, which FEEDS THE L1 STATE
+# ROOT. Emitting effects where we previously wrote `derivable=0` changes the root on upgraded nodes only,
+# which does not risk a fork — it guarantees one. Same reasoning as SETTLE_PROOF_RECORDS above.
+#
+# WHAT IT BUYS, measured 2026-08-06 over a two-hour window: 14 of 18 skipped spans (78%) were refused for
+# "the RECORDS half moved across the span", and every one of the chain's calls carries value (all 25 game
+# contracts call with value; zero zero-value calls exist). So today the fold needs exactly the calls that
+# make a span unprovable. This is what unblocks that.
+#
+# STILL NOT COVERED after this: presence-dividend accrual moves records on an EPOCH boundary with no
+# transaction at all, so the separate refusal of any span crossing one remains.
+#
+# WHAT THE FLAG DOES NOT FIX, stated here so nobody reads it as more than it is. The derivation emits the
+# escrow for EVERY value call, including one the VM REVERTS or the chain SKIPS — for those the chain
+# refunds, so the derived effects are WRONG and the block is nonetheless marked derivable. That is sound
+# only because of the same invariant the flag rests on: `provable` and `executes successfully` are the SAME
+# set of calls (zkvm2.ZkVMRevert), so NO valid proof exists over a span containing such a call —
+# settlement_proofs._run_call raises and vm_circuit.prove_epoch_calls raises. The wrong derivation can
+# therefore only ever cause a REFUSAL, never the acceptance of a false root. It fails closed.
+# The consequence is that a reverting call still costs the whole span, which is NOT fixed here and cannot
+# be fixed by a flag: it needs either an AIR that proves a reverting execution, or a verifier able to
+# RE-DERIVE which calls were no-ops — and the L1 cannot, because it never executes contracts. Narrowing the
+# span to the clean prefix (2d4bcccf's pre-flight) is the mitigation that ships today.
+SETTLE_PROOF_RECORDS_VALUE_CALLS = True    # ENABLED at the alphanet-16 reroll — see generation 17 below.
+
+# PAYOUTS IN-PROOF — ALWAYS ON, no switch. A PAY opcode moves bridge balances, and a payout is an
+# EXECUTION outcome that never appears in the calldata, so block_records_effects (which runs at incorporate
+# time on a node that does not execute contracts) is structurally blind to it. Every span containing one
+# used to be refused outright and left to the bonded quorum.
+#
+# Both halves now derive it from the same reader (runtimes.split_io): the VERIFIER from the proof's own io
+# log (records_bind.pay_effects_from_proof), which the STARK commits to and which
+# settlement_proofs._run_call already raises on for revert/over-pay under the live rules; the PROVER from a
+# dry-run of the same calls (settlement_proofs.span_payout_effects), so the records half it proves contains
+# exactly what the verifier will expect.
+#
+# It shipped without a flag on purpose. A dormant switch is a second code path nobody exercises, and this
+# one was introduced at the only moment it is free to enable: every settle-prove on alphanet-16 has run with
+# calls=0, so no span on chain contains a payout for a mixed fleet to disagree about.
+
+# ---- DEPTH-GATED PROOF VERIFICATION (doc/settle-proof-transport.md §4, option 1) --------------------
+# A settle proof is ~97 MiB against a ~256 KiB block, so it cannot ride in the block and must be fetched.
+# Re-fetching and re-verifying one per settle across all of history would make joining the network cost
+# hundreds of GiB, so verification is gated to blocks still within FINALITY_DEPTH of the known tip; deeper
+# blocks are accepted on accumulated weight.
+#
+# THE COST, stated rather than buried: a from-genesis sync no longer independently verifies historical
+# settlements, it INHERITS them from whoever was online when the block was at the tip. That is the same
+# weak-subjectivity the chain already accepts for snapshot bootstrap ("classic weak-subjectivity
+# checkpoint"), now extended to settlement. It was chosen deliberately over three alternatives — a DA fetch
+# inside consensus validation, leaning on the quorum path, and waiting for recursion — each of which is
+# written up with its objection in the doc.
+#
+# IT CANNOT FORK THE FLEET: the gate only ever RELAXES, so two nodes disagreeing about depth disagree as
+# "strict rejects / relaxed accepts" and diverge only on an INVALID proof — which cannot reach a deep block,
+# because the nodes that saw it at the tip were strict and rejected it there.
+#
+# NEW TERRITORY ONLY (zk audit 2026-11-02): the relaxation never applies at a height the node already held
+# (loops/core_loop.settle_proof_relaxed), so a REORG is always verified in full. Without that, a heavier fork could bury
+# an unverifiable Stwo settle FINALITY_DEPTH deep and have its root marked proven on every node that reorged onto it.
+#
+# Setting this False restores unconditional verification (correct, and unusable at 97 MiB/settle).
+SETTLE_PROOF_DEPTH_GATED = True
+
+# ---- SIGNATURE AGGREGATION (doc/zk-signature-aggregation.md) ----------------------------------------
+# The AUTHORIZATION COMMITMENT is unconditional from alphanet-14: every block commits (auth_root,
+# auth_count) inside its hash preimage and every verifier recomputes both from the block's own
+# transactions. That is a pure function of committed block data, so it costs nothing and can never
+# disagree between honest nodes — it exists so an aggregate proof has a statement it cannot choose.
+#
+# SIGNATURE AGGREGATION WAS REMOVED (it never shipped; SIG_AGG_STARK was always False).
+# The block-level auth COMMITMENT stays and is unaffected: every block still binds (auth_root, auth_count)
+# into its hash preimage and every verifier recomputes both from the block's own transactions. That is a
+# pure function of committed block data, costs nothing, and is what mldsa_block_auth provides.
+#
+# What went, and why, measured rather than argued: ONE ML-DSA-44 signature verifies natively in 120 us and
+# occupies 2420 bytes. Proving the butterfly half of a single signature's w' took 7.11 min, produced a
+# 1.87 MB proof and 6.98 s to verify -- ~770x the size and ~58,000x the verify time of what it replaced.
+# Aggregation only pays by amortising, and break-even was ~116 signatures for size / ~12 for verify against
+# a trace-row budget that capped a batch near 7. ZK earns its keep when CHECKING is far cheaper than DOING;
+# signature verification is already cheap, so there was no asymmetry to exploit.
+#
+# The right shape was already built: settlement_proofs proves an entire epoch as ONE zkVM trace and L1
+# verifies it in ~0.3 s INDEPENDENT of the call count, replacing RE-EXECUTION -- which is genuinely
+# expensive. That is SETTLE_PROOF_RECURSIVE, enabled at the alphanet-14 reroll.
+
+
 # How many recent heights keep an exec summary (kv_ops.exec_summary_*). These live in the `meta` sub-DB,
 # which IS carried in SNAPSHOT_DBS, so without a bound they would grow with chain length AND bloat every
 # snapshot. A settle-with-proof span is capped at SETTLE_PROOF_MAX_SPAN, so any span reaching further back
@@ -560,6 +1141,55 @@ INVARIANT_CHECK_BLOCKS = EPOCH_LENGTH
 DEAD_FORK_STALL_S = 900          # 15 min of a completely frozen tip before the question is even asked
 DEAD_FORK_COOLDOWN_S = 1800      # at most one purge attempt per 30 min
 DEAD_FORK_QUORUM = 2             # distinct peers that must disagree at our finalized height
+# How long a node must be CONTINUOUSLY isolated — stranded, measured DEAD_FORK, and not one peer agreeing —
+# before that overrides the "heavier side does not yield" veto.
+#
+# Without this a lone forker can never heal. Measured live on alphanet-15 (2026-08-03), node .131:
+# stranded=True, fork_state=dead_fork, agree=[], disagree=2 ... but peers_asked=3, so `unanimous` was False
+# because ONE peer never answered, and being the heavy side (a lone miner always is — it wins every slot
+# unopposed) the weight rule vetoed the purge. Both escape hatches were shut by a single silent peer, and
+# the node forked indefinitely with its lead WIDENING.
+#
+# The symmetric-split storm this protects against cannot reach here: in a real split each side still has
+# partners that AGREE with it, and the trigger requires agree == [] — genuinely alone among everyone who
+# answered. A transient partition also clears well inside the window, whereas a true strand never does.
+# And a wrong purge costs time, not safety: the resync validates every block it accepts.
+DEAD_FORK_ALONE_S = 3600         # 1h continuously alone -> purge even if our branch is heavier
+# GENESIS COLD-START QUIET PERIOD — the reroll race.
+#
+# THIS IS THE DEFECT THAT SPLIT alphanet-13. Every node purges and restarts at a reroll, but they do not
+# restart together: on 2026-07-28 185.100.232.5 came back ~4 minutes before the rest, found an empty peer
+# table, and started mining block 1 from the shared genesis on its own. By the time the others were up it
+# sat at tip 273 / weight 88725 against their 217 / 70525 — already PAST the 45-block finality depth, so no
+# rollback could reconcile the two branches and the fleet stayed split until it was rerolled again.
+#
+# Nothing in the ordinary gates catches this, because at a reroll every gate is trivially satisfied: the
+# caught-up gate (peer_claims_heavier_tip) can see no heavier tip when every node is at height 0, and the
+# peer-count gate passes vacuously wherever an operator has set min_peers = 0 for solo production — which is
+# the live setting on more than one fleet node.
+#
+# So gate the one moment that matters: producing THE FIRST BLOCK of a chain. A node at height 0 that knows
+# of seed peers but has reached none of them has no evidence it is alone — only evidence that it is early.
+# Wait for the mesh, then start together.
+#
+# BOUNDED, so this can never brick a node: once GENESIS_QUIET_S has elapsed the node produces regardless.
+# A genuinely standalone deployment (no seeds configured, or none reachable) pays this delay exactly once,
+# at genesis, and never again — the gate is dead the instant the chain has a single block.
+GENESIS_QUIET_S = 1800           # 30 min: a /update wave restarts nodes MINUTES apart and a node that is
+                                 # merely slow to pull must not be left behind by a chain that already started.
+# MIN_PEERS was 2, and 2 IS NOT A MAJORITY. On the betanet-1 launch two nodes reached each other, released
+# the gate, and minted block 1 while the other three were still finishing the OLD chain — a 3-way split
+# (h13 / h12 / h94) with each minority's finality floor locked onto its own fork, which is unrecoverable
+# without a wipe. The gate must require a MAJORITY of the known fleet, not any two nodes: a minority that
+# starts the chain IS the fork. Seed-peer count is the fleet size estimate every node shares (genesis_open
+# is the same file everywhere), so a majority of it is a quorum every node computes identically.
+GENESIS_QUIET_MIN_PEERS = 2      # 2 PEERS = 3 nodes incl. self = a majority of the 5-node fleet. (Raising
+                                 # this to 3/4 was a mis-derivation: 4 demands EVERY other node be linked at
+                                 # once and the fleet sat at 3/4 with block 1 never minted. What actually
+                                 # split betanet-1 was the GENERATION stagger — nodes still on the old chain
+                                 # while others regenesied — plus the seed list missing two operator anchors
+                                 # (see peer_ops.DEFAULT_SEED_PEERS), not this threshold.)
+
 # How long a measured fork state stays cached. The probe costs ~log2(depth) direct peer round-trips, so it
 # must not run every ~1s pass; but it gates reorg/re-anchor decisions, so it must not go badly stale either.
 FORK_STATE_TTL_S = 60
@@ -596,6 +1226,34 @@ RANDAO_ENFORCED = False
 # inside one epoch (60) so the epoch-beacon anchor stays un-reorgable and long-range reorgs stay capped.
 FINALITY_DEPTH = 45
 
+# HARD FINALITY (two-floor model, 2026-08-17). FINALITY_DEPTH above is a LOCAL OBSERVATION — "no reorg
+# reached this deep in 4.5 minutes" — and treating it as un-crossable is what created the "finality
+# revert" class: two branches of a fork each advance their own depth floor within minutes, neither can
+# legally roll back to the ancestor, and recovery must then cross floors (the escalated floor=0
+# re-anchor), truncating archives and stranding the exec layer on the way. Measured on 2026-08-17:
+# eight floor-crossing recoveries in one day.
+#
+# The UN-CROSSABLE floor is now the FFG-finalized checkpoint (ops/attestation_ops) — a >2/3 bonded-seat
+# quorum attested it and its child, so reverting it requires slashable equivocation, not just a heavier
+# chain — with this depth as a wide LIVENESS BACKSTOP: if attestations stall, hard finality still
+# advances at tip - FINALITY_HARD_BACKSTOP, so long-range/51% reorg exposure stays bounded (the #17
+# guarantee) without the 45-block hair trigger. Ten epochs: a fork must sustain a full HOUR of divergence
+# before floors lock, vs 4.5 minutes — and the corroboration gate must ALSO have failed the whole time.
+#
+# FINALITY_DEPTH itself keeps every other role (exec follow depth, pruning, status, duty windows):
+# `finalized_height` still advances at tip - FINALITY_DEPTH, it is just no longer what rollback refuses
+# to cross — rollback.py refuses at the hard floor and legally lowers the depth floor when a deep reorg
+# crosses it (the exec layer absorbs that with its rewind checkpoints).
+FINALITY_HARD_BACKSTOP = 10 * EPOCH_LENGTH
+# TESTNET-ONLY override: the loopback fork-resolution suite must exercise "the backstop crossed the fork
+# ancestor" (scenario `wedge`, scripts/testnet/test_fork_resolution.py) without producing 600 blocks per
+# branch. Guarded on NADO_TESTNET so mainnet stays the literal above; every testnet child sets the same
+# value, so the net is internally consistent.
+import os as _os                       # local alias: protocol.py deliberately has no other imports to leak
+if _os.environ.get("NADO_TESTNET") and _os.environ.get("NADO_TESTNET_BACKSTOP"):
+    FINALITY_HARD_BACKSTOP = int(_os.environ["NADO_TESTNET_BACKSTOP"])
+del _os
+
 # LOAD-BEARING CONSENSUS INVARIANT (asserted): settle-with-proof validation (transaction_ops.validate_
 # transaction) reads exec_summary_get(h) for every height in a proof's span, but `execsum:` rows are EXCLUDED
 # from the state root (retention/rollback-path dependent). A node lacking a needed summary would REJECT a
@@ -617,8 +1275,16 @@ B_MIN = 100_000_000_000            # 10 NADO: capital per bonded selection share
                                    # chain running on the zero-stake open-lane fallback. 10 NADO is reachable
                                    # by an ordinary miner yet still real skin-in-the-game (Sybil in the bonded
                                    # lane costs 10 NADO × shares, locked + slashable — unlike the free open lane).
-BOND_CAP = 10_000_000_000_000      # 1,000 NADO: max effective bond per identity (100x B_MIN)
-MAX_SHARES = BOND_CAP // B_MIN     # 100: variance cap so a whale can't monopolise the bonded lane
+# NO PER-IDENTITY BOND CAP (removed 2026-08-25). There was one — BOND_CAP = 1,000 NADO, MAX_SHARES = 100 —
+# sold as "a whale can't monopolise the bonded lane". It never did that: the cap was per KEY, and a second
+# key (the wallet derives them from the same seed) restored linear weight, while finality safety assumes
+# 2/3 of honest STAKE regardless of how many keys hold it and slashing is per key per offence either way.
+# The only party the cap actually bound was the honest single-identity miner, whose coins went idle at the
+# ceiling. Weight is now what it always was for anyone with two keys: linear in stake, shares = bonded //
+# B_MIN. Removed UNGATED: no identity had ever bonded above the old cap on this chain (leader 272 NADO
+# at removal, total supply ~5,200), so every historical share count is unchanged and fork-choice weight,
+# the FFG quorum and settlement justification replay identically. The bounds that are real stay:
+# capital cost, the BOND_RAMP_EPOCHS producer ramp, slashing, and the OPEN_BPS capital-free lane.
 # BONDED PRODUCER RAMP (anti-sudden-takeover): a newly-bonded identity's PRODUCER-SELECTION weight ramps
 # linearly from 0 to full over BOND_RAMP_EPOCHS, tracked by a STAKE-WEIGHTED bond age (so a top-up re-ramps
 # the new stake, closing the "age a cheap address then dump" loophole, while auto-bond's small top-ups barely
@@ -659,9 +1325,6 @@ FFG_DEN = 3
 # NO auto-bond faucet: free presence must NEVER mint bonded stake (that pipe lets a Sybil swarm
 # reach stake majority for ~0 capital — it broke the rejected fronted/faucet designs). The only
 # free->capital path is the block reward an open-lane miner actually earns (itself OPEN_BPS-capped).
-REGISTER_POW_BITS = 16             # one-time light registration puzzle (~1s in pure-JS blake2b on a phone;
-                                   # 22 bits took tens of seconds in-browser). NOT the Sybil defense —
-                                   # the lane cap is — this only throttles trivial mempool spam.
 OPEN_BASE_FLOOR = 2                # every registered+present identity's minimum open weight (never 0). Raised
                                    # 1->2 so a genuine newcomer earns 2/10 = 20% of a mature miner's rate on
                                    # day one (was 10%) — fairer to new phones, while keeping a 5x loyalty premium.
@@ -686,7 +1349,7 @@ OPEN_FID_BONUS = 8                 # max diligence bonus: open weight ranges OPE
 # so a boundary block can never stall; revert records live in the NODE-LOCAL gc_revert sub-DB so a
 # rollback of the boundary block restores every deleted row/doc exactly.
 GC_IDLE_EPOCHS = 1000                    # lease lapsed this long (~4 days) -> empty account doc is GC-able
-RECERT_HISTORY_EPOCHS = 10_000           # recert rows retained (~6 weeks) — >> SATURATION_LOOKBACK_EPOCHS
+RECERT_HISTORY_EPOCHS = 15_000           # recert rows retained (~9 weeks at 6 min/epoch) — > SATURATION_LOOKBACK_EPOCHS (31 × 360 = 11 160 since the 36 h lease)
 GC_MAX_PER_EPOCH = 2000                  # per-boundary work bound (rows+accounts touched)
 
 # Continuity FIDELITY — now driven by the PoSW RECERT (the single presence signal; there is no separate
@@ -695,9 +1358,95 @@ GC_MAX_PER_EPOCH = 2000                  # per-boundary work bound (rows+account
 # a ramp it stopped paying for. It is only a ~5x open-weight booster, NOT the Sybil bound (the 30% lane cap is).
 FIDELITY_CAP = 30                  # consecutive recerts (~days) to fully ramp the open bonus
 FIDELITY_GAIN = 1                  # per continuous recert
+
+# FIDELITY WAS FARMABLE, and this is the fix. The gain above is per RECERT, and the only spacing rule
+# anywhere is validate's "one register per epoch" — an epoch being 6 minutes. So the ramp the comment
+# describes as "≈ days of continuous presence" could be completed in 30 epochs = 3 HOURS by recerting
+# every epoch, taking open weight from 2 to 10 (a 5x producer-selection AND presence-dividend multiplier)
+# for nothing but a ~1 s sequential PoSW each time — `register` is fee-exempt. Reported by a user who saw
+# their fidelity rise by 4 in one day and asked why the documentation said 1.
+#
+# The signal is meant to measure ELAPSED CONTINUOUS PRESENCE, so a gain now also requires the recert to be
+# spaced at least this far from the previous one. A closer recert still RENEWS THE LEASE (presence is
+# unaffected, nobody is dropped for renewing early) — it simply earns no ramp. 192 epochs is exactly the
+# browser miner's own renewal trigger (80% of the 240-epoch lease) and the node renews at 230, so both
+# honest paths are untouched; only recerting faster than the lease requires stops paying.
+#
+# This also makes the documented rule true. doc/become-a-validator.md already told users "renewing early
+# just pays the sequential proof more often for nothing" — which was FALSE under the old code, because
+# early renewal bought +1 fidelity. It is true now.
+FIDELITY_MIN_GAP_EPOCHS = 192
+
+# UNCONDITIONAL — and it is only safe to be, because this ships WITH a genesis reroll.
+#
+# The rule was height-gated (epoch 862) while it was going to activate on a running chain, because
+# dividend_ops.fidelity_at_epoch REPLAYS an address's whole recert history to reconstruct its weight as of
+# a past epoch, and that replay must stay byte-identical to what the live ramp actually applied — a
+# dividend fraud proof checks exactly that reconstruction, so an ungated change silently rewrites every
+# historical weight and FALSE-SLASHES an honest settler.
+#
+# A reroll leaves NO pre-rule recert history, so there is nothing for the gate to protect. Removing it is
+# strictly correct here, and strictly better than re-dating it: an activation epoch carried into a fresh
+# chain lands days in, leaving fidelity farmable for exactly the window where an early weight advantage
+# compounds most. account_ops.apply_register and dividend_ops.fidelity_at_epoch must stay in lockstep.
 # deepest recert-row lookback any WEIGHT reconstruction needs (see the idle-GC note above):
 # a run longer than this is fidelity-capped, so pre-horizon rows can never change open_shares.
-SATURATION_LOOKBACK_EPOCHS = (FIDELITY_CAP + 1) * POSW_LEASE_EPOCHS
+# PER-CLASS LEASES, GAP-PROPORTIONAL FIDELITY AND SIGNATURE RENEWALS (operator decision 2026-09-14; doc/scaling-open-lane.md
+# phases 1a/1b; doc/device-attestation.md §"Leases per class"). Gen 25 gated all of it at one epoch, LEASE_V2_EPOCH (1600),
+# keyed on the recert's epoch; from gen 26 that gate was 0 and it was deleted after the betanet-8 reroll, so every rule
+# below holds at every epoch. Only a caller with NO epoch (None, one that predates the gate) still gets the legacy value.
+#
+#   * THE LEASE IS PER CLASS, and it is written down. A recert at epoch E grants lease_epochs_for(class, E) epochs, and the
+#     grant is stored as consensus state ("lease:<address>:<E>" in the devbind DB, kv_ops.lease_grant_*), so presence at
+#     any past epoch is reconstructible: present(E) <=> E - last_recert < lease_of(last_recert). Rows from before the gate
+#     have no grant and read as POSW_LEASE_EPOCHS, which is exactly the old rule. Why per class and not one number: an
+#     Android attestation certificate rotates (~13 days measured, <= 90 by rule) and nothing stable survives it, so a lease
+#     longer than 36 h lets one phone hold a second identity for the overlap (lease/rotation: 12 % today, 54 % at 7 days).
+#     The classes whose binding key never rotates — Windows Hello's AIK (per Windows account), a Ledger's factory key, a
+#     Trezor's device certificate, a chip's endorsement key — carry no such overlap and go to 7 days.
+#   * FIDELITY MEASURES TIME, NOT TAPS. With leases of different lengths a per-recert gain would ramp a phone (36 h) eight
+#     times faster than a PC (7 days). From the gate a continuous recert earns FIDELITY_GAIN per FIDELITY_MIN_GAP_EPOCHS of
+#     gap (gap // 192): a weekly renewal earns 8, a 36-hour one still earns 1. Same rate per day of presence for every
+#     class; a lapse still halves. Live apply and the fraud-proof replay call the one function with the recert's epoch.
+#   * SIGNATURE RENEWALS (phase 1a) for LEASE_ASSERT_CLASSES: a Windows Hello identity renews with a WebAuthn assertion by
+#     the credential its statement bound (the COSE public key is stamped on the account as `devcred` at the statement),
+#     ~200 bytes and no attestation prompt, while devbind[devkey] still points at it. Not for android-key: its device key
+#     rotates, and an assertion window longer than the lease would hold the old binding alive past the rotation.
+#   * `devkey` is stamped for EVERY class from the gate (the reverse index a statement-free or signature renewal is checked
+#     against; also what lets /get_account name the class). An identity bound before the gate has no grant, no devkey and
+#     no devcred until its next statement: one more tap, then the new terms.
+LEASE_EPOCHS_BY_CLASS = {"android-key": 360, "tpm": 1680, "ledger": 1680, "trezor": 1680, "ek": 1680}
+LEASE_EPOCHS_MAX = 1680                                    # 7 days: the longest grant any class receives
+LEASE_ASSERT_CLASSES = frozenset(("tpm",))                 # renew by credential signature (phase 1a)
+RECERT_HISTORY_EPOCHS_V2 = 55_000                          # > (FIDELITY_CAP + 1) * LEASE_EPOCHS_MAX = 52 080 (~260 days)
+
+
+def lease_epochs_for(cls, epoch) -> int:
+    """The lease a recert of class `cls` at `epoch` GRANTS. With no epoch (None, a legacy caller), or for a class the
+    table does not name (an identity with no devkey yet), the historical POSW_LEASE_EPOCHS. Pure in (cls, epoch)."""
+    if epoch is None:
+        return POSW_LEASE_EPOCHS
+    return int(LEASE_EPOCHS_BY_CLASS.get(cls, POSW_LEASE_EPOCHS))
+
+
+def recert_history_epochs(epoch) -> int:
+    """Recert-row retention horizon at `epoch` (the GC watermark is consensus): the 7-day-lease horizon at every epoch,
+    the historical one only for a caller with no epoch (None)."""
+    return RECERT_HISTORY_EPOCHS_V2 if epoch is not None else RECERT_HISTORY_EPOCHS
+
+
+def saturation_lookback_at(epoch) -> int:
+    """Rows behind `epoch` a weight reconstruction may need: a run of FIDELITY_CAP + 1 recerts is saturated whatever lies
+    before it, and gaps are <= LEASE_EPOCHS_MAX. Grows from the old bound (FIDELITY_CAP + 1) * POSW_LEASE_EPOCHS at epoch 0
+    (where the per-class leases start: gen 25's LEASE_V2_EPOCH, 0 from gen 26 and deleted) towards
+    (FIDELITY_CAP + 1) * LEASE_EPOCHS_MAX, so the exec node's "history pruned?" check does not refuse every epoch."""
+    e = int(epoch)
+    old = (FIDELITY_CAP + 1) * POSW_LEASE_EPOCHS
+    floor = max(e - (FIDELITY_CAP + 1) * LEASE_EPOCHS_MAX, -old)
+    return max(old, e - floor)
+
+
+SATURATION_LOOKBACK_EPOCHS = (FIDELITY_CAP + 1) * LEASE_EPOCHS_MAX     # the eventual bound (documentation; see the function)
 
 # Seed for the per-epoch selection beacon (S4.3). Epochs 0-1 use this fixed constant directly
 # (no finalized prior epoch exists yet); epoch>=2 chains it with the hash of the first block of
@@ -705,6 +1454,115 @@ SATURATION_LOOKBACK_EPOCHS = (FIDELITY_CAP + 1) * POSW_LEASE_EPOCHS
 # commit-reveal RANDAO is the hardening step (mining_ops.compute_beacon already implements it).
 DOMAIN_GENESIS_BEACON = "genesis-beacon-v1"
 GENESIS_BEACON = blake2b_hash([DOMAIN_GENESIS_BEACON, CHAIN_ID])
+
+
+# ACCOUNT AUTHENTICATION AS STATE (doc/key-rotation.md, Roadmap Track H). An address may carry an auth config —
+# authenticators + a SIGNING policy (who may spend/act) + a RECONFIG policy (who may change the keys) — so keys
+# rotate and a stolen hot key can be recovered while the address, bond, ramp, fidelity and every exec-side
+# balance stay. Absent config = today's single derived key. Generation-keyed: dormant on this chain (the `auth`
+# recipient is refused and no account can hold a config), live from block 0 of the next generation — no gate
+# ever needs deleting. auth_history is a new SNAPSHOT_DBS member; empty it contributes nothing to the root.
+# NADO_AUTH_FORCE=1 activates it on the CURRENT generation for tests and throwaway testnets ONLY — never on a
+# validator: a node with it set accepts txs the fleet refuses and forks itself off.
+import os as _os_auth                  # local alias, same discipline as the other in-file alias below
+AUTH_ACTIVE = CHAIN_GENERATION >= 24 or _os_auth.environ.get("NADO_AUTH_FORCE") == "1"
+
+# EPOCH-WEIGHT ROWS LEAVE THE PER-BLOCK ROOT WINDOW (gen 24+; a clean rule from block 0, no height gate).
+# `epochw:<E>` is one ~18 KB row per epoch, committed forever and — until gen 24 — hashed into EVERY block's
+# state root: 25 MB of value bytes at epoch 1.4k, +4 MB/day, i.e. the one root family whose per-block cost
+# still grew with chain age after the 2026-08-20 retention window. From gen 24 the root commits only the
+# last ROOT_RETENTION_EPOCHS of them PLUS a running accumulator row `epochwacc:<E>` =
+# blake2b(epochwacc:<E-1> || epochw:<E>) written at the same boundary (deleted on revert, like epochw
+# itself), so the newest accumulator inside the window still binds the ENTIRE weight history: a snapshot
+# cannot rewrite an old epoch's weights without changing a root-committed value. Readers
+# (weights_at_epoch / the dividend replay) are untouched — the rows stay in the DB. Expression, not gate:
+# on gen 23 it is False and the root is byte-identical to before; on gen 24+ it is simply the rule.
+EPOCHW_ROOT_WINDOWED = CHAIN_GENERATION >= 24
+AUTH_MAX_KEYS = 4                  # hot, recovery, two guardians; every key is a potential verify per tx
+AUTH_POLICY_MAX_DEPTH = 2          # THRESHOLD of THRESHOLDs of IDs — enough for guardians, nothing more
+AUTH_DELAY = BOND_UNLOCK_DELAY     # a partial-policy change waits this long (1 day): the network gets a day to notice
+AUTH_FREEZE = 7 * BOND_UNLOCK_DELAY  # after a recovery-key cancel, no partial-policy change for a week
+AUTH_HISTORY_KEEP = 8              # configs kept per address for evidence-at-height (deeper is beyond finality)
+
+# ======================================================================================================
+# THE 2026-08-25 DIVIDEND RULES — unconditional since the betanet-5 (gen 23) reroll. They rode the last hours
+# of gen 22 behind a generation-keyed gate (`... if CHAIN_GENERATION == 22 else 0`, the self-retiring shape
+# doc/updates-and-rerolls.md keeps as the pattern); the reroll made the gate's only job — replaying gen-22
+# history identically — moot, and it is deleted rather than left as a dead branch.
+#
+#   1. dividend_weight — the presence dividend's per-miner weight has its OWN curve (convex 1..25 on gen 23;
+#      LINEAR 0..30 since gen 24 — see DIVIDEND_WEIGHT_MAX below) instead of
+#      reusing the producer-selection weight open_shares (2..10). Selection keeps its liveness floor (a
+#      newcomer must be WINNABLE); the dividend has no liveness role, so its floor is purely economic. The
+#      floor/max ratio is the only knob that turns a per-HEADCOUNT payout into a per-PRESENCE one: at 1:5 a
+#      hundred fresh masks out-earn twenty veterans; at 1:25 they out-earn four. 1:25 not 1:100 because the
+#      Sybil math is the same (a patient farm's masks ramp too — doc/progressive-levy.md) while the honest
+#      cost of a lapse is not: two weeks of presence stay at ~25% of max and one missed night is survivable.
+#   2. fidelity_step — a LAPSE halves the ramp (max(GAIN, f // 2)) instead of resetting it to GAIN. Under a
+#      convex curve a full reset would turn one missed renewal into losing everything; halving is
+#      proportionate and gives a farm nothing (its masks never had a ramp to keep).
+#   3. BONDED_DIVIDEND_BPS = 4000 (above) — a bonded block sends 40% of itself to the dividend pool.
+# LINEAR since betanet-6 (2026-09-01, gen 24): weight = fidelity, i.e. DAYS PRESENT, capped at FIDELITY_CAP, and 0 on
+# probation. The convex 1..25 curve back-loaded the pool onto month-long streaks (a 10-day miner held 3.7/25) and
+# made one lapse cost 72% of weight; both curves are LINEAR in identity count, so the shape never taxed a farm — it
+# only decided which honest miners got paid. Shipped UNGATED at chain age <19 h: the curves differ only for
+# fidelity >= 2, and no identity can reach 2 before FIDELITY_MIN_GAP_EPOCHS after its first lease, so every epochw
+# row committed until then is identical under both; the protocol handshake bump (9 -> 10) sheds a node that has
+# not updated by the time the first fidelity-2 row is committed.
+DIVIDEND_WEIGHT_MAX = FIDELITY_CAP   # a FIDELITY_CAP-day streak's dividend weight (== 30); probation is 0
+
+
+def fidelity_step(cur_fid: int, continuous: bool, gap: int, epoch=None) -> int:
+    """THE fidelity ramp — the new fidelity after a recert, given the current value, whether the recert is
+    continuous (gap <= the previous recert's lease) and the gap to the previous one. ONE function, called by the live
+    apply (account_ops.apply_register) AND the fraud-proof replay (dividend_ops.fidelity_at_epoch): the two
+    used to be hand-mirrored, and a divergence there false-slashes an honest settler.
+      continuous, gap >= FIDELITY_MIN_GAP_EPOCHS -> +FIDELITY_GAIN * (gap // FIDELITY_MIN_GAP_EPOCHS)   (time, not taps —
+                                                    a 7-day renewal earns what seven 24-hour ones did)
+                                                 -> +FIDELITY_GAIN                       (epoch None: the legacy rule)
+      continuous, gap <  FIDELITY_MIN_GAP_EPOCHS -> unchanged (renews the lease, earns nothing — anti-farm spacing)
+      lapse / first recert                        -> max(FIDELITY_GAIN, cur_fid // 2)
+    `epoch` is the recert's own epoch (None = the legacy rule, for callers that predate gen 25's LEASE_V2_EPOCH)."""
+    cur_fid = int(cur_fid)
+    if continuous:
+        if gap < FIDELITY_MIN_GAP_EPOCHS:
+            return cur_fid
+        steps = (int(gap) // FIDELITY_MIN_GAP_EPOCHS) if epoch is not None else 1
+        return cur_fid + FIDELITY_GAIN * steps
+    return max(FIDELITY_GAIN, cur_fid // 2)
+
+
+# --- SYBIL RULES — what is left of them at gen 25 (the real-device reroll, doc/device-attestation.md).
+# Gen 23/24 (2026-09-01) answered disposable identities with PROBATION (no dividend and open weight 1 until the
+# first timely renewal) and a slow-adapting PoSW difficulty baseline. Both existed only because an identity was
+# free to mint: 500 disposable identities (~4.5 CPU-hours of PoSW) took over half of all open-lane value. From
+# gen 25 every register tx carries a hardware attestation (DEVICE_ATTEST_HEIGHT), so an identity costs a genuine
+# device and a human tap, and the two crutches are RETIRED: the dividend curve is one clean line over EVERY
+# fidelity level (dividend_weight below — fidelity 1 pays 1 from the first lease, there is no skipped level and no
+# separate "absent" state), and open_shares is the plain floor+bonus curve. `on_probation` survives only as a
+# name that always answers False, so the live paths and the fraud-proof replay cannot drift apart if a caller
+# still asks. Do NOT reintroduce a per-identity delay here: it is linear in identity count and never separated
+# a farm from honest newcomers (memory: per-identity rules are linear).
+POSW_DIFF_TRAIL_LONG = 3360          # 14 days of epochs — kept for the statistics window of ops/reg_difficulty
+
+
+def on_probation(fidelity, epoch: int) -> bool:
+    """RETIRED at gen 25 (the real-device reroll): probation existed against mint-and-discard identities, which
+    now each cost an attested device and a human tap. Every attested identity earns from its first lease. Kept
+    as a name so the live paths and the dividend replay stay in lockstep; always False."""
+    return False
+
+
+def dividend_weight(fidelity, epoch: int) -> int:
+    """Per-miner presence-dividend weight AT `epoch`: ONE clean line over every fidelity level — min(f, FIDELITY_CAP),
+    i.e. days of continuous presence up to DIVIDEND_WEIGHT_MAX (30). Fidelity 1 (the first lease) pays 1, fidelity 2
+    pays 2, ... 30 pays 30 and stays there; None/negative/0 = 0 = OMITTED from the epoch's weight set
+    (dividend_ops.weights_at_epoch, nado.get_open_weights — the exec accrual floors listed weights to 1, so presence
+    in the set is the grant). Gen 24 skipped fidelity 1 (probation) because identities were free to farm; gen 25
+    identities are attested devices, so the line is unbroken. `epoch` is kept in the signature so the live path and
+    the fraud-proof replay call the same function with the same arguments."""
+    cap = DIVIDEND_WEIGHT_CAP_V2   # every epoch (gen 25's DIVIDEND_WEIGHT_CAP_V2_EPOCH, 0 from gen 26, is deleted; callers pass epoch >= 0)
+    return 0 if fidelity is None or int(fidelity) < 0 else min(int(fidelity), cap)
 
 
 def split_block_reward(reward: int):
@@ -720,9 +1578,9 @@ def split_block_reward(reward: int):
 def split_bonded_block_reward(reward: int):
     """Three-way split for a BONDED-lane block: (producer, dividend, treasury) summing to EXACTLY `reward`.
     treasury + dividend are floors, producer is the exact remainder (same rounding discipline as the open
-    split), so apply and rollback subtract identical integers. The bonded producer keeps the majority
-    (BPS_DENOM - TREASURY_BPS - BONDED_DIVIDEND_BPS, = 70%), a modest slice funds the presence dividend, and
-    the treasury keeps its 10% — the passive lane sharing with the capital-free open miners."""
+    split), so apply and rollback subtract identical integers. The dividend slice is BONDED_DIVIDEND_BPS (40%),
+    the treasury keeps its 10%, the producer keeps the rest (50%) — the passive lane sharing with the
+    capital-free open miners."""
     treasury_cut = reward * TREASURY_BPS // BPS_DENOM
     dividend_cut = reward * BONDED_DIVIDEND_BPS // BPS_DENOM
     producer_cut = reward - treasury_cut - dividend_cut
@@ -737,3 +1595,1290 @@ def split_open_block_reward(reward: int):
     tip_cut = reward * OPEN_TIP_BPS // BPS_DENOM
     dividend_cut = reward - treasury_cut - tip_cut
     return tip_cut, dividend_cut, treasury_cut
+
+
+# --- DEVICE ATTESTATION (doc/device-attestation.md, 2026-09-07) ---------------------------------------------
+# A registered identity must be a REAL PHONE: the register tx carries a WebAuthn attestation whose certificate
+# chain ends at one of these PINNED vendor roots (protocol_roots/*.pem, DER bytes verified by the native attest
+# kernel). Roots are consensus constants: never fetched, never learned from a peer, changed only by a gated
+# protocol commit. Fingerprints are SHA-256 over the DER certificate.
+# ---------------------------------------------------------------------------------------------------------------
+# GATE LEDGER (2026-09-09). EVERY consensus gate is written `<live height> if CHAIN_GENERATION == <gen> else <x>`, so a
+# reroll needs no edit: bump CHAIN_GENERATION and each rule lands where a fresh chain wants it. `x = 1` means the rule
+# is live from block 1 (or epoch 0); `x = 0` means the feature never turns on and its code path is dead weight to be
+# DELETED in the cleanup pass. tests/test_gate_reroll_transfer.py pins every live line and every deleted name.
+#
+# THE GEN-25 GATES ARE ALL GONE (cleanup after the betanet-8 reroll, doc/reroll.md §"What the cleanup deletes"):
+#   never (x = 0), path deleted      BOND_DEVICE_CAP_HEIGHT, BOND_WEIGHT_CURVE_HEIGHT, POOL_HEIGHT,
+#                                    OPEN_LANE_EXCLUDE_BONDED_HEIGHT and their retire twins BOND_ATTEST_OPTIONAL_HEIGHT,
+#                                    POOL_RETIRE_HEIGHT, BOND_CURVE_RETIRE_HEIGHT, OPEN_LANE_EXCLUDE_RETIRE_HEIGHT
+#                                    (slice 1 — see "THE SAVINGS LANE IS PLAIN STAKE" below)
+#   live from block 1 (x = 1),       DEVICE_BIND_HEIGHT, DEVICE_BIND_STRICT_HEIGHT, DEVICE_BIND_PERMANENT_HEIGHT,
+#   rule inlined (slice 2)           DEVICE_REBIND_INSTANT_HEIGHT, DEVICE_BIND_PERMANENT_EK_HEIGHT,
+#                                    DEVICE_ATTEST_TPM_ANY_AAGUID_HEIGHT, DEVICE_ATTEST_TREZOR_SERIAL_OPTIONAL_HEIGHT,
+#                                    DEVICE_ATTEST_EK_HEIGHT, DEVICE_ATTEST_EK_SHORT_HEIGHT, DEVICE_ATTEST_EK_ROOTS_V2_HEIGHT,
+#                                    DEVICE_ATTEST_EK_PROVEN_HEIGHT, DEVICE_ATTEST_EK_READY_HEIGHT,
+#                                    TX_AT_MOST_ONCE_STRICT_HEIGHT, PROOF_BIND_HEIGHT, EXEC_RULES_V2_HEIGHT,
+#                                    PROOF_BLOCK_SELECTOR_HEIGHT, REVIEW_R2_HEIGHT, PROOF_TRACE_LDT_HEIGHT,
+#                                    PROOF_FIXED_CID_HEIGHT, PRIVACY_PAUSE_HEIGHT, PROOF_QUERY_FULL_HEIGHT,
+#                                    ADDRESS_KEY_BIND_HEIGHT, SETTLE_ANCHOR_HEIGHT, SLASH_DEDUP_HEIGHT,
+#                                    EXEC_CTX_CURRENT_HEIGHT, EXEC_ROOT_V2_HEIGHT, SHIELD_WIDE_HEIGHT
+#   from epoch 0 (x = 0 = always),   LEASE_V2_EPOCH, DIVIDEND_ATTESTED_EPOCH, DIVIDEND_WEIGHT_CAP_V2_EPOCH,
+#   rule inlined (slice 2)           DIV_CARRY_METER_EPOCH
+# WHERE `>= 1` SURVIVES IN THE CODE it is the deleted gate's own value, kept on purpose: height 0 (genesis, mempool
+# admission on a genesis tip, the exec state at cursor -1 / 0) or a tx's own max_block of 0 was BELOW every one of
+# those gates, and the cleanup must not change any verdict. Where the height is provably >= 1 the guard is gone.
+# DEVICE_ATTEST_HEIGHT (= 1) is a plain constant, not a generation-keyed gate; it stays.
+#
+# THE GEN-27 GATES ARE GONE (cleanup after the betanet-9 reroll, gen 28; each slice replayed the live betanet-9 chain
+# block for block through the node's remote-block path and matched main's hashes and roots at every height):
+#   live from block 1 (x = 1),       SPAM_HARDEN_HEIGHT, TX_HEX_CANONICAL_HEIGHT, DEVICE_BIND_CANONICAL_HEIGHT,
+#   rule inlined                     EK_ENROL_ROOTS_AT_HEIGHT, TPM_DRAW_UNGRINDABLE_HEIGHT, CERT_CLOCK_HEIGHT,
+#                                    SETTLE_STAKE_FLOOR_HEIGHT, EXEC_DA_DEADLINE_HEIGHT (exec layer),
+#                                    BLOCK_SIG_CHAIN_BIND_HEIGHT, LEGACY_CLAIM_HEIGHT
+#   from epoch 0 (x = 0 = always)    DIVIDEND_CARRY_EPOCH
+#   the address format               ADDRESS_FORMAT (`1 if == 27 else 2`): format 2 is unconditional; ADDRESS_CHECKSUM 4
+#                                    and ADDRESS_LENGTH 50 are plain constants; legacy_address() stays for legacy_claim
+# `>= 1` survives, as the deleted gate's own value, only where height 0 reaches the check: tx_shape_check,
+# excluded_witness_check and the msgkey / settle / xmsg fee rules (mempool admission on a genesis tip), the tpm_ready /
+# tpm_enrol uniqueness keys and the settle / xmsg builders (a tx's own max_block), legacy_claim validation, the exec DA
+# deadline (genesis at h = 0), and height-0 block-signature messages / slash evidence judged at 0 or None. The raw-bytes
+# device key stays for devbind rows carried from betanet-8.
+#   ZK hardening                     ZK_HARDEN_HEIGHT: `>= 1` was kept in calls_commit.wide_binding (the narrow calldata
+#                                    binding answered only at cursor 0), shielded_wide.depth_at (a fresh exec state's
+#                                    empty depth-12 pool until block 1) and stark.rules_for_height (0 -> RULES_LEGACY).
+#                                    All three are gone: stark and shielded_wide in G9 slices 4 and 5, and the cursor-0
+#                                    narrow leaf (calls_commit._leaf_value) on 2026-10-28 — unreachable, since block 0
+#                                    is genesis's empty transaction list and never runs block_summary.
+# GEN-28 GATES INLINED IN G9 (slice 3, gen 29): every `<h> if CHAIN_GENERATION == 28 else 1` gate is gone and its rule
+# is unconditional. Each group replayed the live betanet-10 chain through 7608 (L1 and exec roots) IDENTICAL to main.
+# `>= 1` (or its twin) survives only where height 0, cursor -1 or no height reaches the check:
+#   TPM_POOL_CHALLENGER_ACTS_HEIGHT  challenger pool counts only challengers' own acts (a window ending at 0 scans nothing)
+#   TPM_POOL_V2_HEIGHT               online-stake pool, k = 5, misses excluded — `>= 1` at enrol validation (admission on
+#                                    a genesis tip judges the legacy pool, as it did)
+#   TPM_ENROL_V3_HEIGHT              a wrong commitment fails the record; client-failed retries cool down — `>= 1` at
+#                                    validation
+#   TPM_RETRY_OWNER_HEIGHT           retry count per (chip, opener) — `< 1` / None kept in tpm_enrol.client_failed and
+#                                    retry_key, `>= 1` at validation
+#   EVICT_VOIDS_EPOCH_HEIGHT         a device move voids through the epoch — `>= 1` with None kept (_evict_voids)
+#   CARRY_FIDELITY_ALL_HEIGHT        the dividend replay starts an absent carried identity from its carried fidelity —
+#                                    `epoch >= 0` kept (a negative epoch still reads 0)
+#   BEACON_EXTEND_HEIGHT             a reveal-less epoch's exec BEACON waits for the next reveals — epoch 0 keeps its plain
+#                                    value (`e0 < 1` in ExecState.exec_beacon_at)
+#   REVEAL_SEATLESS_HEIGHT           a reveal-only duty needs no seat — `tb >= 1` kept in _validate_duty (max_block is
+#                                    sender-chosen, 0 still required a seat)
+#   RANDAO_MISS_POOL_HEIGHT          an unrevealed commitment leaves the TPM pool for its epoch (no `>= 1` left: E < 2
+#                                    already returns empty)
+#   REGISTRY_SNAPSHOT_HEIGHT         draws read the registry frozen at the epoch's anchor — `>= 1` kept in incorporate and
+#                                    rollback (block 0 never wrote regsnap:1)
+#   AGREED_TIME_SEATS_HEIGHT         the certificate clock weighs committee seats — `seated = int(hi) >= 1` (epoch 0's
+#                                    window is empty)
+#   STWO_POOL_HEIGHT, WIDE_DEPOSIT_CLOSE_HEIGHT, STWO_FEE_TO_HEIGHT, STWO_JS_128_HEIGHT   the Stwo pool, wide-pool close,
+#                                    fee_to, 128-bit config — `>= 1` kept in field_shield_check (no shape check at 0),
+#                                    rules_stwo_pool / rules_stwo_fee_to, execnode _stwo_pool_next / fee_to (cursor -1),
+#                                    stwo_js_native.config_id_at (0 -> CFG_340)
+#   REFERRAL_HEIGHT                  referrals, the 10 % slice, funded invites — `< 1` / `>= 1` kept in
+#                                    validate_register_referrer, validate_invite, referral_to_write; referral_split
+#                                    `epoch < 0`; /get_referrals still answers active_from 1
+#   BLOCK_BUDGET_HEIGHT              MAX_BLOCK_TXS / MAX_BLOCK_TX_BYTES — `< 1` kept in assert_block_budget and
+#                                    cap_block_budget (one test, both sides)
+#   EXEC_BUDGET_V2_HEIGHT            reverting calls pay into the exec budget — rules_budget_v2 is applying_height() >= 1
+#   SIG_SCHEMES_HEIGHT               an account signs with its address's scheme — `>= 1` with None kept in sig_scheme_check
+#   (SIG_SCHEME_KEYS_HEIGHT is keyed on generation 29 below: multisig members and auth keys of every offered scheme)
+#   BLAKE_EXEC_HEIGHT                the BLAKE2s exec root and the 256-bit VM — unconditional at EVERY height (the gate's
+#                                    predicate already covered cursors -1 and 0); exec_root_b2.blake_exec_at is deleted
+# GEN-29 GATES RETIRED IN G9 (slice 5c): LEGACY_SHIELD_CLOSE_HEIGHT (10000) and LEGACY_TRANSFER_CLOSE_HEIGHT (14000)
+#                                    fired; the chain carries no legacy shield below 10000 and no shielded_transfer below
+#                                    14000 (measured), so both refusals are unconditional and the legacy pool is deleted —
+#                                    no `>= 1` survives (mempool admission at None / 0 refuses a legacy shield too)
+# GEN-29 GATE RETIRED (2026-10-28): CODE_COMMIT_WIDE_HEIGHT (19000, exec cursor) — below it a code event's leaf committed
+#                                    the code digest's residue mod the Goldilocks prime. No code event exists below 19000
+#                                    (measured on finalized blocks 0..19004), so calls_commit.code_commitment is the whole
+#                                    digest at every cursor and the prime is gone from the tree — no `>= 1` survives
+# KEYED ON GENERATION 29 (live on betanet-10):
+#                                    EXEC_ADDR_ROOT_HEIGHT (8500, exec cursor; -> 1: the zkvm digest registry is committed in
+#                                    the exec root as T_ADDR records, so a settlement proof resolves payees as the chain)
+#                                    EXEC_CARRY_ROOT_HEIGHT (30000, exec cursor; -> 1: the exec state's dividend carry is
+#                                    committed in the exec root as the T_COUNTER record "div_carry", so a settlement proof
+#                                    reads a span's starting carry from its pre root, never from L1's exec summaries)
+#                                    EXEC_ASSET_ID_ROOT_HEIGHT (115000, exec cursor; -> 1: every asset's id is committed in
+#                                    the exec root as a T_ASSET_ID record, so a settlement proof shows an asset absent)
+#                                    STWO_SETTLE_HEIGHT ((1 << 62) = DORMANT; -> 1: a settle may carry a Stwo settlement
+#                                    proof of its span, which L1 verifies and marks proven — G8)
+#                                    STWO_JS_GRIND_HEIGHT ((1 << 62) = DORMANT; -> 1: a Stwo spend proves at NODE_CFG_128G,
+#                                    which grinds before its LogUp elements and composition coefficient too)
+#                                    SIG_SCHEME_KEYS_HEIGHT (123000, L1 height; -> 1: a multisig member and an auth key may
+#                                    sign with any offered scheme, and an account of another scheme may send `auth`)
+#                                    MSIG_PAY_FLEXIBLE_HEIGHT (123000, L1 height; -> 1: a payment to a multisig account
+#                                    lands anywhere in its [min_block, max_block] window)
+#                                    MSIG_MEMBER_AUTH_HEIGHT (124500, L1 height; -> 1: a protected multisig member signs
+#                                    with its current key, and its rotated-away keys no longer do)
+# ---------------------------------------------------------------------------------------------------------------
+DEVICE_ATTEST_HEIGHT = 1                 # gen 25: every register tx from block 1 carries a hardware attestation (block 0 has no txs)
+
+# ONE DEVICE, ONE IDENTITY (2026-09-07, the point of attestation — "using one device to attest 100,000 wallets must be
+# impossible"). From DEVICE_BIND_HEIGHT every register tx's device certificate (ops/device_attest.device_binding_key:
+# the Android remote-provisioned attestation-key certificate, the Windows AIK certificate) is BOUND to its sender in
+# the consensus `devbind` table for one lease: while that binding is live (POSW_LEASE_EPOCHS from the binding recert)
+# the same certificate cannot register a DIFFERENT sender. Classes that carry no per-device certificate (FIDO2 batch
+# keys, Apple statements, batch-attested pre-RKP Android) are refused from the gate: unbindable = unacceptable.
+# Gate hygiene: shipped on the live betanet-7 chain, so it is a HEIGHT ahead of the fleet's adoption (registrations
+# below it carry no binding and replay unchanged); becomes 1 at the next reroll.
+# DEVICE_BIND_HEIGHT: gen 25 gate at 460; 1 from gen 26 — deleted after the betanet-8 reroll, the rule holds from block 1.
+# STRICT BINDING (review 2026-09-07, two confirmed holes): (1) a statement with DUPLICATE CBOR map keys made the kernel
+# verify one chain (first key) while the Python parser hashed another (last key) for the binding — N identities per
+# device; from this height the consensus parser refuses duplicate keys, so both sides see one map. (2) The binding was
+# checked against PARENT state, so N senders could bind the same device inside ONE block; from this height a register tx
+# also occupies the in-block uniqueness key ("devbind", key) — one device per block, in assembly and verification alike.
+# Height-gated for replayability; becomes 1 at the next reroll.
+# DEVICE_BIND_STRICT_HEIGHT: gen 25 gate at 1700; 1 from gen 26 — deleted after the betanet-8 reroll, the rule holds from block 1.
+# ONE DEVICE, ONE IDENTITY — FOR REAL (audit 2026-09-25, fixed 2026-09-27). The binding key hashed the certificate's RAW
+# bytes while the native kernel ignores bytes after the DER, so one chip's certificate with different junk appended bound
+# a new identity each time: unlimited identities per device. The key is the certificate's SIGNED part
+# (ops/device_attest.cert_signed_part — it cannot vary without breaking the issuer's signature), certificates with
+# trailing bytes are refused, and a device's older raw-bytes binding (a devbind row written on betanet-8 below block
+# 19800 and carried into betanet-9 by the reroll) counts as the same device, so the switch hands no device a second
+# identity. Measured before the fix: no trailing-byte certificate had been registered on betanet-8.
+# DEVICE_BIND_CANONICAL_HEIGHT: gen 27 gate at 19800; 1 from gen 28 — deleted after the betanet-9 reroll, the rule holds
+# from block 1 (every caller derives the key at a block's height, or at a register's own max_block behind `>= 1`).
+# CARRIED IDENTITIES EARN THE DIVIDEND (2026-09-27; our reroll commit 302215f2). The betanet-8 carry leased every carried
+# identity with a recert at epoch 0 — the very marker the dividend rule uses to exclude never-attested genesis seeds —
+# so every carried identity was present, produced blocks, and earned no dividend until it re-registered; and the replay
+# behind the committed weights rebuilt fidelity from gen-27 recerts only, so carried veterans who did renew weighed like
+# newcomers. The rule (ops/dividend_ops): an identity the carry named as present counts as attested, and its replayed
+# fidelity starts from its carried value.
+# DIVIDEND_CARRY_EPOCH: gen 27 gate at epoch 340; 0 from gen 28 — deleted after the betanet-9 reroll, the rule holds from
+# epoch 0.
+# NO FREE REPEATABLE TRANSACTIONS (2026-09-27, operator: "make sure it is not exploitable in the future (no fees empty
+# address spam)"). Measured on betanet-8 before the gate (audit + probes, doc/security-review-2026-09-27.md §"Free
+# transactions"): tpm_ready carried no fee rule and no uniqueness key, so a never-funded address could land any number of
+# them in every block, each writing an account row, and the senders fed the TPM challenger draw; msgkey was free forever
+# from any account that existed, even at zero balance; any transaction could carry unlimited extra top-level keys (the
+# txid hashes them all), so a fee-exempt message was unbounded in size; one chip could open several enrolments in one
+# block; a single 10-NADO bond could land permanent settle rows in unlimited namespaces for free; xmsg was free; and one
+# device could hop to a fresh never-funded sender every block. So (betanet-8 from block 24000, betanet-9 from block 1):
+#   * a transaction carries only TX_TOP_KEYS (plus TX_TOP_KEYS_BY_RECIPIENT) and fits TX_MAX_BYTES (+ per extra signature);
+#   * msgkey is free only for the FIRST bind; a rotation pays MIN_TX_FEE, re-binding the same key is refused, no data;
+#   * tpm_ready is fee-free only from a bonded sender (B_MIN), once per sender per block, and writes no account;
+#   * tpm_enrol occupies ("tpm_enrol", endorsement identity) — one enrolment per chip per block;
+#   * settle is free only in the default namespace and no more than SETTLE_MAX_LAG behind the block; other namespaces pay;
+#   * xmsg pays MIN_TX_FEE;
+#   * a device moves to a DIFFERENT sender at most once per epoch (the first move stays instant).
+# Every fee a free kind now pays is burned like any fee.
+# SPAM_HARDEN_HEIGHT: gen 27 gate at 24000; 1 from gen 28 — deleted after the betanet-9 reroll, the rule holds from block 1.
+# `>= 1` survives where height 0 reaches the check (mempool admission on a genesis tip, a tx's own max_block, a builder).
+# THE ENROLMENT'S CHALLENGERS ARE DRAWN FROM RANDOMNESS THE CLIENT HAS NOT SEEN (audit 2026-09-27, CRIT "draw keyed on
+# client-chosen AIK enrol_id (grindable)"; doc/tpm-attestation-without-a-ca.md §"Who challenges"). The old draw picked the
+# k challengers AT the tpm_enrol from epoch_beacon(epoch of the enrol) keyed on the enrolment id — and that id
+# hashes the attestation key's public area, which the client writes (authPolicy and the modulus are free bytes). That
+# beacon is fixed from block (E-1)*EPOCH_LENGTH on, so a client computes the whole draw offline and grinds public areas
+# until all k seats land on pool members it controls; with every seat colluding the chip proof is forged outright (the
+# challengers hand it S, no TPM is ever touched). So (ops/tpm_enrol "COMMIT, THEN DRAW"):
+#   * the draw is keyed on the ENDORSEMENT identity (fixed per chip by manufacture), never on the enrolment id or any
+#     other field the client writes;
+#   * its randomness is epoch_beacon(E + TPM_DRAW_DELAY_EPOCHS) for an enrol landing in epoch E, whose anchor block
+#     (E+1)*EPOCH_LENGTH lies strictly AFTER the enrol block — so the enrolment is committed before its dice exist;
+#   * the weights are the pool as of the enrol block (frozen before the dice exist, so nobody can join it to aim);
+#   * the draw is exact weighted sampling without replacement, so a pool of >= k weighted members always seats k —
+#     checked at the enrol instead of discovered after the delay;
+#   * the record is written with no challengers, and the first tpm_challenge from the draw epoch on materialises them
+#     into it; the record lives TPM_DRAW_DELAY_EPOCHS' wait plus the usual DEVICE_ATTEST_EK_ENROL_SHORT.
+# The client (apps/nado-tpm-attest) needs no change: /tpm_enrolment serves k placeholders while the draw is pending.
+# TPM_DRAW_UNGRINDABLE_HEIGHT: gen 27 gate at 28500; 1 from gen 28 — deleted after the betanet-9 reroll with the
+# enrol-time draw it replaced: every enrolment record is created by a tpm_enrol in a block >= 1 (genesis carries no
+# transactions and the reroll carries no enrolment), so every record is drawn commit-then-draw.
+# Two, not one: epoch E+1's beacon is anchored on block E*EPOCH_LENGTH, which is at or BEFORE any enrol in epoch E —
+# the client would know it. E+2's anchor (E+1)*EPOCH_LENGTH is the first one strictly after every enrol of epoch E.
+# INVARIANT: never lower this below 2, or the draw is predictable when the enrolment is built.
+TPM_DRAW_DELAY_EPOCHS = 2
+TX_TOP_KEYS = frozenset(("sender", "recipient", "amount", "fee", "timestamp", "data", "nonce", "public_key",
+                         "max_block", "min_block", "chain_id", "txid", "signature", "multisig", "alg"))
+TX_TOP_KEYS_BY_RECIPIENT = {"msgkey": frozenset(("kem_pub",)), "register": frozenset(("device", "posw"))}
+# ONE TRANSACTION, ONE BYTE STRING (audit 2026-09-25, MED "sig/pubkey hex re-encoding"). The txid hashes the body WITHOUT
+# `public_key` (PUBKEY-ONCE) and without `signature` (string or entry list), yet the block hash, the upcoming-block hash
+# and every stored block commit the FULL body. Verification decoded both through bytes.fromhex, which accepts UPPERCASE,
+# mixed case and whitespace between (and around) the bytes, and an entry list took any extra keys and a `public_key` of
+# null. So anyone relaying a transaction could re-encode it into another byte string with the SAME txid that still
+# validated: nodes holding "the same" tx built different blocks from one mempool (every node assembles every block, so
+# that is a fork driver), the pre-assembly reconcile could not heal it (it compares txids, which agree), dedup-by-txid
+# kept whichever copy came first — and a mixed-case key on an account's FIRST tx was stored verbatim as its PUBKEY-ONCE
+# key, after which the owner's own lowercase-key transactions failed key_bound (a relayer could lock an account out).
+# So every txid-excluded witness must be canonical: `public_key`, when the key is present, exactly
+# MLDSA44_PUBKEY_HEX lowercase hex; `signature` exactly MLDSA44_SIG_HEX lowercase hex, or a list of entries each exactly
+# {"signature"[, "public_key"]} with both canonical (ops/transaction_ops.excluded_witness_check). Honest clients already
+# emit this (Python .hex(), noble bytesToHex, Rust {:02x}).
+# AND (found while fixing the above, reproduced in the same test): a tx signed with an entry LIST
+# carries NO top-level public_key. Nothing verifies that key when the signature is a list, yet PUBKEY-ONCE stored it as
+# the sender's key when none was stored, and the implicit auth config then authorizes it: a relayer adding its own key
+# to an account's list-signed FIRST tx took the account over. It stayed open on gen 27 (a live flip would have refused
+# txs some nodes admitted, so the rule waited for the reroll) and is closed from block 1 of gen 28.
+# NOT CLOSED by this rule, because no encoding rule can close it: the SIGNER can mint any number of valid signatures over
+# one txid (ML-DSA signing is hedged), and a relayer can still strip/add a public_key the account already published
+# (top-level, or a sole authenticator's entry key), reorder an entry list, or drop surplus entries. Only a block hash
+# that stops committing witness bytes closes those (tests/test_excluded_hex_fields_are_canonical.py pins them as known
+# open, so the day one closes the test says so).
+# TX_HEX_CANONICAL_HEIGHT: reroll-only gen 27 gate ((1 << 62), never live there); 1 from gen 28 — deleted after the
+# betanet-9 reroll. `>= 1` survives in excluded_witness_check: validate_transaction also runs at mempool admission with the
+# tip's height, which is 0 on a genesis tip, where the rule was off.
+MLDSA44_PUBKEY_HEX = 2 * 1312            # ML-DSA-44 public key (FIPS 204 Table 2), hex chars
+MLDSA44_SIG_HEX = 2 * 2420               # ML-DSA-44 signature, hex chars
+TX_MAX_BYTES = 64 * 1024                 # canonical bytes; the largest honest non-proof tx on betanet-8 was 16.5 KB
+TX_MAX_BYTES_PER_EXTRA_SIG = 8 * 1024    # an auth / multisig entry (ML-DSA signature + key) beyond the first
+TPM_ENROL_MAX_BYTES = 192 * 1024         # an endorsement chain of up to 8 DER certificates of 8 KiB, in hex, + the key
+SETTLE_MAX_LAG = 5000                    # blocks; honest settles on betanet-8 trailed their block by 12..380
+FREE_POOL_PER_SENDER = 16                # MEMPOOL POLICY, not consensus: pooled fee-exempt txs per sender (memserver)
+DEVICE_BIND_MAX_CERT_SECS = 90 * 86400   # an Android attestation certificate valid longer than this is a shared BATCH cert
+DEVICE_BIND_CLASSES = frozenset(("android-key", "tpm", "trezor", "ledger"))   # each carries a PER-DEVICE certificate/key
+# BINDING MODES (doc/device-attestation.md §"Binding modes", operator decision 2026-09-07). A binding is only as durable
+# as the key behind it: an Android attestation certificate rotates (~2 weeks), a TPM AIK is per Windows account, but a
+# Ledger's factory device key and a Trezor's device certificate NEVER change. So from DEVICE_BIND_PERMANENT_HEIGHT a
+# register from a class in DEVICE_BIND_PERMANENT_CLASSES binds for LIFE (devbind mode "perm", the sender's account gets
+# `devkey`) and that identity renews its presence lease WITHOUT a statement (a register tx with no `device`, accepted
+# only while devbind[devkey] points back at the sender). Leased classes keep re-attesting every renewal — a binding
+# that outlived its rotating key would let one phone bind a fresh identity per rotation. A permanent device may MOVE to
+# another sender (rebind, no old-key signature needed: lost key, sold device) once POSW_LEASE_EPOCHS have passed since
+# its last STATEMENT (statement-free renewals never refresh the binding epoch, so an old owner cannot pin it); the move
+# supersedes the old binding in that block. Height-gated on the live betanet-7 chain; becomes 1 at the next reroll.
+# DEVICE_BIND_PERMANENT_HEIGHT: gen 25 gate at 3900; 1 from gen 26 — deleted after the betanet-8 reroll, the rule holds from block 1.
+# INSTANT MOVES (operator decision 2026-09-07 evening, doc/device-attestation.md §"Rebinding"): from this height a device
+# may move to another sender in ANY block — no cooldown — because the move EVICTS the identity it leaves in the same
+# block: an eviction row (devbind key "evict:<address>": [[evict_epoch, voided_recert_epoch], ...]) voids that identity's
+# current lease for the open registry AND for the epoch-weight reconstruction (present only with a recert NEWER than the
+# voided one), so at every instant exactly one identity is backed by the device and hopping earns nothing (each hop
+# kills the previous identity, the new one starts at fidelity 1). Whoever holds the device wins immediately. Before this
+# height the old rule (refuse a different sender for POSW_LEASE_EPOCHS after the last statement) replays unchanged.
+# DEVICE_REBIND_INSTANT_HEIGHT: gen 25 gate at 5400; 1 from gen 26 — deleted after the betanet-8 reroll, the rule holds from block 1.
+DEVICE_BIND_PERMANENT_CLASSES = frozenset(("ledger", "trezor"))
+# PERMANENT EK BINDINGS (operator decision 2026-09-14, doc/device-attestation.md §"Binding modes"). The vendor-endorsed
+# TPM enrolment binds an identity to the chip's ENDORSEMENT key ("ek:<identity>", ops/device_attest.device_binding_key)
+# — burned in at manufacture and never rotated, exactly the durability that made Ledger and Trezor permanent, and unlike
+# the WebAuthn "tpm" class whose AIK is per Windows account. Until this height every helper-enrolled identity had to run
+# the helper again every lease to produce a fresh certify; from it a register carrying an ek statement binds for LIFE
+# and the identity renews without a statement, like a hardware wallet. A previously leased ek row becomes permanent at
+# its next statement (the helper's next run), because only a statement writes the account's `devkey` reverse index.
+# Rebinding by another sender evicts as for every class. Gate at the fleet's adoption block (rule 3); fresh chain: block 1.
+# DEVICE_BIND_PERMANENT_EK_HEIGHT: gen 25 gate at 92900; 1 from gen 26 — deleted after the betanet-8 reroll, the rule holds from block 1.
+
+
+def permanent_classes_at(height) -> frozenset:
+    """The device classes that bind for life at `height` — a pure function of height so a replay reaches the same
+    verdict. None = the latest rule, for ADVISORY readers only (the identity log); validation and apply pass the
+    block's height."""
+    # "ek" is permanent from height 1 (gen 25's DEVICE_BIND_PERMANENT_EK_HEIGHT, 1 from gen 26, deleted); height 0
+    # was below that gate and keeps the set it had
+    if height is None or int(height) >= 1:
+        return DEVICE_BIND_PERMANENT_CLASSES | frozenset(("ek",))
+    return DEVICE_BIND_PERMANENT_CLASSES
+# THE SAVINGS LANE IS PLAIN STAKE (cleanup after the betanet-8 reroll, doc/reroll.md §"What the cleanup deletes").
+# Gen 25 carried eight gates here — the per-device cap (BOND_DEVICE_CAP_HEIGHT), the knee/tail curve
+# (BOND_WEIGHT_CURVE_HEIGHT), staking pools (POOL_HEIGHT), the open-lane exclusion of stakers
+# (OPEN_LANE_EXCLUDE_BONDED_HEIGHT) and the four gates that retired them again (BOND_ATTEST_OPTIONAL_HEIGHT,
+# POOL_RETIRE_HEIGHT, BOND_CURVE_RETIRE_HEIGHT, OPEN_LANE_EXCLUDE_RETIRE_HEIGHT). Their reroll values were 0 / 1, so
+# from generation 26 on none of those rules ever ran: the bonded producer draw is the raw bonded registry, the open
+# draw is the whole attested registry, and pool / delegate / undelegate are refused. The code paths were deleted with
+# the gates; mining_ops.bonded_producer_registry / open_lane_draw_registry and the refusal in
+# transaction_ops.validate_transaction keep that gen-27 behaviour exactly. The history (why each rule came and went)
+# is in doc/device-attestation.md and git.
+# GENTLER DIVIDEND GRADIENT (operator decision 2026-09-08): min(fidelity, 15) instead of 30 from this epoch — a thirty-day identity
+# earned 30x a one-day one; now 15x, so a newcomer's first week is not almost nothing. Gen 25 gated it at epoch 110
+# (DIVIDEND_WEIGHT_CAP_V2_EPOCH); from gen 26 it held from epoch 0 and the gate was deleted after the betanet-8 reroll.
+DIVIDEND_WEIGHT_CAP_V2 = 15
+DEVICE_ATTEST_ROOT_FINGERPRINTS = frozenset((
+    "0915dd5c07a28db549d1f677bb5a75d4bfbe9561a773424327762e9e02f9bb29",  # Apple WebAuthn Root CA (2045)
+    "cedb1cb6dc896ae5ec797348bce9286753c2b38ee71ce0fbe34a9a1248800dfc",  # Google Hardware Attestation Root (2042)
+    "1ef1a04b8ba58ab94589ac498c8982a783f24ea7307e0159a0c3a73b377d87cc",  # Google Hardware Attestation Root (2034)
+    "ab6641178a36e179aa0c1cdddf9a16eb45fa20943e2b8cd7c7c05c26cf8b487a",  # Google Hardware Attestation Root (2036)
+    "6d9db4ce6c5c0b293166d08986e05774a8776ceb525d9e4329520de12ba4bcc0",  # Google Key Attestation CA1 (2035)
+    "870c7a35ceab3d59979f2c6a524042d404cb71518004350925fb2ced79a999da",  # Microsoft TPM Root Certificate Authority 2014 (2039) — Windows Hello hardware (TPM) authenticators
+))
+# FIDO2 SECURITY KEYS (Linux and any computer): roots of every FIDO2 authenticator with full attestation in the
+# FIDO Alliance metadata (protocol_roots/fido_mds_roots.json, a SNAPSHOT curated at commit time — never fetched
+# at validation; refreshed only by a gated protocol commit). A `packed` statement must chain to one of these AND
+# carry an AAGUID listed there.
+def _fido_mds_bundle():
+    import json as _json, os as _os
+    with open(_os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "protocol_roots", "fido_mds_roots.json")) as f:
+        return _json.load(f)
+_FIDO = _fido_mds_bundle()
+DEVICE_ATTEST_FIDO_ROOT_FINGERPRINTS = frozenset(r["sha256"] for r in _FIDO["roots"])
+# AAGUID -> the root fingerprints of THAT authenticator model: a packed statement must chain to one of them,
+# never merely to some root in the set (vendor A's key could otherwise claim vendor B's AAGUID).
+DEVICE_ATTEST_FIDO_AAGUID_ROOTS = {a: frozenset(v["roots"]) for a, v in _FIDO["aaguids"].items()}
+del _FIDO
+# accepted statement formats: apple (iPhone/iPad), android-key (Android, TEE/StrongBox), tpm (Windows Hello on a
+# physical TPM), packed (FIDO2 security keys). Rejected: none, packed self-attestation, android-safetynet, fido-u2f.
+DEVICE_ATTEST_FORMATS = frozenset(("apple", "android-key", "tpm", "packed", "trezor", "ledger"))
+# APPLE DEVICES ARE NOT A DEVICE CLASS (operator decision 2026-09-07). Passkeys carry no attestation; App Attest was built,
+# verified end to end against a real iPad and withdrawn the same evening: its statement carries NO per-device certificate
+# (one shared CA for every iPhone), so one-key-per-device would rest on app code, and a jailbroken checkm8-class iPhone
+# farms identities the chain cannot see. No block ever carried one. Apple users mine through a hardware wallet on a Mac
+# or "attest from another device". History: git log -- apps/nado-attest-ios doc/apple-app-attest.md.
+# tpm: only physical TPM manufacturers — Microsoft's own id (4D534654 "MSFT") is the Hyper-V/Azure VIRTUAL TPM, rejected.
+DEVICE_ATTEST_TPM_AAGUIDS = frozenset(("08987058cadc4b81b6e130de50dcbe96",))   # Windows Hello Hardware Authenticator
+# THE TPM PROOF DECIDES, NOT THE AAGUID (2026-09-10, measured — see the regression note in
+# transaction_ops.verify_register_device and doc/device-attestation.md §"Windows"). The rule used to ALSO require the
+# AAGUID above, on the belief that the other two Windows Hello AAGUIDs (9ddd1817… "VBS", 6028b017… "software") mean the
+# key is not in a TPM. That belief is false and it cost a real user two evenings: index/device_attest holds four
+# statements from one Intel-PTT PC with AAGUID 9ddd1817 that the kernel verifies END TO END — chain to Microsoft TPM
+# Root CA 2014, manufacturer 494E5443 (INTC), and a TPM_ST_ATTEST_CERTIFY over the credential's own pubArea — and every
+# one was refused with "not the Windows Hello hardware authenticator". The AAGUID is a label Windows picks for the
+# authenticator FLAVOUR; it says nothing about where the private key lives. What proves hardware is the certify:
+# TPM2_Certify only signs the name of an object LOADED IN THAT TPM, the kernel checks attested.name == name(pubArea)
+# and pubArea == the credential key, and the AIK that signed it was issued by Microsoft's AIK CA only after a real
+# endorsement key. A Hello key that is genuinely software-only cannot produce this at all — Windows returns fmt "none"
+# and the format check refuses it one line above. So from this height the tpm rule is exactly: pinned Microsoft root +
+# physical manufacturer + the kernel's certify proof. Binding is unaffected (device_binding_key hashes the AIK
+# certificate — one per physical TPM per Windows account — whatever AAGUID the credential carries).
+# DEVICE_ATTEST_TPM_ANY_AAGUID_HEIGHT: gen 25 gate at 41200; 1 from gen 26 — deleted after the betanet-8 reroll, the rule holds from block 1.
+DEVICE_ATTEST_TPM_MANUFACTURERS = frozenset((
+    "49465800",  # IFX  Infineon
+    "53544D20",  # STM  STMicroelectronics
+    "4E544300",  # NTC  Nuvoton
+    "494E5443",  # INTC Intel (PTT)
+    "414D4400",  # AMD  (fTPM)
+    "51434F4D",  # QCOM Qualcomm
+    "4E534D20",  # NSM  Nationz
+    "4E545A00",  # NTZ  Nationz
+    "534D5343",  # SMSC
+    "4C454E00",  # LEN  Lenovo
+    "41544D4C",  # ATML Atmel
+    "42524342",  # BRCM Broadcom
+    "47004F00",  # GOOG Google (Titan)
+))
+# VENDOR ENDORSEMENT ROOTS (doc/tpm-attestation-without-a-ca.md). A TPM that Microsoft will not certify still
+# carries a vendor-signed ENDORSEMENT certificate, and that signature is the entire basis for trusting the
+# hardware without auditing anyone's factory. These are pinned SEPARATELY from DEVICE_ATTEST_ROOT_FINGERPRINTS
+# above: those say "this vendor signed this attestation statement", these say "this vendor made this chip".
+# Conflating the two would let an endorsement root validate a statement or an attestation root vouch for a
+# chip, neither of which its owner ever asserted.
+#
+# WHICH ROOTS ARE PINNED IS THE SYBIL DIAL, and it only reverses in the widening direction. A discrete TPM
+# module is ~£15, so pinning Infineon/Nuvoton/ST would price an identity at the cost of a chip; a CPU-vendor
+# fTPM implies a whole machine. AMD's is verified against a real endorsement certificate from an affected
+# machine (EK -> CN=PRG-RN -> CN=AMDTPM). Add Intel and the rest as each is verified the same way — against a
+# real certificate walked to a self-signed root, never from a vendor's download page alone.
+# VENDOR-ENDORSED TPM ATTESTATION (doc/tpm-attestation-without-a-ca.md). From this height a register tx may
+# prove its device through the chip's VENDOR endorsement certificate instead of through Microsoft, which is
+# what makes the 26.8% of attempts that Windows Hello refuses attestable at all — and what lets a Linux node
+# attest itself, where no path has ever existed.
+#
+# THE ENROLMENT IS THREE MESSAGES AND CANNOT BE FEWER. A challenger seals a secret to the chip and publishes
+# the blob; the client activates it in the TPM and commits to what it recovered; the challenger then reveals
+# (secret, seed) so every node can recompute the blob and check the commitment. Collapsing this into one
+# message would let a client pick the secret and the seed itself, compute the blob with no chip involved, and
+# have consensus verify its own fabrication. The ordering IS the proof.
+#
+# LIVE FROM 45300 (2026-09-10). From this height the four enrolment transactions are accepted and a `register`
+# may prove its device with {"ek", "id", "certinfo", "sig"} — a fresh TPM2_Certify under an enrolled key over
+# that block's own challenge — instead of a WebAuthn statement. The height is ~28 minutes past the block it
+# was committed at, which is margin for the /update wave rather than a guess: a validation rule that arrives
+# on some nodes before others splits the fleet, and the cost of gating late is nothing.
+#
+# The binding handle is "ek:<endorsement identity>" (ops/device_attest.device_binding_key), so this class
+# enters the SAME one-device-one-identity table as every other. One chip is one identity however many
+# attestation keys it enrols, and the endorsement key cannot be re-minted without invalidating the vendor
+# certificate that made the chip admissible in the first place.
+# DEVICE_ATTEST_EK_HEIGHT: gen 25 gate at 45300; 1 from gen 26 — deleted after the betanet-8 reroll, the rule holds from block 1.
+
+# HOW MANY INDEPENDENT CHALLENGERS ONE ENROLMENT NEEDS. The residual attack on a CA-free enrolment is a
+# challenger that privately hands its secret to a client with no chip. With k challengers drawn from the
+# bonded registry by the epoch beacon — never chosen by the client — forging needs ALL k to collude, and the
+# client must recover every one of their secrets. k is a straight trade: raise it and forgery gets harder
+# while a single offline validator can stall an honest enrolment for one draw. 3 is the smallest k where no
+# single validator can mint identities on its own; the retry costs the client a new attestation key and a
+# later block, which is cheap, whereas a wrong k here is a Sybil hole.
+DEVICE_ATTEST_EK_CHALLENGERS = 3
+
+# WHO IS ELIGIBLE TO BE DRAWN: an identity that PRODUCED A BLOCK in the last this-many blocks.
+#
+# The first version drew from bonded stake, and that was wrong in a way worth recording. Bonded stake
+# measures capital, not liveness, and a challenger has to actually be running to answer. Measured on the
+# live chain: 22% of bonded stake sat behind addresses with a live node, so the chance that all three
+# drawn challengers could answer was about 1%. Every enrolment would have stalled until it expired, and
+# the failure would have looked like a bug in the chip or the client.
+#
+# Recent block production is the right signal because it is evidence of the thing we actually need. It is
+# recorded in the block headers, so every verifier derives the same set from committed state and a replay
+# years later derives it again. It proves the node was alive minutes ago. And it cannot be manufactured
+# cheaply: producing a block means winning the two-lane draw, which already requires bonded stake or an
+# attested identity, so an adversary who could flood this set could already do worse things.
+#
+# WHICH EVIDENCE, THOUGH — and the first answer was still wrong. Block production was the second attempt
+# after bonded stake, and it is a better signal but not the right one: an open-lane miner produces blocks
+# from a browser wallet and runs no duty loop at all. Measured over 240 blocks on the live chain: 53
+# distinct producers of which 7 ran the software, so the chance all three drawn challengers could answer
+# was 0.2% — worse than the stake-weighted draw it replaced.
+#
+# The signal that actually means "this node runs the loop that answers challenges" is having landed an
+# FFG duty transaction: attest, commit or reveal. Those require being a bonded validator running the core
+# loop, which is the SAME loop that carries the challenger duty, so the evidence and the requirement are
+# the same thing rather than a proxy for it. Over the same 240 blocks: 11 distinct duty senders of which
+# 7 ran the software — 26%, and it approaches certainty as the fleet updates, because a duty sender is a
+# full node by construction. A browser wallet can never produce one.
+DEVICE_ATTEST_EK_PRODUCER_WINDOW = 240
+
+# An enrolment that stops halfway is abandoned, not remembered forever: a client that never commits, or a
+# challenger that never reveals, leaves a row that would otherwise sit in consensus state for the life of the
+# chain. Past this many blocks from its publication an incomplete enrolment is dead and its row is collected;
+# a PROVEN one is not on this clock (what it proved does not decay — the register lease does).
+DEVICE_ATTEST_EK_ENROL_BLOCKS = 720
+
+# A STALLED ENROLMENT SHOULD RETRY SOON, NOT IN AN HOUR AND A HALF. The window above is how long an
+# incomplete enrolment stays alive, and it is also how long a prover waits before it may try again with a
+# FRESH DRAW — which is the only thing that rescues an enrolment whose drawn challengers cannot answer.
+#
+# Measured on the live chain: of 12 eligible duty senders, 7 were reachable and running current code, so
+# a draw of 3 has roughly a 1-in-6 chance of picking three that all answer. At 720 blocks that is one
+# attempt every 80 minutes and several hours to expect a success; at 180 it is one every 20 minutes. The
+# failure it recovers from is real and was observed: two drawn challengers were alive, producing blocks
+# and landing duties, and silently refused on every attempt because they were running a build from before
+# the max_block clamp. Nothing on their side was broken and nothing on the prover's side could fix it.
+#
+# KEYED ON THE RECORD'S CREATION HEIGHT, not on the height it is evaluated at, so a record's expiry never
+# moves under it: an enrolment opened before the gate keeps the window it was opened with, and every node
+# — including one replaying years later — computes the same deadline for the same record.
+DEVICE_ATTEST_EK_ENROL_SHORT = 180
+# DEVICE_ATTEST_EK_SHORT_HEIGHT: gen 25 gate at 56184; 1 from gen 26 — deleted after the betanet-8 reroll, the rule holds from block 1.
+
+# ROOTS ADDED AFTER THE FIRST SET, GATED. Adding a vendor root is a CONSENSUS change: a node that has it
+# accepts an enrolment a node that does not will reject, and the two then disagree about whether a block is
+# valid. So a new root turns on at a height the whole fleet is past, exactly like any other rule change,
+# rather than the moment it lands in the tree.
+#
+# Intel ships TWO endorsement families and we pinned only one. "OnDie CA Root Cert Signing" (beb40bb7…,
+# below) covers newer SoCs; "TPM EK root cert signing" is the one a great many Intel PTT machines actually
+# chain to, and without it those PCs are refused with "endorsement certificate rejected" — which is what a
+# real owner hit. Verified before pinning to the same standard as the rest: fetched from Intel's own PKI at
+# trustedservices.intel.com AND upgrades.intel.com, byte-identical from both hosts, self-signed (subject ==
+# issuer, verifies against itself), CA:TRUE pathlen:1, ECDSA P-256, valid 2014-01-15 to 2049-12-31.
+# ONLY A NODE THAT HAS ACTED AS A CHALLENGER IS ELIGIBLE TO BE DRAWN AS ONE.
+#
+# The draw used recent FFG duty senders, on the reasoning that landing a duty proves a bonded validator
+# running the core loop. It does not. A WALLET that mines — bonded, registered, attested by its own TPM —
+# lands exactly the same duty transactions and is indistinguishable on chain from a node, while running no
+# daemon and therefore no challenger loop. The owner's own mining wallet was drawn as a challenger for a
+# stranger's enrolment and could never answer: one slot of three dead on arrival, every time.
+#
+# The only signal that distinguishes them is having DONE the job: a tpm_challenge, tpm_commit or
+# tpm_reveal on chain. That is self-selecting, needs no allowlist, and costs an operator nothing to earn.
+#
+# THE WINDOW IS LONG ON PURPOSE. A challenger only acts when drawn, so a short lookback forgets nodes that
+# are perfectly willing and simply have not been picked lately — measured: four nodes answered within one
+# evening but only one fell inside a 1,500-block window.
+DEVICE_ATTEST_EK_PROVEN_WINDOW = 6000
+# ONLY A CHALLENGER'S OWN ACTS EARN A SEAT (2026-10-05, operator: "make sure there is no way to exploit it"). The line
+# above names tpm_commit as "having done the job", but the commit is sent by the ENROLLEE (apply_commit: sender ==
+# owner), and any well-formed 64-hex commitment lands. So opening an enrolment with a copied endorsement certificate and
+# committing garbage put the enrollee into the challenger pool for this whole window: no bond, no node, no challenge
+# answered. Each such seat weighs 1 against ~100 for a node, but costs nothing, so enough of them dilute the pool — dead
+# draws that fail honest enrolments, and, held often enough, all three seats of one enrolment (a forged identity).
+# From this height the pool counts tpm_challenge and tpm_reveal (sent only by DRAWN challengers) and the bonded
+# tpm_ready; never the enrollee's commit. TPM_POOL_CHALLENGER_ACTS_HEIGHT (gen 28's gate, 1 from gen 29) was inlined in
+# G9: the rule holds for every window (one ending at block 0 scans nothing).
+
+# AND A FALLBACK, OR A FRESH CHAIN DEADLOCKS. Eligibility earned by acting, where acting requires being
+# drawn, excludes everyone at genesis and after any long quiet period. When fewer than
+# DEVICE_ATTEST_EK_CHALLENGERS proven challengers exist, the draw falls back to the duty senders it used
+# before — worse, but live, and it self-heals the moment k nodes have answered once.
+# DEVICE_ATTEST_EK_PROVEN_HEIGHT: gen 25 gate at 59400; 1 from gen 26 — deleted after the betanet-8 reroll, the rule holds from block 1.
+
+# TPM CHALLENGER POOL v2 (operator-approved 2026-10-06): ONLINE STAKE, k = 5, MISSES EXCLUDED.
+# Every enrolment applied from block 1 is a "v2" record (ops/tpm_enrol.is_v2). TPM_POOL_V2_HEIGHT (gen 28's gate, 1
+# from gen 29) was inlined in G9; the legacy draw above (_tpm_pool) answers only admission against a genesis tip.
+#   POOL      an account is eligible when it holds bonded >= B_MIN at the enrol block AND landed an FFG duty tx in at
+#             least TPM_POOL_PRESENCE_MIN DISTINCT epochs of the DEVICE_ATTEST_EK_PROVEN_WINDOW / EPOCH_LENGTH epochs
+#             before the enrol block's epoch (transaction_ops._duty_presence) AND is not excluded. Weight = bonded //
+#             B_MIN. Seats are priced in stake that is online, not in duty-tx counts a cheap account can accrue.
+#   SNAPSHOT  the v2 record STORES its pool ("pool": sorted [address, weight] pairs) and its k ("k"), and the delayed
+#             draw reads them — never a recomputation at another height. Frozen before the dice, as COMMIT, THEN DRAW
+#             requires. The enrol is refused unless that pool can seat DEVICE_ATTEST_EK_CHALLENGERS_V2.
+#   PENALTY   a challenger drawn for a v2 record that failed it — open at expiry without its challenge, or in commit at
+#             expiry without its reveal — is left out of every v2 pool built within TPM_MISS_EXCLUDE_BLOCKS of that
+#             record's expiry (transaction_ops._tpm_excluded). Read from state only; no new transaction type. A record
+#             whose challengers all answered and whose CLIENT never committed faults nobody, and neither does a commit
+#             that landed within TPM_REVEAL_GRACE of expiry (the client picks when to commit; nobody can reveal after).
+# Shipped on gen 28 at 100000 (tip ~96980); measured then: 10 eligible accounts, total weight 272, so k = 5 seats (an
+# enrol is refused when it cannot).
+DEVICE_ATTEST_EK_CHALLENGERS_V2 = 5      # k for a v2 record: forging needs all five drawn parties to collude
+TPM_POOL_PRESENCE_MIN = 50               # distinct epochs (of the 100 the proven window covers) with a landed duty tx
+TPM_MISS_EXCLUDE_BLOCKS = 14400          # one day: how long a failed challenger stays out of the v2 pool
+# A reveal can only land after the client's commit, and the client chooses when to commit — so a commit landing within
+# this many blocks of the record's expiry faults NO challenger (a commit in the last block would otherwise get every
+# honest challenger excluded at the client's whim). One epoch: a running challenger reveals ~10-20 blocks after the
+# commit it answers (TX_INCLUSION_DELAY plus inclusion), and an honest client commits as soon as its challenges land.
+TPM_REVEAL_GRACE = 60
+
+# REFERRALS: A SLICE OF THE NEWCOMER'S OWN DIVIDEND, NEVER A BONUS FROM THE POOL (operator-approved 2026-10-06).
+# The operator's first idea was a fidelity bump for whoever onboards someone. Any reward paid from the shared pool per
+# onboarded identity is a per-identity rule, and per-identity rules are linear (doc/device-attestation.md): N attested
+# devices refer each other in a ring and EVERY one collects the bump, so the pool moves from honest non-referrers to
+# farms. So the referrer's reward comes out of the newcomer's weight instead:
+#   LINK      a register tx from block 1 may carry data {"referrer": <address>}. It is written only on the
+#             identity's FIRST attested registration (no recert ever, no device stamp on the account, a fresh device),
+#             immutable, one level (transaction_ops validates the shape; account_ops writes devbind "referral:<newcomer>").
+#   SPLIT     for REFERRAL_EPOCHS epochs from the link, the newcomer's dividend weight w is paid as
+#             (REFERRAL_SCALE - REFERRAL_SHARE) * w to the newcomer and REFERRAL_SHARE * w to the referrer; every other
+#             weight is REFERRAL_SCALE * w. Integer, and the scaled total equals REFERRAL_SCALE * the unscaled total, so
+#             nobody else's share moves. Only while the referrer is itself in the epoch's weight set (present, attested);
+#             otherwise the newcomer keeps the whole of it. The slice is cut from the newcomer's OWN weight, never from
+#             what someone else's referral moved, so it never chains.
+#   FARM RING a ring of N identities each gives REFERRAL_SHARE * w and receives one slice: net zero by construction.
+# One function applies it (dividend_ops.referral_split) for the committed epoch weights, the exec accrual and the live
+# /get_open_weights. REFERRAL_HEIGHT (107000 on gen 28, 1 from gen 29) was inlined in G9: the rule holds from block 1
+# (`>= 1` kept where height 0 reaches: transaction_ops register/invite checks, account_ops.referral_to_write).
+REFERRAL_EPOCHS = 7200                   # 30 days at 240 epochs/day: how long a referrer earns from one newcomer
+REFERRAL_SCALE = 10                      # every epoch's weights are scaled by this so a 10 % slice is an integer
+REFERRAL_SHARE = 1                       # the referrer's slice, in REFERRAL_SCALE units of the newcomer's weight (10 %)
+
+# EXEC BEACON OF A REVEAL-LESS EPOCH (execnode/state.ExecState.exec_beacon_at): the BEACON value of an epoch >= 1 with
+# no RANDAO reveals is computed from the reveals of the first later epoch that has some (at most BEACON_EXTEND_MAX
+# epochs ahead) and is final once that epoch is. Read by the exec node and by the settlement's chain reads alike.
+# (BEACON_EXTEND_HEIGHT, 132000 on gen 28, 1 from gen 29: inlined in G9.)
+BEACON_EXTEND_MAX = 8                    # epochs searched ahead; beyond them the plain value stands
+
+# FUNDED INVITE LINKS (from block 1, as REFERRALS; doc/referrals.md). A newcomer starts with nothing — not even the fee
+# for a first transfer — so the referrer pays the start:
+#   "invite_lock"   the referrer escrows `amount` in INVITE_ESCROW under a THROWAWAY ML-DSA-44 key the wallet generates
+#                   for this one link (data {"key": pubkey hex, "expiry": height}); the invite id is blake2b(pubkey).
+#                   The link carries that key's 32-byte seed in its #fragment, which a browser never sends to a server.
+#   "invite_claim"  fee-exempt, from an ATTESTED identity (an account stamped with a device): carries the link key's
+#                   signature over (chain, id, CLAIMANT). Binding the claimant is what a hashlock cannot do — a secret
+#                   revealed in the mempool can be copied into a rival claim; a signature naming one address cannot
+#                   be re-pointed at another.
+#   "invite_refund" fee-exempt, the referrer takes back an unclaimed invite from its expiry.
+# Not a farm target: nothing is minted — every coin a claim pays out is one the referrer put in, for a link they chose
+# to hand out. The claim carries no referral by itself; the newcomer's first register names the referrer (above).
+INVITE_ESCROW = "invite"                 # reserved escrow pseudo-account holding every unclaimed invite
+INVITE_MIN_TIMELOCK = 1_440              # >= ~2.4 h: room to install a wallet, attest a device and claim
+INVITE_MAX_TIMELOCK = 432_000            # <= ~30 days: bounds how long a forgotten link keeps coins in escrow
+INVITE_KEY_HEX = 2624                    # an ML-DSA-44 public key: 1312 bytes
+
+# RANDAO DUTY CONSISTENCY (Release C). A validator commits a secret for epoch E from a duty tx in E-2 (it held a
+# seat then) and reveals it from a duty tx landing in E-1 — which required a seat in E-1's committee, resampled each
+# epoch. Measured 2026-10-08 over target epochs 2072..2178: 358 of 1240 commitments (28.9 %) were never revealed.
+#   seatless reveal     a duty tx carrying ONLY a reveal section needs no committee seat: the reveal opens the
+#                       sender's own commitment, made while seated, so it is already bounded by seats.
+#   miss leaves pool    an address whose commitment for epoch E was not revealed AND that landed no duty tx in the
+#                       reveal epoch E-1 (absent, not merely late) is left out of the TPM challenger pool (tpm_pool_v2)
+#                       for enrolments opened in E. A present validator's miss is a timing casualty of the 14-block
+#                       reveal window, which cannot widen (transaction_ops._randao_unrevealed).
+#   registry snapshot   the bonded registry is frozen into state at each epoch's first block (but genesis), as the
+#                       registry of the NEXT epoch (whose beacon is anchored at that block): regsnap:<E> is written by
+#                       block (E-1)*EPOCH_LENGTH, and the producer draw and duty committee for E >= 2 read it
+#                       (block_ops.bonded_registry_for_epoch) instead of the live registry.
+# Gen 28 gated them (REVEAL_SEATLESS_HEIGHT and REGISTRY_SNAPSHOT_HEIGHT at 135300, RANDAO_MISS_POOL_HEIGHT at 156400 as
+# ABSENT-ONLY after 122 of 173 measured misses proved to be present validators squeezed by the reveal window); all
+# three were 1 from gen 29 and were inlined in G9.
+
+# CARRIED FIDELITY FOR EVERY CARRIED IDENTITY (dividend_ops.fidelity_at_epoch). The live apply
+# (account_ops.apply_register) continues every carried identity from the fidelity the carry wrote into its account; the
+# dividend replay seeded it only for identities PRESENT at the reroll (their epoch-0 recert), so the 32 identities absent
+# at the gen-28 reroll replayed as newcomers — measured 2026-10-10: account fidelity 16 vs dividend fidelity 12. OUR BUG
+# (the a344f923 fix covered the present ones only). From this height's epoch the replay starts an absent carried
+# identity from its carried value, so its first recert is a lapse through fidelity_step exactly as the live apply did.
+# Weights of epochs before it were unchanged: no back-pay (operator, 2026-10-10). 160020 on gen 28 (epoch 2667); from
+# gen 29 every epoch (CARRY_FIDELITY_ALL_HEIGHT inlined in G9).
+
+# THE STWO SHIELDED POOL (doc/stwo-migration.md §5.1; execnode/shielded_stwo.py, native/stwo_js). Deposits land in the
+# Stwo pool and only a `stwo_js` bundle spends from it; a node without native/stwo_js STALLS at the first Stwo spend
+# (execnode._apply_block), it never skips one. The wide pool takes no new deposits: it never held a note, so nothing is
+# frozen and no wide verifier stays reachable. STWO_POOL_HEIGHT (269000 on gen 28, after the in-house review of
+# 2026-10-11/12) and WIDE_DEPOSIT_CLOSE_HEIGHT (175000 on gen 28) were 1 from gen 29 and were inlined in G9; the rules
+# hold from block 1 (transaction_ops.field_shield_check, ExecState.rules_stwo_pool).
+# THE LEGACY BLAKE2b POOL IS DELETED (G9 slice 5c, 2026-10-28). Two gen-29 gates closed it and both FIRED:
+# LEGACY_SHIELD_CLOSE_HEIGHT (10000) — L1 refused a `shield` with `out_commitments` (no `field`) and the exec layer skipped
+# it — and LEGACY_TRANSFER_CLOSE_HEIGHT (14000) — the exec layer skipped the transparent `shielded_transfer` blob op, which
+# had stayed live because a no-input, zero-value transfer balances (0 + 0 == 0 + 0). Measured on the live chain: no legacy
+# shield in blocks 0..12758 and no `shielded_transfer` in 0..12758 (2026-10-28, finalized tip 12758); no `shielded_transfer`
+# in 0..13999 is this deletion's precondition, measured once 14000 was final. So the pool was empty at every height.
+# Both rules are now unconditional (ops/transaction_ops._validate_shield refuses a legacy shield at every height, ExecState.apply_blob
+# returns the gate's skip for every `shielded_transfer`), execnode/shielded.py is gone, and its two root records are the
+# constants exec_root_b2.RETIRED_SHIELD_ROOT / RETIRED_SHIELD_NFSET. INVARIANT: the names stay retired
+# (tests/test_gate_reroll_transfer.py DELETED); never re-add either as a switch.
+
+# A STWO SPEND MAY NAME WHO ITS FEE PAYS (shadow accounts, 2026-10-18). A bundle may carry `fee_to`: the proof is bound
+# to the destination string "<withdraw_addr>|fee:<fee_to>" (the circuit's aux is BLAKE2s of that string, so neither
+# address can be swapped and a copied bundle cannot redirect the fee), and the fee is recorded as an unshield exit to
+# `fee_to` instead of pool_fees — so a relay is paid by `fee` and the payout goes to any (shadow) address without the
+# user's own account signing. execnode/shielded_stwo.parse_transfer reads it; ExecState.rules_stwo_fee_to allows it.
+# STWO_FEE_TO_HEIGHT (280000 on gen 28, 1 from gen 29) was inlined in G9.
+
+# PRIVATE SENDS PROVE AT 128 BITS, NOT 340 (operator decision 2026-10-26). A Stwo spend's proof must carry the node
+# config its landing height selects (execnode/stwo_js_native.config_id_at; native/stwo_js lib.rs NODE_CFGS):
+# NODE_CFG_128 (56 queries plus a 16-bit grind before the OODS point) from block 1, NODE_CFG_340 only at height 0. By
+# execnode/stark/soundness.py (E = 124 for QM31) the 340 config was capped near 113 bits by its DEEP/OODS term; the
+# grind lifts the 128 config to ~129 conjectured (2026-10-27 incident survey; upstream starkware-libs/proving f0bf0195),
+# matching the settlement proofs that guard the same coins (doc/stwo/g4-settlement-statement.md). A proof at the OTHER
+# config is refused: the height chooses, never the prover. Measured 2026-10-26: proofs 1.12-1.14 MB vs 2.90-2.92 MB,
+# native verify 8 ms vs 15 ms (doc/stwo/phase0-results.md). The wallet proves at CFG_128 (static/interface.js stwoCfgId).
+# STWO_JS_128_HEIGHT (dormant 2^62 on gen 28, 1 from gen 29) was inlined in G9.
+
+# THE CERTIFICATE CLOCK WEIGHS SEATS, NOT SENDERS (2026-10-27 incident survey; cometbft CSA-2026-001 "Tachyon").
+# ops/transaction_ops.agreed_time took one sample per distinct duty sender, so splitting stake into many B_MIN accounts
+# bought clock samples and a seatless reveal-only duty counted; it is the median weighted by each
+# sender's seats in its landing epoch's duty committee (0 seats = no sample). AGREED_TIME_SEATS_HEIGHT was dormant on
+# gen 28 and 1 from gen 29; inlined in G9. tests/test_agreed_time_weighs_committee_seats_not_senders.py.
+
+# A BLOCK-WIDE BUDGET (2026-10-27 incident survey: aleo snarkVM#3443 — a block-wide limit enforced only when building,
+# so every validator accepted an over-limit block; Namada #5050 — a 42 s CheckTx). Each transaction has its own size cap,
+# but nothing bounded the work ONE block demands of every node that validates it. From this height a block carries at
+# most MAX_BLOCK_TXS transactions and MAX_BLOCK_TX_BYTES canonical bytes, enforced identically when assembling
+# (ops/transaction_ops.cap_block_budget: duty first, then txid order) and when validating (assert_block_budget).
+# Measured over the 20,000 blocks before 2026-10-27: p99 7 transactions, max 19; p99 54 KB (the 27.8 MB maximum is an
+# inline settle proof, a path generation 29 refuses — option R). Signature verification is 0.08-0.22 ms per scheme on
+# the relay, so the bound that matters is count and bytes. Both caps are ~100x honest load; retune at a later gate.
+# BLOCK_BUDGET_HEIGHT (dormant on gen 28, 1 from gen 29) was inlined in G9: the bound holds from block 1.
+# tests/test_a_block_carries_at_most_its_budget_built_or_validated.py.
+MAX_BLOCK_TXS = 2000
+MAX_BLOCK_TX_BYTES = 8 * 1024 * 1024
+
+# A STAGED EMERGENCY PAUSE FOR STWO SPENDS (2026-10-27 incident survey: Zcash disabled Orchard by an emergency soft fork
+# after a counterfeiting bug in its circuit, live since 2022; RISC Zero turned affected verifiers off through a
+# pre-built "estop"). From this height every stwo_js spend is refused — by the exec layer and, through the same
+# ExecState.stwo_spend_refusal, by every node relay before it pays an L1 fee. DEPOSITS ARE NOT PAUSED: they escrow coins
+# on L1 before the exec layer sees them, so refusing one there would strand the coins; a paused pool can still grow but
+# nothing leaves it, which is what bounds a counterfeit. (1 << 62) = never, on EVERY generation: this is not a gate
+# that transfers at a reroll but a switch, so an emergency release changes ONLY this number to a height the /update wave
+# reaches first (CLAUDE.md rule 3) — nothing has to be written, reviewed or tested under pressure.
+# tests/test_the_stwo_spend_pause_is_staged_and_refuses_every_spend.py pins the path.
+STWO_PAUSE_HEIGHT = 1 << 62
+
+# REVERTS PAY FOR THEIR STEPS (audit 2026-09-24 #13, confirmed 2026-10-18). EXEC_BLOCK_STEP_BUDGET bounds the VM steps a
+# block may make every exec node execute — but a call that REVERTED (or raised) returned before its steps were counted,
+# so a block of calls each burning GAS_LIMIT and then reverting was unbounded exec CPU for the price of their L1 fees.
+# From this height a reverting call's executed steps (the VM meters them on revert too) and a raising call's GAS_LIMIT
+# count against the block's budget. The settlement prover needs no mirror: any reverted call already makes its span
+# unprovable (settlement_proofs._run_call raises), so the chain's later budget refusals only fall in quorum spans.
+# EXEC_BUDGET_V2_HEIGHT (285000 on gen 28, 1 from gen 29) was inlined in G9: ExecState.rules_budget_v2 holds from block 1.
+
+# THE BLAKE2s EXEC ROOT AND THE 256-BIT VM (Goldilocks retirement G2/G3) are generation 29's rules at every height:
+# BLAKE_EXEC_HEIGHT (2^62 on gen 28, 1 from gen 29) was inlined in G9 — execnode/exec_root_b2.py is the exec root and
+# the exit verifier, zkvm2 runs every call. The field VM (execnode/zkvm.py), its ISA in the assembler, the field digest
+# and the v1 -> v2 carry were deleted in G9 slice 3b; the Goldilocks root (execnode/exec_root.py) went with
+# execnode/stark/ in G9 slice 4; its record tags live on, same numbers, in exec_root_b2.
+
+# THE DIGEST REGISTRY IN THE EXEC ROOT (G4, 2026-10-27; doc/stwo/g4-settlement-statement.md section 5). A zkvm PAY names
+# its payee by a 256-bit digest, and the exec node resolves it through ExecState.zk_addrs, the digest -> address registry
+# that every call boundary feeds; a digest the registry lacks reverts the call. So the registry decides outcomes, yet no
+# root committed it, and a settlement proof (execnode/settle_b2.py) could not tell a payout the chain made from one it
+# reverted: a payout to anyone registered before the span was unprovable. From this exec cursor every registry entry is a
+# record leaf (exec_root_b2.T_ADDR), and a span's replay resolves payees from the witness exactly as the chain does. The
+# first root at the gate inserts the whole registry (240 entries on 2026-10-27); a span that crosses the gate settles by
+# the quorum. Exec-root consensus only: L1 rules and every exit format are unchanged.
+EXEC_ADDR_ROOT_HEIGHT = 8500 if CHAIN_GENERATION == 29 else 1   # exec cursor; L1 was at 5487 when this shipped (2026-10-27)
+
+# THE DIVIDEND CARRY IN THE EXEC ROOT (G8 prerequisite, 2026-10-28; doc/stwo/g4-settlement-statement.md section 5). The
+# presence-dividend accrual of every epoch distributes inflow plus a metered release of the carried remainder
+# (records_effects.dividend_accrual_effects), so a span that crosses an epoch boundary cannot be replayed without the
+# carry at its start. Until now no root committed it: L1 read it from the `dc` of the boundary block's exec summary,
+# which loops/core_loop._accrual_effects chains boundary to boundary and writes only when the boundary block's records
+# are derivable. MEASURED 2026-10-28: block 10860 carried a collect_dividend (not derivable), so it has no `dc`, every
+# later boundary silently found no carry-in, and no Stwo settle could ever land again (a chain kept in per-block summaries
+# that one ordinary transaction ends for good). From this exec cursor the exec state's div_carry is a record
+# (exec_root_b2.T_COUNTER "div_carry", zero absent), and settle_b2 reads it from the span's authenticated pre-state like
+# wd_nonce; ops/settle_chain refuses a span starting below the gate, and a span crossing it is unprovable (its first root
+# inserts the leaf, which no witness opens). Exec-root consensus only: L1 rules and every exit format are unchanged.
+# INVARIANT: STWO_SETTLE_HEIGHT >= EXEC_CARRY_ROOT_HEIGHT (tests/test_gate_reroll_transfer.py) — below this gate L1 has no
+# carry to verify a span with. Tip ~12,460 at ~6.1 s/block when this was chosen (~30 h ahead): if the push slips past
+# ~28,000, move it (a gate in the past makes every exec node switch at its own update moment).
+EXEC_CARRY_ROOT_HEIGHT = 30000 if CHAIN_GENERATION == 29 else 1   # exec cursor; L1 was at ~12460 when this was written
+
+# EVERY ASSET'S ID IN THE EXEC ROOT (2026-11-03). An asset's T_ASSET_META record is POSITIONED by its metadata digest
+# (exec_root_b2.asset_meta_digest), so "no asset with this id exists" names no single leaf and a settlement witness could
+# not show it: every span whose transition asks for a missing asset (an asset_create checking its derived id is free, a
+# transfer of an unknown id) was unprovable — the shadow run measured 85500, 86040, 86220 and 93240 (2026-11-03), each a
+# plain asset read. From this exec cursor every asset also commits record_key(T_ASSET_ID, aid) -> ONE, positioned by the
+# id alone, whose absence proves the asset absent (execnode/settle_b2 FAMILIES "assets"). A span crossing the gate is
+# unprovable (its first root inserts every id record), and block_apply.close touches the state at the gate
+# (exec_root_b2.projection_gate_at), so a memoised root moves there like a cold one. Exec-root consensus only.
+# INVARIANT: STWO_SETTLE_HEIGHT >= EXEC_ASSET_ID_ROOT_HEIGHT (tests/test_gate_reroll_transfer.py). Tip 100439 at 6.1
+# s/block when this was chosen (~25 h ahead): if the push slips past ~110,000, move it.
+EXEC_ASSET_ID_ROOT_HEIGHT = 115000 if CHAIN_GENERATION == 29 else 1   # exec cursor; L1 was at 100439 when this was written
+
+# THE STWO SETTLEMENT OF A SPAN (G8, doc/stwo-migration.md 9.5; doc/stwo/g4-settlement-statement.md section 5). From this L1
+# height a `settle` may carry `stwo`: the DA commitment of an execnode/settle_b2 bundle (a witness of authenticated
+# openings and one Stwo VM proof) proving that the blocks after the namespace's JUSTIFIED settled tip take its root to the
+# settle's state_root. L1 verifies it (ops/transaction_ops._stwo_settle_check) from its own blocks and its own chain
+# inputs (ops/settle_chain.py) and, on apply, marks the root PROVEN (kv_ops.settlement_proof_put), which
+# settlement_justified honours with no quorum. Below the gate the field is IGNORED (validated and applied bare, as before
+# G8 existed — refusing it would tighten validation at no agreed height), so nothing a live block does changes.
+# DORMANT on generation 29: the operator sets the height after two weeks of shadow proofs (tools/settle_b2_shadow.py,
+# every span `proven` with `chain_eq` true), at the fleet's adoption block (CLAUDE.md rule 3), once every node reports
+# native/stwo_settle built. Live from block 1 at the next reroll.
+STWO_SETTLE_HEIGHT = (1 << 62) if CHAIN_GENERATION == 29 else 1
+
+# A STWO SPEND GRINDS BEFORE EVERY CHALLENGE IT CAN RE-ROLL (2026-11-02). NODE_CFG_128 grinds before the FRI queries and
+# the OODS point only. The LogUp elements (drawn right after the trace commitment) and the composition coefficient (right
+# after the interaction commitment) can be re-drawn by re-committing, so their terms, ~124 - log2(lookup fractions) = ~109
+# and ~124 - log2(constraints) = ~115, set the proof's real conjectured level, not the ~129 of its query count. From this
+# height a spend must prove at NODE_CFG_128G (native/stwo_js lib.rs: the same tree, a 16-bit grind before the LogUp
+# elements, a 12-bit one before the composition coefficient, FRI's grind 21 bits; its nonces ride after the proof), so
+# each of those terms clears the remaining floor, the DEEP batching coefficient Stwo's PCS draws (~114; not ground here or
+# upstream). execnode/stwo_js_native.config_id_at and the wallet's stwoCfgId pick the config from this height.
+# DORMANT on generation 29: a live height must wait for the rebuilt WASM to be served and every node to run the verifier
+# (CLAUDE.md rule 3), and a wallet page cached from before it would prove at the old config; live from block 1 at the
+# next reroll. tests/test_stwo_js_honest_proof_verifies_and_forged_public_inputs_are_refused.py.
+STWO_JS_GRIND_HEIGHT = (1 << 62) if CHAIN_GENERATION == 29 else 1
+
+# SETTLE DATA FIELDS (2026-11-02). The two retired settle-proof field names (`proof`, `proof_da`: the Goldilocks
+# settlement proof, deleted in G9) are refused by KEY from this L1 height — present with any value, null included — and
+# apply derives the proven marker from `stwo` alone (at or above STWO_SETTLE_HEIGHT), never from either retired name.
+# Below the height both sites keep their old reading so history replays byte-identically. Mempool admission (no block
+# height) applies the new rule at once. Live from block 1 at the next reroll.
+SETTLE_FIELDS_HEIGHT = 86400 if CHAIN_GENERATION == 29 else 1   # L1 height; tip 85645 when this shipped (2026-11-02)
+
+# USER-SELECTABLE SIGNATURE SCHEMES (doc/signature-schemes.md, operator 2026-10-25: "multiple (pluggable) scheme options
+# ... let users pick"). ML-DSA-44 stays the default and the only scheme of every surface the CHAIN signs with (blocks,
+# status attestations, duties, registration, auth configs, multisig members, invites, messaging): an account picks its
+# scheme when it is created, and from then on every transaction it sends names that scheme in the top-level `alg` field.
+#   - ABSENT `alg` IS ML-DSA-44, and it is the only spelling of it: `"alg": "mldsa44"` is refused, so one transaction
+#     has one byte string (the rule excluded_witness_check exists for). Every existing transaction is unchanged.
+#   - THE ADDRESS COMMITS TO THE SCHEME. An ML-DSA-44 address is blake2b([DOMAIN_ADDRESS_V2, pubkey]) as before; any
+#     other scheme's is blake2b([DOMAIN_ADDRESS_V2, alg, pubkey]) (ops/address_ops.make_address). So proof_sender binds
+#     (address, alg, key) at once and no account record grows a field (no new state, nothing new for the carry).
+#   - `alg` rides in the txid, so the signature binds it.
+# Each row: public key and signature in HEX characters (the canonical spelling excluded_witness_check pins), and the fee
+# floor multiplier — the fee is otherwise flat (MIN_TX_FEE), and a larger witness costs every node more bytes to carry
+# and keep; the multiplier is ceil((pk + sig) / ML-DSA-44's (pk + sig)), so a key-less later tx pays the same floor.
+# NADO_SIG_IDS are the native/pqsig ids, used only by signatures.py. SIG_SCHEMES_HEIGHT (dormant on gen 28, 1 from
+# gen 29) was inlined in G9: transaction_ops.sig_scheme_check keeps `>= 1` (admission on a genesis tip, None heights).
+SIG_DEFAULT = "mldsa44"
+SIG_SCHEME_SIZES = {                       # name -> (pubkey hex, signature hex, fee floor multiplier)
+    "mldsa44": (2 * 1312, 2 * 2420, 1),
+    "mldsa65": (2 * 1952, 2 * 3309, 2),
+    "mldsa87": (2 * 2592, 2 * 4627, 2),
+    "slhdsa128s": (2 * 32, 2 * 7856, 3),
+    "fndsa512": (2 * 897, 2 * 666, 1),
+}
+# FN-DSA-512 (Falcon) is built and tested (native/pqsig) but NOT offered: FIPS 206 is still a draft, and its encoding may
+# change, so no user should hold a key in a pre-standard format (operator 2026-10-25, "plugin now, on at FIPS 206").
+# Adding it here is a consensus change: a gated release, once FIPS 206 is final and the library passes NIST's vectors.
+# tuples, not sets: both go to the wallet through /protocol.js (ops/client_protocol exports lists, never sets)
+SIG_SCHEMES_OFFERED = ("mldsa44", "mldsa65", "mldsa87", "slhdsa128s")
+# What an account of another scheme may NOT send: everything whose key the chain later checks OFF the transaction, with
+# ML-DSA-44 only — a validator's block signatures and status attestations (register, bond, the duty family), the TPM
+# ceremony that enrols a validator, the messaging key and auth configs (key_authorized and ops/auth_ops verify ML-DSA-44
+# keys), and legacy_claim (a format-1 address is a slice of an ML-DSA-44 key). Refused at admission, so nobody holds a
+# stake or an identity the chain cannot later verify. Widening this is a feature per surface, never a one-line change.
+SIG_ML44_ONLY_RECIPIENTS = ("bond", "register", "attest", "commit", "reveal", "duty", "msgkey",
+                            "tpm_enrol", "tpm_challenge", "tpm_commit", "tpm_reveal", "tpm_ready", "legacy_claim")
+# MULTISIG MEMBERS AND AUTH KEYS OF EVERY OFFERED SCHEME (operator 2026-11-04: "extend it to multisig and auth"). From this
+# L1 height a signature ENTRY (a multisig member's, or an auth-configured account's) may carry `alg` — absent = ML-DSA-44,
+# its only spelling — and is sized, priced and verified by it; an auth config's key may be [alg, pubkey] (an ML-DSA-44
+# key stays a bare pubkey string); and `auth` leaves SIG_ML44_ONLY_RECIPIENTS, so an account of another scheme can
+# protect and rotate itself. Below it every entry, key and `auth` tx is ML-DSA-44, as before.
+#   - A MULTISIG MEMBER ADDRESS ALREADY COMMITS TO ITS SCHEME: an entry derives make_address(public_key, alg), so a key
+#     shown under the wrong alg is "a non-member key" — the entry's alg needs no other binding.
+#   - AN AUTH KEY IS NEVER A VALIDATOR KEY: key_authorized and key_valid_at match a BARE key string, so an [alg, pubkey]
+#     key never signs a block, an attestation or a message login, and every SIG_ML44_ONLY_RECIPIENTS kind refuses an
+#     entry that carries `alg`.
+#   - FEES per entry at its scheme's multiplier: a multisig spend pays MIN_TX_FEE x the sum; a configured account's list
+#     pays the sum minus its first entry's (the first is what a single-key tx carries) and, when it pays at all and any
+#     entry is of another scheme, at least the whole sum — what the same keys pay signing one by one.
+# tests/test_a_multisig_member_and_an_auth_key_sign_with_their_own_scheme.py (both rule sets).
+SIG_SCHEME_KEYS_HEIGHT = 123000 if CHAIN_GENERATION == 29 else 1   # L1 height; tip 120811 when this was written (2026-11-04)
+# A PAYMENT TO A MULTISIG ACCOUNT LANDS FLEXIBLY (ops/block_ops._lands_flexibly): from this L1 height a transfer whose
+# recipient is a multisig address is includable anywhere in [min_block, max_block], as every other value transfer is.
+# Before it, is_address() refused the MSIG_PREFIX and the transfer could land only in the block numbered exactly its
+# max_block, so a shared account could not be funded by an ordinary send. Producer and verifier both read it.
+# tests/test_a_payment_to_a_multisig_account_lands_in_its_window.py (both rule sets).
+MSIG_PAY_FLEXIBLE_HEIGHT = 123000 if CHAIN_GENERATION == 29 else 1   # L1 height, with SIG_SCHEME_KEYS_HEIGHT (2026-11-04)
+# A PROTECTED MULTISIG MEMBER SIGNS WITH ITS CURRENT KEY (ops/multisig_ops.member_signs): from this L1 height a member
+# whose account has an auth config signs with a key that alone satisfies its signing policy, naming itself in the
+# entry's `member` when that key does not derive its address; its rotated-away keys no longer sign for it. Before it, a
+# member was only the address its key derives: the owner's current key could not sign after a rotation, and the old
+# (possibly stolen) key still could. tests/test_a_protected_multisig_member_signs_with_its_current_key.py.
+MSIG_MEMBER_AUTH_HEIGHT = 124500 if CHAIN_GENERATION == 29 else 1   # L1 height; tip 122189 when this was written (2026-11-04)
+
+# DEVICE MOVE VOIDS THROUGH THE EPOCH (account_ops._evict_voids): from this height an eviction voids every recert of the
+# evicted identity up to and including the eviction's epoch. TPM ENROLMENT v3 (ops/tpm_enrol): from this height a
+# wrong client commitment fails the record instead of refusing the last reveal, and a chip whose enrolment failed by
+# its own client waits a growing cooldown before enrolling again. Live at 132000 on gen 28; from block 1 on gen 29
+# (EVICT_VOIDS_EPOCH_HEIGHT and TPM_ENROL_V3_HEIGHT inlined in G9).
+TPM_RETRY_COOLDOWN_BASE = 300            # blocks; doubles per consecutive client-failed enrolment of one chip
+TPM_RETRY_COOLDOWN_MAX_EXP = 8           # cap: 300 * 2^8 blocks (~4.5 days at 6.3 s)
+# TPM RETRY PER OPENER (review 2026-10-11). An endorsement certificate is public and tpm_enrol is free, so a stranger
+# could open enrolments with a copied certificate, never commit, and have each one charged to THE CHIP: a cooldown
+# doubling to ~5.5 days per round, locking the real owner out. And one drawn challenger could post a valid blob with a
+# garbage sealed secret, or post it in the record's last block, and the client was charged a failure it never had a
+# chance to avoid. From this height the count is keyed on (chip, opener) and the cooldown applies only when that same
+# opener returns; a stranger's failures cost only the stranger, bounded as before V3 by one open enrolment per chip per
+# window. And only a WRONG COMMITMENT counts against a client: an all-answered record it never committed is ambiguous
+# (an unopenable sealed secret is indistinguishable from a client that walked away), and the address-rotating stranger
+# was never bound by it. INVARIANT: a failure is charged to the party that verifiably failed, never to the chip's name.
+# 175000 on gen 28; from block 1 on gen 29 (TPM_RETRY_OWNER_HEIGHT inlined in G9).
+
+# AT-MOST-ONCE, STRICT FROM HERE (2026-09-13). The canonical chain carries transactions included TWICE —
+# measured: 13 txids at 69056/69057 and 78078, each a replay of a tx mined ~150 blocks earlier, exactly at
+# the re-anchor points of the two incidents. A node that has just imported a snapshot has the STATE but
+# an incomplete tx index (the rebuild runs in the background), so its at-most-once gate was BLIND; the
+# rollback had re-inserted those txs into its mempool, it built them into a block, and the fleet — mid-
+# reindex too — accepted. The three nodes with a complete index (.26, .28, .208) refused, correctly, and
+# were stuck for it.
+#
+# Two halves. BELOW this height the rule is what the chain actually did: a replay is applied again, so a
+# complete-index node — and every future replay from genesis — reaches the fleet's state root instead of
+# refusing forever. AT AND ABOVE it the rule is strict, and the blindness that produced the replays is
+# closed in core_loop: no block is built and no remote block is judged while the tx index is rebuilding.
+# Live value sits above the last replay block and far enough out for the /update wave (rule 3); on a fresh
+# chain it is strict from block 1. Ledger: live from genesis (x = 1).
+# TX_AT_MOST_ONCE_STRICT_HEIGHT: gen 25 gate at 81600; 1 from gen 26 — deleted after the betanet-8 reroll, the rule holds from block 1.
+
+# PROOF VERIFIER PINS (security review 2026-09-23, findings P0 + A1). From PROOF_BIND_HEIGHT every STARK the
+# chain verifies — settle-with-proof segments and their K->1 fold, the shielded pool and shielded contracts, and
+# every merkle-update transition under them — is judged under two extra rules, both of which an HONEST prover
+# already satisfies:
+#   P0  the FRI sub-proof's domain (N, offset) must equal the STARK's own. Nothing tied them: the spot-check
+#       binds layer-0 values at idx mod N/2 with the STARK's N, so a FRI declared over 2N proves "degree < N"
+#       for a vector whose first N points are the composition and whose second half is free — which is ALWAYS
+#       interpolable, so any statement (any settle root, any shielded transfer) was provable at honest cost.
+#       tests/test_proof_bind_gate.py builds that forgery and shows it verifying under the old rule.
+#   A1  the exec epoch's PUBLIC STATEMENT (the rebuilt periodic tables + boundaries: io log, args, programs,
+#       per-row context) is absorbed into the Fiat-Shamir transcript BEFORE the trace roots. Until now only
+#       column roots were absorbed, so the query points were fixed before the statement was chosen and a settler
+#       with a few hundred io entries of their own could rewrite any victim entry by solving a linear system.
+# A1 changes the transcript, so an old-format proof fails at/after the gate and a new-format proof fails before
+# it — every node switches at the same block, and the settler switches its prover at the same height. Verified
+# under stark.rules_at(<height of the block being judged>); ops/transaction_ops (L1 settle), execnode._apply_block
+# (exec layer) and the settler are the three sites that set it. Gate hygiene: a height ahead of the update wave
+# on the live chain; live from block 1 at the next reroll.
+# PROOF_BIND_HEIGHT: gen 25 gate at 208000; 1 from gen 26 — deleted after the betanet-8 reroll, the rule holds from block 1.
+
+# EXEC-LAYER CALL RULES V2 (security review 2026-09-23: C1/F1, F2, Z2, S2). Exec state is computed by every
+# exec node and settled to L1 by quorum or proof, so a rule that changes what a call DOES is a consensus rule
+# for the exec root and is gated on the height of the block being applied, exactly like an L1 rule. From this
+# height:
+#   C1  an ASSET-denominated call value is refused unless the method's program reads ACTX. The layer escrowed
+#       the asset into the contract's asset ledger and handed the contract `value` with no currency tag; every
+#       game reads `value` and later PAYs native NADO from its shared native holding — so one worthless token
+#       drained the native escrow of any of 25 contracts (reproduced on an isolated ExecState).
+#   F2  a call whose `method` is not a string is refused BEFORE the escrow (it used to debit, raise at the VM's
+#       `method not in code`, and keep the coins); any exception the VM raises refunds the escrow; and L1 blob
+#       admission types `method`.
+#   Z2  a shielded_transfer whose `stark` bundle carries no join-split proof is refused (the legacy partial
+#       path accepted `[]` and recorded an unbacked unshield exit for one fee); an exit is bounded by
+#       MAX_EXIT_VALUE here too.
+#   S2  the records fold in a settle proof refuses a running balance that goes negative (verified integers,
+#       not field residues — a prover that dropped its solvency check settled P − v).
+# Gate hygiene: ahead of the update wave on the live chain; block 1 at the next reroll. Callers:
+# execnode/state.py (rules_v2 on cursor+1), execnode/settlement_proofs._run_call (per-call cursor),
+# ops/transaction_ops (blob admission + records fold, block_height).
+# EXEC_RULES_V2_HEIGHT: gen 25 gate at 210000; 1 from gen 26 — deleted after the betanet-8 reroll, the rule holds from block 1.
+
+# IN-BLOCK SELECTOR (security review 2026-09-23, A2). The exec AIR's block schedule (which rows belong to which
+# call) was prover-declared and nothing tied a block's length to its RET: build_periodic filled the context,
+# program and args columns only inside declared blocks and ZERO elsewhere, and no constraint forced a row outside
+# every block to be a NOP. Declaring the last block with n = 1 therefore ran the call to its RET with CTX -> 0,
+# program 0 and call 0's args — deadline/owner checks against 0, or a settler's program on the victim's
+# registers ending in PAY. From this height the epoch AIR carries one more periodic column, P_IN (1 inside a
+# declared block, 0 outside), and the constraint (1 - P_IN) * (1 - f_NOP) = 0: every row outside the schedule
+# is a NOP, so the schedule bounds the execution. An extra column and an extra constraint change the proof
+# format (both the statement digest and the alphas), so prover and verifier flip on the same block through
+# stark.rules_at, like PROOF_BIND_HEIGHT. tests/test_proof_block_selector.py shows a trace executing past its
+# declared block VERIFYING below the gate and refused at it. Block 1 at the next reroll.
+# PROOF_BLOCK_SELECTOR_HEIGHT: gen 25 gate at 212000; 1 from gen 26 — deleted after the betanet-8 reroll, the rule holds from block 1.
+
+# REVIEW ROUND 2 (security review 2026-09-23, the remaining non-reroll items), ONE gate for the exec layer, L1
+# and the proof rules alike (the exec cursor is the L1 height):
+#   exec   Z6 an output commitment already in a pool is refused (a sender-chosen rho let anyone lock a note);
+#          Z9 the field path validates the unshield destination like the transparent path does;
+#          Z4 a field pool at its tree capacity refuses the deposit instead of silently dropping the leaf;
+#          F7 a non-string runtime name is refused; F10 any false-like `upgradable` locks a deploy;
+#          F8 a constructor's asset effects are staged and committed like a call's;
+#          F4 a per-block execution budget (EXEC_BLOCK_STEP_BUDGET): a call that would take the block past it
+#             reverts (escrow refunded), mirrored by the settlement prover.
+#   L1     S4 a DA-carried settle proof records the proven marker like an inline one;
+#          A4 a settle proof's pre_contracts keys must be canonical (a cid alias or "05" for "5" aliased the
+#             pre-root pin, so read-only slot values went unbound).
+#   proof  P2 a string `aux` (the unshield address) is absorbed as digest lanes under the alghash2 backend, which
+#             hashed a string by its byte SUM; P3/Z8 every proof absorbs its AIR identity — T, W, max_degree,
+#             the constraint count, the boundaries and (for AIRs whose statement is not otherwise bound) the
+#             periodic tables — before its roots; P4 every Merkle opening path must be exactly log2(N) long.
+#          These change the proof format, so they ride stark.rules_at like the earlier proof gates; the wallet's
+#          own prover reads this height from /status (`proof_rules`) and switches on the same block.
+# Block 1 at the next reroll.
+# REVIEW_R2_HEIGHT: gen 25 gate at 214000; 1 from gen 26 — deleted after the betanet-8 reroll, the rule holds from block 1.
+
+# TRACE LOW-DEGREE TEST (security review 2026-09-23, P1). Only the composition polynomial ever entered FRI: a
+# witness column with no boundary was an ARBITRARY function on the coset, so any gadget A(x)*w(x) = B(x) was
+# satisfiable POINTWISE (w := B/A) — the VM's inverse witness WI made a JNZ on zero jump and a failed REQUIRE
+# pass, for any epoch whose programs execute no LT (tests/test_proof_trace_ldt.py builds that forgery on a toy
+# AIR and shows it VERIFYING below this height). From the gate the prover adds sum_c beta^(c+1) * f_c(x) — beta
+# drawn after the alphas, every main and aux column — to the composition before FRI, so the one FRI run tests the
+# trace for low degree with the composition (the classic ALI shape, for which the soundness theorem holds), and
+# the verifier adds the same term at every query point. A format change on both sides, so it rides stark.rules_at
+# like the earlier proof gates; the wallet reads it from /status (`proof_rules.trace_ldt`). The K->1 recursion
+# fold does NOT carry the term yet and refuses under it. SETTLE_PROOF_RECURSIVE is TRUE (this said "off" until
+# 2026-09-24), so that refusal is live consensus — SCHEDULED_CLEANUPS.md lists what must precede lifting it.
+# Block 1 at the next reroll.
+# PROOF_TRACE_LDT_HEIGHT: gen 25 gate at 216000; 1 from gen 26 — deleted after the betanet-8 reroll, the rule holds from block 1.
+
+# THE FIXED-NAME CONTRACTS PASS THE PRE-STATE KEY CHECK (2026-09-24). REVIEW_R2's A4 check
+# (settlement_sparse._canonical_pre_contracts) accepted only lowercase-hex contract ids, but live state carries
+# two contracts under FIXED NAMES — `faucet` and `sovereign` (execnode/code_codec.FIXED_CIDS) — so from 214000
+# EVERY honest proof-carrying settle was refused ("cid 'faucet'"), found by verifying a proof built from the live
+# settle stash. A fixed name cannot alias anything: exec_state_bind.cid_limbs blake2b-folds a non-hex id before it
+# becomes limbs, so the A4 concern (two spellings of one leaf) does not arise for it. From this height the check
+# accepts lowercase hex OR exactly a FIXED_CIDS name; below it the refusal stands, so a replay judges every old
+# settle as it was judged. Keyed on the settle's cursor, like EXEC_ROOT_V2. Relaxes a rule, so it needs the
+# fleet on the new code before it fires. Block 1 at the next reroll.
+# DEFERRED 2026-09-24, before it fired: settle proofs stay closed on gen 25 until a pending proof-verifier
+# soundness fix ships (details withheld until then). Re-enable with that fix's gate, never ahead of it.
+# PROOF_FIXED_CID_HEIGHT: gen 25 gate at 2^62 (never on gen 25); 1 from gen 26 — deleted after the betanet-8 reroll, the rule holds from block 1.
+
+# PRIVACY PAUSE (2026-09-24). From this height the exec layer refuses `private_call` (shielded contract notes), the
+# LEGACY field pool's transfers, and a `stark` bundle on the transparent `shielded_transfer` op. (L1 already refuses
+# legacy field-shield deposits, keyed on REVIEW_R2_HEIGHT — ops/transaction_ops.field_shield_check.) A review found
+# value-creating flaws on these paths; none carries value today (0 private notes, 0 field notes, no private_call
+# in the logs), so closing them costs nothing while their fixes ship. The WIDE pool (SHIELD_WIDE_HEIGHT) is not
+# paused. Block 1 at the next reroll: shielded contract notes stay off until they move to the wide hash with
+# zero knowledge, and the legacy field pool is replaced there by the wide one.
+# PRIVACY_PAUSE_HEIGHT: gen 25 gate at 226400; 1 from gen 26 — deleted after the betanet-8 reroll, the rule holds from block 1.
+
+# FULL-DOMAIN QUERIES AND A DEGREE-EXACT TRACE BATCH (review 2026-09-24, both reproduced under every rule then live).
+# (1) A query opened the trace at idx mod N/2 and compared the composition with FRI layer 0 ONLY in the lower half;
+# FRI tests degree < N/2 and N/2 points always interpolate such a polynomial, so an honest FRI over the interpolant of
+# the true composition's lower half made ANY statement verify. From this height the trace is opened at idx itself
+# and compared with whichever half idx lands in (stark.query_pos / fri_claim). (2) The P1 trace batch only bounded a
+# column by deg_bound = next_pow2(md)*T, loose enough for md >= 3 to satisfy a constraint on the whole coset while
+# the trace violates it; each column now enters as x^(deg_bound-T)*f(x), forcing deg f < T (stark.trace_batch_shift,
+# native sp_batch_add_shift, the wallet's stark.js). A format change on both sides, so it rides stark.rules_at like
+# every proof gate; the wallet reads it from /status (`proof_rules.full_query`). Block 1 at the next reroll.
+# PROOF_QUERY_FULL_HEIGHT: gen 25 gate at 228500; 1 from gen 26 — deleted after the betanet-8 reroll, the rule holds from block 1.
+
+# AN ADDRESS IS BOUND TO THE KEY IT FIRST PUBLISHED (review 2026-09-25, reproduced). An address is the first 42 hex of
+# the public key — the first 21 bytes of ML-DSA's rho, a seed anyone may CHOOSE when building a key — so a key built
+# on the victim's rho prefix derives the victim's address and signs validly: every account was spendable, any block
+# signature and double-sign evidence forgeable, from the address alone. From this height a transaction, a block
+# signature and any key evidence must use EXACTLY the key the account already has on chain (PUBKEY-ONCE: its first
+# sent tx recorded it). An address that has NEVER sent has no key on chain and is not protected by this rule — only a
+# hash-based address at the reroll fixes those. Block 1 at the next reroll.
+# ADDRESS_KEY_BIND_HEIGHT: gen 25 gate at 232700; 1 from gen 26 — deleted after the betanet-8 reroll, the rule holds from block 1.
+
+# THE SETTLE QUORUM'S ACTIVITY WINDOW IS ANCHORED BY STAKE, NOT BY THE HIGHEST CURSOR ANYONE CLAIMS (review 2026-09-25,
+# reproduced). The window counted validators who attested within SETTLE_ACTIVITY_CURSORS of the HIGHEST attested cursor,
+# and any bonded validator can push that to the block height — so after honest settlers fell 1,440 cursors behind (an
+# exec stall), one 10-NADO bond was the whole active set and justified any root, then drained the escrows through exit
+# claims. From this height the window is anchored at the cursor that validators holding MORE THAN A THIRD of recently
+# attesting stake have reached (settlement_ops.active_settler_shares); an attacker cannot move it without that stake.
+# Validators still leak out after going dark, relative to that anchor; only those silent for SETTLE_ANCHOR_LONG_CURSORS
+# leave the stake basis entirely. Judged on the namespace's top attested cursor, which cannot exceed the block height.
+# SETTLE_ANCHOR_HEIGHT: gen 25 gate at 232900; 1 from gen 26 — deleted after the betanet-8 reroll, the rule holds from block 1.
+SETTLE_ANCHOR_LONG_CURSORS = 100_800               # ~7 days of blocks: a stall longer than this reopens the leak
+
+# A SETTLED ROOT NEEDS A FLOOR OF ALL BONDED STAKE, NOT ONLY OF THE ACTIVE SETTLERS (audit 2026-09-25 HIGH "lone-settler
+# drain after 100,800 silent cursors / on a fresh chain"; reproduced in tests/test_lone_settler_cannot_settle.py). The
+# quorum denominator (settlement_ops.active_settler_shares) is the stake that ATTESTED recently, so it is EMPTY until
+# somebody settles (a fresh chain, a fresh namespace) and it empties again once the other settlers have been silent for
+# SETTLE_ANCHOR_LONG_CURSORS. In both states the first bonded account to settle is the whole denominator: one B_MIN
+# bond (10 NADO) justified any root it liked, and dividend_withdraw / unshield / bridge_withdraw proven against that root
+# paid DIVIDEND_POOL, SHIELD_ESCROW and BRIDGE_ESCROW out to it. At a reroll every settler starts from zero at once,
+# so the gap opens at block 1 (on betanet-8 the honest settlers' first attestations landed in block 12).
+# So a quorum-justified root ALSO needs its attesting shares to exceed SETTLE_FLOOR_NUM/SETTLE_FLOOR_DEN
+# of ALL bonded shares — a quantity going silent cannot shrink (only unbonding moves it). Validity-proven roots are
+# untouched: they need no quorum.
+# THE FRACTION IS MEASURED, NOT CHOSEN (2026-09-28, live betanet-8 at tip 27777): 67 bonded validators, 952 shares, and
+# FOUR of them settle (48 + 47 + 25 + 5 = 125 shares, 13.1 %). The 2/3-of-active rule already needs ~84 of those 125;
+# 1/16 of 952 is 60, so any three of the four, or the two large ones together, still settle, and the leak still lets
+# the settlers keep going when one of them is dark. Half of bonded stake (the first proposal) would have frozen every
+# exit on the live chain — the alphanet failure the inactivity leak was built to end. A freeze returns if non-settling
+# bonded stake grows past 16x the settling stake (~2.1x today) without a settler joining: WATCH THAT RATIO at a reroll.
+# Counting DISTINCT settlers was rejected: a second 10-NADO key costs nothing (per-key rules are void); stake is the
+# only dial an attacker cannot split around. The floor covers every settled cursor, cursor 0 included.
+# INVARIANT: every exit path reads the settled root through settlement_ops.settlement_justified; never add one that
+# reads attestations directly, or it skips this floor.
+# SETTLE_STAKE_FLOOR_HEIGHT: gen 27 gate at 2^62 (never on gen 27); 1 from gen 28 — deleted after the betanet-9 reroll.
+# It was judged at max(cursor, 1), which is >= 1 for every cursor, so the floor is unconditional.
+SETTLE_FLOOR_NUM = 1
+SETTLE_FLOOR_DEN = 16
+
+# ONE SLASH PER OFFENCE PER BLOCK (review 2026-09-25, reproduced). The in-block uniqueness key for a slash read the
+# block-authorship proof's fields, which a double-vote proof does not carry, so it fell back to a per-txid key and two
+# reports of one offence both entered a block (a double burn, or a raise inside incorporate_block). From this height a
+# slash is keyed by the (offender, dedup height) resolve_slash returns, the identity apply already dedupes on. Keyed on
+# the tx's own max_block, so history replays unchanged. Block 1 at the next reroll.
+# SLASH_DEDUP_HEIGHT: gen 25 gate at 233300; 1 from gen 26 — deleted after the betanet-8 reroll, the rule holds from block 1.
+EXEC_BLOCK_STEP_BUDGET = 1 << 21   # F4: executed VM steps per block per namespace (16 maximal calls); a
+                                   # 1 MiB block of cheap calls measured ~2 h of exec CPU before this existed
+# ONE SENDER, AT MOST A QUARTER OF THE BLOCK (audit 2026-09-24 #18; operator 2026-10-18 "Per-sender share"). The budget is
+# spent in tx order and txids are grindable, so one sender could land first and burn the whole budget, reverting every
+# later call in the block. From block 1 a sender's calls (applied and reverted) may use at most this share;
+# its next call is reverted with its escrow refunded, and the rest of the block stays open to everyone else.
+EXEC_SENDER_STEP_SHARE = EXEC_BLOCK_STEP_BUDGET // 4
+
+# F3 (RIDES A REROLL). The exec layer applies block h's calls with cursor h-1 / chain_clock(h-1) — the context is
+# advanced only AFTER the block — while block_calls stamps each call cursor = h and the settlement prover replays
+# with that, so an honest proof of any span with a cursor/time-reading call proves a transition the chain did not
+# apply. Setting the context BEFORE the loop is a live semantic change for every contract that reads TIME or
+# the cursor, so it turns on only from block 1 of the next generation: the live value is a height this chain
+# will never reach.
+# EXEC_CTX_CURRENT_HEIGHT: gen 25 gate at 2^62 (never on gen 25); 1 from gen 26 — deleted after the betanet-8 reroll, the rule holds from block 1.
+
+# EXEC ROOT V2 + CODE-EVENT BINDING (RIDES A REROLL; security review 2026-09-23, S1 and C5, plus the call-context
+# gap found while closing them). Four things the settlement binding could not see, closed together because each
+# needs the others:
+#   * a contract's DEPLOYER, LOCK FLAG and RUNTIME were in no root — bootstrap adopted them from any peer on a
+#     root-only check (C5), and a prover could not mirror an in-span upgrade's deployer check against anything
+#     authenticated. From the gate the KV half carries a META leaf per contract (exec_state_bind.meta_key ->
+#     meta_commitment(deployer, upgradable, runtime)) beside its code leaf;
+#   * deploy / upgrade / lock / transfer_contract blobs were excluded from block_calls, so the calls_commitment
+#     that binds a settle proof to the on-chain calldata never saw a code change (S1). From the gate they are
+#     CODE EVENTS in the same ordered list (calls_commit.event_leaf), in tx order between the calls;
+#   * the KV transition a bound epoch proves was derived from storage io alone, so an honest proof of any span
+#     with a deploy or upgrade landed on a root the chain does not hold, and a bonded settler could prove calls
+#     against code the chain had replaced. From the gate the VERIFIER replays the bound events over the pinned
+#     pre-state (exec_state_bind.event_updates — never the prover's word) and requires the code- and meta-leaf
+#     updates they cause in the transition, a deploy's constructor is proven as a call, and a later call in the
+#     span runs the code the events left;
+#   * block_calls stamped every call with timestamp 0 while the chain ran it with chain_clock(h): a contract
+#     reading TIME proved a transition the chain never applied, on every span, silently. From the gate the leaf
+#     and the proof carry chain_clock(h) — a pure function of the height, so still committed data.
+# The root layout, the exec summaries (`meta` sub-DB, in the L1 state root) and the DA leaves all change, which is
+# why this cannot turn on mid-generation: block 1 of the next one. Requires EXEC_CTX_CURRENT_HEIGHT to be in force
+# (the prover stamps the block being applied; tests/test_gate_reroll_transfer.py pins the order).
+# EXEC_ROOT_V2_HEIGHT: gen 25 gate at 2^62 (never on gen 25); 1 from gen 26 — deleted after the betanet-8 reroll, the rule holds from block 1.
+
+# WIDE SHIELDED POOL (RIDES A REROLL; security review 2026-09-23, Z3). The pool's note commitment, owner id,
+# nullifier and tree node were ONE Goldilocks element (alghash: ~2^32 collision by its own docstring), so ~2^33
+# sponge evaluations open one leaf two ways and unshield up to the whole escrow with no victim. From the gate the
+# pool is execnode/shielded_wide.py over alghash2 digests (four lanes, ~128-bit) and the join-split is
+# execnode/stark/joinsplit3.py; a `shield` deposit names its owner as a 64-hex digest and L1 refuses any other
+# form (coins would otherwise sit in escrow behind a note the exec layer never created). The legacy pool and
+# circuit are frozen from the same height: a joinsplit/joinsplit2 bundle is refused, a joinsplit3 one is refused
+# below it. Every commitment ever made changes shape, which is why this is block 1 of the next generation.
+# SHIELD_WIDE_HEIGHT: gen 25 gate at 2^62 (never on gen 25); 1 from gen 26 — deleted after the betanet-8 reroll, the rule holds from block 1.
+
+# NODES VOLUNTEER, RATHER THAN BEING INFERRED. Deducing willingness from behaviour is second-guessing: a
+# node that has not been drawn lately looks identical to one that has stopped running the loop, and a
+# mining wallet looks identical to a validator. `tpm_ready` is an operator saying so — one zero-amount
+# message, re-sent while the node keeps running, and eligibility is simply having said it recently.
+#
+# It is a CLAIM, not a capability: saying it and then not answering only wastes the slot the volunteer
+# asked for, which is why nothing is staked on it and anyone may send one. What keeps it honest is that a
+# drawn challenger that does not answer costs itself nothing and the network one enrolment window — the
+# same exposure as before, now with a signal that is at least about the right question.
+DEVICE_ATTEST_EK_READY_WINDOW = 2000        # ~3.8 h: a node re-announces long before this lapses
+DEVICE_ATTEST_EK_READY_EVERY = 400          # how often a running node re-announces (~45 min)
+# DEVICE_ATTEST_EK_READY_HEIGHT: gen 25 gate at 59400; 1 from gen 26 — deleted after the betanet-8 reroll, the rule holds from block 1.
+
+# THE REVERSE INDEX, FOR EVERY CLASS. `devkey` on an account names the device that vouches for it, and it
+# was written only for PERMANENT classes because only they needed it — a statement-free renewal is
+# validated against it. For a TPM, an endorsement key or an Android phone the chain held the binding and
+# no reader could find it: node_attest.bind_info derives bind_cls from this field, so /get_account
+# answered cls: null and a consumer had to guess, or scan blocks backwards to recover a fact consensus
+# already had. Writing it for every class makes that an O(1) read of committed state.
+#
+# KEYED ON THE RECERT EPOCH, because apply_register works in epochs; an account registered before this
+# carries no devkey until its next registration, which is correct — the field describes the binding that
+# register established, and back-filling one would be inventing state no block wrote.
+# DISABLED ON GEN 25 (2026-09-13). Gated at epoch 1110 = block 66600, which the chain had already
+# passed, and the fleet could not adopt the code: every node still ran 5930e5ad, a commit orphaned by a
+# force-push, and self_update correctly refuses a non-fast-forward. So exactly one node carried the rule.
+# At block 69284 an Android (leased-class) registration landed, this node alone stamped `devkey`, its L1
+# state root diverged from the producer's, and it wedged for 11 hours — the relay, 5,000 blocks behind.
+# The rule itself is sound; the HEIGHT was the bug (rule 3: gate at the fleet's adoption block). It stays
+# off until the fleet is verified uniform, then gets a height measured from that fact rather than guessed.
+# RETIRED 2026-09-14 (the devkey-for-all epoch gate): superseded by LEASE_V2_EPOCH, which stamps `devkey` for every class at a height the fleet was
+# verified uniform for (rule 3) — the thing this gate was waiting on. The constant is gone; the incident record stays.
+
+DEVICE_ATTEST_EK_ROOTS_V2 = frozenset((
+    "2e1b3ba79af56d758be51697621bc4b9e8cee0983db3e749c55eb9b37c6d2ae0",  # Intel TPM EK Root CA (2049)
+))
+# DEVICE_ATTEST_EK_ROOTS_V2_HEIGHT: gen 25 gate at 58200; 1 from gen 26 — deleted after the betanet-8 reroll, the rule holds from block 1.
+# ENROLMENT TRUSTS THE ROOTS IN FORCE (2026-09-25). The kernel verified a tpm_enrol chain against ek_roots_at(height)
+# (V2 included), and the next line re-checked the root against the BASE set only, so an Intel chip whose endorsement
+# certificate walks to the V2 root passed the kernel and was refused anyway — while the wallet's pre-flight (every
+# pinned root) told its owner the chip was fine. So validation checks the same set the kernel used (ek_roots_at).
+# EK_ENROL_ROOTS_AT_HEIGHT: gen 27 gate at 1400; 1 from gen 28 — deleted after the betanet-9 reroll, the rule holds from
+# block 1 (the tpm_enrol rule itself refuses height 0, so no height below it reaches the root check).
+
+# ZK HARDENING (zk audit 2026-09-26). One activation height for the consensus-changing fixes the audit found:
+#   * ZKVM-1  the exec AIR's ARG bus: calls are tagged from 1, so an args-table padding row (0,0,0) can no longer stand
+#             in for the first call's first argument (a forged proof read args[0] as 0 — reproduced at 320 queries);
+#   * SETTLE-1 a settle proof's pre_contracts must be exactly the records the exporter emits (runtime zkvm, known keys):
+#             a phantom non-zkvm record at an in-span deploy's cid was invisible to the pre-state pin and made the
+#             verifier treat the deploy as refused, so a trustless settle could omit it (reproduced end to end);
+#   * ZKVM-2  NOP is a real, provable step: the interpreter ran NOP while the AIR halted on it, so any span that
+#             executed one could never be proof-settled; under zk_harden the AIR advances past it (vm_circuit
+#             _nop_halts) instead of the NOP being refused at deploy;
+#   * the wide shielded pool's tree grows from depth 12 (4,096 notes — fillable for ~0.0004 NADO, after which every
+#             note was locked) to depth 48 (2^48 notes), at the same proving cost as depth 20 (joinsplit3 T = 4096).
+#   * ASSET instructions settle by proof: a settle proof may carry asset io (ASEL/AMINT/ABURN/ABAL/ARENOUNCE) and an
+#             asset-valued call, bound against the pinned records pre-state (records_bind.PinnedAssets) — before it
+#             every asset-touching span could only settle by quorum (settle_proof_io_check). doc/assets.md §8.
+#   * the SETTLE CALLDATA BINDING is 4 field elements (audit 2026-09-24/25 HIGH): a settle proof's calls_commitment was
+#             ONE Goldilocks element (64-bit blake2b % P leaves, width-2/capacity-1 alghash chain), so a settler could
+#             birthday-search (~2^32) a second calldata with the same binding, land one on L1 and prove the other. From
+#             the gate the leaves are 256-bit and the chain is the alghash2 sponge (4-element digest, ~2^128 collision);
+#             a segment is keyed on its end cursor and one straddling the gate is refused (calls_commit.span_width).
+#             Native on both sides (no AIR, no Rust kernel); execsum rows are outside the L1 root.
+# UNCONDITIONAL FROM BLOCK 1. ZK_HARDEN_HEIGHT was the gen-27 gate (dormant 2^62 there, 1 from gen 28); deleted after the
+# betanet-9 reroll. Proof rules carry it as stark.Rules.zk_harden (rules_for_height: on from height 1, off in the
+# RULES_LEGACY that height 0 gets). `>= 1` survived only where height 0 reaches the check — calls_commit.wide_binding (a
+# call or segment at cursor 0 kept the narrow form) and shielded_wide.depth_at (the exec state at cursor -1 / 0 holds
+# the depth-12 pool, deepened when block 1 is applied) — so no verdict moved. Neither survives now (see the ledger line).
+
+# EXEC DA DEADLINE (audit 2026-09-25, HIGH "exec stall"). The exec tail resolves every DA-carried proof of a block before
+# mutating anything and, when one cannot be fetched, applies NOTHING and retries — all-or-nothing, so no node ever
+# half-applies a block. With no bound that retry was forever: one MIN_TX_FEE blob {op: field_transfer, proof_da: <a
+# commitment nobody holds>} froze the exec cursor on every exec node for good (every game, asset and exit with it), and
+# so did an honest proof evicted from every DaStore (DA_RETAIN) before a lagging node fetched it. Reproduced in
+# tests/test_exec_never_stalls_on_unheld_proof.py. Now a DA-carried op in block h >= 1 whose proof this node still
+# cannot resolve once L1 finality has reached h + EXEC_DA_WAIT_BLOCKS is REFUSED (never dispatched, nothing moves) and
+# the rest of the block applies; before that point the block stalls exactly as it always did.
+#   WHAT IS AND IS NOT A PURE FUNCTION. The deadline — WHEN the node stops waiting — is (h, finalized height), agreed
+#   data, never a wall clock. The verdict at the deadline is "held or not", and availability is NOT agreed data
+#   (doc/privacy.md "availability-halt griefing"): a proof nobody holds is refused identically everywhere (the attack),
+#   a proof every live exec node pulled while the block was still provisional is applied identically everywhere (every
+#   honest transfer: the wallet publishes before it submits, and the provisional tail fetches seconds after inclusion),
+#   and only a proof first released to SOME nodes inside the last poll before the deadline can split the exec roots —
+#   which the root pool reports (CRITICAL "EXEC ROOT OUT OF MAJORITY"). The sound end state makes availability an
+#   on-chain fact (an attestation quorum the deadline reads); until then this trades a free, permanent, fleet-wide freeze
+#   for a bounded lag (<= EXEC_DA_WAIT_BLOCKS behind finality while under attack). Exec-layer consensus (it moves the exec
+#   state root the settle quorum signs).
+# EXEC_DA_DEADLINE_HEIGHT: gen 27 gate at 29000 (activated 2026-09-27, operator: "should you? yes."); 1 from gen 28 —
+# deleted after the betanet-9 reroll. `>= 1` survives in execnode._da_deadline_passed: the exec node applies genesis
+# (h = 0) from cursor -1, which was below the gate.
+# ~9.6 min at 6.4 s. The tail first reaches block h at finality (~FINALITY_DEPTH = 45 behind the tip) and the provisional
+# tail has already tried the fetch before that, so an honest proof has been retried for well over five minutes when the
+# deadline falls. A literal, not 2 * FINALITY_DEPTH: tuning finality must never silently move an exec verdict.
+EXEC_DA_WAIT_BLOCKS = 90
+# CERTIFICATE VALIDITY READS AGREED TIME (audit 2026-09-25 HIGH, "certificate validity is judged by block_timestamp,
+# which is outside the block hash"). Every device and endorsement certificate's notBefore/notAfter was judged against the
+# ANCHOR block's block_timestamp (ops/transaction_ops._anchor_time, verify_register_device, and the tpm_enrol apply in
+# ops/account_ops). That field is outside the block-hash preimage (block_ops.construct_block hashes it as None) and under
+# leaderless assembly every node stamps its OWN copy of every block with its own wall clock: measured 2026-09-27 on eight
+# fleet nodes, blocks 24000/24500/24700/24800 carried one hash each and block_timestamps up to 12 s apart. Nothing bounds
+# it from below either, so a peer serving sync can hand out a same-hash block stamped 0 or years back. A certificate whose
+# validity edge fell inside that spread was valid on one node and invalid on the next — a fork with no attacker — and a
+# relay could pick the edge at will.
+# SO the clock is transaction_ops.agreed_time(anchor height): the MEDIAN over distinct senders of the
+# timestamps the bonded committee signed into its own duty transactions in the CERT_CLOCK_WINDOW blocks before the anchor's
+# epoch — committed bodies every node reads identically, written by validators' real clocks. chain_clock(height) was the
+# first candidate and was REJECTED: it assumes a cadence and ran 11.8 h behind after 2.3 days (8.1 s real vs 6.4 s
+# assumed), which would have refused every freshly issued certificate. Measured on betanet-8 (2026-09-27, heights 19086,
+# 25086, 27086): 11 senders per window, spread 2-10 min, median 26-31 min behind real time. That lag is absorbed by
+# CERT_NOT_BEFORE_GRACE on notBefore only (transaction_ops.cert_verdict) — expiry is still judged at agreed time, so the
+# grace never accepts an expired certificate.
+# CERT_CLOCK_HEIGHT: gen 27 gate at 29000; 1 from gen 28 — deleted after the betanet-9 reroll with the block_timestamp
+# clock it replaced: every certificate check runs at a height >= 1 (a block's own, a register's max_block, which the
+# mempool admits only above the tip, or behind the tpm_enrol rule's own `>= 1`), and at 0 agreed_time is chain_clock(0)
+# = GENESIS_TIMESTAMP, the genesis block's own stamp.
+# INVARIANT: no consensus certificate check may read block_timestamp or wall time.
+CERT_CLOCK_WINDOW = 120                 # blocks (2 epochs): ~11 committee senders on betanet-8
+CERT_CLOCK_MIN_SAMPLES = 3              # fewer distinct senders (a newborn chain) -> chain_clock, agreed as well
+CERT_NOT_BEFORE_GRACE = 86400           # a certificate may be up to a day "early" (agreed time lags ~30 min; CA skew)
+# A BLOCK SIGNATURE NAMES ITS CHAIN (audit 2026-09-25 MED "cross-generation slash replay: the block signature lacks
+# chain_id"). The winner's detached authorship signature covered blake2b(height, parent_hash, block_hash) and nothing
+# else, and verify_equivocation_proof never asks whether the proof's parent_hash is a block of THIS chain. Validator keys
+# carry across rerolls and slash markers do not, so on a new generation (reproduced in
+# tests/test_slash_evidence_is_this_chain_only.py):
+#   * any real double-sign from ANY earlier chain — already slashed there or not — slashes the carried bond again here;
+#   * a reroll that reuses the genesis (gens 7-9 reused alphanet-8's; gens 26 and 27 share CHAIN_ID and
+#     GENESIS_TIMESTAMP) makes every block-1 winner's honest old-generation signature and its honest new one a valid
+#     "equivocation" at the same parent: anyone holding the old block can burn the bond.
+# The signed message is blake2b(DOMAIN_BLOCKSIG, CHAIN_GENERATION, genesis hash, height, parent_hash, block_hash)
+# (block_ops._block_sig_message_fields), so a signature made for any other generation or genesis does not verify here
+# at all — neither as a block signature nor as slash evidence — and evidence for height 0 is refused when judged at a
+# block. Bound to the GENERATION and the genesis hash, never to the CHAIN_ID label: those two are fixed
+# for a chain's whole life (a different value is a different chain and purges), while a CHAIN_ID rename must never
+# change a signature's bytes (tests/test_genesis_sync_invariant: the relaunch-3 -> alphanet-1 rename wedged sync).
+# The signature is DETACHED (outside the block hash), so block hashes, fork choice and the state root are unchanged;
+# what moves is which signature bytes verify_block_signature accepts.
+# BLOCK_SIG_CHAIN_BIND_HEIGHT: gen 27 gate at 2^62 (never on gen 27); 1 from gen 28 — deleted after the betanet-9 reroll.
+# The chain-less form survives only below height 1 (block 0 has no winner signature), so no verdict moved.
+
+
+def ek_roots_at(height) -> frozenset:
+    """The endorsement roots in force at `height`. A PURE FUNCTION OF HEIGHT so every node — including one
+    replaying this block years from now — trusts exactly the set that was in force when it was written."""
+    base = DEVICE_ATTEST_EK_ROOTS
+    # the V2 roots are in force from height 1 (gen 25's DEVICE_ATTEST_EK_ROOTS_V2_HEIGHT, 1 from gen 26, deleted);
+    # height 0 / None was below that gate and keeps the base set
+    if int(height or 0) >= 1:
+        return base | DEVICE_ATTEST_EK_ROOTS_V2
+    return base
+
+
+DEVICE_ATTEST_EK_ROOTS = frozenset((
+    # Each verified before pinning: fetched from the vendor's own PKI, confirmed self-signed with CA:TRUE, and
+    # checked to be the root a REAL endorsement certificate walks to where one was available to walk.
+    "67bd2472a546751caca5f358a78f80727531671338960a9bcfdfbe6a34d0c6a1",  # AMD fTPM — CN=AMDTPM (2039)
+    "beb40bb7507b33967226aa80e084749fbb6593893c642e818d682e9a8d07fc24",  # Intel PTT — OnDie CA Root (2049)
+    "4aebe77a51ed29959a7f9f5e07a24a558dee8167f3985d724995a541c258dfda",  # Nuvoton TPM Root CA 2110 (2035)
+    "cd8185ff8995ed09811970090a8c36fafab34ef87f47fa51fdb9ecf95c9c2e04",  # Nuvoton TPM Root CA 2111 (2037)
+    "899e35474c9807eb4c7f2f7a12da0028fb250cd02154d0009fca7d9c66574f3b",  # Infineon OPTIGA RSA Root (2043)
+    "cfeb02fecd55ad7a73c6e1d11985d4c47dee248ab63dcb66091a2489660443c3",  # Infineon OPTIGA ECC Root (2043)
+    # STMicroelectronics is NOT pinned yet. The certificate published as "STM TPM EK Root CA" is cross-signed
+    # by GlobalSign and is therefore an intermediate, not a root — pinning it would be a decision to trust
+    # GlobalSign's Trusted Computing CA, which is a different assertion from "ST made this chip". Add ST when
+    # its self-signed root is in hand.
+))
+
+# Relying-party ids whose hash may appear in authenticator data: the public wallet hosts. A wallet served from a
+# node's own ip:port attests against that host, so nodes also accept their configured host at validation
+# (transaction_ops adds it); consensus checks only the SET below plus the tx's declared rp id.
+# HARDWARE WALLETS (2026-09-07, doc/device-attestation.md §Hardware). Both vendors give a PER-DEVICE key certified at
+# the factory, i.e. exactly what one-device-one-identity binds — unlike their FIDO2 mode (batch certificates).
+#   Trezor Safe 3 / 5 / 7: `AuthenticateDevice` — the secure element signs our challenge; its X.509 chain ends at a
+#   bare P-256 ROOT KEY per model (trezorlib.authentication.ROOT_PUBLIC_KEYS, production keys only; the Safe 7 has a
+#   backup root). Trezor One / Model T have no secure element and no per-device certificate: not accepted.
+#   Keys are SEC1 uncompressed points (hex); the model is read from the device certificate's CN by the kernel.
+# TREZOR serialNumber (2026-09-14). The kernel required a subject serialNumber on the device certificate — an
+# assumption from the spec, proven only against a synthetic chain. The first real Trezor Safe statement had none and was
+# refused on that alone. From this height the serial is not required (trezorlib does not require it either; nothing
+# consumes it); below it the refusal is reproduced in ops/transaction_ops so replay is unchanged. Fresh chain: block 1.
+# DEVICE_ATTEST_TREZOR_SERIAL_OPTIONAL_HEIGHT: gen 25 gate at 95500; 1 from gen 26 — deleted after the betanet-8 reroll, the rule holds from block 1.
+DEVICE_ATTEST_TREZOR_ROOTS = {
+    "T2B1": ("04ca97480ac0d7b1e6efafe518cd433cec2bf8ab9822d76eafd34363b55d63e60380bff20acc75cde03cffcb50ab6f8ce70c878e37ebc58ff7cca0a83b16b15fa5",),   # Safe 3
+    "T3B1": ("045b5c3fdd01f3602092834209b86df0ca86a9faf25cac35c73bf6237d66eb21eafcec3706f1ccd5eb4cc7f2fa1751213eccb1c78389afba89a5788ff31ee46a5d",),   # Safe 3 (rev.)
+    "T3T1": ("041854b27fb1d9f65abb66828e78c9dc0ca301e66081ab0c6a4d104f9df1cd0ad5a7c75f77a8c092f55cf825d2abaf734f934c9394d5e75f75a5a06a5ee9be93ae",),   # Safe 5
+    "T3W1": ("040dde0d3e0d4da593fac6fd02a461d0e7eef238aca55c7c50b4e9ec37f3873303b6429ef1c9b78b4411a7dcbbc5dde5225979c1c2da3b073e82b1ed3f5f9825bb",       # Safe 7
+             "04c6a673af4ec44b10441b1d78676e15173ad0e36df9f7f2fa1cd819955f20fe32917b60da5fed3b3aa54a9ab8b3ed27d198b3768cad26eef5935cd87af0af065e"),      # Safe 7 backup root
+}
+#   Ledger (Nano S / S Plus / X, Stax, Flex): every device holds a secp256k1 key whose public key Ledger's ISSUER
+#   signed at the factory ("Issuer certificate", ledgerblue.checkGenuine DEFAULT_ISSUER_KEY). The secure-channel
+#   handshake makes the device sign an ephemeral key together with our nonce — the user confirms the "unsafe
+#   manager" ON THE DEVICE, which is the tap. Binding key: the device public key.
+DEVICE_ATTEST_LEDGER_ISSUER_KEYS = (
+    "0490f5c9d15a0134bb019d2afd0bf297149738459706e7ac5be4abc350a1f818057224fce12ec9a65de18ec34d6e8c24db927835ea1692b14c32e9836a75dad609",
+)
+DEVICE_ATTEST_RP_IDS = ("get.nadochain.com", "nadochain.com")
+
+# ---- CLIENT EXPORTS (2026-10-10): the constants a browser client needs, SERVED rather than copied ----------------------
+# The relay renders exactly these names, from THIS module, as GET /protocol.js (an ES module, `export const NAME = value;`)
+# and GET /protocol.json (ops/client_protocol.py). The wallet (static/interface.js), the dApp SDK (static/nadodapp.js,
+# re-exported to every game) and the website's /emission model import them instead of declaring literals
+# (static/nadotx.js, the environment-free crypto SDK the engines run in plain Node, keeps four address constants that
+# the test pins by value). WHY: every one of these used to be a hand-made copy with a "MUST match protocol.py" comment, and the
+# copies drifted anyway — FINALITY_DEPTH 12 vs 45 (browser reveals rejected), TX_INCLUSION_DELAY 2 vs 8 (sends looked like
+# network faults), the wallet's default auto-bond 80 vs AUTO_BOND_DEFAULT_PERCENT 99. tests/test_constant_mirrors.py renders
+# the module and refuses any of these names (or a known alias) declared as a literal under static/ or website/.
+# Adding a name here is how a client gets a constant. Values must be int / str / bool or a list / dict of them — NO
+# FLOATS (determinism). Integers above 2^53 are emitted as BigInt literals (`123n`) in /protocol.js and as decimal
+# strings in /protocol.json (none today; STWO_POOL_HEIGHT was 2^62 while dormant).
+# NOT here on purpose: the wallet's SEED-derived tags (DOMAIN_HD_ACCOUNT, DOMAIN_SHIELD_NSK*, DOMAIN_RANDAO_SECRET) — they
+# derive from the user's seed, not the chain, and must never move with a relay's answer.
+CLIENT_EXPORTS = (
+    "CHAIN_ID", "DENOMINATION", "BLOCK_TIME", "EPOCH_LENGTH", "FINALITY_DEPTH",
+    "ADDRESS_PREFIX", "ADDRESS_BODY", "ADDRESS_CHECKSUM", "MSIG_PREFIX",
+    "DOMAIN_ADDRESS_V2", "DOMAIN_MSIG", "DOMAIN_REGISTER", "DOMAIN_RANDAO_COMMIT",
+    "POSW_T", "POSW_S", "POSW_K", "POSW_ANCHOR_OFFSET", "POSW_TARGET_MARGIN", "POSW_LEASE_EPOCHS",
+    "MIN_TX_FEE", "TX_INCLUSION_DELAY", "TX_TARGET_MARGIN",
+    "BOND_UNLOCK_DELAY", "B_MIN", "FIDELITY_CAP", "FIDELITY_MIN_GAP_EPOCHS",
+    "TREASURY_BPS", "OPEN_TIP_BPS", "BONDED_DIVIDEND_BPS",
+    "BASE_SUBSIDY", "BOND_ELASTIC_MULT_BPS",
+    "ALIAS_REGISTRATION_FEE", "AUTO_BOND_MIN_RAW", "AUTO_BOND_DEFAULT_PERCENT",
+    "INVITE_MIN_TIMELOCK", "INVITE_MAX_TIMELOCK",
+    "CHAIN_GENERATION",
+    # the wallet offers a signature scheme per account (doc/signature-schemes.md)
+    "SIG_SCHEME_SIZES", "SIG_SCHEMES_OFFERED", "SIG_ML44_ONLY_RECIPIENTS",
+    # multisig members and auth keys of every offered scheme from this height (static/interface.js schemeKeysLive)
+    "SIG_SCHEME_KEYS_HEIGHT", "MSIG_MEMBER_AUTH_HEIGHT",
+    # the node config a Stwo spend proves at (static/interface.js stwoCfgId; execnode/stwo_js_native.config_id_at)
+    "STWO_JS_GRIND_HEIGHT",
+    # (STWO_POOL_HEIGHT, WIDE_DEPOSIT_CLOSE_HEIGHT, STWO_FEE_TO_HEIGHT, STWO_JS_128_HEIGHT, BLAKE_EXEC_HEIGHT and
+    # SIG_SCHEMES_HEIGHT were exported until G9 inlined them: on generation 29 the wallet's Stwo pool, fee_to, 128-bit
+    # config, the 256-bit VM digests and the scheme picker are on from block 1 — static/interface.js, nadodapp.js.
+    # Safe to drop: the wallet page is no-cache, so a browser always pairs the current importer with this module.)
+)

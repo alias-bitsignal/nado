@@ -4,6 +4,10 @@ commitment + availability sampling. See ops/da.py and doc/rolling-mode-and-da.md
 
 Run: python3 tests/test_da.py
 """
+import os as _os, tempfile as _tempfile  # ISOLATION FIRST (CLAUDE.md rule 4): never the live node's HOME or exec files
+_os.environ["HOME"] = _tempfile.mkdtemp(prefix="nado-test-")
+_os.environ["NADO_EXEC_STATE"] = _os.path.join(_os.environ["HOME"], "exec_state.json")
+_os.environ["NADO_EXEC_DA"] = _os.path.join(_os.environ["HOME"], "exec_da")
 import os, sys, itertools, random
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ops import da
@@ -43,9 +47,16 @@ def t4_sampling_verifies_and_rejects():
     """A committed shard verifies against the commitment; a tampered shard or wrong index is rejected."""
     m = da.encode(b"availability", 3, 9)
     sp = da.sample_proof(m, 5)
-    assert da.verify_sample(m["commitment"], 5, sp["shard"], sp["proof"]), "valid sample verifies"
-    assert not da.verify_sample(m["commitment"], 5, sp["shard"] + b"x", sp["proof"]), "tampered shard rejected"
-    assert not da.verify_sample(m["commitment"], 4, sp["shard"], sp["proof"]), "index-swapped proof rejected"
+    assert da.verify_sample(m["commitment"], 5, sp["shard"], sp["proof"], m), "valid sample verifies"
+    assert not da.verify_sample(m["commitment"], 5, sp["shard"] + b"x", sp["proof"], m), "tampered shard rejected"
+    assert not da.verify_sample(m["commitment"], 4, sp["shard"], sp["proof"], m), "index-swapped proof rejected"
+    # THE MANIFEST IS BOUND INTO THE COMMITMENT. It steers the decode (a shorter `length` truncates to
+    # different bytes that would still pass a shard-only check), so a lied manifest must be rejected by the
+    # SAME proof — that is what removes the decode-and-re-encode round-trip from the fetch path.
+    for bad in ({**m, "length": m["length"] - 1}, {**m, "stripes": m["stripes"] + 1},
+                {**m, "k": m["k"] + 1}, {**m, "n": m["n"] + 1}):
+        assert not da.verify_sample(m["commitment"], 5, sp["shard"], sp["proof"], bad), \
+            "a lied manifest must not verify against the commitment"
 
 def t5_determinism():
     """Same data → same commitment and same shards (integer-only, no floats)."""

@@ -1,13 +1,14 @@
 """
 Shielded pool — L1 side (doc/privacy.md): the `shield` escrow deposit + `unshield` exit are the only L1
 touch-points (L1 never sees a note or verifies a STARK). Mirrors the bridge. Covers: shield escrows + reverts
-byte-identically; shield validation (amount + fee + commitments); unshield validation rejects a bad proof and
-a spent nullifier.
+byte-identically; shield validation (amount + fee; a Stwo deposit is admitted, a legacy one — `out_commitments`, no
+`field` — is refused at every height since G9 slice 5c); unshield validation rejects a bad proof and a spent nullifier.
 
 Run: python3 tests/test_shield_l1.py
 """
 import os, sys, tempfile, logging, traceback
 os.environ["HOME"] = tempfile.mkdtemp(prefix="nado_shl1_")
+import atexit, shutil; atexit.register(shutil.rmtree, os.environ["HOME"], ignore_errors=True)   # leave no /tmp home behind (9,600 leaked by 2026-09-22)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 for d in ("index", "blocks", "logs", "peers"):
     os.makedirs(f"{os.environ['HOME']}/nado/{d}", exist_ok=True)
@@ -21,13 +22,9 @@ from ops.account_ops import create_account, get_account, reflect_transaction
 from ops.transaction_ops import validate_transaction, reserved_uniqueness_key, create_txid
 from signatures import generate_keydict, sign, unhex
 
-fails = 0
-def check(name, fn):
-    """Run fn; print PASS/FAIL and count failures."""
-    global fails
-    try: fn(); print(f"PASS  {name}")
-    except Exception as e:
-        fails += 1; print(f"FAIL  {name}: {e}"); traceback.print_exc()
+import _harness
+_report = _harness.Report()
+check = _report.run
 
 def bal(a):
     """Balance of account a, or 0 if the account does not exist."""
@@ -56,7 +53,7 @@ def t1_shield_escrows_and_reverts_byte_identical():
     create_account("alice", balance=1_000_000)
     create_account(SHIELD_ESCROW, balance=3)
     tx = {"sender": "alice", "recipient": "shield", "amount": 100_000, "fee": 7, "txid": "s1",
-          "data": {"out_commitments": ["cm_abc"]}}
+          "data": dict(STWO)}
     before = _dump()
     with kv_ops.write_txn():
         reflect_transaction(tx, logger=logger, block_height=1)
@@ -66,15 +63,20 @@ def t1_shield_escrows_and_reverts_byte_identical():
         reflect_transaction(tx, logger=logger, block_height=1, revert=True)
     assert _dump() == before, "shield reflect rollback is NOT byte-identical"
 
+STWO = {"field": True, "pool": "stwo", "owner": "ef" * 32, "rho": 7}   # a Stwo-pool deposit (the only pool that takes one)
+
+
 def t2_shield_validation():
-    """Prove shield validation accepts a well-formed tx and rejects zero amount, low fee, and empty out_commitments with the right reasons."""
+    """Prove shield validation accepts a well-formed Stwo deposit and rejects zero amount, low fee, and a legacy deposit
+    (with or without commitments) with the right reasons."""
     kd = generate_keydict(); create_account(kd["address"], balance=1_000_000)
     kv_ops.account_set_field(kd["address"], "public_key", kd["public_key"])
-    validate_transaction(signed(kd, "shield", 100_000, MIN_TX_FEE, {"out_commitments": ["cm1"]}), logger, block_height=20)
+    validate_transaction(signed(kd, "shield", 100_000, MIN_TX_FEE, dict(STWO)), logger, block_height=20)
     for bad, why in [
-        (signed(kd, "shield", 0, MIN_TX_FEE, {"out_commitments": ["cm1"]}), "positive"),
-        (signed(kd, "shield", 100, 0, {"out_commitments": ["cm1"]}), "fee below"),
-        (signed(kd, "shield", 100, MIN_TX_FEE, {"out_commitments": []}), "output note commitments"),
+        (signed(kd, "shield", 0, MIN_TX_FEE, dict(STWO)), "positive"),
+        (signed(kd, "shield", 100, 0, dict(STWO)), "fee below"),
+        (signed(kd, "shield", 100, MIN_TX_FEE, {"out_commitments": ["cm1"]}), "takes no new deposits"),
+        (signed(kd, "shield", 100, MIN_TX_FEE, {"out_commitments": []}), "takes no new deposits"),
     ]:
         try:
             validate_transaction(bad, logger, block_height=20); raise RuntimeError("accepted bad shield")
@@ -106,5 +108,5 @@ def t4_unshield_uniqueness_key():
 
 for name, fn in sorted((n, f) for n, f in globals().items() if n.startswith("t") and callable(f) and n[1].isdigit()):
     check(name, fn)
-print(f"\n{'ALL PASSED' if not fails else str(fails)+' FAILED'}")
-sys.exit(1 if fails else 0)
+print(f"\n{'ALL PASSED' if not _report.fails else str(_report.fails)+' FAILED'}")
+sys.exit(1 if _report.fails else 0)

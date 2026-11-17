@@ -59,6 +59,11 @@ _CRYPTO_LOCK = threading.Lock()
 
 def unhex(hexed):
     """hex str -> bytes; every key/seed/signature crosses the API as hex, this is the one decoder."""
+    # LENIENT BY DESIGN, NOT A SPELLING CHECK (audit 2026-09-25 "sig/pubkey hex re-encoding"): fromhex takes uppercase,
+    # mixed case and whitespace, so many strings decode to one key or signature. A transaction's signature/public_key
+    # are outside its txid, so that freedom let a relayer re-encode a tx without changing its id; consensus pins their
+    # spelling in ops/transaction_ops.excluded_witness_check (protocol.py "ONE TRANSACTION, ONE BYTE STRING"). INVARIANT: a new
+    # consensus path that decodes a txid-excluded hex field must run behind that check, never rely on this decoder.
     return b"".fromhex(hexed)
 
 
@@ -134,9 +139,27 @@ def _interop_ok(candidate) -> bool:
             return False  # deterministic keygen must agree (addresses derive from the public key)
         rnd = b"\x07" * 32
         # native signs -> pure-Python verifies, and pure-Python signs -> native verifies
+        good = _PurePyBackend.sign_internal(sec_p, msg, rnd)
         if not _PurePyBackend.verify_internal(pub_p, msg, candidate.sign_internal(sec_p, msg, rnd)):
             return False
-        if not candidate.verify_internal(pub_p, msg, _PurePyBackend.sign_internal(sec_p, msg, rnd)):
+        if not candidate.verify_internal(pub_p, msg, good):
+            return False
+        # NEGATIVE VECTORS (required): a positive-only self-test cannot catch the dangerous direction — a
+        # native verifier that OVER-ACCEPTS (returns True for a signature the FIPS-204 reference rejects:
+        # a broken build, or an unaudited lib mishandling non-canonical/out-of-range encodings). Because
+        # every node runs the same .so, such over-acceptance is chain-wide signature forgery that would not
+        # even show as a fork. The candidate MUST REJECT all of the following, or it is refused:
+        flipped = bytearray(good); flipped[0] ^= 0x01           # (a) one flipped byte
+        if candidate.verify_internal(pub_p, msg, bytes(flipped)):
+            return False
+        if candidate.verify_internal(pub_p, b"a different message", good):  # (b) wrong message
+            return False
+        pub_other, _ = _PurePyBackend.keygen_internal(b"\x99" * 32)
+        if candidate.verify_internal(pub_other, msg, good):     # (c) wrong public key
+            return False
+        if candidate.verify_internal(pub_p, msg, b"\x00" * len(good)):  # (d) all-zero / garbage sig
+            return False
+        if candidate.verify_internal(pub_p, msg, good[:-1]):    # (e) truncated sig
             return False
         return True
     except Exception:
@@ -150,20 +173,51 @@ def _interop_ok(candidate) -> bool:
 _BACKEND_REASON = [None]
 
 
-def _select_backend():
-    """Pick the signing backend at import time. Default = pure-Python. If NADO_PQ_NATIVE_MODULE names
-    an importable module that PASSES the interop self-test, use it; otherwise fall back loudly to
-    pure-Python (never silently trust an unverified native lib)."""
-    mod_name = os.environ.get("NADO_PQ_NATIVE_MODULE", "").strip()
-    if not mod_name:
-        _BACKEND_REASON[0] = "NADO_PQ_NATIVE_MODULE is not set in the node environment"
+def _fallback(reason):
+    """HARD-FAIL. Since betanet-14 the native ML-DSA backend is the only production implementation.
+
+    THE DEFAULT IS NOW INVERTED. This used to return the pure-Python backend and hard-fail only when
+    NADO_PQ_REQUIRE_NATIVE was set. The argument for that default was that the fallback is byte-equivalent
+    (the interop self-test enforces it) so consensus is correct either way, and a light node without a build
+    toolchain should still start. Both halves are true, and together they are how a node ends up degraded with
+    nobody noticing — because nothing ever fails, it just gets ~84x slower.
+
+    That is not hypothetical. On 2026-07-29 this very repository's dev tree was running pure-Python ML-DSA
+    against a production node on the native backend. Consequences, none of which looked like a crypto problem:
+    every signature test ran orders of magnitude slower, four of them hit their timeout and were indistinguishable
+    from failures, and the heavy-proof numbers about to be written into the release notes had been measured under
+    the handicap. Right answers, wrong conclusions.
+
+    There is also a security reason the fallback should never be a default: dilithium_py is educational-origin
+    and NOT constant-time, which is a side-channel risk whenever a real key signs.
+
+    NADO_ALLOW_PYTHON_KERNELS still permits it, for building and for the conformance tests that exist precisely
+    to compare this implementation against the Rust one. Nothing in the node sets it."""
+    _BACKEND_REASON[0] = reason
+    from execnode.native_guard import allow_absent
+    if allow_absent():
         return _PurePyBackend()
+    raise RuntimeError(
+        f"the native ML-DSA (RustCrypto ml-dsa) backend is unavailable: {reason}. REFUSING TO START. Since "
+        f"betanet-14 there is no Python fallback in production: it is byte-equivalent but ~84x slower and not "
+        f"constant-time, so running on it degrades a node silently rather than visibly — which has already "
+        f"cost this project a set of misleading benchmark numbers. Build it with scripts/build_pq_native.sh "
+        f"(needs cargo). For a build or for the Python-vs-Rust conformance tests, set "
+        f"NADO_ALLOW_PYTHON_KERNELS=1 — never on a validator.")
+
+
+def _select_backend():
+    """Pick the signing backend at import time. If NADO_PQ_NATIVE_MODULE names an importable module that PASSES
+    the interop self-test, use it (the reputable, production RustCrypto ml-dsa crate). Otherwise fall back
+    loudly to pure-Python — or HARD-FAIL when NADO_PQ_REQUIRE_NATIVE demands production crypto (see _fallback).
+    A bare NADO_PQ_NATIVE_MODULE also defaults to `nado_pq_native` so an installed node uses native without the
+    operator having to name it."""
+    mod_name = os.environ.get("NADO_PQ_NATIVE_MODULE", "").strip() or "nado_pq_native"
     try:
         candidate = _NativeBackend(importlib.import_module(mod_name))
-    except Exception as e:  # operator-supplied module: import must never crash the node
+    except Exception as e:  # operator-supplied module: import must never crash the node (unless REQUIRE_NATIVE)
         sys.stderr.write(f"[PQ] native backend '{mod_name}' import failed ({e}); using pure-Python\n")
-        _BACKEND_REASON[0] = f"module '{mod_name}' did not import ({e}) — run scripts/build_pq_native.sh"
-        return _PurePyBackend()
+        return _fallback(f"module '{mod_name}' did not import ({e}) — run scripts/build_pq_native.sh")
     if _interop_ok(candidate):
         sys.stderr.write(f"[PQ] native ML-DSA backend '{mod_name}' passed interop self-test; enabled\n")
         _BACKEND_REASON[0] = None
@@ -171,9 +225,8 @@ def _select_backend():
     sys.stderr.write(
         f"[PQ] native backend '{mod_name}' FAILED interop self-test (likely ctx-wrapping mismatch); "
         f"refusing it and using pure-Python — see signatures.py INTEROP TRAP\n")
-    _BACKEND_REASON[0] = (f"module '{mod_name}' failed the interop self-test (likely ctx-wrapping "
-                          f"mismatch) — see signatures.py INTEROP TRAP")
-    return _PurePyBackend()
+    return _fallback(f"module '{mod_name}' failed the interop self-test (likely ctx-wrapping mismatch) "
+                     f"— see signatures.py INTEROP TRAP")
 
 
 _BACKEND = _select_backend()
@@ -212,12 +265,87 @@ def _keypair_from_seed(seed: bytes):
         return _BACKEND.keygen_internal(seed)
 
 
-def sign(private_key, message):
+# ---- the other user-selectable schemes (protocol.py "USER-SELECTABLE SIGNATURE SCHEMES", doc/signature-schemes.md) ----
+# ML-DSA-44 keeps the backend above, unchanged: every existing account signs with it and nothing below touches it. The
+# other schemes come from native/pqsig (nado_pqsig.py), loaded on FIRST USE — a node that never meets a tagged tx never
+# maps the library, and at height 0 (or None) consensus refuses every tagged tx before it reaches verify(). Same key
+# model as ML-DSA-44: one 32-byte seed per account; the scheme's own expansion is in native/pqsig/src/lib.rs.
+_SCHEME_IDS = {"mldsa65": 1, "mldsa87": 2, "slhdsa128s": 3, "fndsa512": 4}
+# KNOWN ANSWERS: blake2b-128 of each scheme's public key for the seed 0x42*32. An address is a hash of the public key, so
+# a library whose keygen drifts would move every account of that scheme — refused at load instead. The browser pins the
+# same digests (tests/test_every_signature_scheme_derives_one_key_in_every_stack.mjs).
+_SCHEME_KAT = {
+    "mldsa65": "d1d310a5d8503b27ad23b4d6006ba238",
+    "mldsa87": "6d5d287e5f9c1c48a46bbbfc7f38713f",
+    "slhdsa128s": "5d911449939d98b95dde5d7fc5fa03db",
+    "fndsa512": "dbfffe3bfae2540e147818833cea21bf",
+}
+_pqs = [None]
+_pqs_lock = threading.Lock()
+
+
+def _scheme_selftest(lib) -> str:
+    """'' when every scheme of `lib` derives its known-answer key, round-trips, and REJECTS the five forgeries the
+    ML-DSA-44 self-test rejects (an over-accepting verifier is chain-wide forgery that never shows as a fork); otherwise
+    the first failure. ML-DSA-65/87 keys are also cross-checked against dilithium-py, the FIPS 204 reference."""
+    import hashlib
+    from dilithium_py.ml_dsa import ML_DSA_65, ML_DSA_87
+    seed, msg, rnd = b"\x42" * 32, b"pq-scheme-selftest", b"\x07" * 32
+    ref = {"mldsa65": ML_DSA_65, "mldsa87": ML_DSA_87}
+    for name, i in _SCHEME_IDS.items():
+        pk, sk = lib.keygen(i, seed)
+        if hashlib.blake2b(pk, digest_size=16).hexdigest() != _SCHEME_KAT[name]:
+            return f"{name}: keygen does not derive the known-answer key"
+        if name in ref and ref[name]._keygen_internal(seed)[0] != pk:
+            return f"{name}: keygen disagrees with the FIPS 204 reference"
+        good = lib.sign(i, sk, msg, rnd)
+        if not lib.verify(i, pk, msg, good):
+            return f"{name}: an honest signature does not verify"
+        flipped = bytearray(good); flipped[len(good) // 2] ^= 1
+        other, _ = lib.keygen(i, b"\x99" * 32)
+        for bad in ((pk, msg, bytes(flipped)), (pk, b"a different message", good), (other, msg, good),
+                    (pk, msg, b"\x00" * len(good)), (pk, msg, good[:-1])):
+            if lib.verify(i, *bad):
+                return f"{name}: a forged signature verifies"
+    return ""
+
+
+def _schemes():
+    """native/pqsig, self-tested once. Raises when it is missing, stale or fails the test — and verify() turns that into
+    False, so a node without it refuses a tagged tx rather than guessing (since gen 29 the crate is required,
+    ops/self_update._CRATES, so a live node has it)."""
+    with _pqs_lock:
+        if _pqs[0] is None:
+            import nado_pqsig
+            why = _scheme_selftest(nado_pqsig)
+            if why:
+                raise RuntimeError(f"native/pqsig failed its self-test: {why}")
+            _pqs[0] = nado_pqsig
+        return _pqs[0]
+
+
+def _scheme_id(alg):
+    """None for ML-DSA-44 (the backend above), the native/pqsig id otherwise; ValueError for an unknown name."""
+    if alg is None or alg == "mldsa44":
+        return None
+    if alg not in _SCHEME_IDS:
+        raise ValueError(f"unknown signature scheme {alg!r}")
+    return _SCHEME_IDS[alg]
+
+
+def sign(private_key, message, alg=None):
     """Sign `message` with the 32-byte seed hex `private_key`; returns the ~2420-byte signature as
     hex. The keypair is re-derived from the seed on every call (only the seed is ever stored), then
     signed INTERNAL-mode with a fresh random hedge — so signatures are randomized and deliberately
     NOT byte-reproducible across calls or implementations (consensus only checks verify()==True)."""
     seed = unhex(private_key)
+    sid = _scheme_id(alg)
+    if sid is not None:
+        if len(seed) != 32:
+            raise ValueError("a signing seed must be exactly 32 bytes")
+        lib = _schemes()
+        _public, secret = lib.keygen(sid, seed)
+        return lib.sign(sid, secret, message, secrets.token_bytes(32)).hex()
     _public, secret = _keypair_from_seed(seed)
     # INTERNAL ML-DSA sign (FIPS 204 Sign_internal — NO ctx/domain wrapping) with a fresh 32-byte
     # hedge. This is the exact convention `@noble/post-quantum` (the browser light-miner) uses by
@@ -228,7 +356,7 @@ def sign(private_key, message):
         return _BACKEND.sign_internal(secret, message, secrets.token_bytes(32)).hex()
 
 
-def verify(signed, public_key, message):
+def verify(signed, public_key, message, alg=None):
     """True iff `signed` (hex) is a valid ML-DSA-44 *internal*-mode signature by `public_key` (hex)
     over `message`. NEVER raises (see below) — malformed input is a False, so a rejection can't
     escalate into an unhandled error or get mis-refactored into an accept. This is THE consensus
@@ -237,34 +365,47 @@ def verify(signed, public_key, message):
     # return False on ANY failure instead of raising: callers use `assert verify(...)` /
     # `if verify(...)`, and a raising verify could turn a rejection into an unhandled error or be
     # mis-refactored into a silent accept. INTERNAL verify to match the signer above + the browser.
+    # `alg` None / "mldsa44": the backend above, exactly as before. Any other scheme: native/pqsig (Rust, no shared
+    # buffers — it needs no lock). An unknown scheme, or a node without the library, is an invalid signature.
     try:
+        sid = _scheme_id(alg)
+        if sid is not None:
+            return bool(_schemes().verify(sid, unhex(public_key), message, unhex(signed)))
         with _CRYPTO_LOCK:                # backend is not concurrency-safe (shared NTT buffers) — see top
             return _BACKEND.verify_internal(unhex(public_key), message, unhex(signed))
     except Exception:
         return False
 
 
-def _keydict_from_seed(seed: bytes):
+def _keydict_from_seed(seed: bytes, alg=None):
     """seed -> the canonical keydict shape the rest of the node stores/passes around. The 32-byte
     seed alone IS the identity: the ML-DSA secret key is never persisted, only re-derived, which
-    keeps key files tiny and makes import-by-seed (from_private_key) possible."""
-    public, _secret = _keypair_from_seed(seed)
-    return {
-        "private_key": seed.hex(),          # 32-byte seed (regenerates the keypair)
-        "public_key": public.hex(),         # full 1312-byte ML-DSA public key
-        "address": make_address(public.hex()),
-    }
+    keeps key files tiny and makes import-by-seed (from_private_key) possible. A key of another
+    scheme carries "alg" (absent = ML-DSA-44, as on the wire), and its address commits to it."""
+    sid = _scheme_id(alg)
+    if sid is None:
+        public, _secret = _keypair_from_seed(seed)
+        return {
+            "private_key": seed.hex(),          # 32-byte seed (regenerates the keypair)
+            "public_key": public.hex(),         # full 1312-byte ML-DSA public key
+            "address": make_address(public.hex()),
+        }
+    if len(seed) != 32:
+        raise ValueError("a signing seed must be exactly 32 bytes")
+    public, _secret = _schemes().keygen(sid, seed)
+    return {"private_key": seed.hex(), "public_key": public.hex(), "alg": alg,
+            "address": make_address(public.hex(), alg=alg)}
 
 
-def from_private_key(private_key):
-    """Recover the full keydict (public_key + address) from the 32-byte seed alone."""
-    return _keydict_from_seed(unhex(private_key))
+def from_private_key(private_key, alg=None):
+    """Recover the full keydict (public_key + address) from the 32-byte seed alone, under scheme `alg`."""
+    return _keydict_from_seed(unhex(private_key), alg)
 
 
-def generate_keydict():
+def generate_keydict(alg=None):
     """Fresh identity from a CSPRNG (secrets) 32-byte seed — the ONLY entropy the whole key model
     ever needs; everything else (secret key, public key, address) derives deterministically."""
-    return _keydict_from_seed(secrets.token_bytes(32))
+    return _keydict_from_seed(secrets.token_bytes(32), alg)
 
 
 if __name__ == "__main__":

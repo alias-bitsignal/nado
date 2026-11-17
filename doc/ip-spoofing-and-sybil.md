@@ -1,5 +1,12 @@
 # IP spoofing, Sybil identities, and fair distribution of the open lane
 
+> **Status (gen 25 onward): historical.** The sequential-work registration proof (PoSW), its difficulty ramp and the
+> per-IP registration cap (`ratelimit.allow_registration`, `nado.py:_ip_registration_rejection`) were retired at the
+> betanet-7 reroll (tests/test_gen25_retirements.py). Every `register` now carries a hardware device attestation, one
+> identity per device (doc/device-attestation.md, `transaction_ops._validate_register`), and no IP is consulted for
+> registration. The `OPEN_BPS` lane cap (30 %) still holds. Where the sections below say "current" or "shipped" about
+> PoSW, the difficulty ramp or the per-IP cap, they describe the pre-gen-25 design.
+
 **This is a FAIR-DISTRIBUTION concern, not a chain-safety one.** Sybil identities and IP spoofing cannot
 halt the chain, double-spend, or take the bonded lane — the objective consensus and the `OPEN_BPS` lane
 cap prevent that. What they *can* do is let **one entity masquerade as many distinct participants and so
@@ -353,10 +360,56 @@ each mask must pay its own fresh, un-fakeable slice of real sequential time.
 2. `POSW_T / POSW_S / POSW_K` (+ `POSW_ANCHOR_OFFSET`) are **`protocol.py` consensus constants**,
    calibrated so an honest phone spends ~1 s once at registration. `POSW_LEASE_EPOCHS` (≈ 1 day) sets the
    recert-lease length.
-3. Browser prover in `static/` (byte-for-byte with Python; cross-checked by `tests/posw_xlang.mjs`) —
+3. Browser prover in `static/` (byte-for-byte with Python; cross-checked by `tests/test_posw_js_and_python_agree.py`, driving `tests/posw_xlang.mjs`) —
    *pending* as part of the S4b light-miner.
 4. **Done:** the `register` branch of `ops/transaction_ops.py` verifies the PoSW
    (`posw.verify(posw.challenge_bytes(sender, anchor), …)`) where `anchor` is the finalized block
    `target_block − POSW_ANCHOR_OFFSET`. Presence is the **renewable recert lease**: a fresh recert keeps an
    identity in `account_ops.get_open_registry` for `POSW_LEASE_EPOCHS` — the "slow, infrequent presence
    re-proof" is live, and there is no separate heartbeat.
+
+
+## Probation and the burst-proof baseline (2026-09-01, gen-23-keyed at block 86 400)
+
+Measured on betanet-5 with 811 present open identities (~540 registered within 48 h, 74 % at fidelity ≤ 2): a
+fresh identity received open weight 2 and dividend weight 1 from its *first* lease, and because 87 % of open-lane
+value flows through the presence-dividend pool — which splits linearly by identity count while the population is
+young — ~500 disposable identities (≈ 4.5 CPU-hours of PoSW) captured over half of it. Five rules
+(`protocol.py` "SYBIL RULES", `tests/test_sybil_rules.py`):
+
+1. **Dividend probation.** Until an identity's first *timely* renewal (fidelity ≥ `PROBATION_FIDELITY` = 2, which
+   needs `FIDELITY_MIN_GAP_EPOCHS` ≈ 19 h of continuous presence) it is **absent** from the epoch's dividend weight
+   set (`dividend_weight` → 0 → omitted; the exec accrual floors *listed* weights to 1, so omission is the grant).
+   Day one pays block wins only; dividends start on day two. A mint-and-discard identity never leaves probation.
+2. **Selection probation.** `open_shares` = 1 (never 0 — a newcomer stays winnable) during probation, the usual
+   2..10 curve after.
+3. **Burst-proof difficulty baseline.** The flood multiplier's baseline is `max(FLOOR, min(2-day rate, 14-day
+   rate))`: a sustained burst can no longer become its own baseline (it did: day 3 of the burst read 1×). The
+   honest steady state, where the two rates agree, is unchanged. Per-epoch counts below the hard-finality epoch
+   are memoised, so the 14-day trail costs nothing per validation.
+4. **Per-IP budget counts entries only, default 8/h** (was 64/h counting renewals). A roaming phone's renewal is
+   never refused; the budget prices exactly new identities. Progressive across ranges as before. Relay policy, not
+   consensus.
+5. **The wallet says it:** "Mining stops when this lease expires. The wallet renews it only while this tab stays
+   open — a saved seed phrase does not renew anything by itself", and a probation note next to the fidelity value.
+
+Combined: a 500-identity farm goes from ≈ 80 NADO/day for ≈ 4.5 CPU-hours to ≈ 10 NADO/day, and its **entry**
+batch costs up to ≈ 70 CPU-hours (500 × 32× entry × up to 16× flood); renewals carry no entry multiplier, so a
+*persistent* farm pays ≈ 2 CPU-hours per renewal cycle at 16× — probation removes the disposable model, PoSW
+remains the enduring per-identity cost. A genuine newcomer loses one day of dividend and nothing else.
+
+**Refinements (relay review, later on 2026-09-01):** the difficulty windows count **entries** only
+(`reg_difficulty.chain_entry_count`: a recert by an address with no lease in the previous
+`POSW_LEASE_EPOCHS`), so renewals — a farm's or a crowd's — can neither pre-train the baseline nor raise
+everyone's cost; the lease is **36 h** (`POSW_LEASE_EPOCHS` 360) so the qualifying renewal window is
+19.2–36 h instead of 19.2–24 h — once a day, any time of day, for intermittent phones; the per-IP budget
+defaults to **8 per hour** (configs still holding the old 64/7200 literal are read as the new default),
+counts entries only and never applies to peer push-gossip. Note the honest cost of an adoption wave: any
+2-hour window with more than the baseline (at least 20) of entries above the 14-day rate raises the multiplier (cap 16×) for everyone
+joining during it. Rules 1–3 are consensus and activate at an
+epoch boundary a few hours after the update wave; the gate self-disarms at gen 24 (SCHEDULED_CLEANUPS.md). Not
+adopted: global entry caps (punish organic onboarding), device identifiers (unreadable in a browser, spoofable),
+bonded vouching (a UX redesign — later).
+
+**Linear dividend weight (2026-09-01, betanet-6):** after probation the weight is simply `min(fidelity, 30)` — days
+present. See doc/presence-dividend.md.

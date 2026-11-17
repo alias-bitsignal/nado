@@ -11,6 +11,7 @@ Run: python3 tests/test_bond_ramp.py
 """
 import os, sys, tempfile, logging, traceback
 os.environ["HOME"] = tempfile.mkdtemp(prefix="nado_bramp_")
+import atexit, shutil; atexit.register(shutil.rmtree, os.environ["HOME"], ignore_errors=True)   # leave no /tmp home behind (9,600 leaked by 2026-09-22)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 for d in ("index", "blocks", "logs", "peers"):
     os.makedirs(f"{os.environ['HOME']}/nado/{d}", exist_ok=True)
@@ -18,19 +19,15 @@ logger = logging.getLogger("bramp"); logger.addHandler(logging.NullHandler())
 from genesis import create_indexers
 create_indexers()
 
-from protocol import BOND_RAMP_EPOCHS, B_MIN, EPOCH_LENGTH, BOND_CAP
+from protocol import BOND_RAMP_EPOCHS, B_MIN, EPOCH_LENGTH
 from ops import kv_ops
 from ops.account_ops import create_account, reflect_transaction, get_bonded_registry, apply_bond_since
 from ops.mining_ops import (bond_ramp_weight, selection_shares, total_bonded_shares,
                             select_producer_two_lane)
 
-fails = 0
-def check(name, fn):
-    """Run fn; print PASS/FAIL and count failures."""
-    global fails
-    try: fn(); print(f"PASS  {name}")
-    except Exception as e:
-        fails += 1; print(f"FAIL  {name}: {e}"); traceback.print_exc()
+import _harness
+_report = _harness.Report()
+check = _report.run
 
 
 def t1_ramp_curve():
@@ -100,7 +97,7 @@ def t6_selector_withholds_slots_from_a_sudden_whale():
     beacon = "c0ffee" * 8
     # aged small validator (unset age => full weight) vs a sudden whale with 100x stake, bonded THIS epoch
     aged = {"ndoAGED": {"bonded": 1 * B_MIN, "fidelity": None, "bond_since": None}}
-    fresh_whale = {"ndoWHALE": {"bonded": BOND_CAP, "fidelity": None, "bond_since": 200}}
+    fresh_whale = {"ndoWHALE": {"bonded": 100 * B_MIN, "fidelity": None, "bond_since": 200}}
     reg = {**aged, **fresh_whale}
     epoch = 200
     whale_wins = aged_wins = 0
@@ -115,8 +112,8 @@ def t7_quorum_and_weight_stay_ramp_free():
     """Prove total_bonded_shares (fork-choice weight + FFG/settlement quorum) ignores the ramp entirely."""
     # total_bonded_shares (fork-choice weight + FFG/settlement quorum) must IGNORE the ramp: a whale bonded
     # this instant still counts its FULL shares for finality — only PRODUCER selection is throttled.
-    fresh_whale = {"ndoWHALE": {"bonded": BOND_CAP, "fidelity": None, "bond_since": 200}}
-    raw = selection_shares(BOND_CAP)                            # 100 shares
+    fresh_whale = {"ndoWHALE": {"bonded": 100 * B_MIN, "fidelity": None, "bond_since": 200}}
+    raw = selection_shares(100 * B_MIN)                         # 100 shares
     assert total_bonded_shares(fresh_whale) == raw, "quorum/weight must use ramp-free shares"
 
 def t8_genesis_topup_keeps_aged_status():
@@ -147,5 +144,5 @@ def t9_liveness_fallback_when_all_fresh():
 
 for name, fn in sorted((n, f) for n, f in globals().items() if n.startswith("t") and callable(f) and n[1].isdigit()):
     check(name, fn)
-print(f"\n{'ALL PASSED' if not fails else str(fails)+' FAILED'}")
-sys.exit(1 if fails else 0)
+print(f"\n{'ALL PASSED' if not _report.fails else str(_report.fails)+' FAILED'}")
+sys.exit(1 if _report.fails else 0)

@@ -1,5 +1,6 @@
 
-from ops.account_ops import (index_totals, get_totals, get_finalized_height)
+from ops.account_ops import (index_totals, get_totals, get_finalized_height, set_finalized_height,
+                             get_hard_finality)
 from ops.block_ops import load_block_from_hash, set_latest_block_info, unindex_block
 from ops import kv_ops
 from ops.transaction_ops import unindex_transactions
@@ -15,10 +16,16 @@ class MissingParentError(Exception):
 
 
 class FinalityViolation(Exception):
-    """The reorg would revert a FINALIZED block (the new tip would fall at/below finalized_height).
-    ENFORCED FINALITY (#17): the finalized prefix is immutable, so we REFUSE the rollback rather than
-    undo it. The caller aborts the cascade and resyncs forward only. This is what bounds 51%/long-range
-    rollback: no amount of attacker chain weight can reorg below the finalized floor."""
+    """The reorg would revert a HARD-FINALIZED block (the new tip would fall at/below hard_finality —
+    the FFG quorum checkpoint folded with the wide liveness backstop; see protocol.FINALITY_HARD_BACKSTOP).
+    ENFORCED FINALITY (#17): that prefix is immutable, so we REFUSE the rollback rather than undo it.
+    The caller aborts the cascade and resyncs forward only. This is what bounds 51%/long-range rollback:
+    no amount of attacker chain weight can reorg below a floor a >2/3 bonded quorum signed.
+
+    The DEPTH floor (finalized_height) no longer refuses anything: treating a 45-block local observation
+    as immutable is what made every deep-but-legitimate reorg a floor-crossing 'wedge recovery' (2026-08-17:
+    eight in one day, two archive truncations). Crossing it is legal above the hard floor, and this module
+    lowers it as it crosses so the depth cadence re-derives on the new branch."""
 
 
 def rollback_one_block(logger, block, depth: int = 1) -> dict:
@@ -35,14 +42,23 @@ def rollback_one_block(logger, block, depth: int = 1) -> dict:
             f"Parent {block.get('parent_hash')} of {block.get('block_hash')} is not on disk; "
             f"cannot roll back — resync required")
 
-    # ENFORCED FINALITY (#17): never revert a finalized block. Reverting tip `block` moves the tip to
-    # previous_block; if that parent is below the finalized floor, `block` itself is finalized -> refuse.
+    # ENFORCED FINALITY (#17, two-floor): never revert a HARD-finalized block. Reverting tip `block`
+    # moves the tip to previous_block; if that parent is below the hard floor, `block` itself is inside
+    # the quorum-signed immutable prefix -> refuse.
     # (previous_block.number < F  <=>  block.number <= F  <=>  block is within the immutable prefix.)
+    hard = get_hard_finality()
+    if previous_block["block_number"] < hard:
+        raise FinalityViolation(
+            f"Refusing to roll back block {block.get('block_number')} below hard finality "
+            f"{hard} (new tip would be {previous_block['block_number']})")
+    # Crossing the DEPTH floor is legal above the hard floor — but the floor must FOLLOW the tip down, or
+    # (a) this same check on the next block in the cascade would compare against a stale high value if it
+    # still used finalized_height, and (b) incorporate's max(prev, ...) would keep the old branch's depth
+    # finality forever. Lower it to the new tip; it re-advances at depth cadence on the branch we land on.
+    # Floored at `hard` for the invariant hard <= finalized at all times.
     finalized_height = get_finalized_height()
     if previous_block["block_number"] < finalized_height:
-        raise FinalityViolation(
-            f"Refusing to roll back block {block.get('block_number')} below finalized height "
-            f"{finalized_height} (new tip would be {previous_block['block_number']})")
+        set_finalized_height(max(hard, previous_block["block_number"]))
 
     # Reverse the SAME lane-aware split incorporate_block applied (so producer + treasury + DIVIDEND_POOL
     # balances and the produced metric return exactly to prior), the totals, and the indexes — atomically.
@@ -56,6 +72,18 @@ def rollback_one_block(logger, block, depth: int = 1) -> dict:
 
         credit_block_reward(block, logger=logger, revert=True)
         apply_treasury_burn(block, logger=logger, revert=True)   # restore any anti-hoard burn at this height
+        # EXACT INVERSE of incorporate_block's committed-epoch-weights write (same gate): the boundary
+        # block created the epochw row, so rolling that block back DELETES it — canonical-absent, never a
+        # phantom row (the divinflow/h4260 rollback-asymmetry lesson). Re-applying the block recomputes
+        # the identical row from the identical recert history.
+        from protocol import EPOCH_LENGTH as _EL
+        if block["block_number"] % _EL == 0:   # ungated since gen 22 (mirror of incorporate)
+            kv_ops.epoch_weights_commit(block["block_number"] // _EL - 1, revert=True)
+            # EXACT INVERSE of incorporate_block's registry snapshot: same test, row deleted. REGISTRY_SNAPSHOT_HEIGHT
+            # (gen 28's gate, 1 from gen 29, inlined in G9): every anchor but genesis writes one, so keep `>= 1` here
+            # exactly as core_loop does — block 0 is an epoch boundary that never wrote a row.
+            if block["block_number"] >= 1:
+                kv_ops.regsnap_del(block["block_number"] // _EL + 1)
 
         totals = get_totals(block=block, revert=True)
         index_totals(produced=totals["produced"], fees=totals["fees"])
@@ -73,8 +101,15 @@ def rollback_one_block(logger, block, depth: int = 1) -> dict:
         _rev = kv_ops.execsum_revert_pop(block["block_number"])
         if _rev:
             _ph, _doc = _rev
-            kv_ops.exec_summary_put(_ph, bool(_doc.get("inert")), _doc.get("calls") or {})
+            kv_ops.exec_summary_restore(_ph, _doc)   # the whole journaled document, not a re-derivation
         unindex_block(block, logger=logger)
+        # UNDO LOG, SHADOW MODE (kv_ops): every consensus key this block's apply wrote must now hold exactly the bytes it
+        # held before the block. A mismatch is logged and counted (/status undo_shadow) — never acted on yet.
+        # SHADOW ONLY: a fault in the diagnostic must never abort a legal rollback (it runs inside rollback's txn).
+        try:
+            kv_ops.undo_shadow_verify(block["block_number"], logger)
+        except Exception as e:
+            logger.warning(f"undo shadow verify failed at {block['block_number']}: {e!r}")
 
     set_latest_block_info(latest_block=previous_block, logger=logger)
 

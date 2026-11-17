@@ -21,8 +21,11 @@ segment files under blocks/ (ops/segment_store.py; the hash->locator `block_loc`
 NODE-LOCAL and snapshot-excluded, and records are self-describing so it stays rebuildable) —
 consensus hashing stays canonical_bytes, untouched by any of this.
 """
+import hashlib
 import os
+import re
 import struct
+import json
 import threading
 
 import lmdb
@@ -51,8 +54,8 @@ MAP_SIZE = 16 * 1024 * 1024 * 1024
 #   commits           "sender|target_epoch"    -> commitment                                   (RANDAO #7)
 #   reveals           target_epoch(8B BE)      -> secret                            [DUPSORT]  (RANDAO #7)
 #   unbonds           address                  -> msgpack({amount, release_block})         (unbond delay)
-_PLAIN_DBS = ("accounts", "totals", "block_by_num", "block_by_hash", "tx", "meta", "commits", "unbonds", "hb_revert", "aliases", "htlcs", "bond_since", "bond_since_revert", "treasury_proposals", "msgkey_revert", "block_loc", "gc_revert", "execsum_revert", "attest_memo")
-_DUP_DBS = ("tx_by_sender", "tx_by_recipient", "attestations", "reveals", "settlements", "recerts", "recert_by_epoch", "treasury_votes")
+_PLAIN_DBS = ("devbind", "devbind_revert", "accounts", "totals", "block_by_num", "block_by_hash", "tx", "meta", "commits", "unbonds", "hb_revert", "aliases", "htlcs", "bond_since", "bond_since_revert", "treasury_proposals", "msgkey_revert", "pubkey_revert", "block_loc", "gc_revert", "execsum_revert", "attest_memo", "auth_revert", "undo")
+_DUP_DBS = ("tx_by_sender", "tx_by_recipient", "attestations", "reveals", "settlements", "recerts", "recert_by_epoch", "treasury_votes", "auth_history")
 
 # CONSENSUS STATE a snapshot carries: every sub-DB EXCEPT the block-body + tx HISTORY (explorer-only,
 # rebuilt by replaying the C+1..tip tail). This is the FULL producer-selection + validation state — account
@@ -78,15 +81,23 @@ _HISTORY_DBS = frozenset(("tx", "tx_by_sender", "tx_by_recipient"))
 #               are REORG-PATH-DEPENDENT (two nodes reaching the same canonical tip via different reorg paths
 #               legitimately retain different journal residue) and, unlike gc_revert, were never pruned — so
 #               they grow unbounded with chain length. Carrying them in the state_root GUARANTEED divergent
-#               snapshot hashes (the alphanet-7 h76000 seed split: ~1730 bond_since_revert + hb/msgkey rows
+#               snapshot hashes (the betanet-7 h76000 seed split: ~1730 bond_since_revert + hb/msgkey rows
 #               differed). A snapshot's state is at a FINALIZED checkpoint C, and rollback can never cross the
 #               finalized floor (>= C), so no journal entry for a block <= C is ever needed; the only journals
 #               rollback ever reads are for the (finalized, tip] reorg window, all ABOVE C, which the normal
 #               C+1..tip tail replay rebuilds byte-for-byte as it re-incorporates each block. wipe_non_carried_dbs
 #               (all-DBs - SNAPSHOT_DBS) clears any stale residue on re-anchor. So they belong here, not in the root.
 _LOCAL_DBS = frozenset(("block_loc", "gc_revert", "bond_since_revert", "hb_revert", "msgkey_revert",
-                        "execsum_revert", "attest_memo"))
+                        "pubkey_revert", "execsum_revert", "attest_memo", "auth_revert", "devbind_revert", "undo"))
+# undo — the GENERIC per-block undo log (UNDO LOG below): the prior bytes of every consensus key a block's apply wrote,
+# keyed be8(height). Node-local rollback bookkeeping exactly like the *_revert journals, so never in the root.
+# (pool_revert — the staking-pool journal — was node-local, never in SNAPSHOT_DBS or the state root, and never written
+# from generation 26 on; it left both tuples with the pool code, so SNAPSHOT_DBS and the root are unchanged.)
+# devbind (device certificate -> {address, epoch}, ops/device_attest.device_binding_key) IS consensus state: written
+# only by apply_register from gen 25's DEVICE_BIND_HEIGHT, block-derived, so it stays IN the snapshot and the root.
+# devbind_revert is its rollback journal (keyed epoch|address), node-local like every other *_revert.
 SNAPSHOT_DBS = tuple(sorted(set(_PLAIN_DBS + _DUP_DBS) - _HISTORY_DBS - _LOCAL_DBS))
+DUP_DBS = frozenset(_DUP_DBS)     # the DUPSORT set, for readers that must treat multi-value keys differently
 
 # account doc fields that default to 0 when missing on read (schemaless: extra fields pass through).
 ACCOUNT_FIELDS = ("balance", "produced", "bonded", "registered", "fidelity", "last_hb_epoch")
@@ -139,6 +150,137 @@ def _bump_write_gen():
     global _write_gen
     with _write_gen_lock:
         _write_gen += 1
+        return _write_gen
+
+
+# ---- ROOT WRITE TRACKING (2026-09-06) --------------------------------------------------------------------
+# The L1 state root is a merkle over ~90k windowed rows and used to be re-WALKED from LMDB on every block
+# (11 % of the core thread's wall time on the relay). Both places a write txn is created (_WriteTxn.__enter__
+# and _write) now hand out a _TrackTxn proxy that records every (sub-DB name, key) it puts/deletes/pops/
+# replaces — including through cursors — and publishes that set to the listeners below when the txn COMMITS.
+# ops/snapshot_ops keeps an incremental leaf structure from it and re-reads only the touched keys.
+# INVARIANTS (the root is consensus; a stale leaf forks THIS node off the fleet):
+#   * every LMDB write goes through one of the two wrapped txn sites — never call get_env().begin(write=True)
+#     anywhere else (tests/test_root_incremental pins this);
+#   * a txn.drop() marks the txn `dropped` and the listener rebuilds from a full walk;
+#   * a commit that bumps write_generation without publishing (there is none today) is detected by the
+#     listener comparing generations and also forces a rebuild;
+#   * snapshot_ops cross-checks the incremental root against the full walk every NADO_ROOT_INC_VERIFY_EVERY roots
+#     (NADO_ROOT_INC=trust, the default since 2026-10-19; =verify walks every block) and logs any mismatch, and
+#     verify_block confirms by the walk before refusing a block over its root (snapshot_ops.confirm_l1_state_root).
+_root_listeners = []
+_handle_names = {}      # env path -> {id(handle): sub-DB name}
+
+
+def register_root_listener(fn):
+    """fn(touched: set[(name, key_bytes)], dropped: bool, gen: int) — called right after each COMMIT."""
+    _root_listeners.append(fn)
+
+
+def _handle_name(db):
+    if db is None:
+        return None
+    path = env_path()
+    m = _handle_names.get(path)
+    if m is None or id(db) not in m:
+        m = _handle_names[path] = {id(h): n for n, h in _dbhandles.get(path, {}).items()}
+    return m.get(id(db))
+
+
+class _TrackCursor:
+    """lmdb Cursor proxy: mutations are recorded on the owning _TrackTxn; everything else passes through."""
+    __slots__ = ("_c", "_name", "_tx")
+
+    def __init__(self, c, name, tx):
+        self._c, self._name, self._tx = c, name, tx
+
+    def put(self, key, value, *a, **k):
+        self._tx._touch(self._name, key)
+        return self._c.put(key, value, *a, **k)
+
+    def putmulti(self, items, *a, **k):
+        items = list(items)
+        for key, _v in items:
+            self._tx._touch(self._name, key)
+        return self._c.putmulti(items, *a, **k)
+
+    def delete(self, *a, **k):
+        self._tx._touch(self._name, self._c.key())
+        return self._c.delete(*a, **k)
+
+    def pop(self, key, *a, **k):
+        self._tx._touch(self._name, key)
+        return self._c.pop(key, *a, **k)
+
+    def replace(self, key, value, *a, **k):
+        self._tx._touch(self._name, key)
+        return self._c.replace(key, value, *a, **k)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._c.close()
+        return False
+
+    def __iter__(self):
+        return iter(self._c)
+
+    def __getattr__(self, n):
+        return getattr(self._c, n)
+
+
+class _TrackTxn:
+    """lmdb write-Transaction proxy — see ROOT WRITE TRACKING above."""
+    __slots__ = ("_t", "touched", "dropped")
+
+    def __init__(self, txn):
+        self._t, self.touched, self.dropped = txn, set(), False
+
+    def _touch(self, name, key):
+        if name is not None:
+            k = bytes(key)
+            self.touched.add((name, k))
+            u = getattr(_local, "undo", None)
+            if u is not None and name in _UNDO_DBS and (name, k) not in u["rec"]:
+                u["rec"][(name, k)] = _undo_prior(self._t, name, k)   # BEFORE the write: _touch precedes every mutation
+
+    # Signatures mirror lmdb.Transaction EXACTLY (positional db included): `txn.cursor(handle)` and
+    # `txn.put(k, v, True, True, False, handle)` are legal lmdb calls, and a `*a, db=None` proxy turned the
+    # first into "TypeError: duplicate argument: db" (tests/test_tx_history_prune, 2026-09-06).
+    def put(self, key, value, dupdata=True, overwrite=True, append=False, db=None):
+        self._touch(_handle_name(db), key)
+        return self._t.put(key, value, dupdata, overwrite, append, db)
+
+    def delete(self, key, value=b"", db=None):
+        self._touch(_handle_name(db), key)
+        return self._t.delete(key, value, db)
+
+    def replace(self, key, value, db=None):
+        self._touch(_handle_name(db), key)
+        return self._t.replace(key, value, db)
+
+    def pop(self, key, db=None):
+        self._touch(_handle_name(db), key)
+        return self._t.pop(key, db)
+
+    def drop(self, db, delete=True):
+        self.dropped = True
+        return self._t.drop(db, delete)
+
+    def cursor(self, db=None):
+        return _TrackCursor(self._t.cursor(db), _handle_name(db), self)
+
+    def __getattr__(self, n):
+        return getattr(self._t, n)
+
+
+def _publish_commit(txn, gen):
+    for fn in list(_root_listeners):
+        try:
+            fn(txn.touched, txn.dropped, gen)
+        except Exception:
+            pass
 
 
 def write_generation() -> int:
@@ -172,7 +314,7 @@ def get_env(home=None):
         env = lmdb.open(
             path,
             map_size=MAP_SIZE,
-            max_dbs=32,          # headroom over the named sub-DBs (_PLAIN_DBS + _DUP_DBS, now 17)
+            max_dbs=40,          # headroom over the named sub-DBs (_PLAIN_DBS + _DUP_DBS, now 17)
             subdir=True,
             readahead=False,     # random point lookups dominate
             writemap=False,      # safe: a full map raises MapFullError (no corruption), per spec
@@ -195,6 +337,13 @@ def get_env(home=None):
 def _dbs():
     get_env()  # ensure opened
     return _dbhandles[env_path()]
+
+
+def db_handles(home=None):
+    """The named sub-DB handles of `home`'s env ({name: handle}), opening it if needed — for callers that
+    run their own single read txn across several sub-DBs (snapshot_ops.read_root_state)."""
+    get_env(home)
+    return _dbhandles[env_path(home)]
 
 
 def init_env(home=None):
@@ -268,10 +417,10 @@ class _WriteTxn:
         depth = getattr(_local, "wdepth", 0)
         if depth == 0:
             try:
-                _local.wtxn = get_env().begin(write=True)
+                _local.wtxn = _TrackTxn(get_env().begin(write=True))
             except lmdb.MapFullError:
                 _grow_map()
-                _local.wtxn = get_env().begin(write=True)
+                _local.wtxn = _TrackTxn(get_env().begin(write=True))
         _local.wdepth = depth + 1
         return _local.wtxn
 
@@ -286,6 +435,9 @@ class _WriteTxn:
         if _local.wdepth == 0:
             txn = _local.wtxn
             _local.wtxn = None
+            undo, _local.undo = getattr(_local, "undo", None), None
+            if exc_type is None and undo is not None:
+                _undo_store(txn, undo)          # in the SAME txn: the record exists iff the block's writes committed
             if exc_type is None:
                 try:
                     txn.commit()
@@ -296,10 +448,97 @@ class _WriteTxn:
                         pass
                     _grow_map()
                     raise
-                _bump_write_gen()
+                _publish_commit(txn, _bump_write_gen())
             else:
                 txn.abort()
         return False  # never suppress
+
+
+# --- UNDO LOG (generic per-block rollback record, SHADOW MODE) -------------------------------------------------------
+# Every hand-written revert path re-derives or journals what one feature overwrote, and the same three bugs were
+# re-learned journal by journal (first write wins, delete vs restore, no journal vs no row). The generic record is
+# correct by construction: while a block applies (undo_begin inside incorporate_block's write txn), the FIRST write to
+# each consensus key records the bytes it held before — the full dup list for a DUPSORT DB, None when absent — and the
+# record is stored with the block's commit. SHADOW MODE: rollback still runs the existing reverts, then
+# undo_shadow_verify compares every recorded key with what they restored and counts any mismatch (/status
+# "undo_shadow"). Once mismatches stay at zero long enough, rollback can replay the record instead.
+# INVARIANT: recording reads through the RAW txn (never tracked, never journaled) and covers exactly the consensus DBs.
+_UNDO_DBS = frozenset(set(_PLAIN_DBS + _DUP_DBS) - _HISTORY_DBS - _LOCAL_DBS)
+UNDO_SHADOW = {"recorded": 0, "checked": 0, "mismatch": 0, "last_mismatch": None}
+
+
+def _undo_prior(raw, name, key):
+    db = _dbs()[name]
+    if name in _DUP_DBS:
+        with raw.cursor(db=db) as cur:
+            if not cur.set_key(key):
+                return None
+            return [bytes(v) for v in cur.iternext_dup(keys=False, values=True)]
+    v = raw.get(key, db=db)
+    return None if v is None else bytes(v)
+
+
+def undo_begin(height: int):
+    """Start recording block `height`'s prior values (call inside the block's write txn). Off with NADO_UNDO_SHADOW=0."""
+    if os.environ.get("NADO_UNDO_SHADOW", "1") == "0":
+        return
+    _local.undo = {"h": int(height), "rec": {}}
+
+
+def _undo_store(txn, undo):
+    rows = [[n, k, p] for (n, k), p in undo["rec"].items()]
+    txn._t.put(be8(undo["h"]), _pack(rows), db=_dbs()["undo"])
+    UNDO_SHADOW["recorded"] += 1
+
+
+def undo_shadow_verify(height: int, logger=None) -> list:
+    """After rollback's reverts ran (inside its txn): every key block `height` wrote must hold exactly its recorded prior
+    value. Returns the mismatches [(db, key hex, expected, got)], counts them in UNDO_SHADOW and logs them; pops the
+    record. A block applied before the undo log existed has no record and is skipped."""
+    def _do(txn):
+        raw_txn = txn._t if isinstance(txn, _TrackTxn) else txn
+        k = be8(int(height))
+        raw = raw_txn.get(k, db=_dbs()["undo"])
+        if raw is None:
+            return None
+        raw_txn.delete(k, db=_dbs()["undo"])
+        out = []
+        for name, key, prior in _unpack(bytes(raw)):
+            got = _undo_prior(raw_txn, name, bytes(key))
+            want = prior if prior is None or isinstance(prior, (bytes, bytearray)) else [bytes(x) for x in prior]
+            if got != want:
+                out.append((name, bytes(key).hex()[:64], want, got))
+        return out
+    res = _write(_do)
+    if res is None:
+        return []
+    UNDO_SHADOW["checked"] += 1
+    if res:
+        UNDO_SHADOW["mismatch"] += len(res)
+        UNDO_SHADOW["last_mismatch"] = {"height": int(height), "keys": [(n, kh) for n, kh, _w, _g in res[:8]]}
+        if logger is not None:
+            logger.error(f"UNDO SHADOW: rollback of {height} left {len(res)} key(s) different from their recorded "
+                         f"prior value: {[(n, kh) for n, kh, _w, _g in res[:8]]}")
+    return res
+
+
+def undo_prune(below_height: int) -> int:
+    """Drop undo records below HARD finality — rollback can never reach them (node-local). The caller passes the
+    hard floor, never finalized_height: rollback crosses the depth floor (see core_loop's prune site)."""
+    def _do(txn):
+        n = 0
+        with txn.cursor(db=_dbs()["undo"]) as cur:
+            if cur.first():
+                while un_be8(cur.key()) < int(below_height):
+                    if not cur.delete():
+                        break
+                    n += 1
+                    # deleting the LAST record leaves the cursor unpositioned and key() == b'', which un_be8
+                    # cannot unpack: re-seat it (gc_revert_prune's guard), or a store wholly below the floor raises
+                    if not cur.first():
+                        break
+        return n
+    return _write(_do)
 
 
 def write_txn():
@@ -324,9 +563,10 @@ def _write(fn):
     active = getattr(_local, "wtxn", None)
     if active is not None:
         return fn(active)
-    with get_env().begin(write=True) as txn:
+    with get_env().begin(write=True) as raw:
+        txn = _TrackTxn(raw)
         result = fn(txn)
-    _bump_write_gen()
+    _publish_commit(txn, _bump_write_gen())
     return result
 
 
@@ -358,6 +598,12 @@ def get_account(address: str):
     body = _read(lambda txn: _get_body(txn, address))
     if body is None:
         return None
+    return _account_doc(address, body)
+
+
+def _account_doc(address: str, body):
+    """get_account's defaulting, shared with get_accounts_many: ACCOUNT_FIELDS default to 0, extra
+    (schemaless) fields pass through, `address` is echoed from the key."""
     acc = {"address": address}
     for f in ACCOUNT_FIELDS:
         acc[f] = body.get(f, 0)
@@ -367,13 +613,27 @@ def get_account(address: str):
     return acc
 
 
+def get_accounts_many(addresses):
+    """{address: doc} for every address in `addresses` that has a row — the SAME docs get_account returns,
+    read in ONE txn instead of one env.begin() per address. Derived-read computes (the open-lane registry)
+    read hundreds of docs per generation; a txn per doc was most of that cost."""
+    def _do(txn):
+        out = {}
+        for address in addresses:
+            body = _get_body(txn, address)
+            if body is not None:
+                out[address] = _account_doc(address, body)
+        return out
+    return _read(_do)
+
+
 def account_value_is_default(value: bytes) -> bool:
     """True iff a raw `accounts` value is the ABSENT-EQUIVALENT doc: every ACCOUNT_FIELDS entry is
     0/falsy AND there are no schemaless extras (public_key, kem_pub, alias binding, …). get_account
     returns the IDENTICAL zero doc whether such a row is present or missing (missing fields default to
     0), so an all-default row is semantically indistinguishable from no row — yet its physical presence
     changes the snapshot state_root. get_account no longer persists on read, but historical
-    read-created-account residue can still sit in one node's DB and not another's (the alphanet-7 h76000
+    read-created-account residue can still sit in one node's DB and not another's (the betanet-7 h76000
     seed split had one such ghost row). read_state skips these so the root is invariant to the residue.
     Deliberately STRICTER than gc_ops._trivially_empty: `registered`/`fidelity`/`last_hb_epoch` must also
     be 0 here, because a nonzero one of those is real open-lane/heartbeat state, NOT absent-equivalent."""
@@ -445,6 +705,32 @@ def account_del_field(address: str, field: str):
             del body[field]
             txn.put(address.encode(), _pack(_normalize(body)), db=_dbs()["accounts"])
     _write(_do)
+
+
+_BONDED_RE = re.compile(rb'"bonded":(-?\d+)')
+
+
+def bonded_map(min_bonded: int):
+    """{address: bonded} for every account whose `bonded` >= min_bonded — the bonded registry's input.
+    Same result as scanning iter_accounts() and reading doc["bonded"] (default 0), read ~10x cheaper: the
+    raw doc is a codec.pack (json.dumps, ":" separator) of kv_ops._normalize's fixed field order, so
+    `"bonded":<int>` is the third key of every doc and a byte regex finds it without decoding a 3.5 KB
+    ML-DSA-pubkey-bearing document per account per block. A doc without the field (never written by
+    _normalize, defensive) falls back to a full decode. Still O(accounts) per write generation — the day
+    the account set is 10k+, this needs a bonded INDEX, not a faster scan."""
+    def _do(txn):
+        out = {}
+        with txn.cursor(db=_dbs()["accounts"]) as cur:
+            for k, v in cur:
+                m = _BONDED_RE.search(v)
+                if m is not None:
+                    b = int(m.group(1))
+                else:
+                    b = int(_unpack(v).get("bonded", 0))
+                if b >= min_bonded:
+                    out[bytes(k).decode()] = b
+        return out
+    return _read(_do)
 
 
 def iter_accounts():
@@ -523,6 +809,85 @@ def meta_del(key: str):
     def _do(txn):
         txn.delete(key.encode(), db=_dbs()["meta"])
     _write(_do)
+
+
+# --- committed epoch weights: the presence-dividend's IMMUTABLE per-epoch input --------------------
+
+def epoch_weights_commit(epoch: int, weights: dict = None, revert: bool = False):
+    """Persist (or on revert DELETE) the open-lane weights for a COMPLETED epoch — the dividend's
+    consensus input, frozen into L1 state the moment the epoch ends.
+
+    WHY COMMITTED, NOT RECONSTRUCTED (2026-08-19, the frozen-quorum post-mortem's last debt):
+    weights_at_epoch(E) is "deterministic and reconstructible" only against ONE version of the ramp
+    code — replaying a 6-hour-old epoch under today's build produced a DIFFERENT answer than the
+    fleet computed live (measured: three reconstruction attempts missed the historically-justified
+    exec root, including one replaying the node's own journal-recorded accrual boundaries). Any
+    fidelity/pool code change silently rewrites history for whoever reconstructs after it. A row
+    committed AT the boundary is computed exactly once, at one code version, at the same height, on
+    every node — version-independent forever after, and it rides the state root so a divergent
+    answer is a root split, not a silent drift.
+
+    Canonical JSON (sort_keys, no spaces) so the stored bytes — and with them the root — are
+    independent of dict insertion order. Revert DELETES the key (canonical-absent, the divinflow
+    lesson: a phantom row forks the root against a forward-only node)."""
+    from protocol import EPOCHW_ROOT_WINDOWED
+    k = f"epochw:{int(epoch)}".encode()
+    ka = f"epochwacc:{int(epoch)}".encode()
+    kprev = f"epochwacc:{int(epoch) - 1}".encode()
+    if revert:
+        def _do(txn):
+            txn.delete(k, db=_dbs()["meta"])
+            if EPOCHW_ROOT_WINDOWED:
+                txn.delete(ka, db=_dbs()["meta"])          # revert = DELETE (canonical-absent), same as epochw
+    else:
+        blob = json.dumps({str(a): int(w) for a, w in (weights or {}).items()},
+                          sort_keys=True, separators=(",", ":")).encode()
+        def _do(txn):
+            txn.put(k, blob, db=_dbs()["meta"])
+            if EPOCHW_ROOT_WINDOWED:
+                # ACCUMULATOR (protocol.EPOCHW_ROOT_WINDOWED): chain this epoch's weight blob onto the previous
+                # accumulator so the newest acc row — always inside the root window — commits every epochw row
+                # ever written. Pure function of committed rows (prev acc, or empty for the first epoch).
+                prev = txn.get(kprev, db=_dbs()["meta"]) or b""
+                txn.put(ka, hashlib.blake2b(bytes(prev) + blob, digest_size=32).digest(), db=_dbs()["meta"])
+    _write(_do)
+
+
+def regsnap_put(epoch: int, registry: dict):
+    """Freeze the bonded registry an epoch's producer draw and duty committee read (epoch >= 2,
+    protocol.py "RANDAO DUTY CONSISTENCY"):
+    meta regsnap:<epoch>, canonical JSON (sort_keys, no spaces), written by the epoch's anchor block
+    (epoch - 1) * EPOCH_LENGTH. INVARIANT: the stored bytes are independent of dict order, so the root is too."""
+    blob = json.dumps({str(a): dict(i) for a, i in (registry or {}).items()},
+                      sort_keys=True, separators=(",", ":")).encode()
+    _write(lambda txn: txn.put(f"regsnap:{int(epoch)}".encode(), blob, db=_dbs()["meta"]))
+
+
+def regsnap_del(epoch: int):
+    """Exact inverse of regsnap_put: rolling back the anchor block DELETES the row (canonical-absent, as epochw)."""
+    _write(lambda txn: txn.delete(f"regsnap:{int(epoch)}".encode(), db=_dbs()["meta"]))
+
+
+def regsnap_get(epoch: int):
+    """The frozen bonded registry for `epoch` as {address: info}, or None when no row is committed."""
+    def _do(txn):
+        raw = txn.get(f"regsnap:{int(epoch)}".encode(), db=_dbs()["meta"])
+        return None if raw is None else json.loads(bytes(raw))
+    return _read(_do)
+
+
+def epoch_weights_acc(epoch: int):
+    """The 32-byte epochw accumulator committed for `epoch` (gen 24+), or None."""
+    return _read(lambda txn: txn.get(f"epochwacc:{int(epoch)}".encode(), db=_dbs()["meta"]))
+
+
+def epoch_weights_get(epoch: int):
+    """The COMMITTED weights for `epoch` as {address: shares}, or None if no row (pre-activation
+    epoch, or the boundary block hasn't landed yet)."""
+    def _do(txn):
+        raw = txn.get(f"epochw:{int(epoch)}".encode(), db=_dbs()["meta"])
+        return None if raw is None else {a: int(w) for a, w in json.loads(raw).items()}
+    return _read(_do)
 
 
 # --- slashing replay guard (#15/#16 step 5C/6): one slash per (offender, height) ------------------
@@ -654,11 +1019,50 @@ def _exec_summary_key(height: int) -> str:
     return f"execsum:{int(height)}"
 
 
-def exec_summary_put(height: int, inert: bool, calls_by_ns: dict):
+def exec_summary_put(height: int, inert: bool, calls_by_ns: dict, records=None, derivable=None,
+                     div_carry=None):
     """Persist block `height`'s exec summary. Called inside incorporate_block's atomic write txn, so it
-    commits with the block or not at all. `calls_by_ns` maps namespace -> ordered list of call leaves."""
+    commits with the block or not at all. `calls_by_ns` maps namespace -> ordered list of call leaves.
+
+    `records` / `derivable` (records_bind.block_records_effects) carry the block's RECORDS-half effects, so
+    the settle branch can bind a records transition without reading a prunable body — the reason
+    records_bind was unreachable before. They are written ONLY when SETTLE_PROOF_RECORDS is on, because
+    these summaries live in the `meta` sub-DB which FEEDS THE L1 STATE ROOT: writing the field on a live
+    chain would change the root on upgraded nodes only and fork the fleet. The flag flips at a reroll, where
+    every node re-derives from a fresh genesis and therefore agrees.
+
+    `derivable=False` is recorded EXPLICITLY rather than omitted. A missing key is ambiguous between "this
+    block moves nothing we cannot derive" and "written by a node that had the feature off", and the settle
+    branch must be able to tell those apart — the first is settleable, the second must refuse.
+    """
     doc = {"inert": 1 if inert else 0,
            "calls": {str(ns): [int(x) for x in leaves] for ns, leaves in (calls_by_ns or {}).items() if leaves}}
+    from protocol import SETTLE_PROOF_RECORDS
+    if SETTLE_PROOF_RECORDS and derivable is not None:
+        doc["rd"] = 1 if derivable else 0
+        if derivable:
+            # [tag, [parts…], delta] — a list, not a dict, because ORDER is part of the derivation and the
+            # codec must not be free to reorder it.
+            doc["rec"] = [[int(tag), [str(p) for p in parts], int(delta)]
+                          for (tag, parts, delta) in (records or ())]
+        # PRESENCE-DIVIDEND CARRY. Written only on an epoch-boundary block, where it is that epoch's
+        # leftover sub-unit remainder — the ONE input to the accrual that is not already on L1. The next
+        # boundary reads it as its carry-in, so the chain lives entirely in these summaries and inherits
+        # their atomicity AND their rollback inverse (rollback_one_block restores the whole journaled doc: exec_summary_restore).
+        # Keeping it here rather than in a separate accumulator row is the point: a new meta row would have
+        # needed its own rollback, and a meta row whose rollback is not the exact inverse of its write is
+        # what corrupted the L1 state root at h4260.
+        if div_carry is not None:
+            doc["dc"] = int(div_carry)
+    def _do(txn):
+        txn.put(_exec_summary_key(height).encode(), _pack(doc), db=_dbs()["meta"])
+    _write(_do)
+
+
+def exec_summary_restore(height: int, doc: dict):
+    """Write back an exec summary EXACTLY as it was journaled (rollback of a retention prune): the whole document —
+    inert, calls and any records-half fields (rd/rec/dc) — byte for byte. INVARIANT: revert restores what apply
+    overwrote; it never re-derives it through exec_summary_put, which would drop the fields it is not given."""
     def _do(txn):
         txn.put(_exec_summary_key(height).encode(), _pack(doc), db=_dbs()["meta"])
     _write(_do)
@@ -672,6 +1076,52 @@ def exec_summary_get(height: int):
         raw = txn.get(_exec_summary_key(height).encode(), db=_dbs()["meta"])
         return _unpack(raw) if raw is not None else None
     return _read(_do)
+
+
+# THE MEMO OUTLIVES EVERY PURGE (2026-10-27 incident survey; cometbft/cometbft#6031 is the same class). The LMDB memo
+# lives in index/state, which purge_chain_data(dead_fork=True) deletes wholesale (ops/data_ops.py) — so a node that
+# purged and resynced inside the same epoch had lost the very interlock wipe_non_carried_dbs keeps on a re-anchor, and
+# could sign a second, different attestation for an epoch it had already attested on the fork: a valid equivocation
+# proof against itself. A sidecar under private/ (which no purge touches) mirrors every memo; reads take either.
+# Keyed by CHAIN_ID so a reroll's epoch numbers (restarting at 0) never read an old chain's memos — an attestation
+# pair across chain ids is no equivocation (the CHAIN_ID bind). tests/test_the_attest_memo_survives_a_dead_fork_purge.py.
+_attest_memo_lock = threading.Lock()
+
+
+def _attest_memo_path():
+    return os.path.join(get_home(), "private", "attest_memo.json")
+
+
+def _attest_memo_load():
+    from protocol import CHAIN_ID
+    try:
+        with open(_attest_memo_path()) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(d, dict) or d.get("chain_id") != CHAIN_ID or not isinstance(d.get("memos"), dict):
+        return {}
+    return {str(k): str(v) for k, v in d["memos"].items()}
+
+
+def _attest_memo_store(memos):
+    """Atomic and durable: write a temp file, fsync it, rename over, fsync the directory — a crash leaves the old
+    file or the new one, never a torn one, and the rename itself survives a power cut."""
+    from protocol import CHAIN_ID
+    path = _attest_memo_path()
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"chain_id": CHAIN_ID, "memos": dict(sorted(memos.items(), key=lambda kv: int(kv[0])))}, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    fd = os.open(d, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def attest_memo_get(epoch: int):
@@ -688,13 +1138,23 @@ def attest_memo_get(epoch: int):
     def _do(txn):
         raw = txn.get(f"{int(epoch)}".encode(), db=_dbs()["attest_memo"])
         return raw.decode() if raw is not None else None
-    return _read(_do)
+    got = _read(_do)
+    if got is None:                       # the LMDB copy is gone after a dead-fork purge; the sidecar is not
+        with _attest_memo_lock:
+            got = _attest_memo_load().get(str(int(epoch)))
+    return got
 
 
 def attest_memo_put(epoch: int, target_hash: str):
     """Record (epoch -> target_hash) BEFORE signing. Write-then-sign is the crash-safe order: a crash
     after the write costs at most a skipped attestation, whereas a crash after signing but before the
     write would let the node re-sign a DIFFERENT hash for the same epoch — the exact slashable event."""
+    # the SIDECAR FIRST: it is the copy a purge cannot take; then the LMDB copy as before
+    with _attest_memo_lock:
+        memos = _attest_memo_load()
+        memos[str(int(epoch))] = str(target_hash)
+        _attest_memo_store(memos)
+
     def _do(txn):
         txn.put(f"{int(epoch)}".encode(), str(target_hash).encode(), db=_dbs()["attest_memo"])
     _write(_do)
@@ -711,6 +1171,11 @@ def attest_memo_prune(below_epoch: int):
                 except Exception:
                     continue
     _write(_do)
+    with _attest_memo_lock:
+        memos = _attest_memo_load()
+        kept = {k: v for k, v in memos.items() if int(k) >= int(below_epoch)}
+        if kept != memos:
+            _attest_memo_store(kept)
 
 
 def execsum_revert_put(block_height: int, pruned_height: int, doc):
@@ -743,7 +1208,7 @@ def execsum_revert_pop(block_height: int):
 
 
 def execsum_revert_prune(below_height: int):
-    """Drop journal entries below the finality floor — rollback can never reach them."""
+    """Drop journal entries below HARD finality — rollback can never reach them (it crosses the depth floor)."""
     def _do(txn):
         with txn.cursor(db=_dbs()["execsum_revert"]) as cur:
             for k, _v in list(cur):
@@ -844,6 +1309,24 @@ def settlement_validators_since(ns: str, floor_cursor: int) -> set:
     return _read(_do)
 
 
+def settlement_last_cursors(ns: str, floor_cursor: int) -> dict:
+    """{validator: its HIGHEST attested cursor} over attestations for `ns` at cursors >= floor_cursor — the input to the
+    stake-weighted settlement anchor (settlement_ops.active_settler_shares). Range scan from the floor key, ascending,
+    so the last write per validator is its maximum. O(attestations inside the window)."""
+    prefix = ns.encode() + b"\x00"
+    start = prefix + be8(max(0, int(floor_cursor)))
+    def _do(txn):
+        out = {}
+        with txn.cursor(db=_dbs()["settlements"]) as cur:
+            if cur.set_range(start):
+                for k, v in cur.iternext(keys=True, values=True):
+                    if not k.startswith(prefix) or len(k) != len(prefix) + 8:
+                        break
+                    out[v.decode().split("|", 1)[0]] = int.from_bytes(k[len(prefix):], "big")
+        return out
+    return _read(_do)
+
+
 def settlement_cursors(ns: str):
     """All exec_cursors in namespace `ns` that have at least one settlement attestation, ascending.
 
@@ -900,6 +1383,18 @@ def recert_addresses_after(floor_epoch: int):
                 for _, v in cur.iternext(keys=True, values=True):
                     addrs.add(v.decode())
         return addrs
+    return _read(_do)
+
+
+def recert_addresses_in_epoch(epoch: int) -> list:
+    """Addresses with a recert recorded in exactly `epoch` (the DUPSORT values under that key), ascending."""
+    def _do(txn):
+        out = []
+        with txn.cursor(db=_dbs()["recert_by_epoch"]) as cur:
+            if cur.set_key(be8(int(epoch))):
+                for v in cur.iternext_dup(keys=False, values=True):
+                    out.append(bytes(v).decode())
+        return out
     return _read(_do)
 
 
@@ -1057,7 +1552,7 @@ def dividend_inflow_add(epoch: int, amount: int, revert: bool = False):
     though meta_get_int reads both as 0. Forward only ever ADDS positive inflow (credit_block_reward calls
     this under `if dividend:`), so a key is present iff its running total is > 0. Reverting the FIRST inflow
     of an epoch back to 0 must therefore DELETE the key, not store a 0 — otherwise rollback leaves a phantom
-    `divinflow:<e>=0` row that forks the root vs a forward-only node (an alphanet-8 rollback-asymmetry wedge
+    `divinflow:<e>=0` row that forks the root vs a forward-only node (an betanet-8 rollback-asymmetry wedge
     cause; see snapshot_ops.ROOT_EXCLUDED_META_PREFIXES for its sibling)."""
     k = f"divinflow:{int(epoch)}"
     new = meta_get_int(k, 0) + (-int(amount) if revert else int(amount))
@@ -1377,6 +1872,11 @@ def bond_since_revert_pop(txid: str):
 # refunded), which is revert-symmetric: the doc is self-describing so rollback restores the prior status.
 def htlc_get(htlc_id: str):
     """The HTLC doc for `htlc_id` (the lock tx's txid), or None if no such lock."""
+    # INVARIANT: an id is client-supplied (htlc_claim / htlc_refund data), and the invite rows share this DB under
+    # "invite:<id>" — never answer one as a swap, or an htlc_claim naming it would read an invite record as an HTLC.
+    # (Invite rows exist from block 1, protocol.py "FUNDED INVITE LINKS".)
+    if str(htlc_id).encode().startswith(_INVITE_PREFIX):
+        return None
     def _do(txn):
         raw = txn.get(htlc_id.encode(), db=_dbs()["htlcs"])
         return _unpack(raw) if raw is not None else None
@@ -1405,7 +1905,53 @@ def htlc_all():
         out = {}
         with txn.cursor(db=_dbs()["htlcs"]) as cur:
             for k, v in cur:
+                if k.startswith(_INVITE_PREFIX):
+                    continue          # an invite (below) shares this DB; it is not a swap and has no swap fields
                 out[k.decode()] = _unpack(v)
+        return out
+    return _read(_do)
+
+
+# --- INVITES (protocol.py "FUNDED INVITE LINKS"; doc/referrals.md): "invite:<id>" in the htlcs DB -> msgpack LIST
+# [sender, amount, expiry, status, claimant]. A list, never a dict: two nodes building the record in a different key
+# order would commit two byte strings for one state. Mutated in place by claim/refund (status "open" -> "claimed" /
+# "refunded", claimant "" -> address) and restored exactly on revert, like an HTLC doc. Same DB as the HTLCs so no new
+# sub-DB enters the state root; htlc_all skips the prefix.
+_INVITE_PREFIX = b"invite:"
+
+
+def invite_get(invite_id: str):
+    """[sender, amount, expiry, status, claimant] for invite `invite_id`, or None."""
+    def _do(txn):
+        raw = txn.get(_INVITE_PREFIX + str(invite_id).encode(), db=_dbs()["htlcs"])
+        return None if raw is None else list(_unpack(raw))
+    return _read(_do)
+
+
+def invite_put(invite_id: str, rec):
+    sender, amount, expiry, status, claimant = rec
+    def _do(txn):
+        txn.put(_INVITE_PREFIX + str(invite_id).encode(),
+                _pack([str(sender), int(amount), int(expiry), str(status), str(claimant)]), db=_dbs()["htlcs"])
+    _write(_do)
+
+
+def invite_del(invite_id: str):
+    def _do(txn):
+        txn.delete(_INVITE_PREFIX + str(invite_id).encode(), db=_dbs()["htlcs"])
+    _write(_do)
+
+
+def invite_all():
+    """{id: [sender, amount, expiry, status, claimant]} for every invite (read-only: /invites, the reroll refund)."""
+    def _do(txn):
+        out = {}
+        with txn.cursor(db=_dbs()["htlcs"]) as cur:
+            if cur.set_range(_INVITE_PREFIX):
+                for k, v in cur:
+                    if not k.startswith(_INVITE_PREFIX):
+                        break
+                    out[k[len(_INVITE_PREFIX):].decode()] = list(_unpack(v))
         return out
     return _read(_do)
 
@@ -1463,6 +2009,74 @@ def block_index_put(block_number: int, block_hash: str):
     _write(_do)
 
 
+def prune_index_window(upto_height: int, keep_num: int, keep_hash: int, max_rows: int = 4000):
+    """Drop number<->hash index rows below the retention window (doc/index-pruning.md). Returns
+    {"num": n, "hash": m} — how many rows each direction lost.
+
+    SAFE ONLY BECAUSE THE SNAPSHOT PAYLOAD IS BOUNDED BY THE SAME RULE. These sub-DBs are in SNAPSHOT_DBS
+    and every carried row feeds state_digest, so before the payload was windowed, a node that pruned them
+    locally would emit a different snapshot_hash for the same checkpoint and fail quorum — a consensus
+    split caused by a disk setting. With snapshot_ops._payload_triples filtering to [C-N, C] on both the
+    export and import sides, rows below the window are outside the snapshot identity, and dropping them
+    locally is unobservable.
+
+    TWO WATERMARKS, because the two directions have DIFFERENT depths (protocol.INDEX_RETENTION_*): 50 000
+    heights of block_by_num for ~20 consensus lookbacks, 10 000 of block_by_hash for one tip-local dedupe
+    guard. A single watermark is wrong and quietly leaks: heights between lo_num and lo_hash have their
+    hash row dropped while the num row must stay, so a shared watermark advances past them and their num
+    row is never collected once the deeper window catches up.
+
+    Both passes iterate block_by_num, which maps height->hash directly, so a hash row is only deleted when
+    we can name it — the reverse index is keyed by hash, and finding a height in it means decoding every
+    value. Each pass is bounded (max_rows) so enabling this on a long chain never stalls the caller."""
+    lo_num = int(upto_height) - int(keep_num)
+    lo_hash = int(upto_height) - int(keep_hash)
+
+    def _do(txn):
+        dbs = _dbs()
+        out = {"num": 0, "hash": 0}
+
+        def _mark_get(key):
+            """Read a watermark INSIDE this txn. meta_get_int/meta_set_int open their own transactions,
+            and LMDB refuses a second write txn on the same thread — the sweep must stay in one."""
+            raw = txn.get(key.encode(), db=dbs["meta"])
+            return int(_unpack(raw)) if raw is not None else 0
+
+        def _mark_set(key, value):
+            txn.put(key.encode(), _pack(int(value)), db=dbs["meta"])
+
+        def _sweep(mark_key, limit, drop):
+            """Walk block_by_num from the watermark up to `limit`, applying `drop(txn, key, hash)`."""
+            if limit <= 0:
+                return 0
+            start = _mark_get(mark_key)
+            if start >= limit:
+                return 0
+            n = last = 0
+            with txn.cursor(db=dbs["block_by_num"]) as cur:
+                if not cur.set_range(be8(max(0, start))):
+                    return 0
+                for k, v in cur.iternext(keys=True, values=True):
+                    h = int.from_bytes(k, "big")
+                    if h >= limit or n >= max_rows:
+                        break
+                    if drop(txn, k, v):
+                        n += 1
+                    last = h
+            # advance only over heights actually visited, so nothing is skipped unswept
+            _mark_set(mark_key, min(last + 1, limit))
+            return n
+
+        # HASH first: its window is shallower, and while the num row still exists we can name the hash.
+        out["hash"] = _sweep("index_pruned_below_hash", lo_hash,
+                             lambda t, k, v: t.delete(bytes(v), db=dbs["block_by_hash"]))
+        # NUM second, deeper. Its rows are what the hash sweep reads, so it must never run ahead of it.
+        out["num"] = _sweep("index_pruned_below_num", lo_num,
+                            lambda t, k, v: t.delete(k, db=dbs["block_by_num"]))
+        return out
+    return _write(_do)
+
+
 def block_index_del(block_number: int, block_hash: str):
     """Delete both directions of the mapping (rollback unindex)."""
     def _do(txn):
@@ -1478,6 +2092,15 @@ def hash_by_number(block_number: int):
         return v.decode() if v is not None else None
     return _read(_do)
 
+
+
+def number_by_hash(block_hash: str):
+    """Height of an INDEXED (canonical-or-orphan) block hash from block_by_hash, or None. Two-KV-read
+    predicates (majority_on_our_canonical) need only the height; loading the full body for it cost the
+    health report and the corroboration probe a zstd+JSON decode of every majority tip (8 % of relay GIL,
+    2026-09-06) — and a settle block's body is 10 MiB."""
+    raw = _read(lambda txn: txn.get(block_hash.encode(), db=_dbs()["block_by_hash"]))
+    return int.from_bytes(raw, "big") if raw else None
 
 
 def block_hash_indexed(block_hash: str) -> bool:
@@ -1582,6 +2205,76 @@ def tx_index_put(txid: str, block_number: int, sender: str, recipient: str):
     _write(_do)
 
 
+def tx_index_put_many(rows):
+    """Index many txs in ONE write txn: rows = iterable of (txid, block_number, sender, recipient), same
+    semantics per row as tx_index_put. THE STARVED CORE LOOP (185.100.232.5, 2026-09-13): the reindex walk
+    called tx_index_put per row, i.e. one durable (sync=True) commit per transaction, tens of thousands
+    back to back with no gap. LMDB has a single writer lock and it is not fair; the core loop needs it
+    every pass and waited behind the walk for 15+ minutes — reported_uptime frozen at 6 s, every block
+    deferred. A background rebuild commits in batches and YIELDS between them (core_loop._start_tx_reindex)."""
+    def _do(txn):
+        dbs = _dbs()
+        tdb, sdb, rdb = dbs["tx"], dbs["tx_by_sender"], dbs["tx_by_recipient"]
+        for txid, block_number, sender, recipient in rows:
+            key = txid.encode()
+            if txn.get(key, db=tdb) is None:
+                txn.put(key, _pack({"block_number": block_number, "sender": sender,
+                                    "recipient": recipient}), db=tdb)
+            dv = _dup_tx_value(block_number, txid)
+            txn.put(sender.encode(), dv, db=sdb, dupdata=True)
+            txn.put(recipient.encode(), dv, db=rdb, dupdata=True)
+    _write(_do)
+
+
+def prune_tx_history(cutoff_height: int, max_rows: int = 20000):
+    """ROLLING MODE, tx half: drop tx-history rows for blocks strictly below `cutoff_height`.
+    Returns the number of primary rows deleted. NODE-LOCAL and non-consensus by construction.
+
+    WHY THIS IS SAFE. The three history sub-DBs are already excluded from the state root AND from
+    snapshots (_HISTORY_DBS), so deleting rows cannot move the root or change what a peer downloads —
+    every snapshot-synced node ALREADY runs with no pre-checkpoint tx history and validates fine.
+
+    THE ONE CONSENSUS-RELEVANT READER is the at-most-once replay guard (`tx_get` in
+    block_ops.match_transactions_target and core_loop's verify path), and it has a natural horizon: a tx
+    is admitted only while `max_block <= tip + TX_LANDING_WINDOW` and can be included only at
+    `block_number <= max_block`, so a tx mined at H is unreplayable past H + TX_LANDING_WINDOW. Keeping
+    anything beyond that window is dead weight for consensus. The caller enforces the floor
+    (block_ops.prune_tx_history_window); this function is the mechanism.
+
+    Rollback safety: a revert can never cross `finalized_height`, and the floor keeps the retained window
+    far above FINALITY_DEPTH, so tx_index_del is never asked to remove a row that was already pruned.
+
+    Bounded per call (`max_rows`) so a node with years of history catches up over several passes instead
+    of blocking the core loop on one enormous transaction."""
+    def _do(txn):
+        tdb, sdb, rdb = _dbs()["tx"], _dbs()["tx_by_sender"], _dbs()["tx_by_recipient"]
+        cur = txn.cursor(tdb)
+        doomed = []
+        for key, raw in cur:                      # the primary is keyed by txid, so this is a scan
+            try:
+                rec = _unpack(raw)
+            except Exception:
+                continue                          # unreadable row: leave it rather than guess
+            if int(rec.get("block_number", 0)) < cutoff_height:
+                doomed.append((key, rec))
+                if len(doomed) >= max_rows:
+                    break
+        for key, rec in doomed:
+            txn.delete(key, db=tdb)
+            dv = _dup_tx_value(int(rec["block_number"]), key.decode())
+            # delete the exact dup written on apply; a missing dup is not an error (an older build may
+            # have indexed only the primary), so failures here must not abort the whole prune.
+            for db, addr in ((sdb, rec.get("sender")), (rdb, rec.get("recipient"))):
+                if not addr:
+                    continue
+                try:
+                    txn.delete(addr.encode(), dv, db=db)
+                except Exception:
+                    pass
+        return len(doomed)
+    return _write(_do)
+
+
 def tx_index_del(txid: str, block_number: int, sender: str, recipient: str):
     """Revert tx_index_put EXACTLY: delete the primary and the precise dups written on apply
     (the block||txid encoding makes each dup key unambiguous)."""
@@ -1633,29 +2326,494 @@ def tx_of_account(address: str, min_block: int, limit: int):
     return _read(_do)
 
 
-def hb_revert_put(epoch: int, address: str, prev_epoch: int, net_delta: int):
+def hb_revert_put(epoch: int, address: str, prev_epoch: int, net_delta: int, fields=None):
     """FIDELITY DECAY (revert record): store the EXACT inverse of a heartbeat's fidelity update — the
     account's PREVIOUS last-seen epoch and the NET fidelity delta applied — keyed (epoch,address), plain
     KV. Rollback reads this to restore fidelity + last_hb_epoch byte-identically. Written inside the
-    incorporate write txn (atomic with the heartbeat itself)."""
+    incorporate write txn (atomic with the heartbeat itself).
+    `fields` (LEASE_V2_EPOCH): [prev_devkey, prev_devcred] — the account fields a statement register overwrote
+    (None = the field did not exist). A two-element record is the legacy shape and restores nothing."""
     def _do(txn):
-        txn.put(be8(epoch) + address.encode(),
-                _pack([int(prev_epoch), int(net_delta)]), db=_dbs()["hb_revert"])
+        rec = [int(prev_epoch), int(net_delta)]
+        if fields is not None:
+            rec.append([(None if v is None else str(v)) for v in fields])
+        txn.put(be8(epoch) + address.encode(), _pack(rec), db=_dbs()["hb_revert"])
     _write(_do)
 
 
 def hb_revert_pop(epoch: int, address: str):
-    """Read + DELETE the revert record for (epoch,address); returns (prev_epoch, net_delta) or None
-    (None => nothing to invert, e.g. a heartbeat from before this feature). Runs in the active txn."""
+    """Read + DELETE the revert record for (epoch,address); returns (prev_epoch, net_delta, fields) or None
+    (None => nothing to invert, e.g. a heartbeat from before this feature). `fields` is None for a legacy record,
+    else [prev_devkey, prev_devcred] to restore exactly. Runs in the active txn."""
     def _do(txn):
         key = be8(epoch) + address.encode()
         raw = txn.get(key, db=_dbs()["hb_revert"])
         if raw is None:
             return None
         txn.delete(key, db=_dbs()["hb_revert"])
-        prev, net = _unpack(raw)
-        return int(prev), int(net)
+        rec = _unpack(raw)
+        prev, net = rec[0], rec[1]
+        fields = [(None if v is None else str(v)) for v in rec[2]] if len(rec) > 2 and rec[2] is not None else None
+        return int(prev), int(net), fields
     return _write(_do)
+
+
+# --- LEASE GRANTS (gen 25's LEASE_V2_EPOCH) --------------------------------------------------------------------
+# "lease:<address>:<epoch>" -> msgpack([lease_epochs]) in the devbind sub-DB — the same trick the eviction and
+# enrolment rows use: consensus state, in the root, snapshot-carried, NO new sub-DB (a pre-gate root is untouched and a
+# node syncing across the gate needs no schema change). A recert's grant is what presence at any epoch is measured
+# against; a recert with no row (written before the gate) reads as POSW_LEASE_EPOCHS, the rule it was made under.
+# devbind_rows() cannot decode these (one-element record) and skips them, so /device_stats never sees a lease as a device.
+def _lease_key(address: str, epoch: int) -> bytes:
+    return f"lease:{address}:{int(epoch)}".encode()
+
+
+def lease_grant_put(address: str, epoch: int, lease_epochs: int):
+    def _do(txn):
+        txn.put(_lease_key(address, epoch), _pack([int(lease_epochs)]), db=_dbs()["devbind"])
+    _write(_do)
+
+
+def lease_grant_del(address: str, epoch: int):
+    def _do(txn):
+        txn.delete(_lease_key(address, epoch), db=_dbs()["devbind"])
+    _write(_do)
+
+
+def lease_grant_get(address: str, epoch: int):
+    """The lease granted by the recert at (address, epoch), or None when that recert predates the gate."""
+    def _do(txn):
+        raw = txn.get(_lease_key(address, epoch), db=_dbs()["devbind"])
+        return None if raw is None else int(_unpack(raw)[0])
+    return _read(_do)
+
+
+def lease_of(address: str, recert_epoch: int) -> int:
+    """How long the recert at `recert_epoch` keeps `address` present — ONE reader for the live registry, the
+    fraud-proof reconstruction and the continuity rule of the fidelity ramp. Pre-gate recerts: POSW_LEASE_EPOCHS."""
+    from protocol import POSW_LEASE_EPOCHS
+    if recert_epoch is None or int(recert_epoch) < 0:
+        return POSW_LEASE_EPOCHS
+    g = lease_grant_get(address, int(recert_epoch))
+    return POSW_LEASE_EPOCHS if g is None else g
+
+
+# --- ONE DEVICE, ONE IDENTITY (gen 25's DEVICE_BIND_HEIGHT; ops/device_attest.device_binding_key) ---------------
+# devbind: <device key str> -> msgpack([address, epoch]) (leased) or msgpack([address, epoch, "perm"]) (permanent, from
+# DEVICE_BIND_PERMANENT_HEIGHT) — which identity a device certificate vouches for and the epoch of the LAST STATEMENT that
+# bound it (a leased binding is live for POSW_LEASE_EPOCHS from that epoch; a permanent one for life, movable after it).
+# Consensus state. devbind_revert: epoch|address -> msgpack([key, prev_address|None, prev_epoch[, prev_mode, prev_devkey]])
+# — the EXACT inverse for rollback.
+
+def devbind_get(key: str):
+    """(address, epoch, mode) bound to a device key, or None. mode is "lease" or "perm" (doc/device-attestation.md
+    §"Binding modes"); rows written before DEVICE_BIND_PERMANENT_HEIGHT are two elements and decode as "lease"."""
+    def _do(txn):
+        raw = txn.get(key.encode(), db=_dbs()["devbind"])
+        if raw is None:
+            return None
+        rec = _unpack(raw)
+        mode = str(rec[2]) if len(rec) > 2 else "lease"
+        return str(rec[0]), int(rec[1]), mode
+    return _read(_do)
+
+
+def devbind_rows():
+    """Every device binding: [(device_key, address, epoch, mode), ...]. One cursor walk of the devbind sub-DB.
+
+    The reverse index (account -> devkey) is stamped only for permanent classes, so the only place the
+    fleet's DEVICE POPULATION can be read is this table, keyed by the device handle consensus binds on
+    ("ek:<identity>", "android-key:<cert>", "ledger:<serial>", ...). Read-only; feeds /device_stats."""
+    def _do(txn):
+        out = []
+        with txn.cursor(db=_dbs()["devbind"]) as cur:
+            for k, raw in cur.iternext(keys=True, values=True):
+                # NOT A DEVICE: "tpmek:<identity>" is the open-enrolment marker (tpm_enrol_open_set), a packed STRING,
+                # which indexes character by character — rec[0] = "3", rec[1] = "6" — and so passed as a binding of
+                # address "3". The gen-27 carry seeded 7 such rows into genesis (2026-09-25) and the gen-28 rehearsal
+                # refused on them ("a device binding names 3"). A device row is always a list [address, epoch(, mode)].
+                # The eviction and lease-grant rows share the table too and used to be skipped only because their
+                # records happen not to decode as one; name them, so a record-shape change cannot turn them into devices.
+                # The enrolment records share a PREFIX with a real device class ("tpm:<enrol id>" vs the binding
+                # "tpm:<ek>"), so they are told apart by shape: a binding has 2 or 3 fields, an enrolment 13 (16 for v2)
+                # (_TPM_ENROL_FIELDS) — it used to be skipped only because its hex ek failed int().
+                # A REFERRAL LINK ("referral:<newcomer>" -> [referrer, height]) is two fields and WOULD decode as a binding
+                # of the referrer: skipped by name, so a referral can never be carried or counted as a device.
+                if k.startswith((b"tpmek:", b"evict:", b"lease:", b"tpmretry:", _REFERRAL_PREFIX)):
+                    continue
+                try:
+                    rec = _unpack(raw)
+                    if not isinstance(rec, (list, tuple)) or not 2 <= len(rec) <= 3:
+                        continue
+                    out.append((k.decode(), str(rec[0]), int(rec[1]), str(rec[2]) if len(rec) > 2 else "lease"))
+                except Exception:
+                    continue                                   # a row we cannot decode is not a device
+        return out
+    return _read(_do)
+
+
+def devbind_set(key: str, address: str, epoch: int, mode: str = "lease"):
+    """mode "lease" writes the historical two-element row (byte-identical to pre-gate rows — replay of old blocks and
+    the state root depend on it); "perm" writes the three-element row."""
+    def _do(txn):
+        rec = [str(address), int(epoch)] + ([str(mode)] if mode != "lease" else [])
+        txn.put(key.encode(), _pack(rec), db=_dbs()["devbind"])
+    _write(_do)
+
+
+def devbind_del(key: str):
+    def _do(txn):
+        txn.delete(key.encode(), db=_dbs()["devbind"])
+    _write(_do)
+
+
+# --- REFERRAL LINKS (protocol.py "REFERRALS"): "referral:<newcomer>" in the devbind DB -> msgpack [referrer, height].
+# Written once, by the newcomer's FIRST attested registration (account_ops), never changed; deleted only by the
+# rollback of that same block (the stored height names it). Consensus state like every devbind row. devbind_rows skips
+# the prefix — a two-field record would otherwise read as a device binding of the referrer.
+_REFERRAL_PREFIX = b"referral:"
+
+
+def referral_get(newcomer: str):
+    """(referrer, height) the newcomer named at its first registration, or None."""
+    def _do(txn):
+        raw = txn.get(_REFERRAL_PREFIX + str(newcomer).encode(), db=_dbs()["devbind"])
+        if raw is None:
+            return None
+        rec = _unpack(raw)
+        return str(rec[0]), int(rec[1])
+    return _read(_do)
+
+
+def referral_set(newcomer: str, referrer: str, height: int):
+    def _do(txn):
+        txn.put(_REFERRAL_PREFIX + str(newcomer).encode(), _pack([str(referrer), int(height)]), db=_dbs()["devbind"])
+    _write(_do)
+
+
+def referral_del(newcomer: str):
+    def _do(txn):
+        txn.delete(_REFERRAL_PREFIX + str(newcomer).encode(), db=_dbs()["devbind"])
+    _write(_do)
+
+
+def referrals_by(referrer: str) -> list:
+    """[(newcomer, height)] that named `referrer`, sorted — a cursor walk of the link rows (read-only: /referrals)."""
+    def _do(txn):
+        out = []
+        with txn.cursor(db=_dbs()["devbind"]) as cur:
+            if cur.set_range(_REFERRAL_PREFIX):
+                for k, v in cur:
+                    if not k.startswith(_REFERRAL_PREFIX):
+                        break
+                    rec = _unpack(v)
+                    if str(rec[0]) == referrer:
+                        out.append((k[len(_REFERRAL_PREFIX):].decode(), int(rec[1])))
+        return sorted(out)
+    return _read(_do)
+
+
+# EVICTION ROWS (DEVICE_REBIND_INSTANT_HEIGHT) live in the devbind DB under "evict:<address>" — a msgpack list of
+# [evict_epoch, voided_recert_epoch] pairs, ascending. Consensus state (in the root, snapshot-carried) like every other
+# devbind row; no new DB, so the root of every pre-gate state is untouched. present(addr, E) requires a recert NEWER
+# than max(voided_recert_epoch over evictions with evict_epoch <= E): the identity a device left is out of the open
+# registry and out of the epoch weights from the block of the move, and back the moment it registers again.
+
+def devevict_get(address: str) -> list:
+    def _do(txn):
+        raw = txn.get(("evict:" + address).encode(), db=_dbs()["devbind"])
+        return [(int(a), int(b)) for a, b in _unpack(raw)] if raw is not None else []
+    return _read(_do)
+
+
+def devevict_set(address: str, pairs):
+    def _do(txn):
+        k = ("evict:" + address).encode()
+        if pairs:
+            txn.put(k, _pack([[int(a), int(b)] for a, b in pairs]), db=_dbs()["devbind"])
+        else:
+            txn.delete(k, db=_dbs()["devbind"])
+    _write(_do)
+
+
+def devevict_voided(address: str, upto_epoch: int) -> int:
+    """The newest recert epoch voided by an eviction at or before `upto_epoch` (-1 if never evicted) — the presence
+    floor: only a recert strictly newer than this counts. Deterministic for any past epoch."""
+    v = -1
+    for ev, voided in devevict_get(address):
+        if ev <= upto_epoch and voided > v:
+            v = voided
+    return v
+
+
+def devbind_revert_put(epoch: int, address: str, key: str, prev, prev_devkey=None, perm: bool = False, evicted=None, prev_evict=None):
+    """Journal what a register's binding OVERWROTE: prev = (address, epoch[, mode]) or None, plus the sender's previous
+    `devkey` account field (permanent bindings only). Always written on apply so pop can distinguish 'no prior binding'
+    (delete on revert) from 'no record' (pre-gate register). A leased binding writes the historical three-element record
+    (node-local, but keep the old shape anyway); a permanent one the five-element record."""
+    def _do(txn):
+        pa, pe = (prev[0], int(prev[1])) if prev else (None, -1)
+        pm = (prev[2] if prev and len(prev) > 2 else "lease")
+        if evicted is not None:
+            # instant-move record (8 fields): explicit perm flag + the evicted address and its previous eviction list
+            rec = [str(key), pa, pe, str(pm), prev_devkey, bool(perm), str(evicted), [[int(a), int(b)] for a, b in (prev_evict or [])]]
+        else:
+            rec = [str(key), pa, pe] + ([str(pm), prev_devkey] if perm else [])
+        txn.put(be8(int(epoch)) + address.encode(), _pack(rec), db=_dbs()["devbind_revert"])
+    _write(_do)
+
+
+def devbind_revert_pop(epoch: int, address: str):
+    """Read + DELETE the binding journal for (epoch, address): (key, prev_address|None, prev_epoch, prev_mode,
+    prev_devkey|None, perm, evicted_address|None, prev_eviction_list|None) or None. Legacy records fill the tail."""
+    def _do(txn):
+        k = be8(int(epoch)) + address.encode()
+        raw = txn.get(k, db=_dbs()["devbind_revert"])
+        if raw is None:
+            return None
+        txn.delete(k, db=_dbs()["devbind_revert"])
+        rec = _unpack(raw)
+        key, pa, pe = rec[0], rec[1], rec[2]
+        if len(rec) >= 8:                      # instant-move record: explicit flags + eviction
+            pm, pdk, perm = str(rec[3]), (str(rec[4]) if rec[4] is not None else None), bool(rec[5])
+            evicted, prev_evict = str(rec[6]), [(int(a), int(b)) for a, b in (rec[7] or [])]
+        else:
+            perm = len(rec) > 3
+            pm = str(rec[3]) if perm else "lease"
+            pdk = (str(rec[4]) if perm and rec[4] is not None else None)
+            evicted, prev_evict = None, None
+        return str(key), (str(pa) if pa is not None else None), int(pe), pm, pdk, perm, evicted, prev_evict
+    return _write(_do)
+
+
+
+# --- VENDOR-ENDORSED TPM ENROLMENT (gen 25's DEVICE_ATTEST_EK_HEIGHT; ops/tpm_enrol) ------------------------
+# Rows live in the devbind DB under "tpm:<enrol id>", the same trick the eviction rows use: consensus state, in
+# the state root and carried by snapshots like every other devbind row, with NO NEW SUB-DB — so the root of
+# every state written before the gate fires is untouched, and a node that syncs across the gate needs no
+# schema migration.
+#
+# THE RECORD IS PACKED POSITIONALLY, NEVER AS A DICT. msgpack preserves insertion order, so two nodes that
+# happen to build the same record with their keys in a different order write different bytes for identical
+# state — a root split that would only surface once a real enrolment landed. The field order below IS the
+# wire format: append to it, never reorder it.
+_TPM_ENROL_FIELDS = ("state", "ek", "ekpub", "name", "pub", "owner", "h", "challengers", "blobs",
+                     "commit", "hc", "reveals", "hp")
+# A v2 RECORD (protocol.py "TPM CHALLENGER POOL v2", ops/tpm_enrol.is_v2) APPENDS three fields: the pool it is drawn from
+# ("pool": sorted [address, weight] pairs), its k, and the misses it carried from the expired record it superseded
+# ("missed": sorted [expiry, address] pairs). APPENDED, so every record written before the gate keeps its 13-field
+# bytes — and the state root of every block before it — exactly. INVARIANT: a row is 13 fields (legacy) or 16 (v2),
+# chosen by whether the record carries "k"; never write a legacy record in the long form or a v2 record in the short.
+_TPM_ENROL_FIELDS_V2 = _TPM_ENROL_FIELDS + ("pool", "k", "missed")
+
+
+def _tpm_enrol_row(rec: dict) -> list:
+    """The positional row for an enrolment record — the legacy 13 fields, or the v2 16 when it carries "k"."""
+    fields = _TPM_ENROL_FIELDS_V2 if "k" in rec else _TPM_ENROL_FIELDS
+    return [rec[k] for k in fields]
+
+
+def _tpm_enrol_from_row(row) -> dict:
+    fields = _TPM_ENROL_FIELDS_V2 if len(row) == len(_TPM_ENROL_FIELDS_V2) else _TPM_ENROL_FIELDS
+    return {k: row[i] for i, k in enumerate(fields)}
+
+
+def _tpm_enrol_key(enrol_id: str) -> bytes:
+    return ("tpm:" + str(enrol_id)).encode()
+
+
+def _is_enrol_record(rec) -> bool:
+    """Distinguish an enrolment row from a WebAuthn device binding that shares its prefix.
+
+    THE PREFIX COLLIDES AND CANNOT BE CHANGED. device_attest.device_binding_key returns
+    "tpm:" + sha256(AIK certificate) for the Windows Hello class, and those rows have lived in this DB
+    since long before enrolments existed. Enrolment rows were then added at "tpm:" + enrol id, so a scan
+    of the prefix returns both — and unpacking a 2-element binding into 13 fields raised IndexError
+    inside the challenger duty on every node, every block, silently, for as long as any enrolment
+    existed. The first real enrolment on this chain sat unanswered because of it.
+
+    Renaming the prefix would be the obvious fix and is the WRONG one: these rows are in the state root,
+    so a node replaying the chain would write them under a different key than the nodes that applied
+    those blocks live, and the two would disagree on the root. Telling them apart by SHAPE changes no
+    stored byte. A binding is 2 or 3 elements; an enrolment is exactly as many as _TPM_ENROL_FIELDS, or as
+    _TPM_ENROL_FIELDS_V2 for a v2 record (every record apply writes from gen 29's block 1)."""
+    return isinstance(rec, (list, tuple)) and len(rec) in (len(_TPM_ENROL_FIELDS), len(_TPM_ENROL_FIELDS_V2))
+
+
+def tpm_enrol_get(enrol_id: str):
+    """The enrolment record for `enrol_id`, or None. Shape: ops/tpm_enrol.new_record."""
+    def _do(txn):
+        raw = txn.get(_tpm_enrol_key(enrol_id), db=_dbs()["devbind"])
+        if raw is None:
+            return None
+        rec = _unpack(raw)
+        if not _is_enrol_record(rec):
+            return None                      # a device binding that happens to share the prefix
+        return _tpm_enrol_from_row(rec)
+    return _read(_do)
+
+
+def tpm_enrol_set(enrol_id: str, rec: dict):
+    def _do(txn):
+        txn.put(_tpm_enrol_key(enrol_id), _pack(_tpm_enrol_row(rec)), db=_dbs()["devbind"])
+    _write(_do)
+
+
+def tpm_enrol_del(enrol_id: str):
+    def _do(txn):
+        txn.delete(_tpm_enrol_key(enrol_id), db=_dbs()["devbind"])
+    _write(_do)
+
+
+def tpm_enrol_open_for_ek(ek_identity: str):
+    """The id of the enrolment currently OPEN for this chip, or None.
+
+    ONE AT A TIME, PER CHIP. This is what lets tpm_enrol into the empty-account bypass without opening a
+    spam hole: an endorsement certificate is public, so anyone can copy one, but they cannot use it to
+    open a second enrolment while the first is alive. An attacker's ceiling becomes the number of genuine
+    vendor-signed certificates they hold, once per expiry window, rather than unbounded.
+
+    A marker row rather than a scan: the scan is bounded and would silently stop bounding once there were
+    more live enrolments than its limit."""
+    def _do(txn):
+        raw = txn.get(("tpmek:" + str(ek_identity)).encode(), db=_dbs()["devbind"])
+        return _unpack(raw) if raw is not None else None
+    return _read(_do)
+
+
+def tpm_enrol_open_set(ek_identity: str, enrol_id):
+    # INVARIANT: every apply-side call is preceded by tpm_enrol_open_revert_put for the same (height, chip), and
+    # every revert-side call restores the JOURNALED value, never a re-derived one. This row is in devbind, so in the
+    # L1 root; the revert used to delete it outright, which is only the prior value for a chip's FIRST enrolment
+    # (audit 2026-09-25, HIGH: a rolled-back second enrolment left the chip with no marker — a state-root split).
+    def _do(txn):
+        k = ("tpmek:" + str(ek_identity)).encode()
+        if enrol_id:
+            txn.put(k, _pack(str(enrol_id)), db=_dbs()["devbind"])
+        else:
+            txn.delete(k, db=_dbs()["devbind"])
+    _write(_do)
+
+
+def _tpm_enrol_open_revert_key(height: int, ek_identity: str) -> bytes:
+    return be8(int(height)) + ("tpmek:" + str(ek_identity)).encode()
+
+
+def tpm_enrol_open_revert_put(height: int, ek_identity: str, prev_enrol_id):
+    """Journal the chip's open-enrolment marker as it stood BEFORE a tpm_enrol overwrote it: the enrolment id it
+    named, or None when there was no marker. Always written, so pop can tell "there was no marker" (delete on
+    revert) from "no journal" (a block applied before this journal existed).
+
+    THE REVERT USED TO DELETE THE MARKER instead of restoring it (audit 2026-09-25, HIGH). That is the prior value
+    only for a chip's first enrolment: once an earlier attempt had expired, a rolled-back second enrolment left the
+    chip with NO marker where every node that never applied the block still named the first — and a re-open of an
+    expired record under the same id left the marker on that id instead of the one it replaced. The marker is in
+    devbind, so in the L1 root: either one is a state-root split from an ordinary one-block reorg.
+
+    Node-local (devbind_revert is in _LOCAL_DBS): rollback bookkeeping, never in the root or a snapshot, so adding
+    it changes no forward state. FIRST WRITE WINS within a block, exactly like tpm_enrol_revert_put — two
+    enrolments of one chip can land in one block (each validates against the parent), and the journal must hold
+    the marker as it stood before the BLOCK, not the one the first enrolment of the block wrote."""
+    def _do(txn):
+        k = _tpm_enrol_open_revert_key(height, ek_identity)
+        if txn.get(k, db=_dbs()["devbind_revert"]) is not None:
+            return
+        txn.put(k, _pack(str(prev_enrol_id) if prev_enrol_id else None), db=_dbs()["devbind_revert"])
+    _write(_do)
+
+
+def tpm_enrol_open_revert_pop(height: int, ek_identity: str):
+    """Read + DELETE the marker journal for (height, chip): (found, previous enrolment id or None)."""
+    def _do(txn):
+        k = _tpm_enrol_open_revert_key(height, ek_identity)
+        raw = txn.get(k, db=_dbs()["devbind_revert"])
+        if raw is None:
+            return False, None
+        txn.delete(k, db=_dbs()["devbind_revert"])
+        return True, _unpack(raw)
+    return _write(_do)
+
+
+def tpm_enrol_revert_put(height: int, enrol_id: str, prev):
+    """Journal what an enrolment message OVERWROTE: the whole previous record, or None when the message
+    CREATED the row. Always written on apply, so pop can tell "there was no row" (delete on revert) from
+    "no journal" (a block from before the gate) — the distinction devbind_revert_put learned the hard way."""
+    # FIRST WRITE WINS within a block: the journal holds the record as it stood BEFORE the block. Two challengers
+    # answering in the same block is the ordinary case; the second put used to overwrite the first, so a rollback
+    # restored the mid-block record, left the first blob behind, and re-applying the block then raised "this
+    # challenger already challenged this enrolment" — the node could not re-take its own block (review 2026-09-25).
+    def _do(txn):
+        k = be8(int(height)) + _tpm_enrol_key(enrol_id)
+        if txn.get(k, db=_dbs()["devbind_revert"]) is not None:
+            return
+        rec = _tpm_enrol_row(prev) if prev else None   # the v2 fields too: a revert restores the record exactly
+        txn.put(k, _pack(rec), db=_dbs()["devbind_revert"])
+    _write(_do)
+
+
+def tpm_enrol_revert_pop(height: int, enrol_id: str):
+    """Read + DELETE the journal for (height, enrol_id): (found, previous record or None)."""
+    def _do(txn):
+        k = be8(int(height)) + _tpm_enrol_key(enrol_id)
+        raw = txn.get(k, db=_dbs()["devbind_revert"])
+        if raw is None:
+            return False, None
+        txn.delete(k, db=_dbs()["devbind_revert"])
+        rec = _unpack(raw)
+        return True, (_tpm_enrol_from_row(rec) if rec is not None else None)
+    return _write(_do)
+
+
+def tpm_enrols_live(limit: int = 64, tip: int = None):
+    """(id, record) for every enrolment still in progress — the challenger loop's work list. A PROVEN
+    record is skipped: it needs nothing from anyone, and the loop must not keep re-reading it forever.
+    Bounded, because this runs once per block on every node.
+
+    With `tip`, an EXPIRED incomplete record (tip >= h + enrol_window(h), the same edge /tpm_enrol_status calls
+    expired) is skipped too. Incomplete rows are never collected (nothing deletes them), so they
+    accumulate for the life of the chain; counted against `limit` in key order, 64 dead rows sorting before a
+    fresh enrolment id hid it from every challenger, and the enrolment expired unanswered. The skip happens
+    BEFORE the limit, so the limit bounds live work only. A node-local read: nothing consensus calls this."""
+    from ops.tpm_enrol import enrol_window    # local: tpm_enrol is a leaf, but keep kv_ops' import graph flat
+
+    def _do(txn):
+        out = []
+        with txn.cursor(db=_dbs()["devbind"]) as cur:
+            if cur.set_range(b"tpm:"):
+                for k, v in cur:
+                    if not k.startswith(b"tpm:") or len(out) >= limit:
+                        break
+                    rec = _unpack(v)
+                    if not _is_enrol_record(rec):
+                        continue             # a device binding sharing the "tpm:" prefix
+                    if rec[0] == "proven":
+                        continue
+                    h = int(rec[6])          # rec[6] is "h" — keep in step with _TPM_ENROL_FIELDS
+                    if tip is not None and int(tip) >= h + enrol_window(h):
+                        continue             # expired: nobody can answer it any more (see docstring)
+                    out.append((k[4:].decode(), _tpm_enrol_from_row(rec)))
+        return out
+    return _read(_do)
+
+
+def tpm_enrols_all():
+    """(id, record) for EVERY enrolment row, in key order, unbounded — the v2 pool's exclusion scan
+    (transaction_ops._tpm_excluded) must see every record whose expiry falls in its window, and a bound would make
+    the answer depend on how many dead rows sort before the one that matters (the tpm_enrols_live lesson). A
+    consensus read: inside a block's write txn it sees the block's own writes, like every other kv read."""
+    def _do(txn):
+        out = []
+        with txn.cursor(db=_dbs()["devbind"]) as cur:
+            if cur.set_range(b"tpm:"):
+                for k, v in cur:
+                    if not k.startswith(b"tpm:"):
+                        break
+                    rec = _unpack(v)
+                    if not _is_enrol_record(rec):
+                        continue             # a device binding sharing the "tpm:" prefix
+                    out.append((k[4:].decode(), _tpm_enrol_from_row(rec)))
+        return out
+    return _read(_do)
 
 
 def msgkey_revert_put(txid: str, prev_value):
@@ -1679,6 +2837,32 @@ def msgkey_revert_pop(txid: str):
         txn.delete(key, db=_dbs()["msgkey_revert"])
         (prev,) = _unpack(raw)
         return (True, prev)
+    return _write(_do)
+
+
+def pubkey_revert_put(txid: str):
+    """PUBKEY-ONCE (revert record): mark that applying tx `txid` is what ESTABLISHED its sender's
+    stored public_key. Written ONLY when index_transactions actually set the field (idempotent
+    apply skips senders whose key is already stored, and then no record is written). Rollback
+    deletes the sender's public_key ONLY when this record exists — the old heuristic asked
+    tx_of_account for an earlier tx, which on a snapshot-bootstrapped or pruned node reads pruned
+    history, returns empty for a long-established sender, and CULLED the key (two accounts lost
+    their pubkey in the 2026-07-30 h15076 wedge — an accounts-root state divergence)."""
+    def _do(txn):
+        txn.put(txid.encode(), b"1", db=_dbs()["pubkey_revert"])
+    _write(_do)
+
+
+def pubkey_revert_pop(txid: str) -> bool:
+    """Read + DELETE the pubkey-establishment record for txid; True iff this tx set the sender's
+    public_key on apply (so its revert must delete it). Runs in the active txn."""
+    def _do(txn):
+        key = txid.encode()
+        raw = txn.get(key, db=_dbs()["pubkey_revert"])
+        if raw is None:
+            return False
+        txn.delete(key, db=_dbs()["pubkey_revert"])
+        return True
     return _write(_do)
 
 
@@ -1748,7 +2932,12 @@ def wipe_non_carried_dbs(txn=None):
     # fork, re-anchor, find attestation_exists(X) False and no memo, and sign a SECOND attestation for X
     # with H2 — a valid same-generation equivocation proof against ourselves (the CHAIN_ID bind only stops
     # CROSS-generation pairs). So it is excluded from the wipe.
-    names = sorted(set(_PLAIN_DBS + _DUP_DBS) - set(SNAPSHOT_DBS) - {"attest_memo"})
+    # BLOCK BODIES ARE NOT "ABOUT THE ABANDONED CHAIN" — most of them are the canonical chain, common to
+    # both sides of the fork, and this node was serving them a minute ago. Dropping block_loc wholesale is
+    # what turned every wedge recovery into an archive truncation (2026-08-17: 0->49735, then ->56735).
+    # The locators are now retained here and RECONCILED against the adopted chain by
+    # ops/canonical_restore + core_loop: canonical bodies stay referenced, fork bodies are unreferenced.
+    names = sorted(set(_PLAIN_DBS + _DUP_DBS) - set(SNAPSHOT_DBS) - {"attest_memo", "block_loc"})
     def _do(t):
         for name in names:
             t.drop(_dbs()[name], delete=False)     # empty, keep the handle
@@ -1756,6 +2945,50 @@ def wipe_non_carried_dbs(txn=None):
         _do(txn)
     else:
         _write(_do)
+
+
+# --- canonical-chain restore across a re-anchor (ops/canonical_restore.py) ------------------------
+
+def block_by_num_items():
+    """Every (height, hash) row of the number->hash index, ascending. Captured BEFORE import_snapshot so
+    the deep rows the windowed payload drops can be re-put afterwards (they are outside the snapshot
+    identity, so restoring them is unobservable to consensus)."""
+    def _do(txn):
+        out = []
+        with txn.cursor(db=_dbs()["block_by_num"]) as cur:
+            for k, v in cur:
+                out.append((un_be8(k), v.decode()))
+        return out
+    return _read(_do)
+
+
+def block_index_put_many(pairs):
+    """INSERT-OR-IGNORE many number<->hash rows in ONE write txn (block_index_put per row would open
+    tens of thousands of txns for an archive's deep index)."""
+    def _do(txn):
+        nd, hd = _dbs()["block_by_num"], _dbs()["block_by_hash"]
+        n = 0
+        for h, bh in pairs:
+            bn, bhb = be8(int(h)), bh.encode()
+            if txn.get(bn, db=nd) is None:
+                txn.put(bn, bhb, db=nd); n += 1
+            if txn.get(bhb, db=hd) is None:
+                txn.put(bhb, bn, db=hd)
+        return n
+    return _write(_do)
+
+
+def block_loc_hashes():
+    """Every block hash that currently has a body locator (the \\x00-prefixed per-segment counters are
+    skipped). Used to find the fork bodies to unreference after a re-anchor."""
+    def _do(txn):
+        out = []
+        with txn.cursor(db=_dbs()["block_loc"]) as cur:
+            for k, _v in cur:
+                if not k.startswith(b"\x00"):
+                    out.append(k.decode())
+        return out
+    return _read(_do)
 
 
 # --- idle-account GC support (ops/gc_ops.py — CONSENSUS sweeps, NODE-LOCAL revert records) ---------
@@ -1849,4 +3082,104 @@ def gc_revert_prune(below_height: int) -> int:
                     if not cur.first():
                         break
         return n
+    return _write(_do)
+
+
+# --- ACCOUNT AUTHENTICATION (doc/key-rotation.md): history of every auth config an address held (DUPSORT,
+# CONSENSUS STATE — in the root) + the txid-keyed revert journal (node-local). ---
+def auth_history_put(address: str, from_height: int, version: int, keys: list):
+    """Append 'from `from_height`, config `version` authorized `address` with `keys`' (`keys` = blake2b digests
+    of the authenticators — a DUPSORT value is capped at 511 bytes). Values sort by the big-endian height
+    prefix, so the newest entry is last and a range read by height is a scan."""
+    def _do(txn):
+        txn.put(address.encode(), be8(int(from_height)) + _pack([int(version), list(keys)]),
+                db=_dbs()["auth_history"], dupdata=True)
+    _write(_do)
+
+
+def auth_history_del(address: str, from_height: int, version: int, keys: list):
+    """Revert auth_history_put exactly (rollback): delete the precise dup."""
+    def _do(txn):
+        txn.delete(address.encode(), be8(int(from_height)) + _pack([int(version), list(keys)]),
+                   db=_dbs()["auth_history"])
+    _write(_do)
+
+
+def auth_history(address: str) -> list:
+    """[(from_height, version, key_digests), ...] ascending by from_height."""
+    def _do(txn):
+        out = []
+        with txn.cursor(db=_dbs()["auth_history"]) as cur:
+            if cur.set_key(address.encode()):
+                for v in cur.iternext_dup(keys=False, values=True):
+                    ver, keys = _unpack(v[8:])
+                    out.append((un_be8(v[:8]), int(ver), list(keys)))
+        return out
+    return _read(_do)
+
+
+def auth_revert_put(txid: str, prev_auth, prev_pending, prev_freeze, hist_row):
+    """The EXACT inverse of one `auth` tx: the account's prior (auth, auth_pending, auth_freeze) fields
+    (None = absent) and the auth_history row it appended (None if none). Keyed by txid, node-local."""
+    def _do(txn):
+        txn.put(txid.encode(), _pack([prev_auth, prev_pending, prev_freeze, hist_row]), db=_dbs()["auth_revert"])
+    _write(_do)
+
+
+def auth_revert_pop(txid: str):
+    """Read + DELETE the auth revert record. (True, prev_auth, prev_pending, prev_freeze, hist_row) or
+    (False, None, None, None, None) when no record exists. Runs in the active txn."""
+    def _do(txn):
+        key = txid.encode()
+        raw = txn.get(key, db=_dbs()["auth_revert"])
+        if raw is None:
+            return (False, None, None, None, None)
+        txn.delete(key, db=_dbs()["auth_revert"])
+        a, p, f, h = _unpack(raw)
+        return (True, a, p, f, h)
+    return _write(_do)
+
+
+# --- TPM RETRY COUNT (ops/tpm_enrol retry spacing): "tpmretry:<ek identity>" in the devbind DB -> msgpack [n], the
+# chip's client-failed enrolments, counted. Consensus state; devbind_rows skips the prefix.
+def tpm_retry_get(ek_identity: str) -> int:
+    def _do(txn):
+        raw = txn.get(("tpmretry:" + str(ek_identity)).encode(), db=_dbs()["devbind"])
+        return 0 if raw is None else int(_unpack(raw)[0])
+    return _read(_do)
+
+
+def tpm_retry_set(ek_identity: str, n: int):
+    def _do(txn):
+        k = ("tpmretry:" + str(ek_identity)).encode()
+        if int(n) > 0:
+            txn.put(k, _pack([int(n)]), db=_dbs()["devbind"])
+        else:
+            txn.delete(k, db=_dbs()["devbind"])
+    _write(_do)
+
+
+def tpm_retry_revert_put(height: int, ek_identity: str, prev: int, count_key=None):
+    """Journal the retry count as it stood BEFORE the block (first write wins, node-local devbind_revert). `count_key`
+    is the row it belongs to when that is not the chip's own (tpm_enrol.retry_key, per opener: "<ek>:<owner>").
+    INVARIANT: revert restores this value into this row; it never re-derives the count or the row."""
+    def _do(txn):
+        k = be8(int(height)) + ("tpmretry:" + str(ek_identity)).encode()
+        if txn.get(k, db=_dbs()["devbind_revert"]) is not None:
+            return
+        row = [int(prev)] if count_key is None or str(count_key) == str(ek_identity) else [int(prev), str(count_key)]
+        txn.put(k, _pack(row), db=_dbs()["devbind_revert"])
+    _write(_do)
+
+
+def tpm_retry_revert_pop(height: int, ek_identity: str):
+    """Read + DELETE the retry-count journal for (height, chip): (found, previous count, the row it belongs to)."""
+    def _do(txn):
+        k = be8(int(height)) + ("tpmretry:" + str(ek_identity)).encode()
+        raw = txn.get(k, db=_dbs()["devbind_revert"])
+        if raw is None:
+            return False, 0, str(ek_identity)
+        txn.delete(k, db=_dbs()["devbind_revert"])
+        row = _unpack(raw)
+        return True, int(row[0]), (str(row[1]) if len(row) > 1 else str(ek_identity))
     return _write(_do)

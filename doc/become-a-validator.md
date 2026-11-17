@@ -1,0 +1,291 @@
+# How to become a NADO validator
+
+> **Correction pass, 2026-09-09.** This document predates **betanet-7 (gen 25)**, the PoSEA reroll.
+> The tables, lease figures and registration prose below are corrected (registration prose 2026-10-26).
+> What changed:
+>
+> - Open-lane entry is **PoSEA**, a WebAuthn hardware attestation, not a sequential hash proof. PoSW,
+>   the per-IP entry budget, the identity cap and probation are all retired. See `doc/device-attestation.md`.
+> - The presence lease is **36 h** (`POSW_LEASE_EPOCHS = 360`), not 24 h.
+> - There is **no per-identity bond cap**. `BOND_CAP` and `MAX_SHARES` were removed 2026-08-25 and the
+>   knee curve was removed 2026-09-09; bonded weight is linear in stake.
+> - **Bonding no longer removes you from the open lane** (the block-6600 exclusion was retired at block
+>   29900). One device is one open-lane slot, staked or not; the presence dividend pays every attested
+>   device either way, and an attested staker earns from both lanes plus the dividend.
+> - The dividend fidelity ramp caps at **15**, not 30, from epoch 110.
+> - The bonded lane needs **no device** (block 16150). Staking pools are retired (block 16900).
+
+There is no application, no whitelist, no minimum hardware tier and no permission to ask. **Every node
+produces blocks.** The only question is which lane you produce in — and one of them costs nothing.
+
+All figures below are the live protocol constants (`protocol.py`). If this document and the code ever
+disagree, the code is right and this document is a bug.
+
+---
+
+## The short version
+
+| | Open lane | Bonded lane |
+|---|---|---|
+| **Cost to enter** | free — no coins | 10 NADO per selection share |
+| **Share of block slots** | 30% | 70% |
+| **What decides your weight** | presence + continuity (capital-free) | stake, one for one |
+| **Cap** | — | none (`BOND_CAP`/`MAX_SHARES` removed 2026-08-25; the knee removed 2026-09-09) |
+| **Device required** | yes, attested hardware (PoSEA) | no (device-free from block 16150) |
+| **Risk** | none | stake is slashable; 24 h unbond timelock |
+| **How to start** | open the wallet, press *Start mining* | bond coins you have already earned |
+
+Start in the open lane. It is the fair-launch path, it needs no coins, and it is how you earn the coins
+you would later bond. Most people never need the bonded lane at all.
+
+---
+
+## The open lane (free)
+
+**What it is.** 30% of every epoch's block slots are reserved for identities that hold a valid *presence
+lease*. Selection weight there is **capital-free**: every present identity gets a flat floor, plus a
+loyalty ramp that grows over consecutive renewals. Coins buy you nothing in this lane.
+
+**How you get in.** You register with a **hardware device attestation** (PoSEA — a WebAuthn attestation
+from a real phone or security key, or a TPM certify; see `doc/device-attestation.md`). It is fee-exempt,
+and one device is one identity: a second sender from the same device is refused while its binding is live.
+
+**It is a lease, not a one-time payment.** The registration is a **renewable presence lease** of about
+**36 hours** (360 epochs). To stay eligible you renew with a *fresh* attestation — this turns "pay once, farm
+forever" into "pay continuously per identity". The miner auto-renews at ~80% of the lease, so once it is
+running it keeps itself alive. There is no separate heartbeat: the renewal *is* the presence signal.
+
+**AFK mining works.** One renewal buys 36 hours of eligibility whether your phone is locked or not.
+
+### Two ways to run it
+
+**1. Phone or browser — nothing to install**
+
+Open **<https://get.nadochain.com>**, create a wallet, press **Start mining**. That is the whole process.
+
+**2. A real node**
+
+This one line is the only officially supported install:
+
+```
+curl -sSfL https://raw.githubusercontent.com/hclivess/nado/main/scripts/install.sh | sudo bash -s -- --service --user nado --pq-native
+```
+
+It installs the node as a systemd service and builds the native post-quantum verifier. On a machine with a
+vendor-certified TPM **it enrols its own chip and registers and renews its open-lane lease by itself**
+(`doc/tpm-attestation-without-a-ca.md`) — nothing to configure. A node without a usable TPM cannot attest a
+device, so it earns in the bonded lane (or you mine the open lane from the wallet on a phone).
+
+The execution node (contracts, the shielded pool, the DEX) is installed by default; `--no-exec` gives an
+L1-only node. L1 validation does not need it — but **without it the node never auto-collects your presence dividend** (see *Getting
+paid* below), so for a mining node it is closer to recommended than optional. This is not a small
+difference: on betanet-2 the two mining nodes without an exec node had **25.54 NADO each sitting
+uncollected**, while the one with it had 0.03 because it sweeps continuously.
+
+---
+
+## Getting paid — block rewards vs the dividend (and what collects automatically)
+
+Two different things arrive, and only one of them is automatic everywhere.
+
+**Block rewards** land in your balance the moment you produce a block. Nothing to claim.
+
+**The presence dividend** does not. Most of every open-lane block streams into a dividend pool that
+accrues to you *off-chain*, on the execution layer, weighted by `dividend_weight` = min(fidelity, 15) (`protocol.dividend_weight`).
+Turning that accrual into spendable NADO is two steps, both of which the software can do for you:
+
+1. `collect_dividend` — sweeps your accrual into a provable withdrawal (costs `MIN_TX_FEE`);
+2. `dividend_withdraw` — a **fee-exempt** Merkle proof against the settled exec root that actually moves
+   the coins to L1. It can only run once the exec root has **settled**, so expect a delay.
+
+| Where you mine | Collects automatically? |
+|---|---|
+| Browser wallet (phone/desktop) | **Yes** — it claims pending dividends and sweeps for you. |
+| Node **with** the exec node (the default) | **Yes** — on by default (`NADO_AUTO_COLLECT`), once per epoch. |
+| Node **without** the exec node | **No.** Nothing collects; the accrual keeps growing unclaimed. |
+
+**That last row is the trap.** The node's auto-collect uses its **local exec node as the accrual oracle** —
+it reads your exact accrued balance and only spends the fee once the accrual is worth it
+(`AUTO_COLLECT_MIN_RAW` = 0.001 NADO, 10 000x the fee). With no local exec node it deliberately does
+nothing rather than burn fees sweeping blind. So an L1-only node **still earns the dividend, but never
+claims it**.
+
+If you run a headless node and want the dividend collected hands-free, keep the default exec node (do not pass `--no-exec`). Otherwise
+you can always open the same address in the browser wallet and let it claim — the accrual is on-chain
+state, not something the node holds locally, so nothing is lost by collecting late.
+
+### What actually maximises open-lane earnings
+
+- **Stay present.** Continuity over consecutive renewals is what builds your weight. A lapse halves it.
+- **Mine to ONE address.** Weight does not shard: splitting across addresses gains you nothing, and
+  onboarding many addresses from one machine is rate-limited by subnet proximity.
+- **Be reachable.** The node's health line should read `Ports open (mineable)`. A node nobody can reach
+  still validates, but it is a worse peer.
+
+---
+
+## The bonded lane (optional stake)
+
+The other **70%** of slots. A `bond` transaction moves spendable balance into a non-spendable `bonded`
+column; `unbond` + `withdraw` moves it back after a timelock.
+
+- **10 NADO buys one selection share.** (`B_MIN`)
+- **No cap** — every 10 NADO bonded is one more share.
+- **Split-neutral.** Weight depends on total bonded capital, so sharding across addresses gains nothing.
+- **24-hour unbond timelock** before withdrawn stake becomes spendable again.
+- **Slashable.** Equivocation (signing two conflicting blocks for one slot) burns stake. Running the same
+  validator key on two machines at once is the usual way people do this to themselves — don't.
+
+There is no premine and no faucet into this lane by design: you mine the open lane first, then bond what
+you earned. The wallet's **auto-save** can compound a percentage of your mining rewards into savings
+automatically, once per epoch.
+
+> **Common misreading:** a share costs **10 NADO**, not 100. If you have seen 100 somewhere, it was a
+> stale tooltip in the wallet (fixed 2026-08-12) — the protocol value has been 10 NADO.
+
+---
+
+## How the presence lease actually works (and why it renews late)
+
+**Registration is a lease, not a flag.** A `register` transaction records a *recert* at the current
+epoch. You are eligible in the open lane **iff your most recent recert is within `POSW_LEASE_EPOCHS`**.
+
+    epoch          = 60 blocks x 6 s = 6 minutes
+    lease          = 360 epochs      = 36 hours
+
+Nothing expires you actively — eligibility is simply "was your last recert within the last 360 epochs?"
+
+**Both miners renew near the end of the lease, on purpose:**
+
+| Who | Renews when | Margin left |
+|---|---|---|
+| Browser wallet | once `epoch - reg_epoch >= 288` (80% of the 360-epoch lease) | ~7.2 hours |
+| Node (TPM self-enrolment) | one epoch before the lease lapses | ~6 minutes |
+
+**Why not renew early?** Renewing *resets the clock* — a recert at 50% of the lease buys the same 36 h a
+recert at 80% does, and a recert less than `FIDELITY_MIN_GAP_EPOCHS` (192) after the previous one earns no
+fidelity, so renewing early just repeats the attestation for nothing. And why not
+renew at the very last epoch? Because a renewal has to be computed, submitted, gossiped and mined; the
+margin is there so a brief outage, a slow block or a missed slot cannot silently drop you out of the lane.
+
+**A renewal is not free and not instant.** It needs a fresh device attestation, and it is an ordinary
+transaction that has to land. This is the whole anti-Sybil design: an identity costs a real device, held
+present *continuously*, not once.
+
+---
+
+## Shares — the thing that actually decides how often you win
+
+"Shares" are **selection weight**: the protocol draws one producer per slot, and your chance is your
+weight over the lane's total. The two lanes compute weight completely differently.
+
+### Open-lane weight (capital-free)
+
+    open_weight = OPEN_BASE_FLOOR + min(fidelity, FIDELITY_CAP) * OPEN_FID_BONUS // FIDELITY_CAP
+                = 2 + min(fidelity, 30) * 8 // 30          ->  ranges 2 .. 10
+
+Coins are irrelevant here. What moves it is **fidelity**, the continuity streak:
+
+- every recert that is **continuous** (you renewed before the lease lapsed) and lands at least
+  `FIDELITY_MIN_GAP_EPOCHS` = 192 epochs (~19 h) after the previous one adds `FIDELITY_GAIN = 1` per 192
+  epochs of gap; a closer recert renews the lease but earns nothing;
+- **a lapse halves fidelity** (never below 1) — half the ramp is lost, not all of it (betanet-5; before, a lapse reset it to 1);
+- it saturates at `FIDELITY_CAP = 30`.
+
+**Fidelity counts RECERTS, not days.** This document previously said reaching maximum weight "takes
+roughly 30 days of unbroken presence". That describes what the *default miners* do, not what the protocol
+requires. A gain needs **192 epochs (~19 h) since the previous recert** (`FIDELITY_MIN_GAP_EPOCHS`); a closer
+recert renews the lease but earns nothing, so fidelity tracks elapsed continuous presence and cannot be
+packed into a few hours.
+
+Two practical consequences:
+
+- **A recert can add more than 1** — a renewal after a longer gap earns +1 per 192 epochs of it, as long as
+  the lease had not lapsed.
+- **Two identities present for the same wall-clock time have about the same fidelity**; what separates
+  them is lapses (each one halves it).
+
+That is worth knowing when comparing your rewards against someone else's.
+
+**Fidelity is paid twice.** The same weight also sets your slice of the **presence dividend** — most of
+every open-lane block streams into a dividend pool that is split by fidelity — `dividend_weight` =
+min(fidelity, 15), not the 2..10 selection weight (`ops/dividend_ops.py`). For a small miner that is usually the larger of the two effects: you are paid
+for presence even in blocks you did not win. The dividend recomputes fidelity *as of the paid epoch*
+(`fidelity_at_epoch`, reconstructed from your recert history) and that reconstruction must stay
+byte-identical to the live ramp — a fraud proof that miscomputed it would false-slash an honest settler.
+
+**Where fidelity does NOT apply:** bonded selection shares (see below), fork-choice weight, and the
+settlement/FFG quorum. It is a presence signal for the free lane and the dividend, never a consensus
+weight for finality.
+
+### Bonded-lane shares (capital, uncapped — ramped by BOND AGE, not fidelity)
+
+    shares = bonded // B_MIN                    = bonded // 10 NADO   (linear, no per-identity cap since 2026-08-25)
+
+- **10 NADO = 1 share**, with **no ceiling**.
+- **Split-neutral:** weight depends on total bonded capital, so spreading it across addresses gains
+  nothing.
+- **Fidelity does NOT apply here.** The bonded registry is built with `fidelity: None`, which switches
+  the fidelity ramp off (`ops/account_ops._compute_bonded_registry`). Fresh stake instead ramps on its
+  own clock:
+
+        producer_weight = shares * min(tenure, BOND_RAMP_EPOCHS) // BOND_RAMP_EPOCHS
+        tenure = current_epoch - bond_since        (BOND_RAMP_EPOCHS = 30 epochs = ~3 hours)
+
+  So newly bonded stake reaches full producer weight over **~3 hours**, not a month — enough that a
+  sudden whale cannot control the very next epoch.
+- **That ramp applies to the producer draw ONLY.** It is deliberately excluded from `total_bonded_shares`,
+  so fork-choice weight and the FFG/settlement quorum stay ramp-free — finality is never made
+  tenure-dependent (`doc/takeover-resistance.md`).
+
+### Reading the wallet's lane panel
+
+The wallet shows two lines that look symmetric and are not. A real example:
+
+    Open lane        115 miners ·  18/60 slots
+    Savings lane       8 miners ·  33 shares
+
+| What you see | What it is |
+|---|---|
+| `115 miners` | `open_registry_size` — identities holding a **valid presence lease right now**. It falls when leases lapse, not when people stop watching. |
+| `18/60 slots` | `K_OPEN / EPOCH_LENGTH` — the open lane's **fixed allocation**: 18 of every 60 slots in an epoch, i.e. the 30% split. |
+| `8 miners` | `bonded_registry_size` — addresses holding bonded stake. |
+| `33 shares` | `total_bonded_shares` — total selection shares across all of them. At `B_MIN` = 10 NADO/share that is ~330 NADO bonded chain-wide. |
+
+**`18/60` is not "18 of 60 slots used".** It is a constant. It does not move with activity, it is not a
+progress bar, and a full epoch always awards all 60 slots. It is telling you the lane split: 18 open,
+42 bonded, every epoch, forever.
+
+**The two lines have completely different competition.** In that example 115 present identities compete
+for 18 slots per epoch, while 8 bonded addresses compete for 42. That is not unfair — it is the design
+working as intended. The open lane is the free, Sybil-resistant, many-participant lane, so a single open
+miner wins rarely; the bonded lane is capital-gated, so few addresses share more slots. It is also why
+**block wins are the wrong thing for a small open miner to watch**: the presence dividend pays you by
+fidelity weight in blocks you did not win, and for most people it is the larger number (see *Getting paid*).
+
+Two useful sanity checks: `33 shares` across `8 miners` averages ~4 shares (~40 NADO) each, ; and if `115 miners` drops sharply, that is leases expiring — usually miners who
+stopped renewing, not a network fault.
+
+### Putting it together
+
+The two lanes are separate draws (30% of slots open, 70% bonded) and **bonding does not remove you from
+the open lane**. A node that registers, stays present, and bonds earned coins is eligible in both, with
+the open weight ramping on fidelity and the bonded weight on bond age. Staying online is not merely good practice here — it
+is the only input that raises weight in *either* lane.
+
+---
+
+## Which lane should someone actually pick?
+
+- **No coins?** Open lane. It is free and it is the only way in from zero.
+- **Have earned coins and want more slots?** Bond them: every 10 NADO is one more share, with no cap.
+- **Want maximum participation?** Do both — bonding does **not** remove you from the open lane. A staked
+  validator that also holds a presence lease is eligible in both.
+
+---
+
+## Honest status
+
+Betanet is **pre-mainnet**. Balances persist across upgrades and carry forward to mainnet, but consensus
+is still hardening, so a genesis reroll remains possible — if that happens, balances are carried across
+and it will be announced openly. Bonded stake carries slashing risk. Nothing here is investment advice.

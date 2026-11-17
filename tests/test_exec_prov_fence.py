@@ -30,6 +30,11 @@ import os
 import sys
 import tempfile
 
+os.environ["HOME"] = tempfile.mkdtemp(prefix="nado-test-prov-fence-")   # BEFORE any nado import
+import atexit, shutil; atexit.register(shutil.rmtree, os.environ["HOME"], ignore_errors=True)
+os.environ["NADO_EXEC_STATE"] = os.path.join(os.environ["HOME"], "exec_state.json")   # ASSIGN: the exec state path is CWD-relative, so a test run from the live checkout reads the live exec files
+os.environ["NADO_EXEC_DA"] = os.path.join(os.environ["HOME"], "exec_da")   # ASSIGN: CWD-relative too, and a generation mismatch rmtree()s it on import
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from execnode import execnode as X
@@ -52,8 +57,8 @@ applied = []
 
 async def _fake_get(session, path):
     """Every height exists, carries a body, and hashes predictably — the chain is not what is under test."""
-    if "get_block_number" in path:
-        h = int(path.split("number=")[1])
+    if "number=" in path:            # /get_block?number= (the /get_block_number alias was removed 2026-08-19)
+        h = int(path.split("number=")[1].split("&")[0])
         return {"block_number": h, "block_hash": f"h{h}", "block_transactions": []}
     return {}
 

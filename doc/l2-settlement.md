@@ -19,10 +19,10 @@ with anything L1 does. Phones stay first-class (headers + DA sampling), exactly 
 | Primitive | Where | What it does |
 |---|---|---|
 | `blob` recipient | `protocol.RESERVED_RECIPIENTS`, `MAX_BLOB_BYTES_PER_BLOCK = 1 MiB` | opaque, size-capped, fee-metered byte carrier — L1 orders it, never decodes it |
-| `execnode` | `execnode/execnode.py`, `state.py`, `zkvm.py` | tails **finalized** L1 blocks, decodes blobs → exec txs, runs the zkVM, maintains a state store (sparse alghash2 root) |
+| `execnode` | `execnode/execnode.py`, `state.py`, `zkvm2.py` | tails **finalized** L1 blocks, decodes blobs → exec txs, runs the zkVM, maintains a state store (BLAKE2s root over a compressed sparse tree, `exec_root_b2.py`) |
 | `settle` tx | `construct_settle_tx` → `{exec_cursor, state_root}`, fee-exempt | a bonded validator running an exec node attests "at cursor C the exec state root is R" |
 | settlement verifier | `settlement_ops.settlement_justified(cursor, root, reg)` | a root is **SETTLED** when attesting bonded shares `> SETTLE_NUM/SETTLE_DEN` (2/3). `latest_settled()` derives the highest justified `(cursor, root)`; exposed at `/get_settled` |
-| trust-minimized bridge | `bridge` / `bridge_withdraw` recipients; `execnode.withdrawal_proof(nonce)` | L1 deposit escrows NADO → exec credit → exec burn → **Merkle proof against the settled root** → L1 releases escrow |
+| trust-minimized bridge | `bridge` / `bridge_withdraw` recipients; `/exec/withdrawal_proof?nonce=` (`ExecState.record_proof_at`) | L1 deposit escrows NADO → exec credit → exec burn → **Merkle proof against the settled root** → L1 releases escrow |
 
 Two properties of this substrate matter for everything below:
 
@@ -31,7 +31,7 @@ Two properties of this substrate matter for everything below:
   signature and every caller stay identical. `execnode.py` already caps POST bodies at 16 MB with the comment
   *"proofs are ~1–4 MB; each apply verifies a ~1 MB proof"* — the code is written in anticipation of this.
 - **Settled state is revert-safe.** `latest_settled()` is *derived* from attestations, not a stored
-  watermark, and L1's `FINALITY_DEPTH = 30` floor means a settled root anchored below finality can never be
+  watermark, and L1's `FINALITY_DEPTH = 45` floor means a settled root anchored below finality can never be
   reorged out. Settlement inherits L1 finality for free.
 
 So NADO is already a settlement layer for **one** execution layer. Ultimate scaling is: make it **many**, and
@@ -41,8 +41,9 @@ make each settlement **a proof instead of a vote**.
 
 ## 2. The settlement interface, generalized to N rollups
 
-Today `settle` carries `{exec_cursor, state_root}` for the single canonical exec layer. Generalize the tuple
-with a **namespace** (rollup id):
+Today `settle` carries `{exec_cursor, state_root}` plus a **namespace** `ns` (default `DEFAULT_NS`, the single
+canonical exec layer), and L1 keeps a settled pointer per `ns` (`latest_settled(ns)`). Generalized fully, the
+tuple becomes:
 
 ```
 settle : { ns, prev_cursor, new_cursor, prev_root, new_root, proof? }
@@ -70,7 +71,7 @@ each is a strictly stronger security claim behind the same predicate.
 | Regime | `settlement_justified` body | Trust | Status |
 |---|---|---|---|
 | **2a — bonded quorum** | 2/3 of bonded stake attested `(ns, cursor, root)` | a validator committee is honest | **BUILT** |
-| **2b — validity proof** | one succinct **STARK** proves `apply(blobs[prev..new]) : prev_root → new_root` verifies | cryptographic soundness only | recursion + on-chain settle-with-proof **BUILT** (`doc/zk-recursion.md`, `kv_ops.settlement_proven` marker) but **DISABLED** in `settlement_justified` — quorum-only today |
+| **2b — validity proof** | one succinct **STARK** proves `apply(blobs[prev..new]) : prev_root → new_root` verifies | cryptographic soundness only | recursion + on-chain settle-with-proof **BUILT** (`doc/zk-recursion.md`, `kv_ops.settlement_proven` marker), and the marker **is honoured** by `settlement_justified` (`SETTLE_PROOF_TRUSTLESS = True`); in practice the bonded quorum settles until the Stwo settlement prover (`doc/stwo-migration.md`) |
 | **2c — recursive aggregation** | one STARK proves **many** rollups' batches at once (proof-of-proofs) | cryptographic; **O(1) L1 cost for the whole ecosystem** | **BUILT + tested**; the full W=106 exec-AIR bundle now COMPLETES + VERIFIES with the native prover (`test_settlement_o1.py NADO_HEAVY=1`) |
 
 **2b — single validity proof (the trust flip).** The exec layer periodically posts `new_root` + a STARK that
@@ -89,7 +90,9 @@ cost is **constant regardless of how many rollups exist or how many transactions
 verification cost is decoupled from aggregate throughput entirely. This is the mechanism by which "ordering +
 DA + one proof" scales without bound on the execution side.
 
-**Status (2026-07, `doc/zk-recursion.md`).** The recursion MECHANISM is **built and tested off the L1 path**: a
+**Status (2026-07, `doc/zk-recursion.md`; superseded).** The Goldilocks recursion below was deleted in G9 with the rest of
+that stack; settlement proofs are now Stwo's (`execnode/settle_b2.py`, dormant behind `STWO_SETTLE_HEIGHT`). As written
+then: the recursion MECHANISM was **built and tested off the L1 path**: a
 verifier-authoritative in-circuit STARK verifier over the wide-sponge **alghash2**; T-independent ("succinct")
 verification; a **K→1** collapse (one bundle re-verifies K chained segment proofs from their public parts); an
 in-circuit Fiat-Shamir transcript; and **fold-of-folds depth** whose root **verifies in ~0.2 s regardless of
@@ -98,8 +101,9 @@ above: **heavy to PROVE (specialized exec/settlement nodes with tens of GB — n
 VERIFY (~0.1–0.2 s, low memory — a phone could).** The two open items are engineering, not soundness: the
 **native Rust prover** for throughput (the pure-Python reference hits a memory/time wall at execution-AIR scale;
 the native NTT already cut recursion-prover memory ~4.5×) and **wiring the proof verifier as the authoritative
-settlement rule** (the on-chain `settlement_proven` marker path exists but is disabled; it needs a decision on binding the claimed full-state
-root — until then the bonded quorum governs and nothing on the money path depends on a proof).
+settlement rule** (the on-chain `settlement_proven` marker path exists and `settlement_justified` honours it, but no
+Goldilocks settle proof lands today — the bonded quorum governs until the Stwo settlement prover,
+`doc/stwo-migration.md`).
 
 ---
 
@@ -111,7 +115,7 @@ exactly one thing: removing the honest-majority assumption.
 
 | | **Exec-node quorum (2a — shipped, possibly permanent)** | **zkVM validity proof (2b — optional)** |
 |---|---|---|
-| To settle a batch | bonded nodes **run the zkVM** (`execnode/zkvm.py`) and attest the root (2/3 bonded-stake quorum, live) | a prover generates a **STARK over every executed instruction** (built off-path; not yet the live rule) |
+| To settle a batch | bonded nodes **run the zkVM** (`execnode/zkvm2.py`) and attest the root (2/3 bonded-stake quorum, live) | a prover generates a **STARK over every executed instruction** (built off-path; not yet the live rule) |
 | Compute to settle | ~**native execution** (µs–ms per call) | **~10³–10⁶× native** (modern GPU zkVMs ~10³–10⁴×); seconds–minutes per batch |
 | Prover hardware | commodity — the VM runs on a phone | tens of GB RAM, typically a GPU / proving cluster |
 | L1 verification | **8 lines — one integer compare** (`settlement_justified`) | verify a STARK — a large consensus-critical verifier |
@@ -172,7 +176,7 @@ they sample, they don't store. Rolling mode and the blob cap must be tuned toget
 Every rollup exposes a trust-minimized two-way bridge, escrow held per-`ns` at the `bridge` reserved address:
 
 - **Deposit:** L1 `bridge` tx escrows NADO against `ns`; the exec node credits it exec-side (already built).
-- **Withdraw:** exec-side burn → `execnode.withdrawal_proof(nonce)` → L1 `bridge_withdraw` with a **Merkle
+- **Withdraw:** exec-side burn → `/exec/withdrawal_proof?nonce=` (`ExecState.record_proof_at`) → L1 `bridge_withdraw` with a **Merkle
   proof against `latest_settled(ns)`** (2a) or an inclusion claim under a **validity-proven** root (2b). L1
   releases escrow only against a settled root, so a bad exec-layer state can never drain the bridge.
 - **Escape hatch (censorship resistance) — to design.** A forced-withdrawal path: if a rollup's sequencer/prover
@@ -203,8 +207,8 @@ the proof system and DA commitments are **PQ-sound hash-based**; the bridge hono
 ## 8. Phasing
 
 1. **2a — bonded-quorum settlement + Merkle bridge. DONE.** Single namespace, committee trust.
-2. **Namespaces.** Generalize `settle`/`blob` to carry `ns`; per-`ns` settled pointer + bridge escrow. Pure
-   extension, no new consensus surface.
+2. **Namespaces.** `settle` already carries `ns` with a per-`ns` settled pointer; what remains is per-`ns`
+   blobs and bridge escrow. Pure extension, no new consensus surface.
 3. **2b — single STARK validity proof.** Replace the `settlement_justified` body with FRI-proof verification;
    flip bridge trust from committee to cryptography. Keep 2a as a fallback/liveness backstop during rollout.
 4. **DA hardening.** Reed–Solomon + hash-based DAS + challenge window (unlocks higher `MAX_BLOB_BYTES`).
@@ -246,6 +250,7 @@ the proof system and DA commitments are **PQ-sound hash-based**; the bridge hono
 > [`rolling-mode-and-da.md`](rolling-mode-and-da.md) (DA, erasure coding, hash-based DAS, pruning),
 > [`quantum-resistance-and-vms.md`](quantum-resistance-and-vms.md) (why proofs/DA must be hash-based),
 > `ops/settlement_ops.py` (`settlement_justified` seam, `latest_settled`), `execnode/` (tailing node,
-> `maybe_settle`, `withdrawal_proof`), `protocol.py` (`RESERVED_RECIPIENTS`, `SETTLE_NUM/DEN`,
-> `MAX_BLOB_BYTES_PER_BLOCK`, `HISTORY_RETENTION_BLOCKS`). Settlement 2a + bridge are implemented; namespaces,
-> validity proofs, aggregation, and DA hardening are design.
+> `maybe_settle`, `h_withdrawal_proof`), `protocol.py` (`RESERVED_RECIPIENTS`, `SETTLE_NUM/DEN`,
+> `MAX_BLOB_BYTES_PER_BLOCK`, `HISTORY_RETENTION_BLOCKS`). Settlement 2a + bridge, the `ns` field on
+> `settle` and the proof-marker path are implemented; per-`ns` blobs/escrow, a landing validity prover,
+> aggregation on the L1 path, and DA hardening are design.

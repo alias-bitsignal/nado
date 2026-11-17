@@ -15,6 +15,7 @@ mainnet. This harness only touches throwaway temp dirs; it does not touch any re
 import json
 import os
 import secrets
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -27,7 +28,10 @@ from hashing import base64encode          # noqa: E402
 from signatures import generate_keydict   # noqa: E402
 from protocol import B_MIN                 # noqa: E402  (bond amount; NOT a literal — must be >= B_MIN)
 
-PORT = 9173
+# NOT 9173: a live node on this box binds 0.0.0.0:9173, so testnet children could not bind their 127.0.0.x and
+# every /status poll below answered from the LIVE node — "CONVERGED" on the first tick, proving nothing
+# (2026-09-02). Same env override + default as test_fork_resolution.py.
+PORT = int(os.environ.get("NADO_TESTNET_PORT", "19173"))
 
 
 def node_ip(i):
@@ -42,7 +46,9 @@ def seed_node(home, i, all_keys, bond_manifest):
     os.makedirs(os.path.join(base, "private"), exist_ok=True)
     os.makedirs(os.path.join(base, "peers"), exist_ok=True)
 
-    json.dump({"port": PORT, "ip": node_ip(i), "protocol": 2,
+    # auto_heal/auto_update off: a testnet child must never run the installer or fast-forward the tree it runs from
+    # (ops/self_update also refuses both under NADO_TESTNET — this is the second lock)
+    json.dump({"port": PORT, "ip": node_ip(i), "protocol": 2, "auto_heal": False, "auto_update": False,
                "server_key": secrets.token_hex(32), "min_peers": 1, "max_rollbacks": 10,
                # fast local blocks so a short run produces many blocks (LOCAL timing knob only —
                # block_time is non-consensus; every node uses the same value so tips still agree).
@@ -69,7 +75,7 @@ def seed_node(home, i, all_keys, bond_manifest):
 def status(i, timeout=4):
     """GET node i's /status; returns {"error": ...} instead of raising so poll loops tolerate down nodes."""
     try:
-        with urllib.request.urlopen(f"http://{node_ip(i)}:{PORT}/status", timeout=timeout) as r:
+        with urllib.request.urlopen(f"http://{node_ip(i)}:{PORT}/status", timeout=timeout) as r:  # nosec B310 # loopback testnet harness: literal http:// to its own 127.0.0.x nodes
             return json.loads(r.read().decode())
     except Exception as e:
         return {"error": str(e)}
@@ -84,6 +90,7 @@ def main():
 
     workdir = tempfile.mkdtemp(prefix="nado_testnet_")
     print(f"[testnet] {n} nodes, up to {run_seconds}s, workdir {workdir}", flush=True)
+    converged = False   # bound before the try so the teardown can always read it
     keys = [generate_keydict() for _ in range(n)]
     # shared, sorted, BYTE-IDENTICAL bond manifest: each node bonds exactly B_MIN -> 1 share each,
     # so total_shares == n > 0 and the fail-closed selector always has a winner from block 1.
@@ -112,19 +119,45 @@ def main():
         while time.time() < deadline:
             time.sleep(10)
             sts = [status(i) for i in range(n)]
+            # IDENTITY + LIVENESS of every answer: a dead child (bind failure, crash) is invisible if anything
+            # else answers 127.0.0.x:PORT — today that was the LIVE node on 0.0.0.0:9173 (2026-09-02). An answer
+            # that is not from OUR key, or a child that has exited, counts as DOWN.
+            for i, s in enumerate(sts):
+                if "error" not in s and s.get("address") != keys[i]["address"]:
+                    sts[i] = {"error": f"answered by a foreign node ({str(s.get('address'))[:12]})"}
+                if procs[i].poll() is not None:
+                    sts[i] = {"error": f"child exited rc={procs[i].returncode}"}
             up = sum(1 for s in sts if "error" not in s)
             blocks = []
             for i, s in enumerate(sts):
                 # /status exposes the tip hash; height is logged, so infer progress via hash != genesis
                 blocks.append(s.get("latest_block_hash", "err")[:10] if "error" not in s else "DOWN")
             tips = {s.get("latest_block_hash") for s in sts if "error" not in s}
+            # ONE-BLOCK PREFIX TOLERANCE: with a 2 s block time a node polled one propagation-hop behind the
+            # rest holds the majority tip's PARENT — converged, not divergent. Ask the first node holding the
+            # majority tip for that block and fold its parent into the agreeing set.
+            if len(tips) == 2:
+                counts = {}
+                for s in sts:
+                    if "error" not in s:
+                        counts[s["latest_block_hash"]] = counts.get(s["latest_block_hash"], 0) + 1
+                maj = max(counts, key=counts.get)
+                try:
+                    i = next(k for k, s in enumerate(sts) if "error" not in s and s["latest_block_hash"] == maj)
+                    with urllib.request.urlopen(f"http://{node_ip(i)}:{PORT}/get_block?hash={maj}", timeout=4) as r:  # nosec B310 # loopback testnet harness: literal http:// to its own 127.0.0.x nodes
+                        blk = json.loads(r.read().decode()); blk = blk.get("block") or blk
+                    if (tips - {maj}) == {blk.get("parent_hash")}:
+                        tips = {maj}
+                except Exception:
+                    pass
             finals = [s.get("finalized_height") for s in sts if "error" not in s]
             ffgs = [s.get("ffg_finalized") for s in sts if "error" not in s]
             print(f"[testnet] t={int(time.time()-(deadline-run_seconds))}s up={up}/{n} "
                   f"tips={blocks} distinct_tips={len(tips)} finalized={finals} ffg={ffgs}", flush=True)
-            # progress check: any node advanced past genesis AND all agree on one tip
-            genesis_hash = "21872f6c3dd92a402fc939587ae7a1580ba448ff75c5ccbe3091f0da248d6e46"
-            advanced = any(s.get("latest_block_hash") not in (None, genesis_hash)
+            # progress check: EVERY node advanced past genesis AND all agree on one tip. (A pinned genesis
+            # hash from the harness's first commit went stale at the next reroll, so any answering node
+            # counted as "advanced" and n nodes sitting on shared block 0 were "CONVERGED" on tick 1.)
+            advanced = all(isinstance(s.get("latest_block_height"), int) and s["latest_block_height"] >= 1
                            for s in sts if "error" not in s)
             if up == n and len(tips) == 1 and advanced:
                 converged = True
@@ -164,7 +197,14 @@ def main():
                 p.kill()
             except Exception:
                 pass
-        print(f"[testnet] torn down. logs under {workdir}", flush=True)
+        # A PASSING RUN LEAVES NOTHING BEHIND (2026-09-22): every run kept its n node homes forever, and with a
+        # run per loop/ops commit that was 1.3 GB of dead chains in /tmp. Logs are only worth keeping when
+        # something went wrong, so a converged run removes its workdir and a failed one keeps it for reading.
+        if converged:
+            shutil.rmtree(workdir, ignore_errors=True)
+            print("[testnet] torn down; workdir removed (converged)", flush=True)
+        else:
+            print(f"[testnet] torn down. logs under {workdir}", flush=True)
 
 
 if __name__ == "__main__":

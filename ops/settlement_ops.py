@@ -10,11 +10,15 @@ justified TWO ways, both pure functions of committed on-chain state (so every no
     every node verified DETERMINISTICALLY at block-validation, recording the on-chain marker
     kv_ops.settlement_proven(ns, cursor, root). One proven root justifies with NO quorum.
   • BONDED QUORUM (Phase-2a, liveness floor): bonded shares attesting the same (cursor, root) exceed
-    SETTLE_NUM/SETTLE_DEN of the ACTIVE settler shares (the participation-windowed inactivity leak).
+    SETTLE_NUM/SETTLE_DEN of the ACTIVE settler shares (the participation-windowed inactivity leak) AND
+    protocol.SETTLE_FLOOR_NUM/SETTLE_FLOOR_DEN of ALL bonded shares (the stake floor that closes the lone-settler
+    drain: an empty or silent active set can no longer make one small bond the quorum).
 The proof path is checked first (cheapest + trustless); the quorum path keeps settlement live when no proof
 has landed yet. The old node-local verifier callback is GONE — proof authority now lives on-chain, where
 transaction-validation reads (cross-msg / dividend / unshield / bridge exit) stay deterministic by construction.
 """
+import threading
+
 from ops import kv_ops
 from ops.account_ops import get_bonded_registry
 from ops.mining_ops import total_bonded_shares, selection_shares
@@ -31,8 +35,28 @@ def active_settler_shares(ns: str, bonded_registry: dict) -> int:
     top = kv_ops.settlement_max_cursor(ns)
     if top < 0:
         return 0
-    active = kv_ops.settlement_validators_since(ns, top - SETTLE_ACTIVITY_CURSORS)
-    return sum(selection_shares(bonded_registry[v]["bonded"]) for v in active if v in bonded_registry)
+    from protocol import SETTLE_ANCHOR_LONG_CURSORS
+    # gen 25's SETTLE_ANCHOR_HEIGHT was 1 from gen 26 (deleted). A namespace whose top attested cursor is 0 (the exec
+    # genesis) was below it and keeps the rule it always had there: the window of the highest attested cursor.
+    if top < 1:
+        active = kv_ops.settlement_validators_since(ns, top - SETTLE_ACTIVITY_CURSORS)
+        return sum(selection_shares(bonded_registry[v]["bonded"]) for v in active if v in bonded_registry)
+    # THE STAKE ANCHOR: anchor the window by STAKE (protocol.SETTLE_ANCHOR_LONG_CURSORS). `last` = each recently attesting bonded
+    # validator's highest cursor; the anchor is the highest cursor that validators holding more than a third of that
+    # stake have reached (ties broken by address, so the order is total). A tiny bond at the top cannot move it.
+    last = kv_ops.settlement_last_cursors(ns, top - SETTLE_ANCHOR_LONG_CURSORS)
+    shares = {v: selection_shares(bonded_registry[v]["bonded"]) for v in last if v in bonded_registry}
+    shares = {v: sh for v, sh in shares.items() if sh > 0}
+    total = sum(shares.values())
+    if total == 0:
+        return 0
+    anchor, acc = None, 0
+    for v in sorted(shares, key=lambda v: (-last[v], v)):
+        acc += shares[v]
+        if acc * 3 > total:
+            anchor = last[v]
+            break
+    return sum(sh for v, sh in shares.items() if last[v] >= anchor - SETTLE_ACTIVITY_CURSORS)
 
 
 def settlement_justified(ns: str, cursor: int, state_root: str, bonded_registry: dict) -> bool:
@@ -42,8 +66,10 @@ def settlement_justified(ns: str, cursor: int, state_root: str, bonded_registry:
     denominator was ALL bonded stake, which froze settlement, and with it every dividend/bridge/unshield
     claim, as soon as non-settling validators bonded past 1/3). Both branches read only committed on-chain
     state, so the result is identical on every node. Integer comparison (attesting*SETTLE_DEN > total*SETTLE_NUM).
+    The attesting shares must ALSO exceed SETTLE_FLOOR_NUM/SETTLE_FLOOR_DEN of total_bonded_shares, at every
+    cursor — see the comment at the check.
 
-    TRUSTLESS PROOF: gated on protocol.SETTLE_PROOF_TRUSTLESS (FALSE on alphanet-10 -> quorum-only, so this
+    TRUSTLESS PROOF: gated on protocol.SETTLE_PROOF_TRUSTLESS (FALSE on betanet-10 -> quorum-only, so this
     is byte-identical to the pre-flag behaviour; a proof still verifies and records its marker but the marker
     is not honoured). The VALIDATION side (ops/transaction_ops settle branch) is complete and hardened: it
     binds the proof to the committed per-block EXEC SUMMARIES (pruning-immune, not block bodies), requires the
@@ -66,12 +92,29 @@ def settlement_justified(ns: str, cursor: int, state_root: str, bonded_registry:
     for validator, root in kv_ops.settlements_for_cursor(ns, cursor):
         if root == state_root and validator in bonded_registry:
             attesting += selection_shares(bonded_registry[validator]["bonded"])
-    return attesting * SETTLE_DEN > total * SETTLE_NUM
+    if not attesting * SETTLE_DEN > total * SETTLE_NUM:
+        return False
+    # STAKE FLOOR (protocol.SETTLE_FLOOR_NUM/DEN; audit 2026-09-25 HIGH, the lone-settler drain). `total` above is
+    # the stake that attested RECENTLY, which is empty on a fresh chain or namespace and after the other settlers have
+    # been silent for SETTLE_ANCHOR_LONG_CURSORS — then the first bonded account to settle was its own 2/3 and paid
+    # itself the escrows through exits proven against its root. The floor is measured against ALL bonded stake, which
+    # silence cannot shrink. INVARIANT: keep this AFTER the active-quorum test and never divide it by `total` — the
+    # floor exists precisely because `total` can be made as small as the attacker. Unconditional, cursor 0 included:
+    # gen 27's SETTLE_STAKE_FLOOR_HEIGHT (1 from gen 28, deleted) was judged at max(cursor, 1), which every cursor meets.
+    from protocol import SETTLE_FLOOR_NUM, SETTLE_FLOOR_DEN
+    return attesting * SETTLE_FLOOR_DEN > total_bonded_shares(bonded_registry) * SETTLE_FLOOR_NUM
 
 
 # latest_settled cache: one ((env_path, write_generation, ns), result) tuple, same single-reference,
 # GIL-atomic pattern as account_ops._bonded_reg_cache and snapshot_ops._root_cache.
 _latest_settled_cache = [None]
+# THUNDERING-HERD LOCK (2026-08-20): the unjustified-top-cursor cliff (docstring below) is expensive,
+# and it is reached from EVERY claim validation in the mempool merge, twice per block, and /get_settled
+# — a dozen Tornado worker threads all miss the generation key at once after every write txn and each
+# re-ran the full walk CONCURRENTLY, serialising on the GIL. py-spy (11:55, node 60 blocks behind):
+# ~80% of busy samples were parallel copies of this walk, starving the core thread to 37s/block applies.
+# One computer per generation; everyone else waits for its cached result instead of duplicating it.
+_latest_settled_lock = threading.Lock()
 
 
 def latest_settled(ns: str = DEFAULT_NS):
@@ -96,9 +139,13 @@ def latest_settled(ns: str = DEFAULT_NS):
     entry = _latest_settled_cache[0]
     if entry is not None and entry[0] == key:
         return entry[1]
-    result = _latest_settled_uncached(ns)
-    _latest_settled_cache[0] = (key, result)
-    return result
+    with _latest_settled_lock:
+        entry = _latest_settled_cache[0]          # re-check: the herd resolves to one compute
+        if entry is not None and entry[0] == key:
+            return entry[1]
+        result = _latest_settled_uncached(ns)
+        _latest_settled_cache[0] = (key, result)
+        return result
 
 
 def _latest_settled_uncached(ns: str = DEFAULT_NS):
@@ -118,6 +165,62 @@ def _latest_settled_uncached(ns: str = DEFAULT_NS):
     return (-1, None)
 
 
+# recent_settled_roots cache: same single-reference generation-keyed pattern as latest_settled — AND the
+# same herd lock. It is reached from every dividend_withdraw validation in the mempool merge, so after each
+# write txn a dozen worker threads miss the generation key together; without the lock each re-ran the
+# justification walk concurrently, exactly the 37s/block pattern latest_settled was locked for.
+_recent_settled_cache = [None]
+_recent_settled_lock = threading.Lock()
+
+
+def recent_settled_roots(ns: str = DEFAULT_NS, k: int = 3):
+    """The last `k` JUSTIFIED (cursor, root) pairs for `ns`, descending — the validity WINDOW for
+    settlement-proven claims (dividend_withdraw). Validating a claim against ONLY latest_settled()
+    meant every claim died the moment the next settle landed: a claim proven against root R became
+    permanently unminable once R+1 justified, so the auto-claimer rebuilt it every epoch and the pool
+    carried a growing graveyard of claims some peers held and others refused — measured as the
+    dominant residual fork/slow-block driver on 2026-08-18 (16 dead claims in one pool). A window of
+    the last k roots gives every claim ~k settle intervals to land; the per-(addr, nonce) NULLIFIER
+    (kv_ops.dividend_nullifier_exists) already guarantees a claim pays at most once, against whichever
+    root it proves.
+
+    DETERMINISTIC: a pure read of committed settlement attestations + the bonded registry (both inside
+    the L1 state root), same as latest_settled — every node at the same parent state derives the
+    identical window. Memoised on the write generation; bypassed inside a write txn."""
+    if kv_ops.in_write_txn():
+        return _recent_settled_uncached(ns, k)
+    key = (kv_ops.env_path(), kv_ops.write_generation(), ns, int(k))
+    entry = _recent_settled_cache[0]
+    if entry is not None and entry[0] == key:
+        return entry[1]
+    with _recent_settled_lock:
+        entry = _recent_settled_cache[0]          # re-check: the herd resolves to one compute
+        if entry is not None and entry[0] == key:
+            return entry[1]
+        result = _recent_settled_uncached(ns, k)
+        _recent_settled_cache[0] = (key, result)
+        return result
+
+
+def _recent_settled_uncached(ns: str, k: int):
+    reg = get_bonded_registry()
+    if total_bonded_shares(reg) == 0:
+        return []
+    out = []
+    for cursor in reversed(kv_ops.settlement_cursors(ns)):
+        seen = set()
+        for _v, root in kv_ops.settlements_for_cursor(ns, cursor):
+            if root in seen:
+                continue
+            seen.add(root)
+            if settlement_justified(ns, cursor, root, reg):
+                out.append((cursor, root))
+                break                                   # one justified root per cursor
+        if len(out) >= max(1, int(k)):
+            break
+    return out
+
+
 def settled_header_commitment(ns: str = DEFAULT_NS):
     """The (exec_cursor, exec_root) the L1 block header commits to BIND L2 into the L1 hash chain: the
     highest L1-JUSTIFIED settled (cursor, root) for `ns` as of committed state, or the empty sentinel
@@ -133,10 +236,12 @@ def settled_header_commitment(ns: str = DEFAULT_NS):
     does NOT by itself re-derive the exec computation — that trust stays on the bonded settle quorum until
     the trustless proof path is enabled. Default ns only is committed EXPLICITLY; every other ns stays bound
     transitively through the settlement attestations already inside state_root."""
-    from protocol import EXEC_GENESIS_ROOT
+    # the sentinel is the generation's empty exec root (exec_root_b2.genesis_canary: the BLAKE2s root on gen 29, the
+    # alghash constant on gen 28 — byte-identical there), so a gen-29 header never carries a Goldilocks root
+    from execnode.exec_root_b2 import genesis_canary
     cursor, root = latest_settled(ns)
     if root is None:
-        return -1, EXEC_GENESIS_ROOT
+        return -1, genesis_canary()
     return int(cursor), root
 
 

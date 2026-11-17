@@ -1,15 +1,17 @@
 // slots.js — NADO Slots: classic 3-reel slots where PLAYERS OWN THE MACHINES, built on the shared game
-// SDK (nadodapp.js). Pure beacon randomness — a spin binds to two blocks that don't exist yet when you
-// sign (no house secret, no reveal, no cadence): the reels stop ~2 blocks after the spin lands.
-//     stop_i = HASH( BLOCKHASH(sh) + BLOCKHASH(sh+1) + spinId  +  i ) % 64        i = 0,1,2
+// SDK (nadodapp.js). Pure beacon randomness — a spin binds to the epoch beacon of the epoch after next
+// (gb = epoch(cursor) + 2), a value nobody knows when you sign (no house secret, no reveal):
+//     stop_i = LO32(HASH( BEACON(gb) + spinId + i )) % 64                        i = 0,1,2
+// A spin placed before the beacon rule (gb == 0) keeps its old base, BLOCKHASH(gh) + BLOCKHASH(gh+1).
 // Symbols come off weighted 64-stop virtual reels; the paytable pays up to 150x (exact RTP 95.796%,
 // full-enumeration-proven — see tests/test_slots_contract.py). The machine's bank commits a 150x cover
-// for every open spin, so it can never welsh. Settle is permissionless; a pruned spin refunds via claim.
-import { NadoDapp, rawToNado, nadoToRaw, randId, blake2bHash, _m, $, gate, canPay, orderCards, alertBar, okBar, notify, confirmingLabel, lsLoad as load, wireWallet, stickyInputs, renderWallet, renderScore, scoreBump, scoreSort, loadQR, resolveAliases, disp, share, shareInvite , installModes , playModes} from "./nadodapp.js?v=db1a59d7";
-import { BankedGame } from "./bankedgame.js?v=8fefa154";
-import { Practice } from "./practice.js?v=69d3a659";      // free in-browser practice (play chips, no chain)
+// for every open spin, so it can never welsh. Settle is permissionless for 18000 blocks; a spin nobody settled in
+// that window goes to the bank via claim (it pays nobody, so the page never fires it for the player).
+import { NadoDapp, chainResultAlg, rawToNado, nadoToRaw, randId, _m, $, gate, canPay, orderCards, alertBar, okBar, notify, confirmingLabel, lsLoad as load, wireWallet, stickyInputs, renderWallet, renderScore, scoreBump, scoreSort, loadQR, resolveAliases, disp, share, shareInvite , installModes , playModes} from "./nadodapp.js";
+import { BankedGame } from "./bankedgame.js";
+import { Practice } from "./practice.js";      // free in-browser practice (play chips, no chain)
 
-const CID = "0bc996d9b087cedff92d60c6fac7b3b0";
+const CID = "13b82a08e3278cc56f50c14b092804d4";
 const dapp = new NadoDapp({ cid: CID, app: "Slots" });
 const bg = new BankedGame(dapp, { icon: "🎰", bankIcon: "🎰" });   // shared banked-table SDK (reader/actions/tracking/chips); slots shows 🎰 for banked machines too
 const SPIN_D = 2, MAXM2 = 300, COVER = (MAXM2 - 2) / 2;   // cover per spin = stake * 149
@@ -22,7 +24,6 @@ let lobbyN = 24;   // the lobby is the only discovery path (no go-to-id box), so
 let watch = null, reelAnim = null;
 
 // ---- derivation (mirror of the contract — display only; settle recomputes it on-chain) --------------
-const H = (v) => BigInt("0x" + blake2bHash(v));
 const symOf = (r) => (r >= 16) + (r >= 30) + (r >= 42) + (r >= 52) + (r >= 58) + (r >= 62);
 const TRIP2 = [16, 20, 24, 30, 60, 100, 300];
 function m2Of(s0, s1, s2) {
@@ -32,10 +33,12 @@ function m2Of(s0, s1, s2) {
   if (c7 === 1) return 3;
   return (s0 === 0) + (s1 === 0) + (s2 === 0) === 2 ? 6 : 0;
 }
+// INVARIANT: byte-identical to the contract's settle because chainResultAlg is its in-VM HASH (BLAKE2s word hash) + LO32 % 64 over
+// (base + g + i) mod 2^256 — base = BEACON(gb) as (bc(gb), "0") for a beacon spin, (bh(gh), bh(gh+1)) for a legacy one
+// (tests/test_slots_settle_from_the_beacon_and_time_out_to_the_bank.py cross-checks both against the contract).
 function spinResult(bh0, bh1, g) {
   if (!bh0 || !bh1) return null;
-  const q = BigInt("0x" + bh0) + BigInt("0x" + bh1) + BigInt(g);
-  const stops = [0, 1, 2].map((i) => Number(H(q + BigInt(i)) % 64n));
+  const stops = [0, 1, 2].map((i) => chainResultAlg(bh0, bh1, String(BigInt(g) + BigInt(i)), 64));
   const syms = stops.map(symOf);
   return { stops, syms, m2: m2Of(...syms) };
 }
@@ -47,10 +50,11 @@ const maxBet = (mc) => Math.max(0, Math.floor((mc.tk - mc.tc) / COVER));   // bi
 const maxBetRaw = () => { const mc = lastTable; return (mc && mc.exists && !mc.closed) ? BigInt(maxBet(mc)) : null; };
 const syncStakeSlider = () => dapp.syncStakeSlider(maxBetRaw(), { label: window.t("slots.betSliderLabel", "bet ") });   // shared SDK slider
 // per-seat walk + newest-first sort = bg.seats; slots only enriches with reel stops / payout multiplier.
-// A "ready" spin still needs both block hashes locally — without them it stays pending (bg.ready flips off).
+// A "ready" spin still needs its randomness locally — the beacon (s.gb != 0) or both block hashes (legacy) — and
+// stays pending without it (bg.ready flips off).
 const spinsOf = (sto, t) => bg.seats(sto, t, (g, s) => {
   if (s.settled) { const gr = _m(sto, "gr")[g] || 0; if (gr) { s.stops = stopsFromGr(gr); s.syms = s.stops.map(symOf); } s.m2 = _m(sto, "gw")[g] || 0; }
-  else if (s.ready) { const r = spinResult(dapp.bh(s.gh), dapp.bh(s.gh + 1), s.g); if (r) Object.assign(s, r); else { s.ready = false; s.pending = true; } }
+  else if (s.ready) { const r = s.gb ? spinResult(dapp.bc(s.gb), "0", s.g) : spinResult(dapp.bh(s.gh), dapp.bh(s.gh + 1), s.g); if (r) Object.assign(s, r); else { s.ready = false; s.pending = true; } }
   else s.pending = true;
   return s;
 });
@@ -78,7 +82,14 @@ async function doSpin() {
 }
 const settleSpin = (g, m2, stake) => { if (dapp.busy("settle", "seat", g)) return; dapp.call("settle", [g], null,
   (m2 > 0 ? window.t("slots.collectLabel", "💰 collect {n} NADO", { n: rawToNado(BigInt(stake) * BigInt(m2) / 2n) }) : window.t("slots.finishLabel", "finish spin #{g}", { g })), { table: bg.active, seat: g, phase: "settle" }); };
-const claimSpin = (g) => { if (dapp.busy("settle", "seat", g)) return; dapp.call("claim", [g], null, window.t("slots.refundLabel", "refund pruned spin #{g}", { g }), { table: bg.active, seat: g, phase: "settle" }); };
+// claim(g) is the TIMEOUT op: after 18000 blocks an unsettled spin resolves to the BANK and pays nobody, so the
+// page never calls it for the player (and offers no "refund" button). A spin past the window is shown as
+// expired; settling a win is always possible inside the window — auto-collect does it the moment it resolves.
+// Only the BANK is offered the manual release (as in dice/roulette/mines/blackjack), so it can free the 149x
+// cover a timed-out spin still reserves and close the machine.
+const HORIZON = 18000;                   // must match slots.HORIZON in execnode/games/slots.py
+const expired = (s) => !s.settled && !!s.gh && dapp.cursor != null && dapp.cursor > s.gh + HORIZON;
+const releaseSpin = (g) => { if (dapp.busy("settle", "seat", g)) return; dapp.call("claim", [g], null, window.t("slots.callRelease", "release timed-out spin #{g} to the bank", { g }), { table: bg.active, seat: g, phase: "settle" }); };
 function fundMachine() {
   const raw = nadoToRaw($("fundAmt").value);
   if (!raw) return alertBar(window.t("slots.enterFund", "Enter how much NADO to add to the bank."));
@@ -104,7 +115,7 @@ const closeMachine = () => bg.close(window.t("slots.closeLabel", "close machine 
 // ---- refresh ---------------------------------------------------------------------------------------
 async function refreshAll() {
   await dapp.refresh();
-  const sto = await dapp.storage({ append: ["gg", "ga", "gs", "gh", "gr", "gw", "gd"] });
+  const sto = await dapp.storage({ append: ["gg", "ga", "gs", "gh", "gr", "gw", "gd", "gb"] });
   if (sto) {
     lastSto = sto;
     bg.track(sto);
@@ -117,7 +128,8 @@ async function refreshAll() {
     if (bg.active != null) {
       lastTable = machineFrom(sto, bg.active);
       // FAST provisional hashes: slot results are PUBLIC + re-validated on-chain at settle
-      await bg.prefetchHashes(sto);
+      await bg.prefetchHashes(sto);      // legacy spins (gb == 0)
+      await bg.prefetchBeacons(sto);     // beacon spins: the finalized epoch beacon gb
       mySpins = spinsOf(sto, bg.active);
     }
     if (watch) {
@@ -128,7 +140,7 @@ async function refreshAll() {
         watch.phase === "close" ? !!_m(sto, "tz")[String(watch.table)] :
         watch.phase === "fund" ? true : false;
       if (done) {
-        okBar({ open: window.t("slots.liveMsg", "✓ Machine is live — share it and earn the edge."), spin: window.t("slots.spinLockedMsg", "✓ Spin locked to the next blocks…"),
+        okBar({ open: window.t("slots.liveMsg", "✓ Machine is live — share it and earn the edge."), spin: window.t("slots.spinLockedMsg", "✓ Spin locked to the next epoch beacon…"),
           settle: window.t("slots.settledMsg", "✓ Settled on-chain."), close: window.t("slots.closedMsg", "✓ Machine closed — bank cashed out."), fund: window.t("slots.toppedMsg", "✓ Bank topped up.") }[watch.phase] || window.t("slots.confirmedMsg", "✓ Confirmed."));
         dapp.clearInflight();   // re-enable the SPIN button the instant the spin lands (was stuck disabled ~3 min)
         watch = null;
@@ -229,7 +241,8 @@ var render = function render() {
     const who = s.addr === dapp.me ? "<b>" + window.t("slots.youLower", "you") + "</b>" : disp(s.addr);
     const res = s.syms ? s.syms.map((x) => SYM[x]).join("") : "⏳";
     const pay = s.m2 ? rawToNado(BigInt(s.stake) * BigInt(s.m2) / 2n) + " NADO" : "";
-    const act = !s.settled && s.ready
+    const act = expired(s) && !s.ready ? '<span class="dim">' + window.t("slots.expiredBank", "expired — stake to the bank") + "</span>"
+      : !s.settled && s.ready
       ? (s.m2 > 0 ? '<button class="pulse" style="padding:4px 10px;font-size:12px" data-collect="' + s.g + '" data-m2="' + s.m2 + '" data-stake="' + s.stake + '">' + window.t("slots.collectShort", "💰 Collect {pay}", { pay }) + "</button>"
                   : '<button class="ghost" style="padding:4px 10px;font-size:12px" data-collect="' + s.g + '" data-m2="0" data-stake="' + s.stake + '">' + window.t("slots.settleShort", "settle") + "</button>")
       : s.settled ? (s.m2 > 0 ? '<span style="color:var(--gold)">' + window.t("slots.paid", "paid {pay}", { pay }) + "</span>" : '<span class="dim">—</span>') : "";
@@ -237,6 +250,15 @@ var render = function render() {
   }).join("");
   $("mySpins").querySelectorAll("[data-collect]").forEach((b) => b.onclick = () =>
     settleSpin(parseInt(b.dataset.collect, 10), parseInt(b.dataset.m2, 10), b.dataset.stake));
+  // the bank releases spins nobody settled inside the window (their stakes stay in its pot) so the machine can close
+  // INVARIANT: claim is offered only to the bank and never auto-fired, because it pays the bank and returns nothing
+  // to the player; a player's win stays settleable (auto-collect) for the whole window before claim opens.
+  const wrap = $("releaseRow"); wrap.innerHTML = "";
+  if (iAmBank && !mc.closed) for (const s of mySpins.filter(expired).slice(0, 8)) {
+    const b = document.createElement("button"); b.style.flex = "1 1 auto"; b.className = "ghost";
+    b.textContent = window.t("slots.releaseSpin", "↩ Release timed-out spin #{g} ({amt}) to the bank", { g: s.g, amt: rawToNado(s.stake) });
+    b.onclick = () => releaseSpin(s.g); wrap.appendChild(b);
+  }
 }
 
 // ---- boot ------------------------------------------------------------------------------------------
@@ -244,7 +266,7 @@ dapp.onReturn((pend, ok, err) => {
   if (pend && pend.table != null) bg.active = pend.table;
   if (ok && pend && ["open", "spin", "settle", "close", "fund"].includes(pend.phase)) watch = pend;
   dapp.showReturn(pend, ok, err, {
-    open: window.t("slots.openingMsg", "Machine opening — confirming…"), spin: window.t("slots.spinSubmittedMsg", "🎰 Spin submitted — the reels lock to the next blocks…"),
+    open: window.t("slots.openingMsg", "Machine opening — confirming…"), spin: window.t("slots.spinSubmittedMsg", "🎰 Spin submitted — the reels lock to the next epoch beacon…"),
     settle: window.t("slots.settlingMsg", "Settling on-chain…"), fund: window.t("slots.toppingMsg", "Topping up the bank…"), close: window.t("slots.closingMsg", "Closing the machine…") });
 });
 function wireUI() {

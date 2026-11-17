@@ -30,7 +30,7 @@ not (the property Zcash's turnstile relies on). ExecState tracks it as pool_valu
 unbacked mint — a transfer blob with public_value > 0 minting notes with no escrow behind them — would have
 tripped check_shielded in the block it landed, with no review and no reasoning about join-splits.
 """
-from protocol import (TREASURY_GENESIS, BRIDGE_ESCROW, SHIELD_ESCROW, DIVIDEND_POOL, HTLC_ESCROW)
+from protocol import (TREASURY_GENESIS, BRIDGE_ESCROW, SHIELD_ESCROW, DIVIDEND_POOL)
 
 
 # Severity by DIRECTION — the distinction that keeps these checks worth reading.
@@ -58,10 +58,6 @@ def _verdict(accounted, backing):
     if delta < 0:
         return True, STRANDED, delta      # escrow > owed: locked coin nobody can claim. Not a mint.
     return False, MINT, delta             # owed > escrow: entitlement with no coin behind it. THE bug class.
-
-
-class Violation(Exception):
-    """Raised only by assert_all() — the TEST entry point. The node path uses check_all() and logs."""
 
 
 def _bal(get_account, address):
@@ -214,13 +210,3 @@ def check_all(iter_accounts, totals, get_account, exec_state=None):
             results.append({"domain": d, "ok": None,
                             "skipped": "no exec-layer view (this node has no local exec node reachable)"})
     return all(r["ok"] for r in results if r["ok"] is not None), results
-
-
-def assert_all(iter_accounts, totals, get_account, exec_state=None):
-    """check_all, but raises Violation on the first failure — the TEST entry point. The node never uses
-    this: on a live chain a false positive must degrade to a loud log, never a halt."""
-    ok, results = check_all(iter_accounts, totals, get_account, exec_state)
-    if not ok:
-        bad = [r for r in results if not r["ok"]]
-        raise Violation(f"conservation invariant violated: {bad}")
-    return results

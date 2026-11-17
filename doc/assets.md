@@ -70,7 +70,7 @@ Rules the ledger keeps, in the code and in the tests:
 ### The id is derived, never assigned
 
 ```
-asset_id = alghash.hashn([ zkvm_addr_digest(issuer), seed ])
+asset_id = zkvm2.hash_words([ zkvm_addr_digest(issuer), seed ])   # the VM's BLAKE2s hash (gen 29; alghash before G9)
 ```
 
 Consequences, and this is the part that makes the rest of the roadmap buildable:
@@ -79,13 +79,13 @@ Consequences, and this is the part that makes the rest of the roadmap buildable:
 2. A **contract can compute the id of its own assets in-circuit**, with the ordinary `hash` macro:
    `hash aid <- me 1`. No registry lookup, no oracle, nobody passing it an id it has to trust. That is
    precisely what an AMM needs to own its LP token and a launchpad needs to own the token it launches.
-3. Ids are field elements, so they fit in a register and travel as ordinary call args.
+3. Ids are 256-bit words, so they fit in a register and travel as ordinary call args.
 
 ---
 
 ## 3. The six opcodes
 
-Appended to `zkvm.OPS` (ids are frozen once contracts deploy against them; appending never shifts an
+Appended to `zkvm2.OPS` (ids are frozen once contracts deploy against them; appending never shifts an
 existing id).
 
 | op | form | effect | io entry |
@@ -132,10 +132,10 @@ That is only safe if the pairing is **atomic**. The failure it prevents:
 This is the same shape as the existing `RANGE ; RANGE ; LT` rule (a jump into a compare macro skipping a
 range check), and it is enforced the same way, in **two** independent places:
 
-1. **`zkvm.validate_code`, at the deploy gate** — every `ASEL` must be immediately followed by `PAY` or
+1. **`zkvm2.validate_code`, at the deploy gate** — every `ASEL` must be immediately followed by `PAY` or
    `AMINT`, no jump may target that follower, and every `AMINT` must be preceded by an `ASEL`. This covers
    all bytecode, including hand-crafted JSON that never went through the assembler.
-2. **`zkvm.replay_io`, in the verifier** — because replay verifies a *log*, not a program. A log arriving
+2. **`zkvm2.replay_io`, in the verifier** — because replay verifies a *log*, not a program. A log arriving
    from a stranger gets the identical pairing check before any effect is derived from it.
 
 Plus one interpreter guard: **`ASEL` of asset `0` reverts.** Asset 0 means "native", so selecting it is the
@@ -216,7 +216,7 @@ as a rule:
 | | create | renounce | mint | move the contract's holdings |
 |---|---|---|---|---|
 | the contract's **deployer** | ✅ | ✅ | ❌ | ❌ |
-| the contract's **code** | ❌ | ❌ (needs an opcode) | ✅ `AMINT` | ✅ `ASEL`+`PAY` / `ABURN` |
+| the contract's **code** | ❌ | ✅ `ARENOUNCE` (in-circuit, issuer-checked) | ✅ `AMINT` | ✅ `ASEL`+`PAY` / `ABURN` |
 | anyone else | ❌ | ❌ | ❌ | ❌ |
 
 `asset_mint`, `asset_transfer` and `asset_burn` all act as `sender`, and the issuer is the *cid*, so the
@@ -247,35 +247,45 @@ call-value escrow rather than built.
 
 ---
 
-## 8. Settlement by validity proof — CLOSED
+## 8. Settlement by validity proof — bound on L1 from block 1
 
-Asset calls are settled by the **bonded quorum** (the path that settles everything else) AND, now, by
-**validity proof**. The gap this section used to describe — `settlement_proofs._run_call` carried only a
-shadow `bridge`, so an `ASEL`+`PAY` looked to it like a native payout and it *refused* asset io — is closed.
+(`ZK_HARDEN_HEIGHT` was the gen-27 gate for this; it was inlined after the betanet-9 reroll, gen 28, so every
+"until `ZK_HARDEN_HEIGHT`" below describes gen-27 history.)
 
-The epoch prover now carries an **asset half of the shadow ledger** (`abal`/`assets`), symmetric to the
-native `bridge`: `_run_call` escrows an asset-denominated call value, threads the contract's balances into
-the VM, splits the io log into native payouts vs asset effects through the shared `runtimes.split_io`, and
-stages those effects against the shadow. `verify_epoch`'s replay opts into `with_assets=True`. The AIR
-needed **nothing** — it already proves the io log that carries every asset effect.
+**The history, because this section once said "CLOSED" while it was not.** The epoch prover has carried an
+**asset half of the shadow ledger** (`abal`/`assets`) for a long time: `settlement_proofs._run_call` escrows an
+asset-denominated call value, threads the contract's balances into the VM, splits the io log through the shared
+`runtimes.split_io`, and stages the effects with `stage_asset_effects_pure` — the function the live apply calls, so
+mint authority (issuer-only, mintable-only, the supply cap) cannot drift between apply and proof. But that only
+stops an HONEST prover from proving a reverted transition. The L1 VERIFIER bound none of it: asset balances live
+in the records half, and an `ABAL` read came from the io log with nothing tying it to the settled ledger. The
+2026-09-24 review therefore made every settle proof **refuse asset io** (`settle_proof_io_check`), and from then
+until `ZK_HARDEN_HEIGHT` an asset-touching span settles by the bonded quorum only.
 
-The rule that makes this sound: the VM/AIR enforces only *holder-side solvency* (a contract can't pay or
-burn more than it holds). **Mint authority** — issuer-only, mintable-only, the supply cap — lives in
-`stage_asset_effects`, and the shadow calls the **exact same function** the live apply path does
-(`stage_asset_effects_pure`, extracted so the two can never diverge). So the prover can never prove a mint
-the chain would reject. `tests/test_assets.py` pins this with the authority test: the VM emits a well-formed
-`AMINT` for a victim's asset or a renounced one, and the prover **raises** because the shadow refuses it —
-the assertion that fails the instant the two paths drift.
+**From `ZK_HARDEN_HEIGHT` the verifier binds it** (zk audit 2026-09-26):
 
-**No consensus/root impact.** The settlement proof's `post_root` binds contract STORAGE only; asset balances
-live in the records half (`T_ASSET_BAL`/`T_ASSET_META`/`T_ASSET_ALLOW`) that this proof does not bind. The
-shadow gates the proof (so it never proves a transition the chain reverts-and-refunds) but never enters any
-root — exactly like the native `bridge` shadow always has.
+- `records_bind.PinnedAssets` loads the asset ledger from the proof's `records_pre`, which must hash to the tip's
+  committed records root, and walks the proven io call by call through `records_bind.asset_records_effects` —
+  which stages with the same `stage_asset_effects_pure`. So issuer, mintability, the cap, holdings, and **every
+  `ABAL` read against the running authenticated balance** are judged on committed state, not the prover's word.
+- An asset's metadata is a preimage the prover ships in `asset_meta_pre`; it is accepted only if its
+  `T_ASSET_META` leaf (positioned by `exec_root.asset_meta_digest`) is in the pinned projection. A mint, burn or
+  renounce retires that leaf and places the new one; balance moves are `T_ASSET_BAL` deltas.
+- Those moves join the records binding of a records-bound proof (`bind_and_verify_records`); a records-FROZEN
+  proof (a span that only reads balances) must net to nothing.
+- An **asset-denominated call value** is a derivable records effect from the gate (`block_records_effects`,
+  keyed exactly as the live apply keys it) and is replayed into the shadow before the call's VM effects, with the
+  live rules re-checked: the asset exists, the caller holds the value, the method reads `ACTX`.
+- The prover side (`execnode._build_settlement_proof`) passes the ledgers and attaches `asset_meta_pre` /
+  `records_pre` only when the proof lands at or past the gate; below it an asset span stays unprovable, as before.
 
-The per-call `/exec/prove_call` + `/exec/verify_call` pair already handled assets and is the template this
-followed: the proof binds `ACTX_ASSET` and `ACTX_SELF` as public columns (`selfd` is *derived from the cid*
-on both sides, so a prover cannot choose what a contract thinks its own address is), and verify re-checks
-every `ABAL` read and declared move against the node's ledger before reporting `state_match`.
+Tests: `tests/test_asset_ops_settle_by_proof.py` (all five ops natively, prover and verifier derive the same
+effects, forged metadata / tampered reads refused), `tests/test_asset_settle_l1.py` (end to end through
+`validate_transaction`: refused below the gate, canon from it, asset-valued calls, frozen balance reads).
+
+The per-call `/exec/prove_call` + `/exec/verify_call` pair already handled assets and was the template: the proof
+binds `ACTX_ASSET` and `ACTX_SELF` as public columns (`selfd` is *derived from the cid* on both sides), and verify
+re-checks every `ABAL` read and declared move against the node's ledger before reporting `state_match`.
 
 ---
 
@@ -314,9 +324,8 @@ This is a stronger trust story than most tokens ship, and it is intended to stay
 **Remaining gaps, with a reasoned disposition** (not everything on this list should be built — where the
 answer is "no", the reason is the deliverable):
 
-1. **Proof settlement for asset calls** (§8) — **DONE.** The epoch prover carries an asset shadow and settles
-   asset-touching calls by validity proof, gated by the same `stage_asset_effects_pure` the chain applies, so
-   authority can never drift between apply and proof. Changed no committed root.
+1. **Proof settlement for asset calls** (§8) — **DONE.** L1 binds asset io at every height
+   (`records_bind.PinnedAssets`); gen 27's `ZK_HARDEN_HEIGHT` gate was inlined at the gen-28 reroll.
 2. **`ARENOUNCE` opcode** (§3, §7) — **DONE.** A contract seals its own token's supply in-circuit; the exec
    layer applies it through the same authority check as a blob renounce, and the AIR constrains the new io
    (a differential prove/replay/forgery test pins the soundness). A coordinated update, since it is a VM
@@ -356,12 +365,12 @@ moves assets and runs the Reserve vault. Still ahead: an **explorer** (asset pag
 
 | what | where |
 |---|---|
-| opcodes, io kinds, pairing gate, replay | `execnode/zkvm.py` |
-| AIR columns + constraints | `execnode/stark/vm_circuit.py` |
+| opcodes, io kinds, pairing gate, replay | `execnode/zkvm2.py` |
+| AIR columns + constraints | `native/stwo_settle` (`vm_air.rs`); the Goldilocks `execnode/stark/vm_circuit.py` was deleted in G9 |
 | assembler macros | `execnode/zkvmasm.py` |
 | DSL wrappers | `execnode/zkpy.py` |
 | ledger, blob ops, staged settlement | `execnode/state.py` |
 | io → effects, address resolution | `execnode/runtimes.py` |
-| root commitment | `execnode/exec_root.py` |
+| root commitment | `execnode/exec_root_b2.py` |
 | read endpoints | `execnode/execnode.py` |
 | tests | `tests/test_assets.py` |

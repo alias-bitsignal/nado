@@ -1,7 +1,8 @@
 # Execution-layer instructions (blobs) — developer reference
 
 > **⚠ Runtime note (2026-07):** the `stackvm` runtime and `execnode/vm.py` were **removed** — the only
-> runtime today is the **field-native zkVM** (`execnode/zkvm.py`, `runtime: "zkvm"`, `DEFAULT_RUNTIME="zkvm"`),
+> runtime today is the **zkVM** (`execnode/zkvm2.py`, a 256-bit wrapping word and a BLAKE2s hash since the
+> generation-29 reroll; `runtime: "zkvm"`, `DEFAULT_RUNTIME="zkvm"`),
 > and contracts live at `execnode/games/*.py`, not `execnode/contracts/*.json`. The **blob envelope,
 > submission, and read paths in this doc are still exactly current**; only the VALUE-opcode sections below
 > (the `stackvm` primitives) and the `execnode/contracts/*.json` example cids are legacy. For authoring a
@@ -118,7 +119,7 @@ Invoke a method, persisting storage on success. Optionally **escrow NADO** into 
 | `op` | yes | `"call"` |
 | `contract` | yes | target `cid` |
 | `method` | yes | method name to run |
-| `args` | no | argument **list** (default `[]`; must be a list). Each arg is an **int in the Goldilocks field** or an **address string** (digested to a field element at the call boundary). Up to **1024 args**: the first 8 preload registers r0..r7, and the `ARG` opcode reaches all of them by dynamic index — variadic inputs (merkle proofs, batches) are first-class, no packing needed. |
+| `args` | no | argument **list** (default `[]`; must be a list). Each arg is an **int in [0, 2^256)** (one VM word; anything outside is refused, not reduced) or an **address string** (digested at the call boundary to its 256-bit BLAKE2s digest, `runtimes.zkvm_addr_digest`, and registered so a payout to that digest resolves back to the address). Up to **1024 args**: the first 8 preload registers r0..r7, and the `ARG` opcode reaches all of them by dynamic index — variadic inputs (merkle proofs, batches) are first-class, no packing needed. |
 | `value` | no | raw NADO to escrow from the caller's bridge INTO the contract for this call (`int >= 0`, bool rejected; default `0`) |
 | `ns` | no | namespace |
 
@@ -221,8 +222,14 @@ the new owner alone can `upgrade`/`transfer_contract`; the old owner can no long
 **Skips if:** no such contract; `sender` is not the current owner; `to` missing/empty.
 
 ```json
-{"op":"transfer_contract","contract":"<cid hex>","to":"ndo…newowner"}
+{"op":"transfer_contract","contract":"<cid hex>","to":"<new owner address>"}
 ```
+
+### Asset ops
+
+The fungible-asset ledger has its own blob ops — `asset_create`, `asset_transfer`, `asset_approve`,
+`asset_transfer_from`, `asset_burn`, `asset_mint`, `asset_renounce`, `asset_set_uri` (`execnode/state.py`
+`_apply_blob_inner`). Their fields, rules and the wallet's Assets tab are specified in [`assets.md`](assets.md).
 
 ---
 
@@ -340,7 +347,7 @@ Each bank escrows **only its own table's bankroll** and receives that table's ex
 to its bridge balance — withdrawable to L1 via `bridge_withdraw` (§4). House winnings are therefore returned
 fairly to whoever funded that table, with no shared pool and no trust. The Roulette dApp
 (`roulette.nadochain.com`) derives table / lobby / scoreboard state from `GET /exec/contract` (§8); there is no
-dedicated read API. The build + full test vector is `tests/test_roulette_contract.py`.
+dedicated read API. The live contract is `execnode/games/roulette.py`.
 
 ```json
 {"op":"call","contract":"186ebadb975794e2ed7eeb1c7b5115a5","method":"open","args":[7,<bankCommit>],"value":5000000000000}
@@ -381,7 +388,7 @@ unpayable pool.
 digested at the call boundary, stored as digests, resolved back to the original text by `decode_view`
 ("hash on-chain, text in the transaction"). Money is tracked in UNITs of 10^4 raw (stakes must be UNIT
 multiples) so `stake×pot` stays inside the `DIVMODW` soundness window; a market's pot caps at 2^31 UNITs.
-Per-user positions live in alghash-keyed slots — the frontend reads them through the read-only **views**
+Per-user positions live in hash-keyed slots (the VM's BLAKE2s `hash`) — the frontend reads them through the read-only **views**
 `claimable_of(m, addr)` / `stake_of(m, i, addr)` / `total_of(m, addr)` / `claimed_of(m, addr)` /
 `vote_of(m, addr)` via `GET /exec/view`.
 
@@ -438,8 +445,9 @@ they carry proofs/commitments and are verified by the pool. Full detail: [`priva
 
 ### `field_transfer`
 
-Phase-2 field-native join-split (full STARK proof from the delegated prover). The proof bundle rides as an
-**opaque JSON string** so its large field ints survive JSON round-trips.
+A private transfer or unshield in the **Stwo pool** (`execnode/shielded_stwo.py`): the bundle carries a `stwo_js`
+join-split proof the wallet builds on-device (`static/stark/stwo_js.js`). The op keeps its pre-Stwo name. The
+bundle rides as an **opaque JSON string** so its large ints survive JSON round-trips.
 
 | field | req | meaning |
 |---|---|---|
@@ -449,9 +457,13 @@ Phase-2 field-native join-split (full STARK proof from the delegated prover). Th
 | `proof_da` | no | DA commitment; the tail loop resolves the bundle from DA before applying (block stalls if unavailable) |
 | `ns` | no | namespace |
 
-Applied via `apply_field_transfer`. **Skips if:** `bundle_json` unparsable; bundle not a dict.
+Applied via `apply_field_transfer`. **Skips if:** `bundle_json` unparsable; bundle not a dict; the bundle carries no
+`stwo_js` proof. The legacy field pool's `joinsplit`/`joinsplit2` and the wide pool's `joinsplit3` paths were deleted
+in G9 slice 5 (both pools were empty).
 
 ### `shielded_transfer`
+
+> **HISTORICAL (G9 slice 5c):** the legacy pool is deleted; this op is skipped at every height (`skip shielded_transfer: the legacy shielded pool is closed`) and moves nothing. Private transfers are `field_transfer` (the Stwo pool).
 
 Phase-1 join-split / unshield against the shielded pool.
 
@@ -467,7 +479,13 @@ Verified + applied by `apply_transfer` (double-spend + value conservation checke
 `unshield_withdrawals[nonce] = {"addr": withdraw_addr, "amount": -public_value}` is recorded for L1 to release
 from `SHIELD_ESCROW` against the settled root (claim proof at `/exec/unshield_proof?nonce=`).
 
-**Skips if:** `public`/`proof` not dicts; verifier rejects; unshield missing `withdraw_addr`.
+**Skips if:** `public`/`proof` not dicts; `public_value > 0`; a `stark` bundle in `proof` (refused on this op since
+the privacy pause); verifier rejects; unshield missing `withdraw_addr`.
+
+### `private_call`
+
+Shielded contract notes. **Refused** on the current generation: the privacy pause (`PRIVACY_PAUSE_HEIGHT`, from
+block 1) makes every `private_call` a no-op (`skip private_call: shielded contract notes are paused`).
 
 ---
 
@@ -493,12 +511,10 @@ must be read from the **finalized** state for a valid claim.
 | `/exec/dividend_proof` | Merkle proof for a collected dividend withdrawal | `nonce` |
 | `/exec/unshields` | pending unshield exits for an L1 `?addr=` | `addr` |
 | `/exec/unshield_proof` | Merkle proof for an unshield exit vs current `state_root` | `nonce` |
-| `/exec/shielded` | phase-1 pool status (root, note/nullifier counts, recent anchors) | — |
-| `/exec/field_shielded` | phase-2 field-pool status; `?cm=` also a commitment's position | `cm` |
-| `/exec/field_leaves` | full field-pool commitment list (build a Merkle path on-device) | — |
+| `/exec/field_shielded` | Stwo pool status (root, note/nullifier counts, depth, `"pool": "stwo"`) | — |
+| `/exec/field_leaves` | full Stwo-pool commitment list (build a Merkle path on-device) | — |
 | `/exec/examples` | starter contract library (`contract_lib.LIBRARY`) | — |
 | `/exec/runtimes` | available runtimes + default | — |
-| `/exec/prove_transfer`, `/exec/prove_transfer2` | **POST** delegated STARK provers (return `bundle_json`; never apply) | POST body = secret witness |
 
 (There is also a `/da/*` data-availability API — publish/fetch erasure-coded proof objects by commitment.)
 

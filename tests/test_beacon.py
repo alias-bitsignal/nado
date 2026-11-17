@@ -3,8 +3,12 @@
 # the VM via the BEACON opcode, so a game can settle OBJECTIVELY from chain randomness with NO player
 # secret-reveal. Each beacon is a pure function of that epoch's FINALIZED reveals, so every node agrees
 # regardless of when it started; a partially-witnessed epoch (below beacon_floor) is unavailable, not wrong.
+import os as _os, tempfile as _tempfile  # ISOLATION FIRST (CLAUDE.md rule 4): never the live node's HOME or exec files
+_os.environ["HOME"] = _tempfile.mkdtemp(prefix="nado-test-")
+_os.environ["NADO_EXEC_STATE"] = _os.path.join(_os.environ["HOME"], "exec_state.json")
+_os.environ["NADO_EXEC_DA"] = _os.path.join(_os.environ["HOME"], "exec_da")
 import sys, tempfile
-sys.path.insert(0, "/root/nado")
+sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.dirname(__import__("os").path.abspath(__file__))))
 from execnode.state import ExecState
 from protocol import EPOCH_LENGTH, GENESIS_BEACON
 from ops.mining_ops import compute_beacon
@@ -23,15 +27,23 @@ ck("reveal order doesn't matter (sorted)", A.beacons.get(13) == exp)
 ck("an epoch below the beacon floor is unavailable (no partial-witness beacon)", (A.beacon_floor - 1) not in A.beacons)
 
 # the BEACON opcode: a contract reads a finalized beacon; a future/unavailable epoch reverts (no-op)
-st = ExecState(tempfile.mktemp()); st.cursor = 1 * EPOCH_LENGTH; st.advance_beacons(st.cursor)   # floor = 3
-st.record_reveal(4, "zz"); st.cursor = 8 * EPOCH_LENGTH; st.advance_beacons(st.cursor)            # epoch 4 >= floor
 from execnode import zkvmasm
-CODE = zkvmasm.assemble_contract({"getb": "beacon r1 r0\n ret r1"})
-st.apply_blob({"op": "deploy", "code": CODE, "nonce": "b"}, "X", "d")
-cid = list(st.contracts)[0]
-from execnode.stark.field import P as _P
-b4 = int(compute_beacon(GENESIS_BEACON, ["zz", "4"]), 16) % _P
-ck("BEACON(finalized epoch) returns the exec beacon", st.view(cid, "getb", [4]) == b4 and 4 in st.beacons)
+
+
+def beacon_contract():
+    st = ExecState(tempfile.mktemp()); st.cursor = 1 * EPOCH_LENGTH; st.advance_beacons(st.cursor)   # floor = 3
+    st.record_reveal(4, "zz"); st.cursor = 8 * EPOCH_LENGTH; st.advance_beacons(st.cursor)            # epoch 4 >= floor
+    CODE = zkvmasm.assemble_contract({"getb": "beacon r1 r0\n ret r1"})
+    st.apply_blob({"op": "deploy", "code": CODE, "nonce": "b"}, "X", "d")
+    return st, list(st.contracts)[0]
+
+
+# the word the contract sees is the VM's: the gen-29 256-bit VM carries the beacon whole (the gen-28 half, reduced mod
+# the Goldilocks prime, retired in G9 with BLAKE_EXEC_HEIGHT: generation 28's rules)
+full4 = int(compute_beacon(GENESIS_BEACON, ["zz", "4"]), 16)
+st, cid = beacon_contract()
+ck("gen 29: BEACON(finalized epoch) returns the whole 256-bit exec beacon",
+   st.view(cid, "getb", [4]) == full4 and full4 < 1 << 256 and 4 in st.beacons)
 ck("BEACON(finalized) is reproducible (deterministic view)", st.view(cid, "getb", [4]) == st.view(cid, "getb", [4]))
 ck("BEACON(future/unavailable epoch) reverts -> None", st.view(cid, "getb", [9999]) is None)
 ck("a game result HASH(beacon || id) differs per id", st.view(cid, "getb", [4]) is not None)

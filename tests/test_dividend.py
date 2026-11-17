@@ -9,6 +9,7 @@ Run: python3 tests/test_dividend.py
 """
 import os, sys, tempfile, logging, traceback
 os.environ["HOME"] = tempfile.mkdtemp(prefix="nado_div_")
+import atexit, shutil; atexit.register(shutil.rmtree, os.environ["HOME"], ignore_errors=True)   # leave no /tmp home behind (9,600 leaked by 2026-09-22)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 for d in ("index", "blocks", "logs", "peers"):
     os.makedirs(f"{os.environ['HOME']}/nado/{d}", exist_ok=True)
@@ -25,13 +26,9 @@ from ops.reward_ops import credit_block_reward, block_lane
 from ops.account_ops import create_account, get_account
 from ops.key_ops import generate_keys
 
-fails = 0
-def check(name, fn):
-    """Run fn; print PASS/FAIL and count failures."""
-    global fails
-    try: fn(); print(f"PASS  {name}")
-    except Exception as e:
-        fails += 1; print(f"FAIL  {name}: {e}"); traceback.print_exc()
+import _harness
+_report = _harness.Report()
+check = _report.run
 
 R = 1_000_000_000        # 0.1 NADO block reward
 def bal(a):
@@ -75,15 +72,15 @@ def t2_open_block_credits_pool_and_reverts():
     assert bal(DIVIDEND_POOL) == div0 and bal(TREASURY_ADDRESS) == tre0, "revert returns pool + treasury exactly"
 
 def t3_bonded_block_also_funds_the_dividend():
-    """Prove a bonded block pays the producer 70% yet still contributes its dividend + treasury shares, revert-exact."""
+    """Prove a bonded block pays the producer 50% and contributes its 40% dividend + 10% treasury shares, revert-exact."""
     from protocol import split_bonded_block_reward
     a = generate_keys()["address"]; create_account(a, balance=0)
     div0, tre0 = bal(DIVIDEND_POOL), bal(TREASURY_ADDRESS)
-    pc, div, tre = split_bonded_block_reward(R)   # (producer 70%, dividend 20%, treasury 10%)
+    pc, div, tre = split_bonded_block_reward(R)   # (producer 50%, dividend 40%, treasury 10%)
     block = {"block_number": BONDED_SLOT, "block_creator": a, "block_reward": R}
     assert block_lane(block) == "bonded"
     with kv_ops.write_txn(): credit_block_reward(block, logger=logger)
-    assert bal(a) == pc, "bonded producer keeps the majority (70%)"
+    assert bal(a) == pc, "bonded producer keeps 50%"
     assert bal(DIVIDEND_POOL) == div0 + div, "a bonded block now contributes its share to the dividend pool"
     assert bal(TREASURY_ADDRESS) == tre0 + tre, "treasury keeps 10%"
     with kv_ops.write_txn(): credit_block_reward(block, logger=logger, revert=True)
@@ -124,5 +121,5 @@ def t5_credit_block_reward_rollback_is_byte_identical():
 for name, fn in sorted(globals().items()):
     if name.startswith("t") and callable(fn) and name[1].isdigit():
         check(name, fn)
-print(f"\n{'ALL PASSED' if not fails else str(fails)+' FAILED'}")
-sys.exit(1 if fails else 0)
+print(f"\n{'ALL PASSED' if not _report.fails else str(_report.fails)+' FAILED'}")
+sys.exit(1 if _report.fails else 0)

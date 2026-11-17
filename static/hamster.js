@@ -5,14 +5,14 @@
 // with the greatest total distance wins, and its backers split the whole pot pro-rata. No house, no oracle:
 // genes come from a block mined BEFORE betting closes (public), the run from blocks mined AFTER (unknown to
 // every bettor) — so you read form + the live tote, exactly like a racetrack. The client mirrors the
-// contract's alghash math (algHashn) to show genes and animate the run; the contract is the authority.
+// contract's hash math (algHashn: the VM's BLAKE2s word hash) to show genes and animate the run; the contract is the authority.
 // Contract: execnode/games/hamster.py.
-import { Book } from "./bookgame.js?v=650810e4";
-import { NadoDapp, rawToNado, nadoToRaw, randId, _m, $, base, gate, canPay, orderCards, alertBar, notify, okBar, confirmingLabel, blocksToTime, wireWallet, stickyInputs, renderWallet, renderTopScores, recentChips, loadQR, resolveAliases, disp, share, shareInvite, algHashn, ALG_P, esc, modeBar, dailyFrame } from "./nadodapp.js?v=db1a59d7";
-import { todayIdx, anchorOf, ensureAnchor, entriesFrom, verifyEntries, provableSeed, packMoves } from "./provable.js?v=24f139ac";
-import * as DERBY from "./hamster-daily.js?v=ccbd0747";
+import { Book } from "./bookgame.js";
+import { NadoDapp, rawToNado, nadoToRaw, randId, _m, $, base, gate, canPay, orderCards, alertBar, notify, okBar, confirmingLabel, blocksToTime, wireWallet, stickyInputs, renderWallet, renderTopScores, recentChips, loadQR, resolveAliases, disp, share, shareInvite, algHashn, ALG_P, esc, modeBar, dailyFrame, BLOCK_TIME } from "./nadodapp.js";
+import { todayIdx, anchorOf, ensureAnchor, entriesFrom, verifyEntries, provableSeed, packMoves } from "./provable.js";
+import * as DERBY from "./hamster-daily.js";
 
-const CID = "71ea1f3c09837a8265ebd05759ddf957";   // execnode/games/hamster.py (zkVM)
+const CID = "3d9b9eeb0c7116f1461bc2b6cadcfe7a";   // execnode/games/hamster.py (zkVM)
 const dapp = new NadoDapp({ cid: CID, app: "Hamster" });
 
 // keep these in lockstep with execnode/games/hamster.py
@@ -24,7 +24,8 @@ const NH = 6, GENE_DELAY = 2, BET_BLOCKS = 50, RACE_LEN = 10, GENE_SPREAD = 8, S
 //   • raw STORAGE maps (tot/pl/...) hold UNITs      -> multiply by UNIT before rawToNado()
 //   • the contract VIEWS (total_of / stake_of / claimable_of) already `mul UNIT` and return RAW NADO
 //     -> pass them to rawToNado() as-is. (A double-multiply here showed a 13.78 NADO stake as 137798.1.)
-const UNIT = 10000n, BLOCK_SECS = 6;
+// BLOCK_TIME: protocol.BLOCK_TIME from the relay's /protocol.js via the SDK — never a literal copy (tests/test_constant_mirrors.py)
+const UNIT = 10000n, BLOCK_SECS = BLOCK_TIME;
 // the fixed-odds BOOK — the model, the solvency ceiling, the five actions and the settle predicates
 // come from the shared scaffold, so this game and bet cannot drift on the part that moves money.
 // The RENDERING stays here: prices belong in the lane table, not in a separate card.
@@ -52,7 +53,7 @@ function geneOf(race, lane) {
   const bits = g >> 32n;
   return { lane, speed, name: NAMES[Number(bits % BigInt(NAMES.length))], coat: COATS[Number((bits >> 8n) % BigInt(COATS.length))] };
 }
-// geneRaw: alghash(BLOCKHASH(gh), lane) — null until the gene block hash is cached.
+// geneRaw: HASH(BLOCKHASH(gh), lane) — null until the gene block hash is cached.
 function geneRaw(race, lane) {
   if (!lastRace || !lastRace.gh) return null;
   const h = dapp.bh(lastRace.gh); if (!h) return null;
@@ -87,6 +88,22 @@ function leaderOf(rows) {
   let best = -1, w = 0;
   for (let l = 0; l < NH; l++) if (rows[l].dist > best) { best = rows[l].dist; w = l; }
   return w;
+}
+
+// A SETTLED RACE IS REDRAWN ONLY WHEN THE REDRAW IS ITS RACE (G6). The genes and steps come from block hashes through
+// the VM hash, and a race carried across the reroll ran on the OLD chain's blocks under gen 28's hash: its heights name
+// other blocks here (or none yet — a carried race can sit above this chain's cursor), so a redraw would give its
+// hamsters other names and speeds, and could crown one the chain did not pay. The stored distances (di) are the race the
+// contract ran: a redraw is kept only when it reaches them exactly; otherwise the lanes are shown plain, by number,
+// at their stored distances. A race settled on THIS chain always redraws to its own di (cursor >= fh, same hash).
+function settledRows(r, rows) {
+  if (!r.sd) return rows;
+  const plain = () => r.di.map((d, l) => ({ lane: l, speed: null, name: window.t("hamster.laneN", "lane {n}", { n: l + 1 }),
+                                            coat: COATS[0], dist: d, blocks: RACE_LEN }));
+  if (r.cur != null && r.cur < r.fh) return plain();          // settled before this chain reached its finish: carried
+  if (!rows) return null;                                     // hashes still loading
+  if (rows.some((row) => row.blocks < RACE_LEN)) return null;
+  return rows.every((row, l) => row.dist === r.di[l]) ? rows : plain();
 }
 
 // ---- reads (hamster storage schema) --------------------------------------------------------------
@@ -438,7 +455,7 @@ function render() {
   $("raceId").textContent = "#" + active;
   if (!r || !r.exists) { $("raceState").textContent = dapp.whereIs(window.t("hamster.raceWord", "race"), active); $("track").innerHTML = ""; $("betPanel").innerHTML = ""; shareInvite("race", null); return; }
   shareInvite("race", active, window.t("hamster.shareText", "Bet on the hamsters at NADO — race #{r}:", { r: active }), 170);
-  const rows = standings(r);                     // null until genes are known
+  const rows = settledRows(r, standings(r));     // null until genes are known; plain lanes for a carried race
   const wnLane = r.sd ? r.wn - 1 : (rows ? leaderOf(rows) : -1);
   // state line + countdown (in blocks -> time)
   const toTime = (blocks) => blocksToTime(Math.max(0, blocks));
@@ -470,7 +487,7 @@ function render() {
     const win = (r.sd || r.phase === "done") ? (l === wnLane && !r.vd) : (r.phase === "racing" && l === wnLane);
     const mine = (myCache[r.id] && myCache[r.id].stakes && (myCache[r.id].stakes[l] || 0n) > 0n);
     return '<div class="lane' + (win ? " win" : "") + (mine ? " mine" : "") + '">'
-      + '<div class="laneHead"><b>' + esc(row.name) + '</b> <span class="dim">' + window.t("hamster.spd", "spd {s}", { s: row.speed }) + "</span>"
+      + '<div class="laneHead"><b>' + esc(row.name) + "</b>" + (row.speed != null ? ' <span class="dim">' + window.t("hamster.spd", "spd {s}", { s: row.speed }) + "</span>" : "")
       + (mine ? ' <span class="b ok">' + window.t("hamster.yours", "yours") + "</span>" : "") + "</div>"
       + '<div class="rail"><div class="runner" style="left:' + pct + '%">' + hamsterSVG(row.coat, win) + '</div><div class="finish"></div></div>'
       + "</div>";

@@ -1,4 +1,6 @@
 import asyncio
+# must match tools/alphanet6_carryforward.CARRY_FIELDS
+CARRY_FIELDS = ("public_key", "kem_pub", "registered", "fidelity", "devkey", "devcred", "auth")
 import json
 import os
 
@@ -11,6 +13,11 @@ from ops.log_ops import get_logger
 from ops.peer_ops import save_peer, get_public_ip
 from ops import kv_ops
 from protocol import GENESIS_ADDRESS, CHAIN_ID, TREASURY_GENESIS
+
+# What the gen-28 (betanet-9) genesis allocation holds in SHIELD_ESCROW with no exec genesis to account for it: deposits
+# stranded since an earlier generation, carried as a balance before the Stwo carry existed. Read only for generation 28
+# (make_genesis "NO SILENT DROP OF SHIELDED VALUE"); delete with the gen-28 cleanup after the next reroll.
+UNCARRIED_SHIELD_ESCROW = 1_123_000
 
 
 def create_indexers():
@@ -67,6 +74,7 @@ def make_genesis(address, balance, ip, port, timestamp, logger):
 
     block_transactions = []
     block_hash = blake2b_hash_link(link_from=timestamp, link_to=block_transactions)
+    from ops import mldsa_block_auth as _auth
 
     genesis_block_message = {
         "block_number": 0,
@@ -78,6 +86,14 @@ def make_genesis(address, balance, ip, port, timestamp, logger):
         "block_reward": 0,
         "cumulative_fees": 0,        # running total of fees burned up to and incl. this block
         "cumulative_weight": 0,      # #17 step 2: fork-choice chain-weight base (genesis = 0)
+        # AUTHORIZATION COMMITMENT, for UNIFORMITY. Genesis carries no transactions, so this is the empty
+        # fold and a count of zero — but every other block has these fields, and a genesis without them is a
+        # special case every reader of the chain has to know about. It costs nothing here: the genesis hash
+        # is blake2b_hash_link(timestamp, []) and does not cover this dict at all, so adding the fields
+        # cannot change block 0's identity. Computed rather than written as a literal, so it follows
+        # AUTH_DOMAIN / AUTH_VERSION if those ever move.
+        "auth_root": _auth.auth_root([]),
+        "auth_count": 0,
         "chain_id": CHAIN_ID,
     }
 
@@ -99,6 +115,23 @@ def make_genesis(address, balance, ip, port, timestamp, logger):
                 create_account(address=entry["address"], balance=0, bonded=entry["bonded"])
             logger.warning(f"TESTNET: seeded {len(bonds)} bonded genesis accounts")
 
+    # STATE OUTSIDE ACCOUNT RECORDS (device bindings, aliases, account-auth history) and the PRESENT set, seeded only when
+    # the carry file names THIS generation — so no node replaying an earlier generation's genesis is ever affected by it.
+    carry = None
+    carry_path = (os.environ.get("NADO_GENESIS_CARRY")        # a rehearsal points this at a scratch copy
+                  or os.path.join(os.path.dirname(os.path.abspath(__file__)), "genesis_data", "genesis_carry.dat"))
+    if os.path.exists(carry_path):
+        from protocol import CHAIN_GENERATION as _GEN
+        with open(carry_path) as cf:
+            carry = json.load(cf)
+        if int(carry.get("generation", -1)) != int(_GEN):
+            carry = None
+    # LEASES AT GENESIS: with a carried "present" list, exactly those identities hold a lease at epoch 0 — NOT every
+    # registered identity and NOT every relay identity in genesis_open.dat. Seeding all registered ones revived 33 lapsed
+    # identities on betanet-8 (79 collectors against 46 live), and a lapsed identity drawn for an open-lane slot produces
+    # nothing for its whole lease. Without a list (a fresh no-premine chain) the relay identities bootstrap the lane.
+    leased = set(carry["present"]) if carry is not None and "present" in carry else None
+
     # MAINNET-capable OPEN-lane bootstrap (no premine, no bonded seed required): seed registered +
     # present relay identities from a byte-identical genesis_open.dat so a fresh chain can PRODUCE
     # from height 1 through the OPEN lane. With TREASURY_GENESIS=0 nobody holds coins to bond, so the
@@ -117,9 +150,15 @@ def make_genesis(address, balance, ip, port, timestamp, logger):
     if os.path.exists(open_path):
         with open(open_path) as of:
             open_ids = json.load(of)
-        for addr in sorted(open_ids):
-            create_account(address=addr, registered=1)
-            kv_ops.recert_put(address=addr, epoch=0)  # seed a lease at epoch 0 (DUPSORT dedups per addr@0)
+        # ONE WRITE TXN FOR THE WHOLE SEED (2026-09-16): each helper below commits durably on its own when no
+        # txn is open, and the carried allocation is ~1,200 accounts x 2 fields — 63 s of fsyncs measured on a
+        # loaded box, which blew the loopback harness's boot deadline and is dead time on every fresh node.
+        # The rows are byte-identical either way; only the commit boundary changes.
+        with kv_ops.write_txn():
+            for addr in sorted(open_ids):
+                create_account(address=addr, registered=1)
+                if leased is None or addr in leased:
+                    kv_ops.recert_put(address=addr, epoch=0)  # seed a lease at epoch 0 (DUPSORT dedups per addr@0)
         logger.warning(f"Seeded {len(open_ids)} registered open-lane genesis identities (epoch 0)")
 
     # RELAUNCH CARRY-FORWARD: seed prior-chain balances + bonded stake from a byte-identical genesis_alloc.dat
@@ -140,20 +179,109 @@ def make_genesis(address, balance, ip, port, timestamp, logger):
         with open(alloc_path) as af:
             alloc = json.load(af)
         carried = 0
-        for e in sorted(alloc, key=lambda x: x["address"]):
-            # AUTHORITATIVE set (not create_account's insert-or-ignore): a carried balance/stake must apply
-            # even when genesis_open.dat already created this address as a registered relay identity above,
-            # otherwise its coins would be silently dropped. account_set_field preserves other fields.
-            kv_ops.account_set_field(e["address"], "balance", int(e.get("balance", 0)))
-            kv_ops.account_set_field(e["address"], "bonded", int(e.get("bonded", 0)))
-            carried += int(e.get("balance", 0)) + int(e.get("bonded", 0))
-        # Count carried-forward coins (balances + locked bonded stake — all real, refundable supply) into
-        # totals so total_supply == TREASURY_GENESIS + produced - fees is accurate: get_supply reports the
-        # true supply, and the BOND-ELASTIC emission ratio (bonded/total_supply) has a correct denominator
-        # instead of dividing by block-produced-only supply. No-op on a fresh no-premine chain (alloc empty).
-        if carried:
-            kv_ops.totals_add(carried, 0)
+        with kv_ops.write_txn():                      # one commit for the whole allocation (see the seed above)
+            for e in sorted(alloc, key=lambda x: x["address"]):
+                # AUTHORITATIVE set (not create_account's insert-or-ignore): a carried balance/stake must apply
+                # even when genesis_open.dat already created this address as a registered relay identity above,
+                # otherwise its coins would be silently dropped. account_set_field preserves other fields.
+                kv_ops.account_set_field(e["address"], "balance", int(e.get("balance", 0)))
+                kv_ops.account_set_field(e["address"], "bonded", int(e.get("bonded", 0)))
+                carried += int(e.get("balance", 0)) + int(e.get("bonded", 0))
+            # Count carried-forward coins (balances + locked bonded stake — all real, refundable supply) into
+            # totals so total_supply == TREASURY_GENESIS + produced - fees is accurate: get_supply reports the
+            # true supply, and the BOND-ELASTIC emission ratio (bonded/total_supply) has a correct denominator
+            # instead of dividing by block-produced-only supply. No-op on a fresh no-premine chain (alloc empty).
+            if carried:
+                kv_ops.totals_add(carried, 0)
         logger.warning(f"RELAUNCH: carried forward {len(alloc)} account balances ({carried} raw) from the prior chain")
+        # IDENTITY CARRY (gen 26, operator decision 2026-09-25): the optional per-account fields the carry-forward tool
+        # writes (tools/alphanet6_carryforward.CARRY_FIELDS). Only present in an allocation built for a generation that
+        # carries identities, so an older allocation seeds byte-identically to before. Registered identities get a
+        # lease at epoch 0, like the open-lane genesis identities above.
+        with kv_ops.write_txn():
+            _ids = 0
+            for e in sorted(alloc, key=lambda x: x["address"]):
+                fields = [f for f in CARRY_FIELDS if f in e]
+                for f in fields:
+                    kv_ops.account_set_field(e["address"], f, e[f])
+                if fields:
+                    _ids += 1
+                if str(e.get("registered", "0")) not in ("0", "", "None") and (leased is None or e["address"] in leased):
+                    kv_ops.recert_put(address=e["address"], epoch=0)
+        if _ids:
+            logger.warning(f"RELAUNCH: carried identity fields for {_ids} accounts")
+
+    if carry is not None:
+        with kv_ops.write_txn():
+            for key, addr, mode in sorted(carry.get("devbind") or []):
+                kv_ops.devbind_set(key, addr, 0, mode)
+            for name, owner in sorted(carry.get("aliases") or []):
+                kv_ops.alias_put(name, owner)
+            for addr, ver, keys in sorted(carry.get("auth_history") or []):
+                kv_ops.auth_history_put(addr, 0, int(ver), list(keys))
+            # CARRIED INVITES (tools/alphanet6_carryforward.carried_invites): each open invite under its id on THIS chain —
+            # the id binds CHAIN_ID, which the reroll changed — with its rebased expiry. INVARIANT: INVITE_ESCROW holds
+            # exactly their coins (checked below), so every carried invite can pay and nothing in the escrow is orphaned.
+            from ops.transaction_ops import invite_id_of as _invite_id_of
+            for key, sender, amount, expiry in sorted(carry.get("invites") or []):
+                kv_ops.invite_put(_invite_id_of(key), [sender, int(amount), int(expiry), "open", ""])
+        if "invites" in carry:
+            from protocol import INVITE_ESCROW as _INVITE_ESCROW
+            _inv = sum(int(r[2]) for r in carry["invites"])
+            _iheld = int((kv_ops.get_account(_INVITE_ESCROW) or {}).get("balance", 0))
+            if _iheld != _inv:
+                raise SystemExit(f"genesis: INVITE_ESCROW holds {_iheld} raw but the carried invites total {_inv}")
+        logger.warning(f"RELAUNCH: carried {len(carry.get('devbind') or [])} device bindings, "
+                       f"{len(carry.get('aliases') or [])} aliases, {len(carry.get('auth_history') or [])} auth histories, "
+                       f"{len(carry.get('invites') or [])} open invites")
+
+    # CARRIED CONTRACT POTS (execnode/exec_genesis.py): contracts the reroll carried keep their pots on the exec side, so
+    # L1 must start holding exactly those coins in BRIDGE_ESCROW and count them in the default namespace's escrow
+    # counter — every exit checks both (transaction_ops bridge_withdraw), and the counter used to start at 0 always.
+    # INVARIANT: BRIDGE_ESCROW == Σ carried pots at block 0, because the exec layer starts holding exactly those; a
+    # mismatch refuses to build genesis rather than start a chain whose first exit fails or whose escrow is unbacked.
+    from execnode import exec_genesis as _exec_genesis
+    if _exec_genesis.load():
+        from protocol import BRIDGE_ESCROW as _BRIDGE_ESCROW
+        _pots = _exec_genesis.pots_total()
+        _held = int((kv_ops.get_account(_BRIDGE_ESCROW) or {}).get("balance", 0))
+        if _held != _pots:
+            raise SystemExit(f"genesis: BRIDGE_ESCROW holds {_held} raw but the carried contracts' pots total {_pots}")
+        if _pots:
+            with kv_ops.write_txn():
+                kv_ops.bridge_escrow_ns_add("default", _pots)
+        logger.warning(f"RELAUNCH: carried {len(_exec_genesis.load()['contracts'])} contracts; {_pots} raw in their pots")
+        # THE CARRIED STWO POOL (execnode/exec_genesis.py): its notes start the new exec layer, so SHIELD_ESCROW must start
+        # holding exactly their value plus what the carry booked as burned in-pool (pool_fees). INVARIANT: SHIELD_ESCROW ==
+        # stwo_value + pool_fees at block 0 (ops/invariants.check_shielded exact) — less is an unbacked note, more is
+        # a coin the shielded accounting does not know. Asserted only for a document that carries the shielded section.
+        if _exec_genesis.load().get("shield"):
+            from protocol import SHIELD_ESCROW as _SHIELD_ESCROW
+            _want = _exec_genesis.shield_total()
+            _sheld = int((kv_ops.get_account(_SHIELD_ESCROW) or {}).get("balance", 0))
+            if _sheld != _want:
+                raise SystemExit(f"genesis: SHIELD_ESCROW holds {_sheld} raw but the carried Stwo pool needs {_want} "
+                                 "(stwo_value + pool_fees)")
+            logger.warning(f"RELAUNCH: carried the Stwo pool: "
+                           f"{len(_exec_genesis.load()['stwo_pool']['commitments'])} notes, {_want} raw in SHIELD_ESCROW")
+
+    # NO SILENT DROP OF SHIELDED VALUE (review 2026-10-12). Without an exec genesis that accounts for SHIELD_ESCROW — the
+    # document missing, built for another generation (exec_genesis.load() ignores it), or without the shielded section —
+    # the exec layer starts with an empty pool and no pool_fees, so every raw the allocation left in SHIELD_ESCROW would
+    # back nothing: carried notes lost, or coins the shielded invariant cannot explain. INVARIANT: that case refuses
+    # unless SHIELD_ESCROW is empty. The one exception is the live generation's own tracked allocation: betanet-9
+    # (gen 28) was built before the Stwo carry existed and holds UNCARRIED_SHIELD_ESCROW raw stranded since an earlier
+    # generation (tools/alphanet6_carryforward.exec_shield_doc), and a fresh node must still build that genesis. From the
+    # next generation the carry always writes the shielded section, so the exception is 0 there.
+    _gdoc = _exec_genesis.load()
+    if not (_gdoc and _gdoc.get("shield")):
+        from protocol import SHIELD_ESCROW as _SE, CHAIN_GENERATION as _GEN_NOW
+        _sheld = int((kv_ops.get_account(_SE) or {}).get("balance", 0))
+        _known = UNCARRIED_SHIELD_ESCROW if int(_GEN_NOW) == 28 else 0
+        if _sheld not in (0, _known):
+            raise SystemExit(f"genesis: SHIELD_ESCROW holds {_sheld} raw but no exec genesis for generation {_GEN_NOW} "
+                             "accounts for it (genesis_data/exec_genesis.json is missing, for another generation, or "
+                             "has no shielded section) — the carried shielded value would be silently dropped")
 
     # FAUCET GUARD: there is intentionally NO auto-bond faucet anywhere. Granting a fresh address a
     # bonded share would pipe the CAPPED free lane into the UNCAPPED capital lane (a Sybil ->

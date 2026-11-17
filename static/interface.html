@@ -7,11 +7,14 @@
      'unsafe-inline', and this page has ZERO inline scripts or inline event handlers of its own. 'wasm-unsafe-eval'
      (+'unsafe-eval' for older engines) keeps the in-browser WASM prover/miner working; the two CDN hosts are the
      crypto fallback loadDeps() uses; connect-src * because the relay/exec node is a user-configurable origin. -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval' https://esm.sh https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src *; object-src 'none'; base-uri 'self'; form-action 'self' https://forum.nadochain.com" />
+<!-- form-action MUST name every site the wallet signs a login for (interface.js FORUM_ORIGIN_ALLOW, LAND_ORIGIN_ALLOW):
+     the signed login goes back as a top-level form POST, and an origin missing here is blocked by the browser AFTER the
+     user approves — Land sign-in silently went nowhere until 2026-11-06. tests/test_the_wallet_may_post_every_login_it_signs.py -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval' https://esm.sh https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src *; object-src 'none'; base-uri 'self'; form-action 'self' https://forum.nadochain.com https://land.nadochain.com" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <meta name="theme-color" content="#0b0f14" />
 <meta name="color-scheme" content="dark" />
-<title>NADO Interface — wallet, miner & explorer in your browser</title>
+<title>NADO Interface — wallet, collector & explorer in your browser</title>
 <meta name="description" content="Your NADO wallet, miner, block explorer and shielded pool in one page — no install, no signup. Mine from your phone, send post-quantum transactions and fully private zk-STARK transfers." />
 <meta name="robots" content="index, follow" />
 <link rel="canonical" href="https://get.nadochain.com/" />
@@ -69,37 +72,50 @@
 </head>
 <body>
 <header class="app">
-  <img class="logo" src="/static/logo.svg" width="34" height="34" alt="NADO" />
+  <svg class="logo" width="34" height="34" role="img" aria-label="NADO" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192">
+<g stroke="#000" stroke-width="2" stroke-linejoin="round">
+  <path fill="var(--logo-1, #004438)" d="M122.90 80.75L153.92 79.88L126.90 65.02L96.25 65.08ZM96.25 65.08L111.00 37.78L84.62 53.75L69.34 80.33ZM69.34 80.33L53.08 53.90L53.72 84.73L69.10 111.25ZM69.10 111.25L38.08 112.12L65.10 126.98L95.75 126.92ZM95.75 126.92L81.00 154.22L107.38 138.25L122.66 111.67ZM122.66 111.67L138.92 138.10L138.28 107.27L122.90 80.75Z"/>
+  <path fill="var(--logo-2, #006c56)" d="M138.28 107.27L168.46 106.90L153.92 79.88L122.90 80.75ZM126.90 65.02L141.67 38.70L111.00 37.78L96.25 65.08ZM84.62 53.75L69.21 27.79L53.08 53.90L69.34 80.33ZM53.72 84.73L23.54 85.10L38.08 112.12L69.10 111.25ZM65.10 126.98L50.33 153.30L81.00 154.22L95.75 126.92ZM107.38 138.25L122.79 164.21L138.92 138.10L122.66 111.67Z"/>
+  <path fill="var(--logo-3, #008367)" d="M126.90 65.02L153.92 79.88L168.66 52.66L141.67 38.70ZM84.62 53.75L111.00 37.78L94.79 11.41L69.21 27.79ZM53.72 84.73L53.08 53.90L22.14 54.75L23.54 85.10ZM65.10 126.98L38.08 112.12L23.34 139.34L50.33 153.30ZM107.38 138.25L81.00 154.22L97.21 180.59L122.79 164.21ZM138.28 107.27L138.92 138.10L169.86 137.25L168.46 106.90Z"/>
+  <path fill="var(--logo-4, #009974)" d="M168.46 106.90L184.23 79.60L168.66 52.66L153.92 79.88ZM141.67 38.70L125.92 11.39L94.79 11.41L111.00 37.78ZM69.21 27.79L37.68 27.79L22.14 54.75L53.08 53.90ZM23.54 85.10L7.77 112.40L23.34 139.34L38.08 112.12ZM50.33 153.30L66.08 180.61L97.21 180.59L81.00 154.22ZM122.79 164.21L154.32 164.21L169.86 137.25L138.92 138.10Z"/>
+  <path fill="var(--logo-5, #00ad93)" d="M141.67 38.70L168.66 52.66L153.16 26.11L125.92 11.39ZM69.21 27.79L94.79 11.41L64.06 11.55L37.68 27.79ZM23.54 85.10L22.14 54.75L6.90 81.44L7.77 112.40ZM50.33 153.30L23.34 139.34L38.84 165.89L66.08 180.61ZM122.79 164.21L97.21 180.59L127.94 180.45L154.32 164.21ZM168.46 106.90L169.86 137.25L185.10 110.56L184.23 79.60Z"/>
+</g>
+</svg>
   <div>
     <h1 data-i18n="app.title">NADO Interface</h1>
-    <div class="sub" data-i18n="app.sub">browser-only · no full node</div>
+    <!-- THE WAY BACK TO THE PROJECT. The wallet had no link to its own website; a newcomer who arrived here
+         from a share had nowhere to read what NADO is. A domain is not translated. -->
+    <a class="site-link faint small" href="https://nadochain.com" target="_blank" rel="noopener">nadochain.com ↗</a>
   </div>
   <div class="conn">
     <div><span id="netTag" class="net-tag mono">…</span><span id="connDot" class="dot"></span><span id="connText" data-i18n="conn.connecting">connecting…</span></div>
     <div id="tipText" class="faint">tip: —</div>
+    <div id="relayTag" class="faint"></div>
   </div>
 </header>
 
 <div class="wrap">
 
   <!-- boot / dependency error -->
+  <div id="booting" class="card" style="display:flex;align-items:center;gap:12px;color:var(--txt-dim)"><span class="spin"></span><span data-i18n="boot.loading">Loading the wallet…</span></div>
   <div id="bootError" class="card hidden">
     <h2 data-i18n="boot.title">Startup error</h2>
     <div class="warnbox danger" id="bootErrorMsg"></div>
     <p class="small dim" data-i18n-html="boot.msg">This page loads its crypto (blake2b + ML-DSA-44 post-quantum signatures) from a public CDN over the
-      network. If you are offline or the CDN is blocked, mining cannot run.</p>
+      network. If you are offline or the CDN is blocked, collecting cannot run.</p>
   </div>
 
   <!-- ONBOARDING -->
   <div id="onboard" class="card hidden">
     <h2 data-i18n="onboard.title">Get started</h2>
-    <p class="small dim" data-i18n-html="onboard.intro">Generate a brand-new mining identity (an ML-DSA-44 post-quantum keypair) or import an
+    <p class="small dim" data-i18n-html="onboard.intro">Generate a brand-new collecting identity (an ML-DSA-44 post-quantum keypair) or import an
       existing private key. Everything happens locally in your browser — your private key never
       leaves this device.</p>
     <div class="row mt">
       <button id="btnGenerate" class="primary pulse-ready" data-i18n="btn.genKey">Generate new key</button>
       <button id="btnShowImport" class="ghost" data-i18n="btn.importKey">Import key</button>
     </div>
+    <div class="small mt"><a href="#" id="onboardAdvanced" style="color:var(--muted)">Advanced settings ›</a></div>
     <div id="importBox" class="mt hidden">
       <label data-i18n="import.label">Private key (64-hex seed) or 24-word recovery phrase</label>
       <input id="importKey" placeholder="4d3c2b1a…   or   word1 word2 … word24" autocomplete="off" spellcheck="false" />
@@ -113,7 +129,7 @@
   <!-- NEW KEY SAVE PROMPT -->
   <div id="savePrompt" class="card hidden">
     <h2 data-i18n="save.title">⚠ Save your private key</h2>
-    <div class="warnbox danger" data-i18n-html="save.warn">This key controls your mining rewards. Back up <b>either</b> the 24-word recovery phrase <b>or</b> the raw private key below — save it somewhere safe. Anyone who has it controls your coins, and if you lose both there is no way to recover.</div>
+    <div class="warnbox danger" data-i18n-html="save.warn">This key controls your collecting rewards. Back up <b>either</b> the 24-word recovery phrase <b>or</b> the raw private key below — save it somewhere safe. Anyone who has it controls your coins, and if you lose both there is no way to recover.</div>
     <label class="mt" data-i18n="save.mnemonic">🧠 Recovery phrase (24 words) — the easy backup</label>
     <div class="addr-box"><span class="a mono" id="newMnemonic" style="line-height:1.7"></span>
       <button class="copy" data-copy="newMnemonic" data-i18n="btn.copy">Copy</button></div>
@@ -125,19 +141,19 @@
     <label class="mt" data-i18n="save.addr">Address</label>
     <div class="addr-box"><span class="a mono" id="newAddr"></span></div>
     <div class="row mt">
-      <button id="btnDlKeySave" class="accent pulse-ready" data-i18n="btn.dlKey">⤓ Download key file (JSON)</button>
+      <button id="btnDlKeySave" class="accent pulse-ready" data-i18n="btn.dlKey">Download key file (JSON)</button>
     </div>
     <div class="row mt">
-      <label class="small tgl" style="display:flex;align-items:center;gap:10px;margin:0;cursor:pointer">
-        <input type="checkbox" id="ackSave" />
-        <span class="tgl-track" aria-hidden="true"><span class="tgl-knob"></span></span>
+      <label class="small" style="display:flex;align-items:center;gap:10px;margin:0;cursor:pointer">
+        <input type="checkbox" id="ackSave" class="switch" />
         <span data-i18n="save.ack">I have saved my private key</span>
       </label>
     </div>
     <div class="row mt">
       <button id="btnConfirmSave" class="primary pulse-ready" disabled data-i18n="save.continue">Continue → store on this device</button>
+      <p class="small faint mt" data-i18n="save.deviceNote">Collecting identities must prove they run on a real phone. Right after this step the wallet asks your device to attest itself; a computer, VM or emulator cannot, and will not be able to collect once the rule is active.</p>
     </div>
-    <p class="small faint mt" data-i18n-html="save.note">“Continue” stores the key in this browser's <span class="mono">localStorage</span> so mining can auto-resume. By default it is plain text — turn on <b>Settings → Encrypt wallet with a password</b> to encrypt it at rest and enable auto-lock. Only keep a plain-text key on a device you trust.</p>
+    <p class="small faint mt" data-i18n-html="save.note">“Continue” stores the key in this browser's <span class="mono">localStorage</span> so collecting can auto-resume. By default it is plain text — turn on <b>Settings → Encrypt wallet with a password</b> to encrypt it at rest and enable auto-lock. Only keep a plain-text key on a device you trust.</p>
   </div>
 
   <!-- UNLOCK (shown when an encrypted wallet is locked) -->
@@ -202,8 +218,13 @@
     </div>
     <button class="tab" data-tabbtn="messages" data-i18n="tab.messages">Messages<span id="msgBadge" class="tabbadge hidden"></span></button>
     <button class="tab" data-tabbtn="settings" data-i18n="tab.settings">Settings</button>
-    <a class="tab" href="https://nadochain.com" target="_blank" rel="noopener" data-i18n="tab.web">Web</a>
+    <a class="tab" href="https://nadochain.com/apps" target="_blank" rel="noopener" data-i18n="tab.apps">Apps</a>
   </nav>
+
+  <!-- A PENDING INVITE (#invite=<seed>, interface.js "FUNDED INVITE LINKS"): who invited you, what is waiting, and the
+       one next step. Outside every tab on purpose — it stays until the gift has landed, whatever page is open.
+       Filled by renderInviteBanner(). -->
+  <div id="inviteBanner" class="hint-banner hidden" role="status" aria-live="polite"></div>
 
   <!-- WALLET -->
   <div id="wallet" class="card hidden" data-tab="wallet">
@@ -213,27 +234,58 @@
     <div class="addr-box"><span class="a" id="walAddr"></span>
       <button class="copy" data-i18n="btn.copy" data-copy="walAddr">Copy</button></div>
     <div class="stat-grid mt">
-      <div class="stat" data-i18n-title="tip.free" title="FREE — your spendable balance: coins you can send or bond right now.">
-        <div class="label" data-i18n="lbl.free">Free <span class="hint">ⓘ</span></div><div class="value sm" id="walBalance">—</div>
+      <!-- ONE BALANCE CARTOUCHE. Free, Bonded and Total were three boxes for one number and its two parts —
+           the total is the sum of the other two, so three cartouches said the same thing three times and
+           made the row hard to scan. The total leads because it answers "how much do I have"; the split
+           sits under it because that is the detail, not the headline. Every id is unchanged, so the code
+           that writes these values did not have to move. -->
+      <div class="stat" data-i18n-title="tip.total" title="TOTAL — free (spendable) + bonded (staked). Free coins can be sent or bonded right now; bonded coins produce blocks in the savings lane on their own and unlock 1440 blocks after you request an unbond.">
+        <div class="label" data-i18n="lbl.balance">Balance</div>
+        <div class="value sm" id="walTotal">—</div>
+        <div class="small faint"><span id="walBalance">—</span> <span data-i18n="lbl.free">free</span>
+          · <span id="walBonded">—</span> <span data-i18n="lbl.bonded">bonded</span></div>
         <div class="pend hidden" id="walBalancePend" data-i18n-title="tip.pendFree" title="Still confirming — the network is sealing these coins into a block. They are NOT spendable yet; they'll appear in your balance automatically (usually well under a minute). Nothing is lost."></div></div>
-      <div class="stat" data-i18n-title="tip.bonded" title="BONDED — coins locked as bonded stake. Bonded stake increases your odds in the bonded mining lane; it unlocks BOND_UNLOCK_DELAY (1440) blocks after you request an unbond.">
-        <div class="label" data-i18n="lbl.bonded">Bonded <span class="hint">ⓘ</span></div><div class="value sm" id="walBonded">—</div></div>
-      <div class="stat" data-i18n-title="tip.total" title="TOTAL — free (spendable) + bonded (staked).">
-        <div class="label" data-i18n="lbl.total">Total <span class="hint">ⓘ</span></div><div class="value sm" id="walTotal">—</div></div>
       <div class="stat hidden" id="walExecStat" data-i18n-title="tip.playable" title="PLAYABLE (TOKENS) — your execution-layer balance: the tokens the NADO games spend and pay out. Buy in from your Free balance in any game; cash out any time to get NADO back.">
-        <div class="label" data-i18n="lbl.playable">🪙 Playable <span class="hint">ⓘ</span></div><div class="value sm" id="walExec">—</div>
-        <div class="pend hidden" id="walExecPend" data-i18n-title="tip.pendExec" title="Still confirming — this buy-in / cash-out is being sealed into a block. It is NOT playable yet; your token balance updates automatically (usually well under a minute). Nothing is lost."></div></div>
-      <div class="stat" data-i18n-title="tip.registered" title="REGISTERED — you've done the one-time on-chain registration (a quick proof-of-work). It's required once before you can mine the OPEN lane. Done automatically when you start mining.">
-        <div class="label" data-i18n="lbl.registered">Registered <span class="hint">ⓘ</span></div><div class="value sm" id="walReg">—</div></div>
-      <div class="stat" data-i18n-title="tip.present" title="PRESENT — you hold a valid presence lease (a recent PoSW recert), so you're currently ELIGIBLE to win open-lane blocks. The wallet renews the lease automatically before it lapses; if it stops, presence lapses and you stop earning until it resumes.">
-        <div class="label" data-i18n="lbl.present">Present <span class="hint">ⓘ</span></div><div class="value sm" id="walPresent">—</div></div>
-      <div class="stat" data-i18n-title="tip.fidelity" title="FIDELITY — a continuity score that rises each epoch you stay present (up to a cap) and increases your weight in the open lane, so steady miners win a bit more often. Going absent reduces its effect.">
-        <div class="label" data-i18n="lbl.fidelity">Fidelity <span class="hint">ⓘ</span></div><div class="value sm" id="walFidelity">—</div></div>
+        <div class="label" data-i18n="lbl.playable">🪙 Playable</div><div class="value sm" id="walExec">—</div>
+        <div class="pend hidden" id="walExecPend" data-i18n-title="tip.pendExec" title="Still confirming — this buy-in / cash-out is being sealed into a block. It is NOT playable yet; your token balance updates automatically (usually well under a minute). Nothing is lost."></div>
+        <!-- The row's own tooltip promises "cash out any time", but until now the only cash-out lived in the
+             GAME pages (nadodapp.wireWallet's ⬇ Cash out slider). A player who checked their wallet saw a
+             balance they had no way to act on — the same shape as the pending-unbond gap fixed above. -->
+        <button class="accent" id="btnExecCashOut" data-i18n="exec.cashOut" style="display:block;margin:6px auto 0">Cash out</button></div>
+      <!-- ONE IDENTITY CARTOUCHE. Registered, Present and Fidelity are three readings of one thing: whether
+           this identity currently holds a live device lease, and how long it has held one. Presence is the
+           headline because it is what decides whether the open lane pays; the other two qualify it. Ids
+           unchanged. -->
+      <div class="stat" data-i18n-title="tip.present" title="PRESENT — the relay confirms this identity is in the current epoch\'s open registry, so it can win open-lane blocks and earns the presence dividend. REGISTERED means a real device attested it and the lease has not lapsed. FIDELITY rises by 1 per renewal made at least ~19 h after the last, up to 15 days of dividend weight; a lapsed lease halves it.">
+        <div class="label" data-i18n="lbl.identity">Identity</div>
+        <div class="value sm" id="walPresent">—</div>
+        <div class="small faint"><span data-i18n="lbl.registered">Registered</span> <span id="walReg">—</span>
+          · <span data-i18n="lbl.fidelity">Fidelity</span> <span id="walFidelity">—</span></div>
+        <div class="small faint" id="walProbation"></div></div>
+      <!-- SAVINGS AT WORK (operator 2026-09-08): its own full-width row, beside Registered / Present. Hidden while nothing
+           is bonded. Two states: producing / bonded but idle (the delegated-to-a-pool state went with the pool code). -->
+      <div class="stat hidden" id="walDelegStat">
+        <div class="label" data-i18n="lbl.savingsWork">Savings</div>
+        <div class="value sm" id="walDelegValue" style="font-family:inherit;font-size:13px;line-height:1.3;overflow-wrap:anywhere">—</div>
+        <div class="small faint" id="walDelegLine" style="margin-top:2px;line-height:1.3"></div></div>
     </div>
+
 
     <!-- PENDING EXPLAINER: shown only while something is confirming, so a mid-flight send/buy-in/cash-out
          never looks like lost money — the single most nervous-making moment in any wallet. -->
     <div id="walPendNote" class="pendnote hidden" data-i18n="pend.note">⏳ Amounts marked “confirming” are being sealed into a block right now. They can't be spent or played yet — they unlock automatically, usually in under a minute. Nothing is lost.</div>
+
+    <!-- CASH-OUT PENDING. A cash-out is two steps: the exec layer debits the playable balance and records the
+         withdrawal, then an L1 claim proves that record against a SETTLED root and releases the coins. Nothing built
+         the claim, so every cash-out stopped halfway (4 of them, 10.06 NADO, 2026-10-10) — the playable balance went
+         down and nothing came back. This shows the record and finishes it the moment it is provable
+         (refreshCashOuts in interface.js). Visible whether or not anything is playable: the stuck ones read 0. -->
+    <div id="cashOutPanel" class="pendnote hidden">
+      <div><span data-i18n="cash.pending">Cash-out pending:</span> <b id="cashOutAmt">—</b></div>
+      <div id="cashOutWhen" class="small mt"></div>
+      <button id="btnClaimCashOut" class="primary mt hidden" style="width:100%"
+              data-i18n="cash.claimNow">Claim now</button>
+    </div>
 
     <!-- a little touch: your pile of coins, scaled to the richest wallet on the network -->
     <div id="coinPileWrap" class="mt hidden" style="text-align:center">
@@ -241,16 +293,7 @@
       <div id="coinPileCap" class="small faint" style="margin-top:2px">—</div>
     </div>
 
-    <!-- PRESENCE DIVIDEND (doc/presence-dividend.md): your share of the open lane's redistributed pool, accrued
-         off-L1 while you mine; collect it to your balance on demand. Hidden until there's something to collect. -->
-    <div id="divWrap" class="mt hidden" style="text-align:center">
-      <span class="label" data-i18n="div.label">Dividend accrued <span class="hint" data-i18n-title="tip.dividend"
-         title="PRESENCE DIVIDEND — the open lane redistributes most of its block reward to everyone mining it, weighted by fidelity. Your share accrues off-chain while you're present (stop mining and it stops growing). 'Collect' sweeps it into your spendable balance — it lands automatically a few minutes later, once the execution layer's state is settled on-chain.">ⓘ</span></span>
-      <span class="value sm" id="divAccrued">—</span>
-      <button class="accent" id="btnCollectDiv" data-i18n="div.collect" style="display:block;margin:6px auto 0" disabled>Collect dividend</button>
-    </div>
-
-    <details class="mt">
+    <details class="mt" id="walReveal">
       <summary class="small dim" style="cursor:pointer" data-i18n="wallet.reveal">Reveal / export private key</summary>
       <div class="warnbox danger mt" data-i18n="wallet.neverShare">Never share this. Anyone with it owns your rewards.</div>
       <label class="small mt" data-i18n="wallet.mnemonic">Recovery phrase (24 words)</label>
@@ -260,44 +303,221 @@
       <div class="addr-box"><span class="a mono" id="walPriv"></span>
         <button class="copy" data-i18n="btn.copy" data-copy="walPriv">Copy</button></div>
       <div class="row mt">
-        <button id="btnDlKey" class="accent" data-i18n="btn.dlKey">⤓ Download key file (JSON)</button>
+        <button id="btnDlKey" class="accent" data-i18n="btn.dlKey">Download key file (JSON)</button>
       </div>
     </details>
   </div>
 
   <!-- MINING -->
   <div id="mining" class="card hidden" data-tab="wallet">
-    <h2 data-i18n="mining.title">Mining</h2>
-    <button id="btnMine" class="big primary" data-i18n="btn.startMining">Start mining</button>
+    <h2 data-i18n="mining.title">Collecting</h2>
+    <!-- ONE BUTTON (operator, 2026-09-08): Start mining registers the device itself when a lease is needed — the press arms
+         the one device prompt. Renew sits beside it, shown only inside the fidelity-earning window. -->
+    <div class="row" style="align-items:stretch">
+      <button id="btnMine" class="big primary" data-i18n="btn.startMining">Start collecting</button>
+      <button id="btnRenewLease" class="accent" data-i18n="lease.renew" style="display:none;flex:0 0 auto;padding:0 18px" disabled>Renew</button>
+    </div>
+    <!-- NO CEREMONY, BUT NOT NO BACKUP (operator 2026-09-13: "just generate a wallet by default and show them
+         the landing page with the start mining button"). A first visit now creates the wallet silently and
+         lands here. The coins are real, so the one thing the old save screen protected against — losing the
+         key — survives as this single line: a reminder, not a gate, gone the moment the owner opens the backup
+         or downloads the key file. Filled by renderAutoWalletNote(). -->
+    <div id="autoWalletNote" class="hint-banner mt hidden" role="status"></div>
+    <!-- HARDWARE WALLETS (static/hwattest.js): a Ledger (WebHID) or Trezor Safe (WebUSB) vouches for this identity
+         instead of the phone/TPM — per-device factory certificates, bindable. Chrome/Edge/Brave on a computer. -->
+    <!-- REAL DEVICE (doc/device-attestation.md): what this device proved to the network, right where mining
+         starts. Updated by attestDevice() during registration and by the "Verify this device" preview. -->
+    <div id="mineDevice" class="small mt" role="status"></div>
+    <!-- THE WAY OUT, AS A BUTTON, ABOVE THE EXPLANATION. The download that fixes a Windows PC used to sit
+         inside the "why this device cannot register" disclosure, four paragraphs down, as a text link —
+         so the one action that helps was the hardest thing on the card to find. An owner should not have
+         to read a diagnosis to reach the remedy. Filled by renderDeviceStatus() for failed verdicts. -->
+    <div id="mineFix" class="mt hidden"></div>
+    <!-- DEVICE GUIDE: when the device cannot attest, the specific reasoning and the exact steps for THAT verdict
+         (Windows Hello under VBS / Credential Guard, software key, passkey without attestation, unbindable class).
+         Filled by renderDeviceStatus() from deviceGuide(); hidden while the device is fine. -->
+    <details id="mineDeviceGuide" class="mt hidden disc">
+      <summary data-i18n="device.guide.title">Why this device cannot register, and what to do</summary>
+      <div id="mineDeviceGuideBody" class="small mt" style="white-space:pre-line"></div>
+    </details>
 
+    <!-- HOW TO ATTEST (2026-09-08 UX pass, progressive disclosure): one primary action above; the four ways to attest sit
+         behind ONE disclosure as a list with a one-line caption each — no wall of equal buttons and paragraphs.
+         Ledger (WebHID) / Trezor Safe (WebUSB) via static/hwattest.js: per-device factory certificates, bindable. -->
+    <details id="hwWrap" class="mt disc">
+      <summary data-i18n="hw.other">Attest another way</summary>
+      <div class="optlist">
+        <button id="btnHwNone" class="opt"><b data-i18n="hw.none">This device</b><small data-i18n="hw.cap.none">Android 12+ phone or Windows PC with a TPM · a phone re-attests every 36 h, a PC renews weekly</small></button>
+        <button id="btnHwLedger" class="opt"><b data-i18n="hw.ledger">Ledger</b><small data-i18n="hw.cap.ledger">Nano S, Nano S Plus, Nano X, Stax, Flex — once, for life · Chrome, Edge or Brave on a computer</small></button>
+        <button id="btnHwTrezor" class="opt"><b data-i18n="hw.trezor">Trezor Safe</b><small data-i18n="hw.cap.trezor">Safe 3, Safe 5, Safe 7 — once, for life · One and Model T have no secure element</small></button>
+        <button id="btnHwRemote" class="opt"><b data-i18n="hw.remote">Another device</b><small data-i18n="hw.cap.remote">A phone or PC you trust vouches for this wallet</small></button>
+      </div>
+      <p class="small faint mt" data-i18n="hw.note">A Ledger or Trezor Safe can vouch for this wallet instead of a phone or TPM (Chrome, Edge or Brave on a computer; close Ledger Live / Trezor Suite first). The wallet's coins stay here — the hardware only proves it is one real device.</p>
+    <details class="mt">
+      <summary class="small dim" style="cursor:pointer" data-i18n="hw.guide.title">How to attest with a Ledger or Trezor</summary>
+      <div class="small mt" style="white-space:pre-line" data-i18n="hw.guide.ledger">Ledger Nano S, Nano S Plus, Nano X, Stax, Flex:
+1. Close Ledger Live — it holds the device.
+2. Plug the Ledger in, enter the PIN, stay on the dashboard (no app open).
+3. Use Chrome, Edge or Brave on a computer, press "Attest with Ledger" and pick the device in the browser dialog.
+4. The Ledger asks "Allow unsafe manager?": press both buttons to allow. The wallet registers by itself.
+Renews weekly on its own; the Ledger only vouches, it never holds this wallet's key.</div>
+      <div class="small mt" style="white-space:pre-line" data-i18n="hw.guide.trezor">Trezor Safe 3 (T2B1, T3B1), Safe 5 (T3T1), Safe 7 (T3W1):
+1. Close Trezor Suite (and the Trezor Bridge) — they hold the device.
+2. Plug the Trezor in and unlock it.
+3. Use Chrome, Edge or Brave on a computer, press "Attest with Trezor Safe" and pick the device in the browser dialog.
+4. Confirm the device-authentication prompt on the Trezor's screen. The wallet registers by itself.
+Trezor One and Model T have no secure element and cannot vouch.</div>
+    </details>
+    </details>
     <!-- Staged setup/registration status. Reuses the .hint-banner ⓘ convention; updated live through
          the one-time auto-registration (solve PoW → submit → wait for confirmation → mining). -->
     <div id="regBanner" class="hint-banner mt hidden" role="status" aria-live="polite">
-      <span class="hint">ⓘ</span><span id="regBannerMsg"></span>
+      <!-- The spinner is a SIBLING of the message and is always in the DOM, so a banner shown with no text
+           renders as a turning circle in a blank panel — which is precisely what users reported. It is
+           given an id so setRegBanner can hide it with the message rather than leaving it spinning over
+           nothing if any path ever shows this panel empty again. -->
+      <span class="spin" id="regBannerSpin" aria-hidden="true"></span><span id="regBannerMsg"></span>
     </div>
 
+    <!-- ATTEST A NODE (ops/node_attest, doc/device-attestation.md §"Attesting a node"): a headless node has no secure
+         element and no hand to tap, so its OPERATOR taps here for the node's address. The attestation is dropped on
+         this relay and the node picks it up from the network and signs its own registration. -->
+    <details id="nodeAttestWrap" class="mt disc">
+      <summary><span data-i18n="node.title">Attest another wallet or node</span><span id="nodeAttestDue" class="badge warn hidden" style="margin-left:8px;font-size:11px"></span></summary>
+      <!-- WHO THIS DEVICE VOUCHES FOR (operator 2026-09-08: "expiration and renewal are not obvious"): every address this
+           device attested, with its lease state and an "Attest again" button; the summary badge counts the ones due. -->
+      <div id="nodeAttestList" class="optlist mt hidden"></div>
+      <p class="small mt" data-i18n="node.blurb">Vouch for another wallet or a node from this device. Paste the address (a wallet's address, or a node's from its /status page), then press the button: this device attests that address, the statement travels through the network, and the other wallet or node registers itself with it. Renew once per lease (36 h from a phone, 7 days from a Windows PC). This device is the one bound, so it cannot vouch for a second identity while that lease lives.</p>
+      <input id="nodeAttestAddr" placeholder="wallet or node address (46 hex characters)" data-i18n-ph="node.addrPh" autocomplete="off" spellcheck="false" class="mono" />
+      <div id="nodeAttestStatus" class="small mt" role="status" aria-live="polite"></div>
+      <div class="row mt">
+        <button id="btnNodeAttest" class="accent" data-i18n="node.btn">Attest this node</button>
+      </div>
+    </details>
+
     <div id="powWrap" class="mt hidden">
-      <label id="powLabel" data-i18n="pow.label">Solving one-time registration proof-of-work…</label>
+      <label id="powLabel" data-i18n="pow.label">Registering your device…</label>
       <div class="progress indet"><span id="powBar"></span></div>
       <div class="small faint mt" id="powStats">—</div>
       <button id="btnCancelPow" class="ghost mt small" style="width:100%" data-i18n="btn.cancelReg">Cancel registration</button>
     </div>
 
     <div class="stat-grid mt">
-      <div class="stat"><div class="label" data-i18n="mine.status">Status</div><div class="value sm" id="mineState" data-i18n="mine.idle">Idle</div></div>
-      <div class="stat"><div class="label" data-i18n="mine.epoch">Current epoch</div><div class="value sm" id="mineEpoch">—</div></div>
-      <div class="stat" data-i18n-title="tip.eta" title="EXPECTED TIME TO MINE — a rough average wait until you win a block, based on your share of the open lane vs everyone else mining it. It's a statistical average, not a countdown.">
-        <div class="label" data-i18n="mine.eta">Expected time to mine <span class="hint">ⓘ</span></div><div class="value sm" id="mineEta">—</div></div>
-      <div class="stat" data-i18n-title="tip.locked" title="MINING WHILE LOCKED — your PoSW presence lease stays valid on-chain, so a locked/asleep phone keeps mining until it lapses. Renewing the lease (a fresh post-quantum PoSW recert) needs your phone active, so reopen the app before this runs out — it renews in about a second, automatically. (Sending a transaction always needs your phone unlocked at that moment.)">
-        <div class="label" data-i18n="mine.locked">Mining while locked <span class="hint">ⓘ</span></div><div class="value sm" id="mineLocked">—</div></div>
+      <div class="stat" data-i18n-title="tip.status" title="STATUS — what this wallet is doing right now. Collecting means the identity is in the current epoch's registry and is drawn for blocks; the dot pulses for as long as that is true. Registering means a device statement is on its way to a block. Idle means nothing is running here.">
+        <div class="label" data-i18n="mine.status">Status</div><div class="value sm" id="mineState" data-i18n="mine.idle">Idle</div></div>
+      <!-- WHAT VOUCHES FOR THIS IDENTITY, beside the other cartouches rather than only in a sentence
+           further down. The icon distinguishes the device classes at a glance and the handle underneath
+           is what consensus binds on, so it can be checked against the chain instead of trusted. -->
+      <div class="stat" id="statDevice" hidden data-i18n-title="tip.device" title="DEVICE — the hardware that vouches for this identity, and the handle the chain binds it by. One device holds one identity at a time: the handle is derived from the device's own certificate (a chip's endorsement key, a phone's attestation certificate, a hardware wallet's factory certificate), so it cannot be re-minted by reinstalling anything. Hover the handle to see it in full.">
+        <div class="label" data-i18n="mine.device">Device</div>
+        <div class="value sm"><span id="mineDevIcon" aria-hidden="true"></span> <span id="mineDevCls"></span></div>
+        <div class="small faint" id="mineDevId" style="word-break:break-all"></div>
+      </div>
+      <div class="stat" data-i18n-title="tip.epoch" title="CURRENT EPOCH — the chain's 60-block accounting period. Registry membership, dividend weight and fidelity are all counted per epoch, so a lease renewed inside one epoch counts once.">
+        <div class="label" data-i18n="mine.epoch">Current epoch</div><div class="value sm" id="mineEpoch">—</div></div>
+      <div class="stat" data-i18n-title="tip.eta" title="EXPECTED TIME TO COLLECT — a rough average wait until you win a block, from your share of the open lane (if attested) and of the savings lane (your stake). A statistical average, not a countdown.">
+        <div class="label" data-i18n="mine.eta">Expected time to collect</div><div class="value sm" id="mineEta">—</div></div>
+      <div class="stat" data-i18n-title="tip.perDay" title="EARNING — what you would earn in a day at the rate of recent blocks: collecting (your share of open-lane block rewards), the dividend (your share, from the latest committed epoch) and savings (your bonded stake's share of savings-lane blocks). An estimate from recent blocks, not a promise.">
+        <div class="label" data-i18n="mine.earn">Earning</div><div class="value sm" id="minePerDay">—</div>
+        <div class="small faint" id="minePerDaySplit"></div></div>
+      <div class="stat" data-i18n-title="tip.locked" title="COLLECTING WHILE LOCKED — the device lease lives on chain, so a locked or sleeping phone keeps collecting until its lease lapses. Renewals need the wallet open; a hardware-bound identity renews without a prompt.">
+        <div class="label" data-i18n="mine.locked">Collecting while locked</div><div class="value sm" id="mineLocked">—</div></div>
+    </div>
+
+    <!-- PRESENCE LEASE: when it lapses, and a MANUAL renew for the fidelity-earning window. The automatic
+         renewal fires at 80% of the lease (the earliest point a recert earns fidelity), which walks the
+         expiry ~5 h earlier every day until it lands in the middle of someone's night — one missed
+         renewal there resets the fidelity streak. Renewing by hand inside the window pins the expiry to a
+         time of day the user chooses. Hidden until a lease exists. Lives under Mining, next to the lease-related stats. -->
+    <div id="leaseWrap" class="mt hidden compact">
+      <div class="lrow">
+        <span class="label" style="margin:0" data-i18n="lease.label">Presence lease <span class="hint" data-i18n-title="tip.lease" title="PRESENCE LEASE — the device attestation keeps this identity present for its lease (36 h for a phone, 7 days for a Windows PC, hardware wallet or enrolled chip) and renews automatically while the wallet is open. Fidelity rises by 1 per ~19 h between renewals, up to 30 days of weight. Renewing never reduces fidelity.">ⓘ</span></span>
+        <span class="value sm" id="leaseLeft" style="font-size:14px">—</span>
+      </div>
+      <div class="small" id="bindModeLine" style="margin-top:4px"></div>
+      <div class="small faint" id="leaseNote" style="margin-top:2px"></div>
+      <div class="small faint" id="leaseWarn" style="margin-top:2px"></div>
+      <!-- THE HELPER BELONGS WHERE RENEWAL IS OFFERED. Its download links used to render ONLY from
+           renderMineFix(), which hides itself the moment the device verdict is ok — so an owner whose chip
+           was enrolled by the helper, and who therefore needs it again at every renewal, had no path back
+           to it and no URL to type. "WHEN THERE IS AN OPTION TO RENEW BEFORE EXPIRY LINKS SHOULD BE
+           AVAILABLE." Filled by refreshLeasePanel() for LEASED bindings on a platform that can run it. -->
+      <div class="small" id="leaseHelper" style="margin-top:8px"></div>
     </div>
 
     <!-- Auto-bond is also settable right here on the mining interface (kept in sync with the Stake tab). -->
-    <div class="row mt" style="align-items:center;gap:8px" data-i18n-title="tip.autobond" title="While mining, automatically bond this percentage of the block rewards you earn — compounding your bonded-lane weight hands-free. Capped at BOND_CAP; 0 = off. The node has the same option for headless mining (NADO_AUTO_BOND_PERCENT).">
-      <label style="margin:0;flex:1" data-i18n="stake.autobond">Auto-bond mining rewards <span class="hint">ⓘ</span></label>
+    <div class="row mt" style="align-items:center;gap:8px" data-i18n-title="tip.autobond" title="Automatically bond this percentage of the block rewards you earn while collecting, compounding your savings-lane weight hands-free. Weight is stake, one for one. 0 = off.">
+      <label style="margin:0;flex:1" data-i18n="stake.autobond">Auto-bond collecting rewards</label>
       <input id="autoBondPctMine" type="number" min="0" max="100" step="1" inputmode="numeric" placeholder="80" autocomplete="off" style="max-width:80px" />
       <span class="small faint">%</span>
     </div>
+    <!-- THE DIVIDEND LIVES WITH MINING, because that is what earns it. It sat in the wallet card, above
+         the private-key disclosure and below the balances, hidden until something had accrued — so the
+         one control that turns it into spendable coins was in a different section from every number
+         describing it, and invisible until the moment it mattered.
+         PRESENCE DIVIDEND (doc/presence-dividend.md): your share of the open lane's redistributed pool, accrued
+         off-L1 while you mine; collect it to your balance on demand. Hidden until there's something to collect. -->
+    <div id="divWrap" class="mt hidden" style="text-align:center">
+      <span class="label" data-i18n="div.label">Dividend accrued <span class="hint" data-i18n-title="tip.dividend"
+         title="PRESENCE DIVIDEND — about half of all emission: every open-lane block puts 70 % of its reward into the pool and every savings-lane block 40 %. It is paid to ATTESTED DEVICES only, weighted by fidelity, staked or not — no device, no dividend. Your share accrues while your lease is live; \'Collect\' claims what has settled.">ⓘ</span></span>
+      <span class="value sm" id="divAccrued">—</span>
+      <button class="accent" id="btnCollectDiv" data-i18n="div.collect" style="display:block;margin:6px auto 0" disabled>Collect dividend</button>
+    </div>
+
+    <!-- REWARDS, IN THE SAME CARD AS THE THING THAT EARNS THEM. This was a third headed card on the
+           wallet tab — "Peněženka", "Těžba" and "Mining rewards" all describing one activity, each with
+           its own cartouches, which is what made the page confusing to read. It keeps its id and its
+           hidden-toggle so _applyMineVisibility and the tab switcher still own when it appears; it has
+           simply stopped pretending to be a separate subject. -->
+    <div id="mineCard" class="mt hidden">
+        <h3 data-i18n="mine.title" style="margin:18px 0 8px">Collecting rewards
+          <span class="pill"><span id="mineRange" class="badge idle" data-i18n="mine.range">last 7 days</span></span></h3>
+      <div class="mine-head">
+        <div class="mine-total"><span id="mineTotal">—</span> <small>NADO</small></div>
+        <div class="mine-legend">
+          <span class="lg"><i class="sw open"></i><span data-i18n="lanes.open">OPEN lane</span> <b id="mineOpen">—</b></span>
+          <span class="lg"><i class="sw bonded"></i><span data-i18n="lanes.bonded">BONDED lane</span> <b id="mineBonded">—</b></span>
+          <!-- empty full-width item: breaks the legend before Dividend (it once carried the gen-25 savings-cap line) -->
+          <span class="lg" id="bondCapLine" style="flex-basis:100%"></span>
+          <span class="lg" data-i18n-title="tip.mineDiv" title="Presence dividend — your fidelity-weighted share of the dividend pool, paid to attested devices, counted on the day the claim landed on-chain."><i class="sw div"></i><span data-i18n="mine.dividend">Dividend</span> <b id="mineDiv">—</b></span>
+        </div>
+      </div>
+      <div id="mineChart" class="mine-chart"></div>
+      <div id="mineNote" class="mine-note"></div>
+    <!-- shown only when the chain credits more than this node can still break down by day -->
+      <div id="mineMissing" class="mine-note warn hidden"></div>
+    </div>
+  </div>
+
+  <!-- INVITE A FRIEND (protocol.py "FUNDED INVITE LINKS" + "REFERRALS"). Hidden until the chain accepts invites
+       (/referrals active_from) unless this wallet already has invites or referrals to show. One primary action;
+       the expiry and the list sit behind captioned disclosures. -->
+  <div id="inviteCard" class="card hidden" data-tab="wallet">
+    <h2 data-i18n="invite.title">Invite a friend</h2>
+    <p class="small dim" id="inviteDeal"></p>
+    <div id="inviteCreate" class="hidden">
+      <label for="inviteAmount" data-i18n="invite.amountLbl">Gift (NADO)</label>
+      <div class="row">
+        <input id="inviteAmount" placeholder="1" inputmode="decimal" autocomplete="off" />
+        <button id="btnInviteCreate" class="primary" style="flex:0 0 auto" data-i18n="invite.create">Create link</button>
+      </div>
+      <details class="disc" id="inviteMore">
+        <summary id="inviteExpirySum">7</summary>
+        <label class="small" for="inviteDays" data-i18n="invite.daysLbl">Days before you can take an unclaimed gift back (1–30)</label>
+        <input id="inviteDays" type="number" min="1" max="30" value="7" inputmode="numeric" />
+      </details>
+      <div id="inviteMsg" class="small mt faint"></div>
+      <div id="inviteLinkBox" class="mt hidden">
+        <div class="addr-box"><span class="a" id="inviteLinkText"></span>
+          <button class="copy" data-copy="inviteLinkText" data-i18n="btn.copy">Copy</button></div>
+        <button id="btnInviteShare" class="accent mt" style="width:100%" data-i18n="invite.share">Share link</button>
+        <div class="small faint mt" data-i18n="invite.linkNote">Anyone who opens this link can claim the gift — send it to one person.</div>
+      </div>
+    </div>
+    <details class="disc mt hidden" id="inviteListWrap">
+      <summary><span><span data-i18n="invite.yours">Your invites and referrals</span> <span id="inviteListCount" class="faint"></span></span></summary>
+      <div id="inviteList" class="ex-rows mt"></div>
+    </details>
   </div>
 
   <!-- LANE SPLIT -->
@@ -305,23 +525,23 @@
     <h2 data-i18n="lanes.title">Selection lanes</h2>
     <!-- Who's in each lane right now (from /mining_status: open/bonded registry sizes + lane weights) -->
     <div class="stat-grid">
-      <div class="stat" data-i18n-title="tip.openLane" title="Registered, present miners competing for the ~20% free lane">
-        <div class="label" data-i18n="lanes.open">Open lane <span class="hint">ⓘ</span></div>
-        <div class="value sm"><span id="laneOpenCount">—</span> <span data-i18n="lane.miners">miners</span></div></div>
-      <div class="stat" data-i18n-title="tip.bondedLane" title="Bonded-stake validators competing for the ~80% stake lane">
-        <div class="label" data-i18n="lanes.bonded">Bonded lane <span class="hint">ⓘ</span></div>
+      <div class="stat" data-i18n-title="tip.openLane" title="Registered, present collectors competing for the ~30% free lane">
+        <div class="label" data-i18n="lanes.open">Open lane</div>
+        <div class="value sm"><span id="laneOpenCount">—</span> <span data-i18n="lane.miners">collectors</span></div></div>
+      <div class="stat" data-i18n-title="tip.bondedLane" title="Bonded-stake validators competing for the ~70% stake lane">
+        <div class="label" data-i18n="lanes.bonded">Bonded lane</div>
         <div class="value sm"><span id="laneBondedCount">—</span> <span data-i18n="lane.validators">validators</span></div></div>
-      <div class="stat" data-i18n-title="tip.openWeight" title="Total open-lane selection weight across all present miners. Your weight is a share of this — the bigger your slice, the more often you win the free lane.">
-        <div class="label" data-i18n="lanes.openWeight">Open weight <span class="hint">ⓘ</span></div>
+      <div class="stat" data-i18n-title="tip.openWeight" title="Total open-lane selection weight across all present collectors. Your weight is a share of this — the bigger your slice, the more often you win the free lane.">
+        <div class="label" data-i18n="lanes.openWeight">Open weight</div>
         <div class="value sm" id="laneOpenWeight">—</div></div>
-      <div class="stat" data-i18n-title="tip.bondedShares" title="Total bonded selection shares across all validators. Your bonded shares are a portion of this (100 NADO / B_MIN per share).">
-        <div class="label" data-i18n="lanes.bondedShares">Bonded shares <span class="hint">ⓘ</span></div>
+      <div class="stat" data-i18n-title="tip.bondedShares" title="Total bonded selection shares across all validators. Your bonded shares are a portion of this (10 NADO / B_MIN per share).">
+        <div class="label" data-i18n="lanes.bondedShares">Bonded shares</div>
         <div class="value sm" id="laneBondedShares">—</div></div>
     </div>
     <div class="lanes mt">
       <div class="lanebar">
-        <div class="open" id="laneOpen" style="flex:0 0 20%">OPEN 20%</div>
-        <div class="bonded" id="laneBonded" style="flex:0 0 80%">BONDED 80%</div>
+        <div class="open" id="laneOpen" style="flex:0 0 30%">OPEN 30%</div>
+        <div class="bonded" id="laneBonded" style="flex:0 0 70%">BONDED 70%</div>
       </div>
       <div class="lane-legend">
         <span><i class="open"></i><span data-i18n="lane.legendOpen">Open lane — free, capital-less</span><span id="laneOpenYou" class="youmark"></span></span>
@@ -335,33 +555,16 @@
        context is read first and the chart then shows what those lanes actually paid. Hidden
        entirely for a wallet with no mining presence and nothing mined, so it never becomes dead furniture
        for someone who only holds coins. -->
-  <div id="mineCard" class="card hidden" data-tab="wallet">
-    <h2 data-i18n="mine.title">Mining rewards
-      <span class="pill"><span id="mineRange" class="badge idle" data-i18n="mine.range">last 7 days</span></span></h2>
-    <div class="mine-head">
-      <div class="mine-total"><span id="mineTotal">—</span> <small>NADO</small></div>
-      <div class="mine-legend">
-        <span class="lg"><i class="sw open"></i><span data-i18n="lanes.open">OPEN lane</span> <b id="mineOpen">—</b></span>
-        <span class="lg"><i class="sw bonded"></i><span data-i18n="lanes.bonded">BONDED lane</span> <b id="mineBonded">—</b></span>
-        <span class="lg" data-i18n-title="tip.mineDiv" title="Presence dividend — your fidelity-weighted share of the dividend pool, counted on the day the claim landed on-chain."><i class="sw div"></i><span data-i18n="mine.dividend">Dividend</span> <b id="mineDiv">—</b></span>
-      </div>
-    </div>
-    <div id="mineChart" class="mine-chart"></div>
-    <div id="mineNote" class="mine-note"></div>
-    <!-- shown only when the chain credits more than this node can still break down by day -->
-    <div id="mineMissing" class="mine-note warn hidden"></div>
-  </div>
-
   <!-- SEND -->
   <div id="sendCard" class="card hidden" data-tab="send">
     <h2 data-i18n="send.title">Send</h2>
     <div id="payBanner" class="hint-banner hidden">
-      <span class="hint">ⓘ</span><span id="payBannerMsg" data-i18n="payBanner.msg">Payment request loaded — review and confirm.</span>
+     <span id="payBannerMsg" data-i18n="payBanner.msg">Payment request loaded — review and confirm.</span>
     </div>
     <label data-i18n="send.recipient">Recipient address
       <span class="hint" data-i18n-title="tip.recipient" title="A 49-character NADO address starting with 'ndo'. The final 4 characters are a checksum — a mistyped address fails validation and is never broadcast.">ⓘ</span>
     </label>
-    <input id="sendTo" placeholder="mldsa44… address or an alias name" autocomplete="off" spellcheck="false" list="sendToBook" />
+    <input id="sendTo" placeholder="NADO address or an alias name" autocomplete="off" spellcheck="false" list="sendToBook" />
     <datalist id="sendToBook"></datalist>
     <div class="mt"><button type="button" id="btnSaveContact" class="copy">⭐ Save recipient to address book</button></div>
     <div id="sendToMsg" class="small mt faint"></div>
@@ -406,7 +609,7 @@
     <!-- SHARE THE MINER: a QR of the site URL so anyone who scans opens the miner and starts mining. -->
     <hr style="border:none;border-top:1px solid var(--line,#1c2530);margin:18px 0" />
     <h2 data-i18n="share.title">📣 Share NADO</h2>
-    <p class="small dim" data-i18n="share.intro">Anyone who scans this opens the miner and can start mining in one tap — no install, no signup. This is how NADO spreads: share the link.</p>
+    <p class="small dim" data-i18n="share.intro">Anyone who scans this opens the collector and can start collecting in one tap — no install, no signup. This is how NADO spreads: share the link.</p>
     <div class="qr-wrap">
       <canvas id="shareQR" class="qr hidden" width="260" height="260"></canvas>
       <div id="shareQRNote" class="small faint hidden" data-i18n="share.qrNote">QR generator unavailable — copy the link below.</div>
@@ -433,7 +636,7 @@
     <label data-i18n="assets.asset">Asset</label>
     <select id="assetSendId"></select>
     <label class="mt" data-i18n="assets.to">To (address or alias)</label>
-    <input id="assetSendTo" placeholder="mldsa44…" autocomplete="off" spellcheck="false" />
+    <input id="assetSendTo" placeholder="NADO address" autocomplete="off" spellcheck="false" />
     <label class="mt" data-i18n="assets.amount">Amount</label>
     <div class="row">
       <input id="assetSendAmt" placeholder="0.0" autocomplete="off" spellcheck="false" style="flex:1" />
@@ -483,7 +686,7 @@
     <div id="assetIssuedList" class="small mono">—</div>
     <div class="row mt">
       <select id="assetIssuedId" style="flex:1"></select>
-      <input id="assetMintTo" placeholder="mldsa44… (mint to)" autocomplete="off" spellcheck="false" style="flex:1" />
+      <input id="assetMintTo" placeholder="NADO address (mint to)" autocomplete="off" spellcheck="false" style="flex:1" />
       <input id="assetMintAmt" placeholder="amount" autocomplete="off" spellcheck="false" style="width:9rem" />
       <button id="btnAssetMint" data-i18n="btn.mint">Mint</button>
       <button id="btnAssetRenounce" data-i18n="btn.renounce">Renounce minting</button>
@@ -510,7 +713,7 @@
       or more than you hold. Approving again replaces the amount; approving 0 revokes.</p>
     <div class="row">
       <select id="allowAsset" style="flex:1"></select>
-      <input id="allowSpender" placeholder="mldsa44… (spender)" autocomplete="off" spellcheck="false" style="flex:2" />
+      <input id="allowSpender" placeholder="NADO address (spender)" autocomplete="off" spellcheck="false" style="flex:2" />
       <input id="allowAmt" placeholder="amount" autocomplete="off" spellcheck="false" style="width:8rem" />
       <button id="btnAllowApprove" data-i18n="allow.approve">Approve</button>
     </div>
@@ -523,7 +726,7 @@
     <div id="allowToYou" class="small mono">—</div>
     <div class="row mt">
       <select id="allowSpendId" style="flex:2"></select>
-      <input id="allowSpendTo" placeholder="mldsa44… (to)" autocomplete="off" spellcheck="false" style="flex:2" />
+      <input id="allowSpendTo" placeholder="NADO address (to)" autocomplete="off" spellcheck="false" style="flex:2" />
       <input id="allowSpendAmt" placeholder="amount" autocomplete="off" spellcheck="false" style="width:8rem" />
       <button id="btnAllowSpend" class="accent" data-i18n="allow.spend">Spend</button>
     </div>
@@ -593,7 +796,7 @@
   <div id="aliasCard" class="card hidden" data-tab="aliases">
     <h2 data-i18n="alias.title">Aliases <span class="pill" data-i18n="alias.pill">a name instead of a hash</span></h2>
     <p class="small dim" data-i18n-html="alias.intro">Register a short name that resolves to <b>your own address</b> (self) — others
-      can then send to the name instead of your 49-char mldsa44… address. Names are global and first-come:
+      can then send to the name instead of your 49-char NADO address. Names are global and first-come:
       3–32 chars, lowercase letters/digits/<code>_</code>/<code>-</code>, starting with a letter.
       Registering costs a small anti-squat fee; use <b>Transfer</b> to point it at a different address,
       or <b>Unregister</b> to free it.</p>
@@ -603,9 +806,9 @@
       <button id="btnAliasReg" class="accent" data-i18n="btn.register">Register</button>
       <button id="btnAliasUnreg" data-i18n="btn.unregister">Unregister</button>
     </div>
-    <label class="mt" data-i18n="alias.transferTo">Transfer ownership to (mldsa44… address)</label>
+    <label class="mt" data-i18n="alias.transferTo">Transfer ownership to (NADO address)</label>
     <div class="row">
-      <input id="aliasTo" placeholder="mldsa44…" autocomplete="off" spellcheck="false" style="flex:1" />
+      <input id="aliasTo" placeholder="NADO address" autocomplete="off" spellcheck="false" style="flex:1" />
       <button id="btnAliasXfer" data-i18n="btn.transfer">Transfer</button>
     </div>
     <div id="aliasMsg" class="small mt"></div>
@@ -617,15 +820,15 @@
     <h2 data-i18n="stake.title">Stake — bond / unbond</h2>
     <div class="stat-grid">
       <div class="stat"><div class="label" data-i18n="stake.spendable">Spendable</div><div class="value sm" id="stkAvail">—</div></div>
-      <div class="stat" data-i18n-title="tip.stakeBonded" title="BONDED — coins locked as bonded stake. Bonded stake earns you slots in the BONDED mining lane (~80% of blocks). 100 NADO (B_MIN) per selection share.">
-        <div class="label" data-i18n="lbl.bonded">Bonded <span class="hint">ⓘ</span></div><div class="value sm" id="stkBonded">—</div></div>
+      <div class="stat" data-i18n-title="tip.stakeBonded" title="BONDED — coins locked as savings stake. Your weight in the savings lane (70 % of blocks) is your stake, one for one, from 10 NADO up; no device needed.">
+        <div class="label" data-i18n="lbl.bonded">Bonded</div><div class="value sm" id="stkBonded">—</div></div>
     </div>
 
     <!-- Estimated savings (bonded-lane) APY, computed from recent on-chain performance + the presence dividend. -->
     <div class="hint-banner mt" style="display:block">
       <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
         <label style="margin:0" data-i18n="stake.apyLabel">Savings APY
-          <span class="hint" data-i18n-title="tip.apy" title="Estimated from the reward of recent blocks: the bonded lane mints ~80% of blocks and a bonded block pays its producer 70% of the reward, shared across all bonded shares (100 NADO each). The presence dividend — funded by 20% of every bonded block plus 70% of every open block — is an EXTRA, capital-free yield paid to present open-lane miners, shown separately. Estimate only; it falls as more coins bond.">ⓘ</span>
+          <span class="hint" data-i18n-title="tip.apy" title="Estimated from the reward of recent blocks: the savings lane mints 70 % of blocks and a savings block pays its producer 50 % of the reward (40 % feeds the presence dividend, 10 % the treasury), shared across all bonded stake. Your weight is your stake. An estimate, not a promise.">ⓘ</span>
         </label>
         <button id="btnApy" class="ghost" style="width:auto;padding:6px 12px" data-i18n="stake.apyBtn">Estimate</button>
       </div>
@@ -635,7 +838,7 @@
     <div class="warnbox mt" data-i18n-html="stake.warn">Unbonded stake stays locked for <b id="stkDelay">1440</b> blocks (BOND_UNLOCK_DELAY) after an unbond request before it is spendable again.</div>
 
     <label class="mt" data-i18n="stake.bondAmount">Bond amount (NADO) — move spendable → bonded
-      <span class="hint" data-i18n-title="tip.bondAmt" title="Locks spendable balance as bonded stake to mine the bonded lane. 100 NADO buys one bonded selection share.">ⓘ</span>
+      <span class="hint" data-i18n-title="tip.bondAmt" title="Locks spendable balance as bonded stake to collect the bonded lane. 10 NADO buys one bonded selection share.">ⓘ</span>
     </label>
     <input id="bondAmount" placeholder="0.0" inputmode="decimal" autocomplete="off" />
     <div class="small faint mt" data-i18n="send.fee">Network fee: <span id="bondFeeInfo" class="mono">—</span>
@@ -645,16 +848,16 @@
 
     <!-- AUTO-BOND: compound a % of mining rewards straight into bonded stake, hands-free. Mirrors the
          node's unattended auto-bond (core_loop.maybe_auto_bond): once per epoch, dust-floored, stops at
-         BOND_CAP. Applies in THIS browser while the tab is mining. -->
+         (no cap: bonded weight is linear in stake). Applies in THIS browser while the tab is mining. -->
     <div class="hint-banner mt" style="display:block">
-      <label style="margin:0" data-i18n="stake.autobond">Auto-bond mining rewards
-        <span class="hint" data-i18n-title="tip.autobond" title="While this tab is mining, automatically bond this percentage of the block rewards you earn — compounding your bonded-lane weight hands-free. Capped at BOND_CAP; 0 = off. The node itself has the same option for headless mining (auto_bond_percent / NADO_AUTO_BOND_PERCENT).">ⓘ</span>
+      <label style="margin:0" data-i18n="stake.autobond">Auto-bond collecting rewards
+        <span class="hint" data-i18n-title="tip.autobond" title="Automatically bond this percentage of the block rewards you earn while collecting, compounding your savings-lane weight hands-free. Weight is stake, one for one. 0 = off.">ⓘ</span>
       </label>
       <div class="mt" style="display:flex;align-items:center;gap:10px">
         <input id="autoBondPct" type="number" min="0" max="100" step="1" inputmode="numeric" placeholder="80" autocomplete="off" style="max-width:96px" />
         <span class="faint" data-i18n="stake.autobondSuffix">% of new rewards → bonded</span>
       </div>
-      <div id="autoBondNote" class="small faint mt">On — bonding 80% of new mining rewards each epoch (auto-compounding the bonded lane). Set 0 to keep rewards spendable.</div>
+      <div id="autoBondNote" class="small faint mt">On — bonding 80% of new collecting rewards each epoch (auto-compounding the bonded lane). Set 0 to keep rewards spendable.</div>
     </div>
 
     <label class="mt" data-i18n="stake.unbondAmount">Unbond amount (NADO) — move bonded → spendable
@@ -716,7 +919,7 @@
     <div class="mt"><div class="label" data-i18n="stats.feesDay">Fees burned per day (NADO, last 30 days)</div>
       <svg id="chartFeesDay" viewBox="0 0 320 120" width="100%" style="height:auto;max-width:520px" aria-hidden="true"></svg>
       <div class="small faint" id="feesDaySub">—</div></div>
-    <div class="mt"><div class="label" data-i18n="stats.minersDay">Mining participation per day — present miners at daily peak</div>
+    <div class="mt"><div class="label" data-i18n="stats.minersDay">Collecting participation per day — present collectors at daily peak</div>
       <svg id="chartMinersDay" viewBox="0 0 320 120" width="100%" style="height:auto;max-width:520px" aria-hidden="true"></svg>
       <div class="small faint" id="minersDaySub">—</div></div>
     <div class="mt"><div class="label" data-i18n="stats.peersDay">Network size per day — peers this relay knew at daily peak</div>
@@ -735,6 +938,12 @@
       <div class="small faint" id="holdersSub">—</div></div>
     <div class="mt"><div class="label" data-i18n="stats.lanes">Lane participation</div>
       <svg id="chartLanes" viewBox="0 0 320 70" width="100%" style="height:auto;max-width:520px" aria-hidden="true"></svg></div>
+    <!-- DEVICES (operator 2026-09-13: "/stats should display types of mining devices and their representation").
+         What the network's collectors run on, by class, from /device_stats: live bindings only in the donut,
+         the all-time count in the caption. Filled by renderStats(). -->
+    <div class="mt"><div class="label" data-i18n="stats.devices">Devices — what collectors run on</div>
+      <svg id="chartDevices" viewBox="0 0 320 132" width="100%" style="height:auto;max-width:520px" aria-hidden="true"></svg>
+      <div class="small faint" id="devicesSub">—</div></div>
     <div class="mt"><div class="label" data-i18n="stats.rewardSplit">Reward distribution — where each block's reward flows</div>
       <svg id="chartRewardSplit" viewBox="0 0 320 132" width="100%" style="height:auto;max-width:520px" aria-hidden="true"></svg></div>
     <div class="mt"><div class="label" data-i18n="stats.supplySplit">Supply distribution</div>
@@ -744,7 +953,7 @@
       <svg id="chartGeo" viewBox="0 0 640 320" width="100%" style="height:auto;max-width:880px;border:1px solid var(--line,#1c2530);border-radius:12px;background:#0b1016"></svg>
       <div id="geoCountries" class="faint small" style="margin-top:6px"></div></div>
     <div class="mt"><div class="label" data-i18n="stats.nodes">Network nodes — what each peer is running</div>
-      <div id="nodesTable"></div>   <!-- no overflow-x: the table is built to FIT, not to scroll -->
+      <div id="nodesTable" style="max-width:100%;overflow-x:auto"></div>   <!-- built to FIT; overflow-x is a guard so a wide row can never bleed past the card -->
       <div class="faint small" id="nodesSub">—</div></div>
     <div class="faint small mt" data-i18n="stats.note">Live from the relay you're connected to. Time-series cover the most recent blocks.</div>
   </div>
@@ -791,7 +1000,7 @@
   <!-- SETTLEMENT (L2 settlement-layer status, read-only) -->
   <div id="settlementCard" class="card hidden" data-tab="settlement">
     <h2>⚖️ Settlement (L2)</h2>
-    <div class="faint small">NADO settles a separate execution layer: bonded miners attest the L2 state root to L1, and it becomes canonical once 2/3 of bonded stake agrees. This shows the settled root, this node's execution tip, and your role as a miner.</div>
+    <div class="faint small">NADO settles a separate execution layer: bonded collectors attest the L2 state root to L1, and it becomes canonical once 2/3 of bonded stake agrees. This shows the settled root, this node's execution tip, and your role as a collector.</div>
     <div class="mt"><div class="label">L1 settled root</div><div id="settleL1Root" class="mono">—</div></div>
     <div class="mt"><div class="label">Settled at block</div><div id="settleL1Cursor">—</div></div>
     <div class="mt"><div class="label">Execution tip (this node)</div><div id="settleExecCursor">—</div></div>
@@ -808,10 +1017,10 @@
 
     <div class="mt"><div class="label" data-i18n="swap.newTitle">Create a lock</div></div>
     <label data-i18n="swap.claimant">Claimant address (who can claim with the secret)</label>
-    <input id="swapClaimant" placeholder="mldsa44…" autocomplete="off" spellcheck="false" />
+    <input id="swapClaimant" placeholder="NADO address" autocomplete="off" spellcheck="false" />
     <div class="row mt">
       <div style="flex:1"><label data-i18n="swap.amount">Amount (NADO)</label>
-        <input id="swapAmount" type="number" min="0" step="0.0001" placeholder="0.0" /></div>
+        <input id="swapAmount" type="text" min="0" placeholder="0.0" / inputmode="decimal"></div>
       <div style="flex:1"><label data-i18n="swap.timelock">Timelock (blocks until refund)</label>
         <input id="swapTimelock" type="number" min="10" step="1" value="120" /></div>
     </div>
@@ -843,7 +1052,7 @@
     <div class="hint-banner mt" style="display:block">
       <label data-i18n="quorum.proposeTitle">Propose a spend (bonded stakers)</label>
       <div class="row mt" style="gap:8px">
-        <input id="qPropRecipient" class="grow" placeholder="mldsa44… address · alias · faucet" autocomplete="off" />
+        <input id="qPropRecipient" class="grow" placeholder="NADO address · alias · faucet" autocomplete="off" />
         <button id="qPropMine" class="ghost small" style="flex:0 0 auto" data-i18n="quorum.myAddr">My address</button>
       </div>
       <div class="row mt" style="gap:8px">
@@ -854,6 +1063,19 @@
       <div id="qPropMsg" class="small faint mt"></div>
     </div>
     <div id="qStatus" class="small mt"></div>
+    <div class="row mt" style="align-items:flex-start;gap:10px">
+      <input id="qAutoYes" type="checkbox" class="switch" />
+      <label for="qAutoYes" style="margin:0;flex:1;cursor:pointer">
+        <b data-i18n="quorum.autoYes">Automatically vote yes on new proposals</b>
+        <span class="small faint" style="display:block" data-i18n="quorum.autoYesSub">On by default, and limited to the recipients listed below — which ships pre-filled with the project's address. While this wallet is open, any open proposal paying a listed recipient that you haven't voted on gets a yes vote from your bonded stake, and each vote costs a fee. Edit the list, clear it to approve every recipient, or switch this off. Your own "no" is never overridden, and it never executes a payout — that stays a manual button.</span>
+      </label>
+    </div>
+    <div id="qAutoYesRow" class="mt hidden">
+      <b class="small" data-i18n="quorum.autoYesAllow">Only auto-approve these recipients</b>
+      <span class="small faint" style="display:block" data-i18n="quorum.autoYesAllowSub">Optional. One address (or "faucet") per line. Leave empty to auto-approve every open proposal, whoever it pays.</span>
+      <textarea id="qAutoYesAllow" rows="3" class="mt" style="width:100%" spellcheck="false" placeholder="faucet"></textarea>
+    </div>
+    <div id="qAutoYesMsg" class="small mt"></div>
     <div id="qProposals" class="mt"></div>
   </div>
 
@@ -867,7 +1089,7 @@
       and anyone submits it once enough have signed.</p>
 
     <label data-i18n="msig.members">Member addresses (one per line)</label>
-    <textarea id="msigMembers" rows="4" class="mono" placeholder="mldsa44…&#10;mldsa44…" autocomplete="off" spellcheck="false" style="width:100%"></textarea>
+    <textarea id="msigMembers" rows="4" class="mono" placeholder="NADO address&#10;NADO address" autocomplete="off" spellcheck="false" style="width:100%"></textarea>
     <label class="mt" data-i18n="msig.threshold">Signatures required to spend (M)</label>
     <input id="msigThreshold" inputmode="numeric" placeholder="2" autocomplete="off" style="max-width:120px" />
     <button id="btnMsigDerive" class="accent mt" data-i18n="btn.msigDerive">Derive shared address</button>
@@ -882,7 +1104,7 @@
     <hr style="border:none;border-top:1px solid var(--line,#1c2530);margin:18px 0" />
     <label data-i18n="msig.proposeTitle">Propose a spend from the shared account</label>
     <div class="row mt" style="gap:8px">
-      <input id="msigTo" class="grow" placeholder="mldsa44… address or alias" autocomplete="off" spellcheck="false" />
+      <input id="msigTo" class="grow" placeholder="NADO address or alias" autocomplete="off" spellcheck="false" />
       <input id="msigAmount" style="flex:0 0 130px" inputmode="decimal" placeholder="NADO" autocomplete="off" />
     </div>
     <button id="btnMsigPropose" class="primary mt" style="width:100%" data-i18n="btn.msigPropose">Create proposal + sign</button>
@@ -914,7 +1136,7 @@
 
     <div class="mt"><div class="label" data-i18n="shield.depositTitle">Deposit (shield)</div></div>
     <label data-i18n="shield.amount">Amount (NADO)</label>
-    <input id="shieldAmount" type="number" min="0" step="0.0001" placeholder="0.0" />
+    <input id="shieldAmount" type="text" min="0" placeholder="0.0" / inputmode="decimal">
     <button id="btnShield" class="primary mt" style="width:100%" data-i18n="shield.deposit">Shield coins</button>
 
     <div class="mt"><div class="label" data-i18n="shield.notesTitle">Your banknotes</div></div>
@@ -944,7 +1166,7 @@
     <label data-i18n="shield.sendTo">Recipient shielded address</label>
     <input id="zsendTo" placeholder="zaddr…" autocomplete="off" spellcheck="false" />
     <label class="mt" data-i18n="shield.amount">Amount (NADO)</label>
-    <input id="zsendAmount" type="number" min="0" step="0.0001" placeholder="0.0" />
+    <input id="zsendAmount" type="text" min="0" placeholder="0.0" / inputmode="decimal">
     <div class="small faint mt" style="display:flex;align-items:center;gap:8px">🔒 <span data-i18n="shield.ondevice">Proved on this device — fully private (the node never sees your amounts or keys)</span></div>
     <button id="btnZsend" class="primary mt" style="width:100%" data-i18n="shield.zsend">Send shielded</button>
     <div id="zsendCodeBox" class="warnbox mt small hidden">
@@ -954,6 +1176,12 @@
       <div class="addr-box"><span class="mono break" id="zsendLink"></span>
         <button class="copy" data-copy="zsendLink" data-i18n="btn.copy">Copy</button>
         <button class="copy" id="btnZcodeShare" data-i18n="btn.share">Share</button></div>
+      <label class="mt" data-i18n="shield.deliverLabel">Deliver it over NADO — encrypted, no copy-paste</label>
+      <div class="addr-box">
+        <input id="zsendDeliverTo" placeholder="address or @alias" autocomplete="off" spellcheck="false"
+               style="flex:1;min-width:0" />
+        <button class="copy" id="btnZdeliver" data-i18n="shield.deliverBtn">Send</button></div>
+      <div class="small faint" id="zsendDeliverHint"></div>
       <label class="mt" data-i18n="shield.codeLabel">Claim code (manual)</label>
       <div class="addr-box"><span class="mono break" id="zsendCode"></span>
         <button class="copy" data-copy="zsendCode" data-i18n="btn.copy">Copy</button></div>
@@ -966,18 +1194,31 @@
     <hr style="border:none;border-top:1px solid var(--line,#1c2530);margin:16px 0" />
     <div class="mt"><div class="label" data-i18n="shield.withdrawTitle">Withdraw (unshield)</div></div>
     <label data-i18n="shield.toAddr">To address (leave blank = your own address)</label>
-    <input id="unshieldTo" placeholder="mldsa44…" autocomplete="off" spellcheck="false" />
+    <input id="unshieldTo" placeholder="NADO address" autocomplete="off" spellcheck="false" />
     <label class="mt" data-i18n="shield.amount">Amount (NADO)</label>
-    <input id="unshieldAmount" type="number" min="0" step="0.0001" placeholder="0.0" />
+    <input id="unshieldAmount" type="text" min="0" placeholder="0.0" / inputmode="decimal">
     <button id="btnUnshield" class="accent mt" style="width:100%" data-i18n="shield.unshield">Unshield</button>
     <div id="shieldStatus" class="faint small mt"></div>
     <div class="faint small mt" data-i18n="shield.autoclaim">Withdrawals arrive on their own once the proof settles — no extra step. <a id="btnClaimUnshield" href="javascript:void(0)" data-i18n="shield.checkNow">check now</a></div>
   </div>
 
+  <!-- SHADOW ACCOUNTS (interface.js shadowKeypair / doFundShadow / doReturnShadow): a separate account per game, funded
+       from the private balance by a relay, so nothing on chain ties the game's player to this wallet -->
+  <div id="shadowCard" class="card hidden" data-tab="shield">
+    <div class="label" data-i18n="shadow.title">Use apps privately</div>
+    <div class="faint small" data-i18n="shadow.lead">A game, the DEX or lending sees a separate account funded from your private balance. Nothing on chain ties it to this wallet.</div>
+    <label class="mt" data-i18n="shadow.game">App</label>
+    <select id="shadowGame" style="width:100%"></select>
+    <label class="mt" data-i18n="shield.amount">Amount (NADO)</label>
+    <input id="shadowAmount" type="text" placeholder="0.0" inputmode="decimal" />
+    <button id="btnShadowFund" class="accent mt" style="width:100%" data-i18n="shadow.fundOk">Fund privately</button>
+    <div id="shadowList" class="mt"></div>
+  </div>
+
   <div id="exploreSearchCard" class="card hidden" data-tab="explore">
     <h2 data-i18n="explore.title">Explore</h2>
     <div id="exSearch">
-      <input id="exQ" placeholder="address (mldsa44… or alias) · block number · block hash · txid" autocomplete="off" spellcheck="false" />
+      <input id="exQ" placeholder="address (NADO address or alias) · block number · block hash · txid" autocomplete="off" spellcheck="false" />
       <button id="exGo" class="accent" data-i18n="btn.search">Search</button>
     </div>
     <div id="exSearchErr" class="warnbox danger mt hidden"></div>
@@ -986,7 +1227,7 @@
   <div id="exOverviewCard" class="card hidden" data-tab="explore">
     <div class="ex-grid2">
       <div><h2 data-i18n="explore.network">Network</h2><div id="exNetwork"><div class="faint small">loading…</div></div></div>
-      <div><h2 data-i18n="explore.mining">Mining</h2><div id="exMining"><div class="faint small">loading…</div></div></div>
+      <div><h2 data-i18n="explore.mining">Collecting</h2><div id="exMining"><div class="faint small">loading…</div></div></div>
     </div>
   </div>
   <div id="exRecentCard" class="card hidden" data-tab="explore">
@@ -1004,7 +1245,7 @@
     <div class="msg-layout">
       <div class="msg-side">
         <div class="row" style="gap:6px">
-          <input id="msgTo" placeholder="alias or mldsa44… address" data-i18n-ph="msg.toPh" autocomplete="off" spellcheck="false" style="flex:1">
+          <input id="msgTo" placeholder="alias or NADO address" data-i18n-ph="msg.toPh" autocomplete="off" spellcheck="false" style="flex:1">
           <button class="btn ghost sm" id="msgNewBtn" data-i18n="msg.new">New</button>
         </div>
         <div id="msgConvList" class="msgconv-list"></div>
@@ -1012,7 +1253,7 @@
       <div class="msg-main">
         <div id="msgThread" class="msgthread"></div>
         <div class="row msg-compose" style="gap:6px">
-          <input id="msgBody" placeholder="Write a message…" data-i18n-ph="msg.bodyPh" autocomplete="off" style="flex:1">
+          <input id="msgBody" placeholder="Write a message…" data-i18n-ph="msg.bodyPh" autocomplete="off" maxlength="1800" style="flex:1">
           <button class="accent" id="msgSendBtn" data-i18n="msg.send">Send</button>
         </div>
         <div class="small faint" id="msgHint"></div>
@@ -1022,11 +1263,20 @@
 
   <div id="settingsCard" class="card hidden" data-tab="settings">
     <h2 data-i18n="settings.title">Settings</h2>
+    <div style="margin-bottom:18px">
+      <div class="settings-sect" style="margin-top:0;padding-top:0;border-top:0" data-i18n="settings.sectLang">Language</div>
+      <div id="langMount"></div>
+      <div class="settings-sect" data-i18n="settings.sectLook">Appearance</div>
+      <b data-i18n="settings.theme">Theme</b>
+      <span class="small faint" style="display:block" data-i18n="settings.themeSub">Recolours the whole interface — surfaces, text and controls. Contrast is checked for every theme.</span>
+      <div id="themeGrid" class="themegrid"></div>
+    </div>
+    <div class="settings-sect" data-i18n="settings.sectSign">Signing & dApps</div>
     <div class="row" style="align-items:flex-start;gap:10px;margin-bottom:14px">
       <input id="autosignDapp" type="checkbox" class="switch" />
       <label for="autosignDapp" style="margin:0;flex:1;cursor:pointer">
-        <b data-i18n="settings.autosign">Auto-sign game moves</b>
-        <span class="small faint" style="display:block" data-i18n="settings.autosignSub">On by default: no-cost actions (chess moves, reveals, collects) sign without a tap. Bets and anything that moves NADO always ask.</span>
+        <b data-i18n="settings.autosign">Auto-sign no-cost actions — game moves, atomic-swap claims and settles</b>
+        <span class="small faint" style="display:block" data-i18n="settings.autosignSub">On by default: actions that cost nothing and cannot take anything from you sign without a tap — game moves, reveals, collects, and the two bookkeeping steps of an atomic swap: claiming NADO that is locked for you, and settling a finished swap. Bets, locks and anything that moves NADO always ask.</span>
       </label>
     </div>
     <div class="row" style="align-items:flex-start;gap:10px;margin-bottom:14px">
@@ -1064,25 +1314,40 @@
       <div class="row"><input id="autosignBetCap" inputmode="decimal" placeholder="0 = always confirm bets" style="max-width:200px"></div>
       <span class="small faint" data-i18n="settings.betCapSub">A middle ground if you leave the switch above off: bets/spins that escrow up to this much sign without a tap; bigger stakes always ask.</span>
     </div>
-    <label data-i18n="settings.relay">Relay node URL (a full node that accepts your transactions)</label>
+    <div class="settings-sect" data-i18n="settings.sectNet">Network</div>
+    <!-- RELAY DROPDOWN (operator 2026-09-08: "there should be a relay dropdown"): the relays this chain advertises
+         (/relays, TLS-reachable from this page), each with its measured round trip; picking one pins it, "Automatic"
+         lets the wallet fail over on its own. The URL field below stays for a relay that is not advertised. -->
+    <label data-i18n="settings.relaySel">Relay</label>
+    <select id="relaySel" style="width:100%"></select>
+    <label class="mt" style="display:flex;align-items:center;gap:8px"><input type="checkbox" id="relayAuto" checked /> <span data-i18n="settings.relayAuto">Switch relay automatically if collect stops answering</span></label>
+    <p class="small faint" data-i18n="settings.relayAutoNote">Only the backend changes — this page, its code and your key never move. A failover relay is used only if its finalized chain matches your home relay, re-checked every 5 minutes, and alias payments are cross-checked. Off: the wallet shows offline instead.</p>
+    <label class="mt" data-i18n="settings.relay">Relay node URL (a full node that accepts your transactions)</label>
     <div class="row">
       <input id="relayUrl" class="grow" placeholder="https://node.example:9173" />
       <button id="btnSaveRelay" class="accent" style="flex:0 0 auto" data-i18n="btn.save">Save</button>
     </div>
-    <p class="small faint mt" data-i18n-html="settings.relayNote">Defaults to this page's origin. A custom relay must be same-origin or
-      send CORS headers, or your browser will block reads.</p>
+    <p class="small faint mt" data-i18n-html="settings.relayNote">Defaults to this page's origin. Your key never leaves this page: a relay only receives signed transactions. A relay can still answer wrongly, so the wallet checks a pinned or failover relay against your home relay (finalized block hash, alias addresses) and every payment confirm shows the exact address. Load the wallet only from get.nadochain.com or a node you run.</p>
+    <div class="settings-sect" data-i18n="settings.sectBackup">Backup</div>
     <div class="row mt">
-      <button id="btnDlKeySettings" class="accent" data-i18n="btn.dlKey">⤓ Download key file (JSON)</button>
+      <button id="btnDlKeySettings" class="accent" data-i18n="btn.dlKey">Download key file (JSON)</button>
     </div>
+    <!-- IMPORT WITHOUT FORGETTING FIRST (2026-10-08): the wallet creates one for a newcomer, so a person who already owns a
+         wallet arrives holding a second one — and the only way in used to be Forget wallet, i.e. destroy the auto-created
+         wallet before the old one was even typed in. This opens the SAME import fields (#importBox is moved here, so
+         btnImport / importKeyFile run unchanged); confirmReplaceWallet() decides, at the moment of replacing, whether
+         the wallet being replaced needs its backup first. -->
+    <button id="btnImportExisting" class="ghost mt" style="width:100%" data-i18n="import.existing">Import an existing wallet</button>
+    <div id="importMountSettings"></div>
 
     <hr style="border:none;border-top:1px solid var(--line,#1c2530);margin:16px 0" />
-    <div class="label" data-i18n="sec.title">🔐 Wallet security</div>
+    <div class="label" data-i18n="sec.title">Wallet security</div>
     <p class="small faint" data-i18n="sec.intro">Encrypt the private key stored in this browser with a password (AES-256-GCM). It's decrypted only in memory while unlocked, and auto-lock re-locks it after a period of inactivity.</p>
     <div id="secStatus" class="small mt"></div>
     <button id="btnEncrypt" class="accent mt" style="width:100%" data-i18n="sec.encrypt">Encrypt wallet with a password</button>
     <button id="btnRemoveEnc" class="ghost mt hidden" style="width:100%" data-i18n="sec.remove">Remove password (store in plain text)</button>
-    <button id="btnLockNow" class="ghost mt hidden" style="width:100%" data-i18n="sec.lockNow">🔒 Lock now</button>
-    <button id="btnDlEnc" class="ghost mt hidden" style="width:100%" data-i18n="sec.dlEnc">⤓ Download encrypted backup</button>
+    <button id="btnLockNow" class="ghost mt hidden" style="width:100%" data-i18n="sec.lockNow">Lock now</button>
+    <button id="btnDlEnc" class="ghost mt hidden" style="width:100%" data-i18n="sec.dlEnc">Download encrypted backup</button>
     <label class="mt" data-i18n="sec.autolock">Auto-lock after inactivity</label>
     <select id="autolockSel">
       <option value="0" data-i18n="sec.autolockOff">Off</option>
@@ -1093,6 +1358,40 @@
       <option value="60">60 min</option>
     </select>
 
+    <hr style="border:none;border-top:1px solid var(--line,#1c2530);margin:16px 0" />
+    <!-- ACCOUNT KEYS (doc/key-rotation.md): the account's on-chain authentication policy. "Protect" adds a
+         recovery phrase so a stolen phone cannot take the account; "Rotate" moves signing to a fresh key while
+         the address (and stake, streak, everything) stays. Hidden until the chain generation supports it. -->
+    <div id="authWrap" class="hidden">
+      <div class="label" data-i18n="auth.title">Account keys</div>
+      <p class="small faint" data-i18n="auth.intro">Your address stays the same forever; the keys that may act for it can change. Protecting the account adds a separate recovery phrase — a thief with your device can spend what is liquid, but cannot take the account, your stake or your streak.</p>
+      <div id="authStatus" class="small mt"></div>
+      <div id="authPending" class="hint-banner mt hidden" role="status"></div>
+      <button id="btnAuthProtect" class="accent mt hidden" style="width:100%" data-i18n="auth.protect">Protect this account (add a recovery phrase)</button>
+      <button id="btnAuthRotate" class="ghost mt hidden" style="width:100%" data-i18n="auth.rotate">Rotate signing key</button>
+      <button id="btnAuthCancel" class="ghost mt hidden" style="width:100%" data-i18n="auth.cancel">Cancel pending change</button>
+      <div id="authRecoveryBox" class="mt hidden">
+        <label class="small" data-i18n="auth.recoveryPrompt">Recovery phrase (24 words) — needed for this action</label>
+        <textarea id="authRecoveryPhrase" rows="3" autocomplete="off" spellcheck="false"></textarea>
+        <div class="row mt">
+          <button id="btnAuthGo" class="accent" data-i18n="auth.confirm">Confirm</button>
+          <button id="btnAuthAbort" class="ghost" data-i18n="btn.cancel">Cancel</button>
+        </div>
+      </div>
+      <div id="authPhraseReveal" class="warnbox mt hidden">
+        <div class="small" data-i18n="auth.phraseIntro">Write this recovery phrase down and keep it OFFLINE. It is shown once, never stored on this device, and it can never spend — it can only cancel or approve key changes.</div>
+        <div class="addr-box mt"><span class="a mono" id="authNewPhrase" style="line-height:1.7"></span></div>
+        <label class="small mt"><input type="checkbox" id="authPhraseAck" /> <span data-i18n="auth.phraseAck">I have written it down</span></label>
+        <div class="row mt">
+          <button id="btnAuthPhraseGo" class="accent" disabled data-i18n="auth.phraseGo">Protect account</button>
+          <button id="btnAuthPhraseAbort" class="ghost" data-i18n="btn.cancel">Cancel</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- The "Real device" block that lived here (status + Verify this device) duplicated the Mining page's device line and
+         its guide; removed 2026-09-08 (operator: "why is this under settings? duplication?"). -->
+    <div class="settings-sect" data-i18n="settings.sectAdv">Advanced</div>
     <div class="row mt">
       <button id="btnSelfTest" class="ghost" data-i18n="btn.selftest">Run self-test</button>
       <button id="btnForget" class="danger" data-i18n="btn.forget">Forget wallet</button>
@@ -1115,7 +1414,7 @@
   </div>
 
   <footer data-i18n-html="footer">
-    NADO light-miner · the chain stays on full nodes; this page only generates keys, registers, and renews
+    NADO light collector · the chain stays on full nodes; this page only generates keys, registers, and renews
     your presence lease. Your reward lands on your address because a relay builds the block crediting it.
   </footer>
 </div>
@@ -1125,7 +1424,7 @@
 <!-- i18n.js is ~1 MiB: defer keeps it from blocking first paint. Execution order is preserved —
      deferred classic scripts and module scripts share one in-order after-parse execution list,
      so i18n.js still runs before interface.js. -->
-<script defer src="/static/i18n.js?v=201913cb"></script>
-<script type="module" src="/static/interface.js?v=bf147735"></script>
+<script defer src="/static/i18n.js"></script>
+<script type="module" src="/static/interface.js"></script>
 </body>
 </html>

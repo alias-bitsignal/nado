@@ -5,8 +5,9 @@ loses the turn. First seat to bank 4000 finishes the table; the highest banked t
 `settle`. Ported from the deleted stackvm contract with identical scoring:
   straight (6 kept, all faces once) = 1500; else per face BASE[f]·2^(k-3) for k≥3 kept, plus single 1s(×100)
   and 5s(×50); BASE = {1:1000,2:200,3:300,4:400,5:600? no}: {1:1000,2:200,3:300,4:400,5:500,6:600}.
-The 6 rolled dice re-derive in-VM as die_p = alghash([bh(rh)+bh(rh+1)+seat*1000+rolln*10+p]) % 6 + 1
-(p<diceLeft) — matching farkle.js rollDice — so no keep can claim a die that wasn't rolled.
+The 6 rolled dice re-derive in-VM as die_p = LO32(H([bh(rh)+bh(rh+1)+seat*1000+rolln*10+p])) % 6 + 1
+(p<diceLeft; H = the VM's BLAKE2s word hash, the sum wrapping at 2^256) — matching farkle.js rollDice — so no keep
+can claim a die that wasn't rolled.
 
 Table: 1 ta 2 t0 3 ts 4 tp 5 tn 6 tx 7 tz 8 tb 9 tw 10 tfr 11 ti.  Seat: 12 gg 13 ga 14 gdl 15 grh 16 grn
 17 gfin 18 gsc 19 gts 20 ggs 23 gla.  Scratch field 30.  Index: slot0/field21 tables, slot1/22 seats.
@@ -16,7 +17,7 @@ has won yet (tb==0); it consumes the seat id rather than freeing it, so a score 
 new table. join() refuses a decided table (tb!=0) — that ante had no way home.
 """
 from execnode import zkvmasm
-from execnode.stark import alghash, field as F
+from execnode.games import _lib
 
 TA, T0, TS, TP, TN, TX, TZ, TB, TW, TFR, TI = 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11
 GG, GA, GDL, GRH, GRN, GFIN, GSC, GTS, GGS = 12, 13, 14, 15, 16, 17, 18, 19, 20
@@ -31,8 +32,8 @@ WIN = 4000
 
 def roll_dice(rh_hash0, rh_hash1, seat, rolln, dice_left):
     """In-clear 6 dice (0 past dice_left) — matches the in-VM derivation + farkle.js."""
-    seed = (rh_hash0 % F.P + rh_hash1 % F.P + seat * 1000 + rolln * 10) % F.P
-    return [((alghash.hashn([(seed + p) % F.P]) & 0xFFFFFFFF) % 6 + 1) if p < dice_left else 0 for p in range(6)]
+    seed = (rh_hash0 % _lib.vm_mod() + rh_hash1 % _lib.vm_mod() + seat * 1000 + rolln * 10) % _lib.vm_mod()
+    return [((_lib.vm_hash([(seed + p) % _lib.vm_mod()]) & 0xFFFFFFFF) % 6 + 1) if p < dice_left else 0 for p in range(6)]
 
 
 def score_counts(counts, straight):
@@ -49,19 +50,6 @@ def score_counts(counts, straight):
         elif f == 5:
             s += k * 50
     return s
-
-
-def keep_valid(keep, rolled_counts, dice_left):
-    """Whether `keep` (per-face) is a legal set-aside against the rolled counts."""
-    for f in (2, 3, 4, 6):
-        if not (keep[f] == 0 or keep[f] >= 3):
-            return False
-    for f in range(1, 7):
-        if keep[f] > rolled_counts[f]:
-            return False
-    ksum = sum(keep[f] for f in range(1, 7))
-    straight = dice_left == 6 and all(keep[f] == 1 for f in range(1, 7))
-    return ksum >= 1 and (score_counts(keep, straight) > 0)
 
 
 # ------- asm generators -------
@@ -267,6 +255,13 @@ SRC = {
         movi r4 0
         lt r4 r1
         require r4
+        movi r4 4294967296
+        mov r5 r0
+        lt r5 r4
+        require r5
+        mov r5 r1
+        lt r5 r4
+        require r5
         slot r4 1 r0
         sload r5 r4
         nez r5
@@ -576,4 +571,70 @@ ABI = {
 def build():
     src = dict(SRC)
     src["hold"] = "\n".join(_hold())
-    return zkvmasm.assemble_contract(src)
+    # C2 (security review 2026-09-23): every id-taking method refuses an id >= 2^32 before touching a slot;
+    # see _lib.id_guard. The ABI, the field layout and every honest call are unchanged.
+    ID_GUARDS = {**{m: ["r0"] for m in ("roll", "hold", "settle", "reclaim", "cancel")}, "join": ["r0", "r1"]}
+    return zkvmasm.assemble_contract(_lib.guard_ids(src, ID_GUARDS))
+
+
+# ---- the gen-29 carry (tools/carry.py, doc/stwo/g5-carry.md) ----------------------------------------------------------
+CARRY_PIN_FLOOR = _lib.CARRY_PIN_FLOOR
+
+
+def _carry_view(storage):
+    slots = (storage or {}).get("slots") or {}
+    return slots, (lambda f, k: int(slots.get(str((f << 32) + k), 0)))
+
+
+def carry_in_flight(storage):
+    """Why this contract cannot cross a reroll yet ([] = it can): an open table (ta set, tz not) that still holds an
+    ante (tp != 0) or a seat still playing (gfin == 0). Its antes ride rolls pinned to old-chain block hashes, and
+    reclaim's idleness gate is an old-chain height. Resolved on the old chain: settle(t) once a seat has banked 4000
+    (permissionless), the host's cancel(t) at a solo table, or reclaim(g) of each seat idle 18000 blocks
+    (permissionless) — a table every seat has reclaimed holds tp == 0 and is at rest (a later join plays it on the new
+    chain from scratch). Reached through the contract's own indexes only (tables: slot 0 / TLIST, seats: slot 1 /
+    GLIST)."""
+    slots, g = _carry_view(storage)
+    live = {}
+    for s in _lib.carry_ids(slots, 1, GLIST):
+        if g(GG, s) and not g(GFIN, s):
+            live.setdefault(g(GG, s), []).append(s)
+    out = []
+    for t in _lib.carry_ids(slots, 0, TLIST):
+        if not g(TA, t) or g(TZ, t) or not (g(TP, t) or live.get(t)):
+            continue
+        if g(TB, t):
+            out.append(f"table {t} has a winner - settle({t}) (permissionless)")
+        elif g(TN, t) == 1:
+            out.append(f"table {t} is a solo table in play - cancel({t}) (host), or reclaim(seat) once idle 18000 blocks")
+        else:
+            out.append(f"table {t} is in play - bank to {WIN} and settle({t}), or reclaim(seat) for each seat idle "
+                       "18000 blocks (permissionless)")
+    return out
+
+
+def carry_rebase(storage, tip):
+    """This contract's storage on a new chain whose block 0 stands where the old chain's `tip` stood. Once
+    carry_in_flight is [], the one height a method still reads is a seat's pending roll grh: roll() never checks the
+    table, so a seat at a SETTLED or cancelled table keeps rolling for nothing (hold() then reads bhash(grh)). Such a
+    pin is re-pinned to a new-chain block >= CARRY_PIN_FLOOR — unknown when the carry is built. That can re-roll an
+    outcome the owner saw, deliberately: nothing rides on it (the table's pot is paid out), and blocking on it instead
+    would let anyone hold the carry hostage with one free roll that only they can hold().
+    Not moved: gla (reclaim's idleness clock) — reclaim refuses every seat at rest (gfin set, or the table closed) —
+    and t0, which no method reads.
+    INVARIANT: every value written is an INT (exec_root.kv_projection commits only int-valued slots; a string made the
+    carried genesis root unprovable, review 2026-10-11), and only (field, seat) slots reached through the seat index
+    are touched."""
+    tip = int(tip)
+    blocked = carry_in_flight(storage)
+    if blocked:
+        # carry_contract never rebases a blocked contract; refusing here keeps a direct caller from re-rolling them
+        raise ValueError("farkle carry_rebase: resolve these on the old chain first: " + "; ".join(blocked))
+    slots = {str(k): v for k, v in ((storage or {}).get("slots") or {}).items()}
+    for s in _lib.carry_ids(slots, 1, GLIST):
+        key = str((GRH << 32) + s)
+        if int(slots.get(key, 0)):
+            slots[key] = int(max(CARRY_PIN_FLOOR, int(slots[key]) - tip))
+    out = dict(storage or {})
+    out["slots"] = slots
+    return out

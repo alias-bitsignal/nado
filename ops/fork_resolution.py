@@ -33,20 +33,117 @@ BEHIND, REORG, DEAD_FORK, SYNCED, UNKNOWN = "behind", "reorg", "dead_fork", "syn
 # Peers that do not answer are not evidence either way — an outage must never be read as a fork.
 _AGREE = 0.5
 
+# Uniform-sweep resolution used only when the doubling stride fails to land inside the peers' answerable
+# window (see _find_answerable). Bounds the worst-case probe count while resolving any window wider than
+# range/_SWEEP — ~200 blocks on a 13k chain, well under any real pruning retention.
+_SWEEP = 64
+
+
+SHALLOW_SPLIT_DEPTH = 3     # heights under the tip tested before the generic floor-discovery + bisection search
+
 
 def majority_hash(height, peers, probe, min_answers=2):
-    """The hash a strict majority of ANSWERING peers report at `height`, or None if there is no majority or
-    too few answers. `probe(peer, height) -> hash|None`."""
+    """The hash a strict majority of ANSWERING WEIGHT reports at `height`, or None if there is no majority
+    or too few answers.
+
+    `probe(peer, height)` returns either `hash|None` (legacy headcount) or `(hash, seats)` — the
+    STAKE-SIGNED probe (peer_ops.probe_block_hash_signed): a verified bonded validator's answer counts
+    1 + its selection seats, an unsigned/unverifiable answer counts 1. This closes the Sybil-softness of
+    the per-IP headcount without becoming a liveness dependency: a fleet with no signed answers degrades
+    to exactly the old seeds-first headcount, while a single real validator outweighs any number of
+    seatless IPs. min_answers stays a COUNT of answers — stake weighs the verdict, never quorum liveness."""
     answers = {}
-    for p in peers:
-        h = probe(p, height)
+    count = 0
+    # PARALLEL FAN-OUT. Serial probing cost ~1.5 s per peer, ~45 s per fresh verdict round — and the
+    # emergency loop evaluates the verdict every pass, so nodes spent ~half their wall-clock parked in
+    # non-producing emergency mode "evaluating" (measured 2026-08-18: 51% of an hour, 45-120 s per
+    # episode, block gaps up to 150 s fleet-wide). One slow peer now costs one timeout, not a round.
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(peers)))) as ex:
+        results = list(ex.map(lambda pr: probe(pr, height), peers))
+    for r in results:
+        h, seats = (r if isinstance(r, tuple) else (r, 0))
         if h:
-            answers[h] = answers.get(h, 0) + 1
-    total = sum(answers.values())
-    if total < int(min_answers):
+            answers[h] = answers.get(h, 0) + 1 + max(0, int(seats or 0))
+            count += 1
+    if count < int(min_answers):
         return None
+    total = sum(answers.values())
     top, n = max(answers.items(), key=lambda kv: kv[1])
     return top if n > total * _AGREE else None
+
+
+def _find_answerable(floor, tip, agrees):
+    """Any height in [floor, tip] that is COMPARABLE -- the peer majority answers and so do we -- or None.
+
+    The comparable range is a CONTIGUOUS WINDOW, not the whole chain: peers prune old history (rolling
+    mode) so everything below their retention is gone, and a node that raced ahead sits above everything
+    they hold. WE prune too, so the window is also bounded below by OUR retention (see agrees()); a height
+    only one side holds tells us nothing. So a probe can come back empty from either end, and neither end
+    can be assumed good.
+
+    Walks back from the tip with a doubling stride because the window is always at the TOP of the range —
+    recent heights are the ones peers are most likely to hold. O(log depth) probes, and each uses a low
+    retry count: here an empty answer is the expected outcome we are searching for, not a flaky peer worth
+    retrying eight times."""
+    step, h = 1, tip
+    while h > floor:
+        if agrees(h, 2) is not None:
+            return h
+        step *= 2
+        h = tip - step
+    if agrees(floor, 2) is not None:
+        return floor
+    # The doubling stride can JUMP OVER a narrow window (its gaps grow to half the range), so fall back to
+    # a uniform sweep of bounded cost. This finds any window wider than (range / _SWEEP) — far below any
+    # real retention setting. A window narrower than that is simply not found and the verdict stays
+    # UNKNOWN, which is the safe direction: UNKNOWN only ever means "change nothing", and no amount of
+    # probing can make a purge safe on evidence this thin.
+    span = tip - floor
+    for i in range(1, _SWEEP):
+        probe_h = tip - (span * i) // _SWEEP
+        if probe_h <= floor:
+            break
+        if agrees(probe_h, 2) is not None:
+            return probe_h
+    return None
+
+
+def _lowest_answerable(floor, anchor, agrees):
+    """The LOWEST height in [floor, anchor] the majority can answer, given `anchor` IS answerable.
+
+    Mirror of _highest_answerable for the other end of the window. Without it the search floor stays at 0,
+    where a pruned fleet can never answer — which collapsed every verdict to UNKNOWN and, on 2026-07-28,
+    left two nodes that had ALREADY detected they were stranded unable to confirm it, so the self-heal
+    could not fire. (`ancestor=None, probes=9`: eight retries at the tip, then one at the floor.)"""
+    if agrees(floor, 2) is not None:
+        return floor
+    lo, hi = floor, anchor                        # invariant: unanswerable at lo, answerable at hi
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if agrees(mid, 2) is None:
+            lo = mid
+        else:
+            hi = mid
+    return hi
+
+
+def _highest_answerable(tip, floor, agrees):
+    """The highest height in [floor, tip] the peer majority can actually answer, or None.
+
+    Used only when we are AHEAD of every peer (they hold no block at our tip). Binary-searches the
+    answerability boundary — `agrees(h)` returns None exactly when the majority could not be established at h
+    — so it costs O(log tip) probes and never changes the verdict at a height that IS answerable."""
+    if agrees(floor) is None:
+        return None                              # they cannot even answer at the floor -> genuinely no majority
+    lo, hi = floor, tip                           # invariant: answerable at lo, unanswerable at hi
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if agrees(mid) is None:
+            hi = mid
+        else:
+            lo = mid
+    return lo
 
 
 def find_common_ancestor(our_hash_at, tip, peers, probe, floor=0, min_answers=2):
@@ -58,23 +155,112 @@ def find_common_ancestor(our_hash_at, tip, peers, probe, floor=0, min_answers=2)
     dead-fork case."""
     probes = 0
 
-    def agrees(h):
-        nonlocal probes
-        probes += 1
-        theirs = majority_hash(h, peers, probe, min_answers=min_answers)
-        if theirs is None:
-            return None
-        return our_hash_at(h) == theirs
+    def agrees(h, _attempts=8):
+        """None only when the majority genuinely cannot be established — RETRIED first.
 
+        With a small peer set this search is brutally fragile: min_answers=2 against 2 reachable peers means
+        BOTH must answer on EVERY one of the ~26 probes a binary search makes, so one dropped packet anywhere
+        collapses the whole verdict to UNKNOWN. Measured live on .141: stranded_below_finality said stranded
+        with 2 peers disagreeing and none agreeing, yet the fork state stayed 'unknown' pass after pass and
+        blocked the purge. Retrying an inconclusive probe costs nothing when peers are healthy and is what
+        makes the verdict obtainable at all on a 2-peer node. This does NOT weaken the test: a real majority
+        is still required, we just decline to abandon it over one timeout."""
+        nonlocal probes
+        # OUR OWN PRUNING IS NOT A DISAGREEMENT (2026-09-13). This compared `our_hash_at(h) == theirs`,
+        # and a height WE have pruned makes our side None -- so `None == "<hash>"` is False, and the
+        # absence of our own block was recorded as a CLAIM that we hold a different one. An ARCHIVE peer
+        # answering at h0 was therefore enough to drive the ancestor to floor-1 on any node that had
+        # pruned its early history, which classify() reads as DEAD_FORK -- the one verdict whose remedy is
+        # destructive, reached from a height the node cannot see.
+        # Measured live: four nodes frozen for hours on `dead_fork, ancestor: -1` while merely needing a
+        # rollback of ~60 blocks, with this node (an archive node AND DEFAULT_SEED_PEERS[0]) supplying the
+        # h0 answer to every one of them. Everywhere else this module refuses to build a claim out of an
+        # absent answer ("Peers that do not answer are not evidence either way"); our own side is held to
+        # the same rule. A height we cannot serve is not comparable, and an incomparable height is None.
+        if our_hash_at(h) is None:
+            return None
+        for _ in range(max(1, int(_attempts))):
+            probes += 1
+            theirs = majority_hash(h, peers, probe, min_answers=min_answers)
+            if theirs is not None:
+                return our_hash_at(h) == theirs
+        return None
+
+    # DISCOVER THE FLOOR. `floor` is a REQUEST, not a fact. Peers prune history, so on a pruned fleet
+    # NOBODY can serve block 0 and every probe there is empty — which the old code read as "no majority
+    # could be established" and turned into UNKNOWN, permanently. Measured live on 2026-07-28: no peer
+    # could answer at h0, h1, h5000 or h11000, the lowest commonly-held height was ~h12000, and two nodes
+    # that had already PROVEN they were stranded could never confirm it, so the purge never fired.
+    # Anchor inside the answerable window first, then find its lower edge and search from there. Agreement
+    # at the lowest height they can serve is just as conclusive: any height they hold is one we must also
+    # match to be on their chain.
+    # TIP FIRST (2026-09-06). A node that is merely SHORT of the majority — the everyday case on a loaded
+    # relay that flaps into emergency a few blocks behind — matches the majority at its own tip, and that
+    # single answer decides the verdict: nothing below the tip can change it (the range search below only
+    # serves the binary search, which never runs when `top` is True). Measured before this check: 27-28
+    # probes per verdict every FORK_STATE_TTL_S, ~15 s of serial socket waits per minute on the core thread.
+    # Equivalent to the old order: when the tip is answerable, _find_answerable returned it on its first
+    # probe anyway; when it is NOT answerable (None), everything below runs exactly as before.
     top = agrees(tip)
+    if top:
+        return tip, probes
+    # SHALLOW SPLIT FAST PATH (2026-09-17). A block hash commits to its whole prefix, so a majority that matches
+    # ours at tip-k is on our chain up to tip-k EXACTLY, and with the tip already disagreeing the ancestor IS
+    # tip-k — no search can say otherwise. The generic path below did not use that: after "tip disagrees" it
+    # went looking for the fleet's pruning floor near block 0, retrying every unanswerable height eight times,
+    # and only then bisected — measured on the relay 2026-09-17 00:02: 49 rounds, 43 s, for a one-block split
+    # whose answer was one probe away. Every same-height split (the everyday case: an announcement one side
+    # held) is answered here in one extra round; anything deeper than SHALLOW_SPLIT_DEPTH falls through
+    # unchanged. `None` (peers cannot answer just below our tip) falls through too: that is the lone-forker
+    # signature the generic path handles.
+    if top is False:
+        for k in range(1, SHALLOW_SPLIT_DEPTH + 1):
+            if tip - k < floor:
+                break
+            a = agrees(tip - k)
+            if a is True:
+                return tip - k, probes
+            if a is None:
+                break
+    _requested_floor = floor
+    _anchor = _find_answerable(floor, tip, agrees)
+    if _anchor is None:
+        return None, probes                      # they can answer nowhere in range -> genuinely unknown
+    floor = _lowest_answerable(floor, _anchor, agrees)
+
     if top is None:
-        return None, probes
+        top = agrees(tip)
+    if top is None:
+        # PEERS CANNOT ANSWER AT OUR TIP — the signature of a node that is AHEAD of everyone, which is exactly
+        # what a lone forker looks like: it mines every slot unopposed and outruns the honest majority. Giving
+        # up here meant such a node could never obtain ANY verdict (always UNKNOWN), so the dead-fork escape's
+        # second confirmation could never be satisfied and it stayed forked forever — .141 sat 350+ blocks past
+        # the majority for hours (2026-07-28). Retry from the highest height the peers CAN answer; comparing
+        # there is just as conclusive, since any height they hold is one we must also agree on to be on their
+        # chain. Costs O(log tip) extra probes and only on this path.
+        ceiling = _highest_answerable(tip, floor, agrees)
+        if ceiling is None:
+            return None, probes
+        tip = ceiling
+        top = agrees(tip)
+        if top is None:
+            return None, probes
     if top:
         return tip, probes                      # we match at our own tip: not forked at all, just short
     bottom = agrees(floor)
     if bottom is None:
         return None, probes
     if not bottom:
+        # We disagree at the lowest height in range. If that IS the floor the caller asked about, the
+        # divergence really is below everything and the dead-fork reading is sound.
+        #
+        # But when PRUNING raised the floor, "below the floor" only means "below what anyone can still
+        # see" — the true fork point may sit either side of our finality horizon and nothing in range can
+        # tell us which. Returning floor-1 there would hand classify() an ancestor we never established:
+        # with a floor above our finalized height it reads as REORG and the node attempts a rollback that
+        # cannot reach the real divergence. UNKNOWN is the honest answer, and the safe one.
+        if floor > _requested_floor:
+            return None, probes
         return floor - 1, probes                # divergence is at or below the floor -> dead fork
 
     lo, hi = floor, tip                          # invariant: agree at lo, disagree at hi
@@ -88,6 +274,75 @@ def find_common_ancestor(our_hash_at, tip, peers, probe, floor=0, min_answers=2)
         else:
             hi = mid
     return lo, probes
+
+
+def pairwise_ancestor(our_hash_at, tip, peer_probe, floor=0):
+    """Highest height in (floor, tip] where OUR hash equals ONE peer's hash, or None.
+
+    THE NO-MAJORITY ESCAPE. resolve() needs a probe MAJORITY, and a multi-way scatter has none: every
+    branch is a minority, every verdict is UNKNOWN, and UNKNOWN correctly never reverts — so the whole
+    fleet can deadlock, each side producing its own branch (observed live 2026-08-18 09:00, a three-way
+    scatter at ~64940 that froze this node for 35 minutes). Weight is the objective rule that still
+    exists without a majority: sync toward the strictly-heaviest advertised branch — and for that, the
+    common ancestor with THAT ONE ADVERTISER is enough, no quorum required. Safety is unchanged: the
+    caller possession-adopts (fetch, pre-verify, full validation on apply), so a lying advertiser still
+    cannot cause a revert onto anything invalid.
+
+    Binary search, ~log2(depth) probes against a single peer. `peer_probe(height) -> hash|None`; a
+    non-answer narrows the search downward (no evidence never widens a claim)."""
+    lo, hi = int(floor), int(tip)
+    best = None
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        ours = our_hash_at(mid)
+        theirs = peer_probe(mid)
+        if ours and theirs and ours == theirs:
+            best = mid
+            lo = mid
+        else:
+            hi = mid - 1
+    if best is None:
+        ours = our_hash_at(lo)
+        theirs = peer_probe(lo) if lo > 0 else None
+        if lo > 0 and ours and theirs and ours == theirs:
+            best = lo
+    return best
+
+
+def tie_winner(ours_first_divergent: str, theirs_first_divergent: str,
+               ours_txids=None, theirs_txids=None) -> str:
+    """STABLE equal-weight fork choice: which branch is canonical when two branches carry EXACTLY equal
+    cumulative weight (weight increments are content-independent, so every same-height split is a
+    permanent exact tie).
+
+    The old tie-break compared TIP hashes — which re-roll every block, so which side "wins" flipped
+    every ~6 s and neither side could finish a reorg before the verdict inverted; splits see-sawed for
+    hours (observed 2026-08-17/18 at 62655 and 62895). The FIRST DIVERGENT block (ancestor+1) never
+    changes as the branches grow, so this comparison is computed identically and PERMANENTLY by both
+    sides: exactly one side reorgs, once.
+
+    Returns "ours" / "theirs". Missing or equal inputs return "ours" — no evidence never switches a
+    node off its own chain (the same asymmetry as everything else in this module)."""
+    if (not ours_first_divergent or not theirs_first_divergent
+            or ours_first_divergent == theirs_first_divergent):
+        return "ours"
+    # MOST-COMPLETE-POOL RULE (2026-09-01, leaderless assembly touch-up). Blocks are a pure function of
+    # the mempool, so a same-height split MEANS one assembler held a tx the other did not. The block whose
+    # tx set is the STRICT SUPERSET is the one built from the more complete pool — prefer it: every node
+    # can adopt it at once (the block carries the txs it lacked), the tx lands instead of waiting for a
+    # re-mine, and "propagate faster" becomes the winning strategy rather than a coin flip. Incomparable
+    # sets fall back to the larger set (more inclusion), equal-size sets to the permanent lowest-hash
+    # rule. Both sides compute the same answer from the same two blocks. Sets absent -> hash rule only.
+    if ours_txids is not None and theirs_txids is not None:
+        o, t = frozenset(ours_txids), frozenset(theirs_txids)
+        if o != t:
+            if t > o:
+                return "theirs"
+            if o > t:
+                return "ours"
+            if len(t) != len(o):
+                return "ours" if len(o) > len(t) else "theirs"
+    return "ours" if ours_first_divergent < theirs_first_divergent else "theirs"
 
 
 def classify(ancestor, tip, finalized):
@@ -110,5 +365,25 @@ def resolve(our_hash_at, tip, finalized, peers, probe, min_answers=2):
     DEAD_FORK -> purge chain data + resync; UNKNOWN -> do nothing this pass."""
     ancestor, probes = find_common_ancestor(our_hash_at, tip, peers, probe, floor=0,
                                             min_answers=min_answers)
+    if ancestor is None and finalized and finalized > 0:
+        # RE-ANCHORED-ONTO-A-FORK RESCUE (2026-07-30, the h15076 aftermath). A node that snapshot-anchored
+        # onto a minority fork holds NO block at any height it shares with the canonical chain's history —
+        # find_common_ancestor's raised-floor caution then honestly answers UNKNOWN ("the true fork point
+        # may sit either side of our finality horizon"), and UNKNOWN blocks the dead-fork escape forever.
+        # Three such nodes sat mining a private branch with the verdict permanently unknowable.
+        #
+        # But one comparison IS still available and conclusive: our own FINALIZED height. We always hold
+        # that block (earliest <= finalized by construction), and if the peer majority serves a DIFFERENT
+        # block there, the divergence is proven to lie at/below our floor — the exact DEAD_FORK
+        # definition, and the same "disagreement at a height that is final on our side" principle
+        # stranded_below_finality already stands on. Report ancestor as finalized-1 ("at or below the
+        # floor"); the purge itself stays behind the escape's quorum/weight/unanimity gates.
+        ours_f = our_hash_at(finalized)
+        theirs_f = majority_hash(finalized, peers, probe, min_answers=min_answers)
+        probes += 1
+        if ours_f is not None and theirs_f is not None and ours_f != theirs_f:
+            return {"state": DEAD_FORK, "ancestor": finalized - 1,
+                    "tip": tip, "finalized": finalized, "probes": probes,
+                    "via": "finalized-height disagreement (ancestor unlocatable)"}
     return {"state": classify(ancestor, tip, finalized), "ancestor": ancestor,
             "tip": tip, "finalized": finalized, "probes": probes}

@@ -13,6 +13,7 @@ fork-choice).
 """
 import os, sys, tempfile, traceback
 os.environ["HOME"] = tempfile.mkdtemp(prefix="nado_randman_")
+import atexit, shutil; atexit.register(shutil.rmtree, os.environ["HOME"], ignore_errors=True)   # leave no /tmp home behind (9,600 leaked by 2026-09-22)
 os.environ["NADO_TESTNET"] = "1"
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 for d in ("index", "blocks", "logs", "peers"):
@@ -29,14 +30,9 @@ from ops import kv_ops
 from ops.block_ops import randao_eligible_bonded
 from ops.mining_ops import beacon_commitment, select_producer_two_lane, EPOCH_LENGTH
 
-fails = 0
-def check(name, fn):
-    """Run fn; print PASS/FAIL and count failures."""
-    global fails
-    try:
-        fn(); print(f"PASS  {name}")
-    except Exception as e:
-        fails += 1; print(f"FAIL  {name}: {e}"); traceback.print_exc()
+import _harness
+_report = _harness.Report()
+check = _report.run
 
 E = 5
 GOOD, LAZY, WITHHOLDER = "ndoGOOD", "ndoLAZY", "ndoWITHHOLD"
@@ -114,12 +110,17 @@ def t5_weight_sites_use_full_registry():
         for line in src.splitlines():
             if "block_fork_weight(" in line and "def block_fork_weight" not in line:
                 assert "eligible" not in line, f"{path}: fork weight fed a filtered registry: {line.strip()}"
-    # and both producer-selection sites in core_loop draw over the filtered set
+    # the producer draw happens in ONE place (block_ops.derive_header) over the filtered set, and production, rebuild
+    # and verification all call it
+    with open(os.path.join(root, "ops/block_ops.py")) as f:
+        bo = f.read()
+    dh = bo[bo.index("def derive_header("):bo.index("def get_block_candidate(")]
+    assert "randao_eligible_bonded(" in dh, "derive_header lost the RANDAO filter"
     with open(os.path.join(root, "loops/core_loop.py")) as f:
         core = f.read()
-    assert core.count("randao_eligible_bonded(") >= 2, "core_loop selection sites lost the filter"
+    assert core.count("derive_header(") >= 3 and "derive_header(latest_block" in bo, "a selection site bypasses derive_header"
 check("fork weight stays on the FULL registry; selection sites keep the filter", t5_weight_sites_use_full_registry)
 
 
-print(f"\n{'ALL RANDAO-GATE CHECKS PASSED' if not fails else str(fails) + ' FAILURE(S)'}")
-sys.exit(1 if fails else 0)
+print(f"\n{'ALL RANDAO-GATE CHECKS PASSED' if not _report.fails else str(_report.fails) + ' FAILURE(S)'}")
+sys.exit(1 if _report.fails else 0)

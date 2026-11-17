@@ -125,6 +125,11 @@ MOVE = f"""
     movi r6 1
     add r5 r6
     sstore r4 r5
+    slot r4 9 r0
+    ctx r5 cursor
+    movi r6 300
+    add r5 r6
+    sstore r4 r5
 {_wincheck()}
     jnz r6 @won
     slot r4 8 r0
@@ -203,4 +208,22 @@ ABI = {
 
 
 def build():
-    return zkvmasm.assemble_contract(SRC)
+    # C2 (security review 2026-09-23): every id-taking method refuses an id >= 2^32 before touching a slot;
+    # see _lib.id_guard. The ABI, the field layout and every honest call are unchanged.
+    ID_GUARDS = {m: ["r0"] for m in ("open", "join", "move", "resign", "abort", "cancel")}
+    return zkvmasm.assemble_contract(_lib.guard_ids(SRC, ID_GUARDS))
+
+
+def carry_in_flight(storage):
+    """Why this contract cannot cross a reroll yet ([] = it can): an open game (_lib.pvp_games_in_flight) — finish,
+    resign or abort it on the old chain first."""
+    return [f"game {g} is open" for g in _lib.pvp_games_in_flight(storage, NN, SD, LIST)]
+
+
+def carry_rebase(storage, tip):
+    """This contract's storage on a new chain whose block 0 stands where the old chain's `tip` stood: only the daily
+    board's unresolved anchors move (_lib.rebase_daily_anchors); everything else is at rest once carry_in_flight is []."""
+    slots = {str(k): v for k, v in ((storage or {}).get("slots") or {}).items()}
+    out = dict(storage or {})
+    out["slots"] = _lib.rebase_daily_anchors(slots, tip, A_H, A_V, DCNT_SLOT, DLIST)
+    return out

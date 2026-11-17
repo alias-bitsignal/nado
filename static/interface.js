@@ -10,81 +10,149 @@
  */
 
 /* ----------------------------------------------------------------------------------------------
- * Protocol constants (mirror protocol.py — consensus-critical)
+ * Protocol constants — IMPORTED from the relay's /protocol.js (protocol.CLIENT_EXPORTS, rendered by nado.py from the
+ * protocol.py the relay runs; ops/client_protocol.py). They used to be hand-made copies here with "MUST match
+ * protocol.py" comments, and they drifted (FINALITY_DEPTH 12 vs 45, TX_INCLUSION_DELAY 2 vs 8, the auto-bond default
+ * 80 vs 99). NO NEW TRUST: this page is served by the same relay, which already supplies this code, every balance and
+ * every fee target. tests/test_constant_mirrors.py refuses any of these names re-declared as a literal.
+ * Values that can move under a running page (finality_depth, the lease, the fidelity gap, chain_id) are still
+ * ADOPTED from /status by refreshNetIdentity(); the import is their starting value.
  * -------------------------------------------------------------------------------------------- */
-import { poswProveAsync, challengeBytes } from "./posw.js?v=012201e1";
-import { share as sdkShare } from "./nadodapp.js?v=db1a59d7";   // THE one share implementation (SDK)
-import * as shielded from "./shielded.js?v=4e224dbe";
-import { flagSvg, ccBadge } from "./flags.js?v=a5087315";   // drawn country flags (emoji flags do not render on Windows)
-import * as alghash from "./alghash.js?v=849f345a";
-import * as sfield from "./stark/field.js";
-import { initHashing as initStarkHashing } from "./stark/hashing.js";
-import { initBlake2bWasm, initMerkleWasm } from "./vendor/blake2b-wasm.js";
-import { initGoldilocksWasm } from "./vendor/goldilocks-wasm.js";
-import { setFieldWasm } from "./stark/field.js";
-import { setMerkleWasm } from "./stark/merkle.js";
-import * as sjoinsplit2 from "./stark/joinsplit2.js";
-import * as sstark from "./stark/stark.js";
-import { treePath } from "./stark/tree.js";
-import { seedToMnemonic, mnemonicToSeed, looksLikeMnemonic } from "./bip39.js?v=527c8fc6";
+import * as P from "/protocol.js";
+import { EPOCH_LENGTH, POSW_T, POSW_S, POSW_K, POSW_ANCHOR_OFFSET, POSW_TARGET_MARGIN, MSIG_PREFIX, DOMAIN_ADDRESS_V2,
+         DOMAIN_MSIG, DOMAIN_REGISTER, DOMAIN_RANDAO_COMMIT, MIN_TX_FEE, TX_INCLUSION_DELAY, TX_TARGET_MARGIN,
+         BOND_UNLOCK_DELAY, ALIAS_REGISTRATION_FEE, FIDELITY_CAP, TREASURY_BPS, OPEN_TIP_BPS, BONDED_DIVIDEND_BPS,
+         INVITE_MIN_TIMELOCK, INVITE_MAX_TIMELOCK } from "/protocol.js";
+import { poswProveAsync, challengeBytes } from "./posw.js";
+import { share as sdkShare, autoEnhanceSelects } from "./nadodapp.js";   // THE one share implementation (SDK) + the shared select picker
+import { flagSvg, ccBadge } from "./flags.js";   // drawn country flags (emoji flags do not render on Windows)
+// THE WALLET IMPORTS NO RETIRED-POOL CODE (G6, doc/stwo-migration.md §9.5): alghash, alghash2, stark/joinsplit2|3,
+// stark/stark|field|hashing|tree and the Goldilocks WASM served only the legacy, field and wide pools, all closed and
+// empty. The Stwo prover (stark/stwo_js.js) is imported on demand. tests/test_the_wallet_builds_only_stwo_notes.mjs.
+import { initBlake2bWasm } from "./vendor/blake2b-wasm.js";
+import { seedToMnemonic, mnemonicToSeed, looksLikeMnemonic } from "./bip39.js";
+import { makeCredential as tpmMakeCredential, credentialBlob as tpmCredentialBlob, hexToBytes as tpmHex, bytesToHex as tpmToHex } from "./tpmcred.js";   // TPM challenger duty (maybeTpmChallenge); the server versions it by content (ops/static_versions.py)
 /* The chain this wallet signs for. ADOPTED DYNAMICALLY from the relay's /status at boot (initNetTag) so the
  * wallet self-resolves across chain upgrades — the literal below is only the pre-fetch fallback. Signing with
  * the relay's declared chain_id preserves replay protection (a tx binds to exactly the chain it lands on) and
  * adds no trust: the relay already supplies balances, fees and block targets. */
-let CHAIN_ID = "alphanet-11";   // default MUST track protocol.CHAIN_ID; refreshNetIdentity() re-adopts the relay's live chain at boot AND before every automated (auto-bond / epoch-duty) signing
-const EPOCH_LENGTH = 60;
-let FINALITY_DEPTH = 45;     // MUST match protocol.py FINALITY_DEPTH: reveal window for epoch E ends at E*EPOCH_LENGTH - FINALITY_DEPTH - 1 (block_ops.py:534)
-const REGISTER_POW_BITS = 16;  // legacy hashcash (retired) — kept only for the self-test vector
-// Registration Proof of Sequential Work (must match protocol.py). Non-parallelizable ~1 s chain; the
-// registration is a renewable presence LEASE renewed once ~POSW_LEASE_EPOCHS (≈1 day at ~8 min/epoch).
-const POSW_T = 1_000_000, POSW_S = 2_000, POSW_K = 20, POSW_ANCHOR_OFFSET = 30, POSW_LEASE_EPOCHS = 240;
+// The chain this browser LAST ADOPTED from a relay, if any. Read before the fallback literal so a returning
+// browser boots straight onto the chain it actually uses; a fresh browser has nothing here and the tag shows
+// "…" until the relay answers — never a literal that may be generations stale (a fresh install showed
+// "betanet-2" on a betanet-5 chain because the /status fetch lost a race with an overloaded relay, and the
+// literal had not been touched since betanet-2).
+const LS_CHAIN_ID = "nado_chain_id";
+const CHAIN_ID_SAVED = (() => { try { return localStorage.getItem(LS_CHAIN_ID) || ""; } catch (e) { return ""; } })();
+// A STALE TAB IS REFUSED, NEVER CARRIED ACROSS A REROLL (G6, doc/stwo-migration.md §9.5). /protocol.js is the serving
+// node's protocol module, and every rule this page applies comes with it: the gates, the VM hash a game commits with
+// (nadodapp algHashn), the RANDAO secret's form (randaoSecretFor). A tab loaded before a reroll keeps the OLD module in
+// memory, and adopting the new chain's id from its relay let it sign for the new chain under the old rules — a game
+// commitment hashed with the gen-28 hash can never be revealed on gen 29, so its stake is lost. So the page signs only
+// for PAGE_CHAIN: a relay on another chain is never adopted (relayOnPageChain), nothing is submitted while the current
+// relay is on one (staleChain), and the page reloads by itself, when idle, once its own origin serves the new chain.
+// INVARIANT: CHAIN_ID is PAGE_CHAIN or nothing; tests/test_a_stale_tab_never_signs_for_a_rerolled_chain.mjs.
+const PAGE_CHAIN = P.CHAIN_ID;
+let staleChain = "";                             // the chain the current relay reports when it is not PAGE_CHAIN
+let CHAIN_ID = PAGE_CHAIN;                       // confirmed by refreshNetIdentity() at boot AND before every automated (auto-bond / epoch-duty) signing
+let netAdopted = false;                          // true once a relay's /status has confirmed CHAIN_ID THIS session
+let FINALITY_DEPTH = P.FINALITY_DEPTH;     // protocol.FINALITY_DEPTH (adopted from /status): reveal window for epoch E ends at E*EPOCH_LENGTH - FINALITY_DEPTH - 1 (block_ops.py:534)
+// Registration Proof of Sequential Work (POSW_T/S/K/ANCHOR_OFFSET imported above). Non-parallelizable ~1 s chain; the
+// registration is a renewable presence LEASE renewed once per its class's grant (36 h for a phone, 7 days otherwise).
+let POSW_LEASE_EPOCHS = P.POSW_LEASE_EPOCHS;   // the historical / default grant (protocol.POSW_LEASE_EPOCHS); refreshNetIdentity() adopts the relay's value
+// PER-CLASS LEASES (protocol.LEASE_V2_EPOCH, 2026-09-14): a phone keeps 36 h, a Windows PC, Ledger, Trezor or enrolled
+// chip is present for 7 days per renewal. The relay tells the wallet the lease THIS identity's latest recert granted
+// (`devbind.lease_epochs` on /get_account) and the class table (`lease_epochs_by_class` on /status); every countdown,
+// renewal trigger and sentence below reads leaseEpochsOf(acc), never the constant, so no screen can name a stale number.
+let LEASE_BY_CLASS = {};
+function leaseEpochsOf(acc) {
+  const db = acc && acc.devbind;
+  if (db && Number.isInteger(db.lease_epochs) && db.lease_epochs > 0) return db.lease_epochs;
+  if (db && db.cls && Number.isInteger(LEASE_BY_CLASS[db.cls]) && LEASE_BY_CLASS[db.cls] > 0) return LEASE_BY_CLASS[db.cls];
+  return POSW_LEASE_EPOCHS;
+}
+function leaseText(acc, epochSecs) { return humanizeSeconds(leaseEpochsOf(acc) * (epochSecs || EPOCH_LENGTH * (state.blockTime || 8))); }
 // Headroom (in blocks) between the current tip and the register/recert max_block, so the tx still lands
 // BEFORE its target while the sequential PoW is computing. It is capped by POSW_ANCHOR_OFFSET: the anchor is
 // block (target − POSW_ANCHOR_OFFSET), which the client must be able to FETCH now, so target ≤ tip + offset.
-// The old value (8 blocks ≈ 64 s at 8 s/block) was too tight when the PoW runs in pure JS (WASM unavailable) —
-// the chain passed target during proving and the node rejected it "Target block too low". Use the max (≈240 s).
-const POSW_TARGET_MARGIN = POSW_ANCHOR_OFFSET;
-const DENOMINATION = 10_000_000_000n; // 1 NADO in raw units (1e10)
-// ADDRESS FORMAT — mirrors protocol.py ADDRESS_PREFIX/BODY/CHECKSUM (the one-constant rebrand point).
-const ADDR_PREFIX = "mldsa44";
-const MSIG_PREFIX = "msig";                 // policy accounts (multisig) — own discriminator
-const ADDR_BODY = 42, ADDR_LEN = ADDR_PREFIX.length + ADDR_BODY + 4;                     // 49 today
-const ADDR_RE = new RegExp("^" + ADDR_PREFIX + "[0-9a-f]{" + (ADDR_BODY + 4) + "}$");    // strict (lowercase)
+// This used to be pinned AT the offset (30 blocks, 180 s), which also made the anchor the live tip. Both
+// were wrong: the budget has to cover the WORK the difficulty demands, and an entry registration owes up
+// to 512 x POSW_T sequential hashes — unfinishable on a phone inside 180 s, which surfaced only as a
+// rejected tx. protocol.py now separates the two: offset 150, target 90, so the anchor is tip-60 (deeper
+// than FINALITY_DEPTH at prove time) and the budget is 90 blocks = 540 s. POSW_TARGET_MARGIN is imported above.
+// The margin a PARTICULAR proof needs, rather than the worst case. `register` lands EXACTLY at max_block,
+// so every block of margin is latency the user waits through — and the ceiling (90 = 9 min) is budgeted
+// for the most expensive ENTRY proof at a flood multiplier, which a renewal never pays. Derived from the
+// work actually owed and this device's MEASURED hash rate, with 3x headroom for a slow/throttled tab, a
+// floor of 12 blocks so propagation always has time, and the protocol ceiling on top.
+// MUST NOT exceed POSW_TARGET_MARGIN: the anchor is max_block-POSW_ANCHOR_OFFSET and has to already exist.
+// gen 25: a registration's only wait is the device prompt (a Windows Hello PIN dialog can take a minute, a relay may
+// be mid-restart), so the target sits a fixed 30 blocks (~3.5 min) ahead — well inside POSW_TARGET_MARGIN (90), which
+// is what the nodes accept. The old 12-block minimum was a PoSW proving budget and tripped "tip passed the target".
+const REG_TARGET_MARGIN = 30;
+function poswTargetMarginFor(requiredT) {
+  const secs = (Number(requiredT) || POSW_T) / Math.max(1, poswRate());
+  const blocks = Math.ceil((secs * 3) / 6) + 12;          // 3x headroom + propagation floor
+  return Math.max(12, Math.min(POSW_TARGET_MARGIN, blocks));
+}
+const DENOMINATION = BigInt(P.DENOMINATION); // 1 NADO in raw units (1e10)
+// ADDRESS FORMAT — protocol.py ADDRESS_PREFIX/BODY/CHECKSUM (the one-constant rebrand point), served by the relay.
+const ADDR_PREFIX = P.ADDRESS_PREFIX;    // "" since betanet-14; MSIG_PREFIX (imported) is the policy-account discriminator
+// ADDRESS FORMAT 2 (gen 28): mirrors ops/address_ops.make_address and static/nadotx.js (tests/test_address_format_v2.py).
+// A key-derived address commits to the WHOLE public key (format 1's first 21 bytes are the key's rho, which a forger
+// chooses); a multisig address (its own prefix) keeps format 1's body rule — its descriptor hash's first 42 hex.
+// (DOMAIN_ADDRESS_V2 is imported above.)
+// a 4-byte checksum (protocol.ADDRESS_CHECKSUM; format 1 had 2): an old 46-char address is not an address here
+const ADDR_CK = P.ADDRESS_CHECKSUM;
+const ADDR_BODY = P.ADDRESS_BODY, ADDR_LEN = ADDR_PREFIX.length + ADDR_BODY + ADDR_CK * 2;          // 50
+const ADDR_RE = new RegExp("^" + ADDR_PREFIX + "[0-9a-f]{" + (ADDR_BODY + ADDR_CK * 2) + "}$");    // strict (lowercase)
 const ADDR_RE_I = new RegExp(ADDR_RE.source, "i");
 const ADDR_RE_LOOSE = new RegExp("^" + ADDR_PREFIX + "[0-9a-f]{40,}$", "i");
-const MSIG_RE_I = new RegExp("^" + MSIG_PREFIX + "[0-9a-f]{" + (ADDR_BODY + 4) + "}$", "i");   // policy accounts are payable
+const MSIG_RE = new RegExp("^" + MSIG_PREFIX + "[0-9a-f]{" + (ADDR_BODY + ADDR_CK * 2) + "}$");   // strict (lowercase)
+const MSIG_RE_I = new RegExp("^" + MSIG_PREFIX + "[0-9a-f]{" + (ADDR_BODY + ADDR_CK * 2) + "}$", "i");   // policy accounts are payable
 const ADDR_PRE_RE = new RegExp("^" + ADDR_PREFIX), ADDR_PRE_RE_I = new RegExp("^" + ADDR_PREFIX, "i");
-// DOMAIN-SEPARATION TAGS — mirror protocol.py DOMAIN_* (renamed only at a CHAIN_GENERATION reroll).
-const DOMAIN_MSIG = "msig-v2", DOMAIN_REGISTER = "register-v1";
-const DOMAIN_RANDAO_COMMIT = "randao-commit-v1", DOMAIN_RANDAO_SECRET = "randao-secret-v1";
+// DOMAIN-SEPARATION TAGS — protocol.py DOMAIN_MSIG / DOMAIN_REGISTER / DOMAIN_RANDAO_COMMIT are imported above.
+// DOMAIN_RANDAO_SECRET is NOT a protocol constant and stays here: the per-epoch secret derives from the USER'S SEED
+// (randaoSecretFor), no node ever computes it, and a relay's answer must never be able to move it between a commit
+// and its reveal.
+const DOMAIN_RANDAO_SECRET = "randao-secret-v1";
 // ⚠ KEY-DERIVED TAGS — these derive from the USER'S SEED, not the chain: a reroll does NOT reset
 // them, and renaming them silently orphans every derived account / shielded note. FROZEN FOREVER
 // (they are invisible to users); a rename would require explicit migration code, never a sed.
 const DOMAIN_HD_ACCOUNT = "hd-account-v1";        // child-account key derivation
-const DOMAIN_SHIELD_NSK = "shield-nsk-v1";        // shielded nullifier-secret derivation
+const DOMAIN_SHIELD_NSK = "shield-nsk-v1";        // RETIRED with the legacy pool (G6); kept so the tag is never reused
+// THE WIDE POOL'S KEY COMES FROM ITS OWN DOMAIN, AND IS FOUR LANES (review 2026-09-24). Every legacy (non-ZK)
+// proof published the v1 key; reusing it for the wide pool would hand anyone holding an old proof the new spend key.
+const DOMAIN_SHIELD_NSK_WIDE = "shield-nsk-v2";   // RETIRED with the wide pool (G6); kept so the tag is never reused
+// THE STWO POOL'S KEY COMES FROM ITS OWN DOMAIN TOO (review 2026-10-11). It was the v2 digest taken whole, i.e. the wide
+// key's four lanes before reduction: any leak of a wide witness (the v1 precedent above) would have handed over every
+// Stwo note of the same wallet. Set while the Stwo pool is dormant and empty, so no note was ever made under the old form.
+const DOMAIN_SHIELD_NSK_STWO = "shield-nsk-stwo-v1";
 const DOMAIN_FORUM_LOGIN = "forum-login-v1";      // forum login challenge (matches forum/server.py)
-const MIN_TX_FEE = 1000;
+const DOMAIN_LAND_LOGIN = "land-login-v1";        // Land world login challenge (matches scripts/land_server.py DOMAIN)
+// MIN_TX_FEE is imported above.
 // Blocks to delay a flexibly-landing tx's earliest inclusion (min_block = tip + this) so it gossips to
 // every producer before any may include it -> identical mempools -> byte-identical blocks -> the node
 // fast-forward always hits (steady block_time). Mirror of protocol.TX_INCLUSION_DELAY.
-const TX_INCLUSION_DELAY = 2;
+// IMPORTED from /protocol.js (above). It was a hand-maintained mirror that sat at 2 while protocol.py moved to 8:
+// the browser stamped min_block = tip + 2, producers that had not yet seen the tx rejected it as too early, and a
+// send looked like an intermittent network fault rather than a constant mismatch.
 // GENEROUS landing headroom for a FLEXIBLY-landing tx (value send, blob/collect, bridge, dividend_withdraw):
 // max_block = tip + this, so the tx may be mined anywhere in [min_block, max_block] and does not expire (and
 // re-gossip-flood "Target block too low") before a producer includes it. Kept below the tip+360 mempool cap.
-// Mirror of protocol.TX_TARGET_MARGIN. (Exact-landing txs — bond/unbond/register/governance — do NOT use it.)
-const TX_TARGET_MARGIN = 300;
-const BOND_UNLOCK_DELAY = 14400; // protocol.py: blocks a bond stays locked after an unbond request (= 1 day at 6s)
-const BOND_CAP = 10_000_000_000_000n;   // protocol.py BOND_CAP: 1,000 NADO — bonding past this buys no weight.
-// Was 10x this (and the comment said 10,000 NADO) — stale since B_MIN dropped 1000 -> 10 NADO. autoBond()
-// below compounds up to BOND_CAP, so the wrong value silently bonded ~9,000 NADO of a user's coins into
-// weight-less stake. MUST track protocol.py: MAX_SHARES = BOND_CAP // B_MIN must stay 100.
-const ALIAS_REGISTRATION_FEE = 10_000_000; // protocol.py: 0.001 NADO anti-squat fee for `alias` register
-const AUTO_BOND_MIN_RAW = 10_000_000n;  // protocol.py: dust floor for an auto-bond (0.001 NADO)
+// protocol.TX_TARGET_MARGIN, imported. (Exact-landing txs — bond/unbond/register/governance — do NOT use it.)
+// BOND_UNLOCK_DELAY (imported): blocks a bond stays locked after an unbond request (= 1 day at 6s).
+// No per-identity bond cap (protocol.py, removed 2026-08-25): bonded weight is linear in stake, so autoBond()
+// below compounds without an upper stop. (The old BOND_CAP was per key and only ever idled honest miners' coins.)
+// ALIAS_REGISTRATION_FEE (imported): the 0.001 NADO anti-squat fee for `alias` register.
+const AUTO_BOND_MIN_RAW = BigInt(P.AUTO_BOND_MIN_RAW);  // protocol.py: dust floor for an auto-bond (0.001 NADO)
 
 /* ----------------------------------------------------------------------------------------------
  * Dependency loading: @noble/hashes (blake2b) + @noble/post-quantum (ML-DSA-44) as ESM from a CDN.
  * -------------------------------------------------------------------------------------------- */
 let blake2b, bytesToHex, hexToBytes, ml_dsa44, ml_kem768;
+// the other user-selectable signature schemes (doc/signature-schemes.md); undefined on a stale cached bundle, which
+// schemeLib() reports instead of signing with the wrong scheme
+let ml_dsa65, ml_dsa87, slh_dsa_sha2_128s, shake256;
 
 // Optional, locally-vendored QR generator (static/vendor/qrcode.js). Loaded best-effort: if it is
 // missing the Receive tab degrades to showing the address text instead of failing (NO runtime CDN).
@@ -98,9 +166,10 @@ async function loadDeps() {
   // 1) LOCAL self-contained bundle (no internet needed) — all symbols from one vendored module.
   //    This is what makes the wallet WORK on a phone / restricted network where the CDN is blocked.
   try {
-    const m = await import('./vendor/nado-crypto.js?v=mlkem');
+    const m = await import('./vendor/nado-crypto.js');
     blake2b = m.blake2b; bytesToHex = m.bytesToHex; hexToBytes = m.hexToBytes; ml_dsa44 = m.ml_dsa44;
     ml_kem768 = m.ml_kem768;   // ML-KEM-768 for messaging E2E (may be undefined on a stale cached bundle)
+    ml_dsa65 = m.ml_dsa65; ml_dsa87 = m.ml_dsa87; slh_dsa_sha2_128s = m.slh_dsa_sha2_128s; shake256 = m.shake256;
     if (blake2b && ml_dsa44) return;
   } catch (e) { /* fall through to CDN */ }
   // 2) CDN fallback (esm.sh, then jsdelivr) only if the local bundle isn't served.
@@ -111,12 +180,15 @@ async function loadDeps() {
   let lastErr;
   for (const build of cdns) {
     try {
-      const [hb, hu, pq, pk] = await Promise.all([
+      const [hb, hu, pq, pk, slh, h3] = await Promise.all([
         import(build("@noble/hashes@1.4.0/blake2b")),
         import(build("@noble/hashes@1.4.0/utils")),
         import(build("@noble/post-quantum@0.2.0/ml-dsa")),
         import(build("@noble/post-quantum@0.2.0/ml-kem")),
+        import(build("@noble/post-quantum@0.2.0/slh-dsa")),
+        import(build("@noble/hashes@1.4.0/sha3")),
       ]);
+      ml_dsa65 = pq.ml_dsa65; ml_dsa87 = pq.ml_dsa87; slh_dsa_sha2_128s = slh.slh_dsa_sha2_128s; shake256 = h3.shake256;
       blake2b = hb.blake2b;
       bytesToHex = hu.bytesToHex;
       hexToBytes = hu.hexToBytes;
@@ -201,26 +273,82 @@ function blake2bHashLink(a, b, size = 32) { return blake2bHash([a, b], size); }
 /* ----------------------------------------------------------------------------------------------
  * Addresses, keys, registration PoW
  * -------------------------------------------------------------------------------------------- */
-function makeAddress(pubHex, prefix = ADDR_PREFIX) {
-  const body = prefix + pubHex.slice(0, ADDR_BODY);
-  return body + blake2bHash(body, 2);
+// `alg`: the key's signature scheme (absent / "mldsa44" = the address exactly as before). Any other scheme's address
+// commits to it — ops/address_ops.address_body_v2, byte for byte: [domain, alg, key] instead of [domain, key].
+function makeAddress(pubHex, prefix = ADDR_PREFIX, alg = undefined) {
+  const pk = String(pubHex).toLowerCase();
+  const body = prefix + (prefix === ADDR_PREFIX
+    ? blake2bHash(alg && alg !== SIG_ML44 ? [DOMAIN_ADDRESS_V2, alg, pk] : [DOMAIN_ADDRESS_V2, pk], ADDR_BODY / 2)
+    : pubHex.slice(0, ADDR_BODY));
+  return body + blake2bHash(body, ADDR_CK);
 }
 
-function newKeypair() {
-  // The private key is a 32-byte ML-DSA-44 SEED; the 1312-byte public key derives from it.
-  const seed = crypto.getRandomValues(new Uint8Array(32));
-  const { publicKey } = ml_dsa44.keygen(seed);
-  const seedHex = bytesToHex(seed);
-  const pubHex = bytesToHex(publicKey);
-  return { privateKey: seedHex, publicKey: pubHex, address: makeAddress(pubHex) };
+/* ---- USER-SELECTABLE SIGNATURE SCHEMES (protocol.py; doc/signature-schemes.md) -------------------------------------
+ * An account signs with ML-DSA-44 unless it was created with another offered scheme. Every key is still ONE 32-byte
+ * seed, so the recovery phrase restores it; the scheme's expansion is native/pqsig/src/lib.rs's, mirrored here:
+ *   ML-DSA-65/87   the seed is FIPS 204's xi (as ML-DSA-44)
+ *   SLH-DSA-128s   (SK.seed, SK.prf, PK.seed) = SHAKE256("NADO/sig/slh-dsa-sha2-128s/keygen" || seed)[0..48]
+ * tests/test_every_signature_scheme_derives_one_key_in_every_stack.mjs pins the public keys against the node's.
+ * A key of another scheme carries `alg` on the keypair object; ML-DSA-44 keypairs carry none (as on the wire). */
+const SIG_ML44 = "mldsa44";
+const SIG_DST_SLH = "NADO/sig/slh-dsa-sha2-128s/keygen";
+const SIG_NAMES = { mldsa44: "ML-DSA-44", mldsa65: "ML-DSA-65", mldsa87: "ML-DSA-87", slhdsa128s: "SLH-DSA-128s" };
+function schemeLib(alg) {
+  const lib = (!alg || alg === SIG_ML44) ? ml_dsa44 : ({ mldsa65: ml_dsa65, mldsa87: ml_dsa87, slhdsa128s: slh_dsa_sha2_128s })[alg];
+  if (!lib || (alg === "slhdsa128s" && !shake256)) throw new Error(i18("sig.noLib", "This page cannot sign with {s} — reload it.", { s: SIG_NAMES[alg] || alg }));
+  return lib;
+}
+function schemeKeygen(alg, seed) {
+  const lib = schemeLib(alg);
+  if (alg === "slhdsa128s") {
+    const dst = _enc.encode(SIG_DST_SLH), buf = new Uint8Array(dst.length + seed.length);
+    buf.set(dst); buf.set(seed, dst.length);
+    // .slice(): noble's SLH-DSA keygen ZEROES the secret part (SK.seed, SK.prf) of the buffer it is given — a reused
+    // buffer would derive another key the next time (found by the interop test, 2026-10-25; pinned there)
+    return lib.keygen(shake256(buf, { dkLen: 48 }).slice());
+  }
+  return lib.keygen(seed);
+}
+// hedged: ML-DSA's own randomness; SLH-DSA's opt_rand is 16 fresh bytes (FIPS 205 hedged variant)
+function schemeSign(alg, secretKey, m) {
+  const lib = schemeLib(alg);
+  return alg === "slhdsa128s" ? lib.sign(secretKey, m, crypto.getRandomValues(new Uint8Array(16))) : lib.sign(secretKey, m);
+}
+function schemeVerify(alg, publicKey, m, sig) { return schemeLib(alg).verify(publicKey, m, sig); }
+function schemeOf(w) { return (w && w.alg) || SIG_ML44; }
+// the fee floor a PAYING tx of this scheme must meet (protocol SIG_SCHEME_SIZES[alg][2] x MIN_TX_FEE); exempt stays 0
+function schemeFee(alg, fee) {
+  const units = ((P.SIG_SCHEME_SIZES || {})[alg || SIG_ML44] || [0, 0, 1])[2];
+  return fee ? Math.max(Number(fee), MIN_TX_FEE * units) : fee;
+}
+// Surfaces the chain verifies with ML-DSA-44 only (protocol SIG_ML44_ONLY_RECIPIENTS: mining and its stake, messaging,
+// legacy claims — and forum sign-in): an account of another scheme is told so instead of signing something no node
+// will accept. (Auth configs and multisig membership take every offered scheme from SIG_SCHEME_KEYS_HEIGHT.)
+function ml44Only(w, what) {
+  if (schemeOf(w) === SIG_ML44) return false;
+  log("warn", i18("sig.ml44Only", "{what} needs an ML-DSA-44 account — this one signs with {s}. Switch to your Main account for it.",
+    { what, s: SIG_NAMES[schemeOf(w)] || schemeOf(w) }));
+  return true;
+}
+function legacyAddress(pubHex) { const body = ADDR_PREFIX + pubHex.slice(0, ADDR_BODY); return body + blake2bHash(body, 2); }
+
+function newKeypair(alg = undefined) {
+  // The private key is a 32-byte SEED; the public key derives from it (ML-DSA-44 unless `alg` names another scheme).
+  return keypairFromPriv(bytesToHex(crypto.getRandomValues(new Uint8Array(32))), alg);
 }
 
-function keypairFromPriv(privHex) {
+// `alg` DEFAULTS TO ML-DSA-44 ON PURPOSE: auth signer children, recovery keys, invite keys and the self-test call this
+// for keys the chain verifies as ML-DSA-44 only. A wallet account of another scheme passes its own (accountKeypair,
+// the persisted master's `alg`).
+function keypairFromPriv(privHex, alg = undefined) {
   privHex = (privHex || "").trim().toLowerCase();
   if (!/^[0-9a-f]{64}$/.test(privHex)) throw new Error("private key (seed) must be 64 hex chars (32 bytes)");
-  const { publicKey } = ml_dsa44.keygen(hexToBytes(privHex));
+  const a = alg && alg !== SIG_ML44 ? alg : undefined;
+  const { publicKey } = schemeKeygen(a, hexToBytes(privHex));
   const pubHex = bytesToHex(publicKey);
-  return { privateKey: privHex, publicKey: pubHex, address: makeAddress(pubHex) };
+  const kp = { privateKey: privHex, publicKey: pubHex, address: makeAddress(pubHex, ADDR_PREFIX, a) };
+  if (a) kp.alg = a;
+  return kp;
 }
 
 // ---- HD ACCOUNTS: multiple addresses from ONE master seed / recovery phrase -----------------------
@@ -232,12 +360,61 @@ function keypairFromPriv(privHex) {
 // same child addresses for recovery.
 const LS_HD_COUNT = "nado_hd_accounts";     // how many DERIVED accounts (beyond Main) the user has added
 function hdCount() { return Math.max(0, parseInt(localStorage.getItem(LS_HD_COUNT) || "0", 10) || 0); }
-function accountChildSeed(masterHex, index) { return blake2bHash([DOMAIN_HD_ACCOUNT, masterHex, index], 32); }
+// A DERIVED ACCOUNT MAY SIGN WITH ANOTHER SCHEME (doc/signature-schemes.md): the scheme is chosen when the account is
+// added and kept per index in LS_HD_ALGS (absent = ML-DSA-44; Main, the mining identity, is always ML-DSA-44). Its seed
+// is domain-separated by the scheme — [domain, master, index, alg] — so no seed ever serves two schemes, and an
+// ML-DSA-44 child keeps exactly the seed it always had. The key file carries the map (downloadKeyFile hd_algs).
+const LS_HD_ALGS = "nado_hd_algs";
+function hdAlgs() {
+  try { const v = JSON.parse(localStorage.getItem(LS_HD_ALGS) || "{}"); return v && typeof v === "object" && !Array.isArray(v) ? v : {}; }
+  catch (e) { return {}; }
+}
+function hdAlg(index) { const a = index > 0 ? hdAlgs()[String(index)] : undefined; return SIG_NAMES[a] && a !== SIG_ML44 ? a : undefined; }
+function setHdAlg(index, alg) {
+  const m = hdAlgs();
+  if (alg && alg !== SIG_ML44) m[String(index)] = alg; else delete m[String(index)];
+  try { localStorage.setItem(LS_HD_ALGS, JSON.stringify(m)); } catch (e) {}
+}
+function accountChildSeed(masterHex, index, alg = undefined) {
+  return blake2bHash(alg && alg !== SIG_ML44 ? [DOMAIN_HD_ACCOUNT, masterHex, index, alg] : [DOMAIN_HD_ACCOUNT, masterHex, index], 32);
+}
 function accountKeypair(masterHex, index) {
-  return keypairFromPriv(index === 0 ? masterHex : accountChildSeed(masterHex, index));
+  const alg = hdAlg(index);
+  return keypairFromPriv(index === 0 ? masterHex : accountChildSeed(masterHex, index, alg), alg);
 }
 function masterSeedOf() { return state.masterSeed || (state.wallet && state.wallet.privateKey) || null; }
-function accountLabel(i) { return i === 0 ? i18("acct.main", "Main") : i18("acct.n", "Account {n}", { n: i + 1 }); }
+// ---- SHADOW ACCOUNTS: one private account per dApp, unlinkable to this wallet (2026-10-18) ------------------------
+// "Use apps privately" for an app signs that app's requests with an account derived from the MASTER seed and the app's
+// origin — so the recovery phrase restores it, every game sees a different player, and nothing on chain ties it to
+// this wallet: it is FUNDED from the Stwo pool by a relayed spend (a spend's fee_to: the relay is paid by
+// the spend's fee, the payout goes to the shadow address) and RETURNS to the pool by its own deposit. Its activity is
+// public (it is an ordinary account); the link to the wallet is what is hidden. Wallet-only derivation, like the HD
+// accounts above; the seed never leaves the device.
+const DOMAIN_HD_SHADOW = "hd-shadow-v1";
+const LS_SHADOW = "nado_shadow_origins";          // origins this wallet plays privately (JSON array)
+function shadowOrigins() {
+  try { const v = JSON.parse(localStorage.getItem(LS_SHADOW) || "[]"); return Array.isArray(v) ? v.filter((x) => typeof x === "string") : []; }
+  catch (e) { return []; }
+}
+function shadowOn(origin) { return !!origin && shadowOrigins().includes(origin); }
+function setShadowOn(origin, on) {
+  const cur = shadowOrigins().filter((o) => o !== origin);
+  if (on) cur.push(origin);
+  try { localStorage.setItem(LS_SHADOW, JSON.stringify(cur)); } catch (e) {}
+}
+function shadowKeypair(origin) {
+  const m = masterSeedOf();
+  return m && origin ? keypairFromPriv(blake2bHash([DOMAIN_HD_SHADOW, m, String(origin)], 32)) : null;
+}
+// the account that signs for `origin`: its shadow account when the user plays it privately, else the active account
+function signerFor(origin) { return (shadowOn(origin) && shadowKeypair(origin)) || state.wallet; }
+// every origin whose shadow account may hold value (private ones now, plus the official games, for a restore)
+function shadowCandidateOrigins() { return [...new Set([...shadowOrigins(), ...EXEC_SIGN_ALLOW])]; }
+function accountLabel(i) {
+  const base = i === 0 ? i18("acct.main", "Main") : i18("acct.n", "Account {n}", { n: i + 1 });
+  const a = hdAlg(i);
+  return a ? base + " · " + SIG_NAMES[a] : base;
+}
 // Keep the HD layer consistent with state.wallet. A wallet (re)loaded by unlock/import/boot is ALWAYS the
 // master on account 0 — its address won't match our expected active-account address — so re-anchor to it.
 function hdSync() {
@@ -252,24 +429,56 @@ function switchAccount(i) {
   const master = masterSeedOf();
   if (master == null) return;
   i = Math.max(0, Math.min(hdCount(), i | 0));
+  // THE COLLECTING LOOP FOLLOWS THE ACCOUNT (operator 2026-09-29: "when i switch to Account 2 and back to Main, it
+  // wrongly shows 'start collecting'"). The loop runs for ONE address; on an unregistered account it halts for
+  // registration, and switching back never restarted it, so a registered, collecting Main sat on the idle button.
+  // Pause it for the old account (the persisted intent survives, exactly as a lock does) and resume it below for the
+  // new one: a registered account goes straight back to Collecting, an unregistered one shows Register.
+  const resume = localStorage.getItem(LS_MINING) === "1";
+  if (state.mining || state.starting) pauseMining();
   const kp = accountKeypair(master, i);
   state.masterSeed = master;              // preserve the master; state.wallet becomes the derived signer
   state.wallet = kp;
   state.activeIdx = i;
   state._hdExpectedAddr = kp.address;      // so hdSync won't mistake this switch for an external reload
   // NEVER persistWallet here — LS_WALLET must stay the master seed so one phrase restores every account.
+  state.authAcct = null;
+  state._authReady = null;                 // the new account's signer is not known yet (authReady)
   showWalletUI();
   refreshDashboard().catch(() => {});
+  if (resume) startMining();
+  else if (!state.pollTimer) startPollLoop();            // else at least keep the dashboard live
 }
-function addAccount() {
+async function addAccount() {
   const n = hdCount() + 1;
+  let alg;
+  // SIG_SCHEMES_HEIGHT (gen 28's gate, 1 from gen 29, inlined in G9): every account picks its scheme when it is added
+  // ONE CHOICE, DEFAULT FIRST: most people never need another scheme; the picker says what each one costs
+  const offered = (P.SIG_SCHEMES_OFFERED || [SIG_ML44]).filter((a) => SIG_NAMES[a]);
+  const units = (a) => ((P.SIG_SCHEME_SIZES || {})[a] || [0, 0, 1])[2];
+  alg = await uiChoose({
+    title: i18("sig.pickTitle", "Signature scheme for the new account"),
+    body: i18("sig.pickBody", "Every scheme here is post-quantum. The scheme is part of the account's address and cannot be changed later. To restore this account from your recovery phrase, add it again with the same scheme."),
+    choices: offered.map((a) => ({ value: a, label: SIG_NAMES[a],
+      note: a === SIG_ML44 ? i18("sig.note44", "Default. Smallest signatures, works everywhere in the wallet.")
+        : a === "slhdsa128s" ? i18("sig.noteSlh", "Hash-based: safe even if lattice schemes are broken. Large signatures — fees x{n}.", { n: units(a) })
+        : i18("sig.noteMl", "Higher security level than ML-DSA-44. Fees x{n}.", { n: units(a) }) })),
+    confirmText: i18("acct.add", "+ Add"),
+  });
+  if (alg == null) return;
   localStorage.setItem(LS_HD_COUNT, String(n));
+  setHdAlg(n, alg);
   switchAccount(n);
 }
 function renderAccountBar() {
   const bar = $("accountBar");
   if (!bar || !state.wallet) return;
   const count = hdCount(), active = state.activeIdx || 0;
+  // REBUILD ONLY ON A CHANGE: this runs on every wallet refresh (showWalletUI, then again after authSync), and tearing
+  // the picker down each time made it flicker for no reason (operator 2026-09-29).
+  const sig = JSON.stringify([count, active, Array.from({ length: count + 1 }, (_, i) => accountLabel(i)), i18("acct.label", "Account")]);
+  if (bar.dataset.sig === sig && bar.childElementCount) return;
+  bar.dataset.sig = sig;
   bar.textContent = "";
   bar.style.cssText = "display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap";
   const lbl = document.createElement("span");
@@ -298,38 +507,133 @@ function renderAccountBar() {
 function validateAddress(addr) {
   addr = (addr || "").trim();
   if (!ADDR_RE.test(addr)) return false; // prefix + body + checksum hex
-  return blake2bHash(addr.slice(0, -4), 2) === addr.slice(-4);
+  return blake2bHash(addr.slice(0, -ADDR_CK * 2), ADDR_CK) === addr.slice(-ADDR_CK * 2);
+}
+
+// A NADO PAYMENT may go to a multisig account too (ops/address_ops.validate_address takes its prefix): Send refused one as
+// "Invalid recipient", so the shared account the Multisig tab says to "fund like any address" could not be funded from
+// it (found by the scheme-wallet walk, 2026-11-04). Only for plain NADO: a multisig account makes plain transfers only,
+// so an asset, an allowance or a membership sent to one could never move — those keep validateAddress.
+function validatePayee(addr) {
+  addr = (addr || "").trim();
+  if (validateAddress(addr)) return true;
+  return MSIG_RE.test(addr) && blake2bHash(addr.slice(0, -ADDR_CK * 2), ADDR_CK) === addr.slice(-ADDR_CK * 2);
 }
 
 // ALIAS: a short human-readable name that resolves to an owner address on-chain. Client mirror of
-// ops/alias_ops.valid_alias_name (3..32 chars, lowercase [a-z0-9_-], starts with a letter, not "mldsa44…").
+// ops/alias_ops.valid_alias_name (3..32 chars, lowercase [a-z0-9_-], starts with a letter).
 // case-insensitive on purpose: on-chain alias names are all-lowercase, and callers normalize with
 // .toLowerCase() before resolving/sending — typing "Alice" must behave exactly like "alice".
-function looksLikeAlias(s) { return /^[a-z][a-z0-9_-]{2,31}$/i.test(s || "") && !ADDR_PRE_RE_I.test(s || ""); }
+// An alias is a NAME that is not address-shaped. The old test was `!ADDR_PRE_RE_I.test(s)` — a prefix
+// check — and ADDR_PREFIX is "" since the debrand, so that regex is /^/ and matches EVERY string: the
+// function returned false for every input, which silently broke alias REGISTRATION and every send-to-alias
+// path. (Exactly the hazard ops/address_ops.is_address documents on the Python side: with an empty prefix
+// `startswith(ADDRESS_PREFIX)` is true for everything, so the sniff must be replaced by a real test.)
+// Address-shaped = exactly ADDR_LEN lowercase hex; an alias must start with a letter and may contain
+// [a-z0-9_-], so the two are only ambiguous for an all-hex name of exactly that length — which the
+// address test wins, since an address is what a user would mean by it.
+const isAddressShaped = (s) => typeof s === "string" && s.length === ADDR_LEN && /^[0-9a-f]+$/i.test(s);
+// RESERVED NAMES ARE NOT ALIASES. `faucet` and `bridge` are protocol-reserved recipients that take an
+// ordinary positive-amount transfer (transaction_ops: "Faucet donation amount must be positive" /
+// "Bridge deposit amount must be positive"), but they also match the alias shape — so the send path
+// resolved them as aliases and refused with `Alias "faucet" is not registered.` Nobody can ever register
+// them either, because they are reserved, so the lookup could never start succeeding.
+// Kept to the names that genuinely accept a plain value transfer: every other reserved recipient
+// (bond/unbond/register/attest/…) has its own flow and its own tx shape, and typing one into the send box
+// should still be rejected rather than silently sent.
+const SENDABLE_RESERVED = new Set(["faucet", "bridge"]);
+const isSendableReserved = (s) => SENDABLE_RESERVED.has(String(s || "").trim().toLowerCase());
+function looksLikeAlias(s) {
+  return /^[a-z][a-z0-9_-]{2,31}$/i.test(s || "") && !isAddressShaped(s || "") && !isSendableReserved(s);
+}
 // i18n helper for dynamic (JS-set) strings — translates via i18n.js's window.t, English fallback.
-function i18(k, fb, vars) { return (typeof window !== "undefined" && window.t) ? window.t(k, fb, vars) : (fb != null ? fb : k); }
+// Before i18n.js has loaded, the English fallback still gets its {placeholders} filled: returning it raw rendered
+// "via {h}" in the header of every fresh load that drew it early (betanet-8 walk, 2026-09-25).
+function i18(k, fb, vars) {
+  if (typeof window !== "undefined" && window.t) return window.t(k, fb, vars);
+  return String(fb != null ? fb : k).replace(/\{(\w+)\}/g, (m, n) => (vars && vars[n] != null ? String(vars[n]) : m));
+}
 async function resolveAlias(name) {
   try {
     name = (name || "").trim().toLowerCase();   // registry names are all-lowercase
     const r = await fetch(relayBase() + "/resolve_alias?name=" + encodeURIComponent(name), { cache: "no-store" });
     const d = await r.json();
-    return d && d.owner ? d.owner : null;
+    const owner = d && d.owner ? d.owner : null;
+    // A LYING RELAY CANNOT REDIRECT A PAYMENT (operator 2026-09-08: "make sure people cant host malicious relays"). Keys
+    // never leave this page, so the one thing a hostile relay can do is answer wrongly — and an alias → address answer
+    // is the only relay answer a user signs against. Away from home (failover or a pinned relay), the home relay must
+    // agree; on disagreement the alias is treated as unresolved and the reason is logged.
+    if (owner && relayBase() !== homeRelay()) {
+      try {
+        const r2 = await fetchWithTimeout(homeRelay() + "/resolve_alias?name=" + encodeURIComponent(name), { cache: "no-store" }, 8000);
+        const d2 = await r2.json();
+        if (d2 && d2.owner && d2.owner !== owner) {
+          log("err", i18("log.aliasDisagree", "Relay {a} resolves \"{n}\" to a different address than your home relay — refusing. Switch relays before paying an alias.", { a: relayHost(relayBase()), n: name }));
+          return null;
+        }
+      } catch (e) { /* home unreachable: the active relay's answer stands, and the confirm dialog shows the address */ }
+    }
+    return owner;
   } catch { return null; }
 }
-// Live validation of the Send "to" field: a valid mldsa44… address, OR a registered alias (resolved
+// SAME CHAIN, NOT JUST SAME CHAIN ID: before the wallet adopts a relay it did not load its code from, the relay's
+// finalized block (60 below the lower of the two tips) must hash the same as the home relay's. A relay that serves a
+// forged chain is refused; an unreachable home passes (there is nothing to compare, and the confirm dialogs still show
+// every address and amount the user signs).
+async function relayAgreesWithHome(url, candTip) {
+  const home = homeRelay();
+  if (!url || url === home) return true;
+  let hs = null;
+  try { hs = await fetchWithTimeout(home + "/status", { cache: "no-store" }, 6000).then((r) => r.json()); } catch (e) {}
+  // HOME CANNOT BE ASKED — which is exactly when a failover happens. A candidate was then adopted on its own word
+  // (audit 2026-09-25). Ask another pool relay instead: the candidate is used only if one of up to two others holds
+  // the same finalized block. With no other relay to ask it is used as before (liveness over nothing at all).
+  if (!hs || !Number(hs.latest_block_height)) return relayCorroborated(url, candTip);
+  try {
+    const n = Math.min(Number(hs.latest_block_height) || 0, Number(candTip) || 0) - 60;
+    if (n <= 0) return true;
+    const [a, b] = await Promise.all([url, home].map((base) =>
+      fetchWithTimeout(base + "/get_block?number=" + n + "&hash_only=1", { cache: "no-store" }, 6000).then((r) => r.json()).then((d) => d && d.block_hash).catch(() => null)));
+    if (a && b && a !== b) {
+      log("err", i18("log.relayForked", "Relay {a} is on a different chain than your home relay (block {n} differs) — not using it.", { a: relayHost(url), n }));
+      return false;
+    }
+  } catch (e) { /* no comparison possible */ }
+  return true;
+}
+async function relayCorroborated(url, candTip) {
+  const n = (Number(candTip) || 0) - 60;
+  if (n <= 0) return true;
+  const hashAt = (base) => fetchWithTimeout(base + "/get_block?number=" + n + "&hash_only=1", { cache: "no-store" }, 6000)
+    .then((r) => r.json()).then((d) => (d && d.block_hash) || null).catch(() => null);
+  const others = relayPool.list.map((c) => c.url).filter((u) => u !== url && u !== homeRelay()).slice(0, 2);
+  if (!others.length) return true;
+  const mine = await hashAt(url);
+  if (!mine) return false;
+  const theirs = await Promise.all(others.map(hashAt));
+  if (theirs.some((h) => h === mine)) return true;
+  log("err", i18("log.relayUncorroborated", "Relay {a} could not be confirmed by any other relay (block {n}) — not using it.", { a: relayHost(url), n }));
+  return false;
+}
+// Live validation of the Send "to" field: a valid address, OR a registered alias (resolved
 // against the node, so the ✗ clears once the alias exists). Guards against stale async results.
 async function validateSendTo() {
-  const v = ($("sendTo").value || "").trim().toLowerCase();
+ const v = ($("sendTo").value || "").trim().toLowerCase();
   if (!v) { setMsg("sendToMsg", "", null); return; }
-  if (validateAddress(v)) { setMsg("sendToMsg", i18("sto.valid", "✓ valid address"), "ok"); return; }
+  if (validatePayee(v)) { setMsg("sendToMsg", i18("sto.valid", "✓ valid address"), "ok"); return; }
+  // A reserved recipient is valid as typed — looksLikeAlias already excludes these, but say so plainly
+  // rather than falling through to "invalid", which is what a user sending to the faucet would have read.
+  if (isSendableReserved(v)) {
+    setMsg("sendToMsg", i18("sto.reserved", "✓ reserved name — sends directly to {n}", { n: v }), "ok"); return;
+  }
   if (looksLikeAlias(v)) {
     setMsg("sendToMsg", i18("sto.resolving", "resolving alias…"), null);
     const owner = await resolveAlias(v);
     if (($("sendTo").value || "").trim().toLowerCase() !== v) return;   // input changed while resolving — ignore stale
-    setMsg("sendToMsg", owner ? `${i18("sto.aliasPre","✓ alias →")} ${owner.slice(0, 14)}…` : `${i18("sto.aliasNoPre","✗ alias")} “${v}” ${i18("sto.aliasNoSuf","is not registered")}`, owner ? "ok" : "err");
+    setMsg("sendToMsg", owner ? `${i18("sto.aliasPre","✓ alias →")} ${_abShort(owner)}` : `${i18("sto.aliasNoPre","✗ alias")} “${v}” ${i18("sto.aliasNoSuf","is not registered")}`, owner ? "ok" : "err");
     return;
   }
-  setMsg("sendToMsg", i18("sto.invalid", "✗ invalid — a 49-char mldsa44… address or a registered alias name"), "err");
+  setMsg("sendToMsg", i18("sto.invalid", "✗ invalid — a 46-char address, a registered alias, or a reserved name"), "err");
 }
 
 // ADDRESS BOOK: every recipient you send to (alias or address) is remembered in localStorage, offered
@@ -366,7 +670,13 @@ async function abResolveAliases(addrs) {
     catch { _abAlias[a] = ""; }
   }));
 }
-const _abShort = (a) => ADDR_RE.test(a) ? a.slice(0, 10) + "…" + a.slice(-4) : a;
+// Same rule as the SDK's shortAddr (static/nadodapp.js): drop the constant ADDRESS_PREFIX before truncating,
+// or the head-slice is spent on the 7 characters every address shares. `slice(0, 10)` showed three
+// distinguishing characters; this shows ten. Written out rather than imported because interface.js is a
+// classic script, not an ES module — so the RULE is duplicated and must stay in step with the SDK.
+const _abShort = (a) => ADDR_RE.test(a)
+  ? a.slice(ADDR_PREFIX.length, ADDR_PREFIX.length + 6) + "…" + a.slice(-5)
+  : a;
 function _abRow(x) {
   const alias = _abAlias[x.addr] ? "@" + _abAlias[x.addr] : "", short = _abShort(x.addr);
   const name = x.label || alias || short;
@@ -379,12 +689,12 @@ function _abRow(x) {
 async function saveCurrentContact() {
   let to = ($("sendTo").value || "").trim().toLowerCase(); let alias = "";
   if (!to) { setMsg("sendMsg", "Enter an address or alias to save.", "err"); return; }
-  if (!validateAddress(to) && looksLikeAlias(to)) {
+  if (!validateAddress(to) && !isSendableReserved(to) && looksLikeAlias(to)) {
     const owner = await resolveAlias(to);
     if (!owner) { setMsg("sendMsg", `Alias "${to}" is not registered.`, "err"); return; }
     alias = to; to = owner;
   }
-  if (!validateAddress(to)) { setMsg("sendMsg", "Enter a valid mldsa44… address or a registered alias to save.", "err"); return; }
+  if (!validateAddress(to) && !isSendableReserved(to)) { setMsg("sendMsg", "Enter a valid address, a registered alias, or a reserved name to save.", "err"); return; }
   const label = await uiPrompt({ title: i18("ab.nameIt", "Name this contact (optional):"), placeholder: alias || "e.g. Alice" });
   if (label === null) return;
   addrBookAdd(to, (label || "").trim() || alias);
@@ -400,12 +710,6 @@ function addrBookRender() {
   paint();
   abResolveAliases(book.map((x) => x.addr)).then(paint);
 }
-
-function powTarget() { return 1n << BigInt(256 - REGISTER_POW_BITS); }
-function powHashInt(address, nonce) {
-  return BigInt("0x" + blake2bHash([DOMAIN_REGISTER, address, nonce]));
-}
-function powValid(address, nonce) { return powHashInt(address, nonce) < powTarget(); }
 
 /* ----------------------------------------------------------------------------------------------
  * Transactions: build body, add txid (over the body incl. fee), then ML-DSA-44 sign(unhex(txid)).
@@ -428,19 +732,28 @@ function createTxid(body) {
   return blake2bHash(preimage);
 }
 
-function finalizeTransaction(draft, privHex, fee) {
-  const body = { ...draft, fee }; // fee is part of the signed body (matches create_transaction)
+// `key`: the signing keypair (its `alg` names a scheme other than ML-DSA-44), or a bare seed hex = ML-DSA-44. A tx of
+// another scheme names it in `alg` and a PAYING fee is lifted to that scheme's floor — both ride in the txid, so they
+// are set first (ops/transaction_ops._seal, the same rule). A kind the chain verifies with ML-DSA-44 only is refused
+// here rather than signed into a transaction no node accepts.
+function finalizeTransaction(draft, key, fee) {
+  const privHex = typeof key === "string" ? key : key.privateKey;
+  const alg = typeof key === "string" ? undefined : key.alg;
+  if (alg && (P.SIG_ML44_ONLY_RECIPIENTS || []).includes(draft.recipient))
+    throw new Error(i18("sig.ml44Only", "{what} needs an ML-DSA-44 account — this one signs with {s}. Switch to your Main account for it.",
+      { what: draft.recipient, s: SIG_NAMES[alg] || alg }));
+  const body = alg ? { ...draft, alg, fee: schemeFee(alg, fee) } : { ...draft, fee }; // fee is part of the signed body
   const txid = createTxid(body);  // public_key (if present in body) is excluded from this hash
-  // Derive the ML-DSA-44 secret key from the 32-byte seed, then sign the message bytes M = unhex(txid).
-  const { publicKey, secretKey } = ml_dsa44.keygen(hexToBytes(privHex));
+  // Derive the secret key from the 32-byte seed, then sign the message bytes M = unhex(txid).
+  const { publicKey, secretKey } = schemeKeygen(alg, hexToBytes(privHex));
   const m = hexToBytes(txid);
   // ML-DSA-44 signing is HEDGED (randomized). A rare bad hedge yields a signature that does NOT verify —
   // the node then rejects the tx with "Invalid signature" (seen intermittently on auto-bond). Verify our own
   // signature locally and re-sign until it checks out, so we never submit a non-verifying signature.
   let signature = null;
   for (let i = 0; i < 8; i++) {
-    const sig = ml_dsa44.sign(secretKey, m);
-    if (ml_dsa44.verify(publicKey, m, sig)) { signature = bytesToHex(sig); break; }
+    const sig = schemeSign(alg, secretKey, m);
+    if (schemeVerify(alg, publicKey, m, sig)) { signature = bytesToHex(sig); break; }
   }
   if (!signature) throw new Error("could not produce a verifying signature — please retry");
   return { ...body, txid, signature };
@@ -449,27 +762,31 @@ function finalizeTransaction(draft, privHex, fee) {
 // REGISTER is by definition an address's FIRST on-chain tx, so it MUST carry public_key — this is
 // what establishes the sender's pubkey on-chain (the node stores it on first use) and lets every
 // later tx omit it. Always include it here.
-function buildRegisterTx(wallet, targetBlock, posw, timestamp) {
+function buildRegisterTx(wallet, targetBlock, posw, timestamp, device) {
   const draft = {
     sender: wallet.address,
     recipient: "register",
     amount: 0,
     timestamp,
-    data: "",
+    // "" — or {"referrer": <the pending invite's sender>} (registerData). EVERY register this wallet builds goes
+    // through here (first registration, renewal, helper hand-back, another device's statement), so the referrer can
+    // not be missed on whichever path lands first. INVARIANT: never name this wallet itself (consensus refuses it).
+    data: registerData(wallet.address),
     nonce: randNonce(),
     public_key: wallet.publicKey,
     max_block: targetBlock,
     chain_id: CHAIN_ID,
-    posw,                        // sequential Proof of Work (renewable presence lease); replaces pow_nonce
   };
-  return finalizeTransaction(draft, wallet.privateKey, 0);
+  if (posw) draft.posw = posw;         // retired at gen 25 (ignored by validation); never sent by this wallet
+  if (device) draft.device = device;   // the registration proof: hardware attestation over the anchor-bound challenge   // {att, cdj, rp}: hardware attestation over the anchor-bound challenge (doc/device-attestation.md)
+  return finalizeTransaction(draft, wallet, 0);
 }
 
 // ON-CHAIN messaging key (fee-exempt identity tx): binds the sender's ML-KEM-768 pubkey to their account so
 // peers can DM them by address/alias with NO off-chain prekey. Mirrors buildRegisterTx — the extra committed
 // field is `kem_pub` (register's `posw`). public_key is included (pubkey-once stores it idempotently; it's
 // excluded from the txid so its presence is free and always safe).
-function buildMsgkeyTx(wallet, kemPubHex, targetBlock, timestamp) {
+function buildMsgkeyTx(wallet, kemPubHex, targetBlock, timestamp, fee = 0) {
   const draft = {
     sender: wallet.address,
     recipient: "msgkey",
@@ -482,7 +799,7 @@ function buildMsgkeyTx(wallet, kemPubHex, targetBlock, timestamp) {
     chain_id: CHAIN_ID,
     kem_pub: kemPubHex,
   };
-  return finalizeTransaction(draft, wallet.privateKey, 0);
+  return finalizeTransaction(draft, wallet, fee);
 }
 
 // The sequential proof hashes POSW_T (1,000,000) times in a chain. Route that through the WASM blake2b —
@@ -490,38 +807,867 @@ function buildMsgkeyTx(wallet, kemPubHex, targetBlock, timestamp) {
 // which is far faster than pure JS. Cached; falls back to the JS blake2b if WASM is unavailable.
 let _wasmB2b;   // undefined = not yet tried; function = ready; null = unavailable
 async function miningHashDeps() {
-  if (_wasmB2b === undefined) { try { _wasmB2b = await initBlake2bWasm(); } catch (e) { _wasmB2b = null; } }
+  if (_wasmB2b === undefined) {
+    try { _wasmB2b = await initBlake2bWasm(); } catch (e) { _wasmB2b = null; }
+    // Losing WASM is not a mild slowdown — measured, it is ~3.2M hashes/s vs ~0.07M, and the registration
+    // proof has a fixed-length window to land in. On the JS path a registration simply cannot finish in
+    // time, and the only symptom used to be a rejected tx. Name the cause once, up front.
+    if (_wasmB2b === null) {
+      log("err", i18("log.noWasm", "WebAssembly is unavailable in this browser — the proof-of-work falls " +
+        "back to a ~45× slower path and registration will very likely time out. Try a browser with WASM " +
+        "enabled (or disable any script blocker on this page)."));
+    }
+  }
   return { blake2b: _wasmB2b ? (b) => _wasmB2b(b) : blake2b, bytesToHex, hexToBytes };
 }
 
 // Fetch the PoSW anchor (hash of block max_block − POSW_ANCHOR_OFFSET — a finalized, stable block that
 // the node derives identically), compute the non-parallelizable sequential proof, and build the register tx.
-async function computeRegisterTx(targetBlock, onProgress, requiredT) {
+// The identity's binding mode from the relay's /get_account (`devbind: {mode, cls, live, epoch}`): "perm" + live means a
+// hardware wallet vouches for it for life and renewals need no statement. Cached per poll (state.devbind) so the
+// Register gate and the lease panel agree with the tx builder; a relay without the field reads as leased.
+async function bindIsPermanent() {
+  try {
+    const acc = await getAccount(state.wallet.address);
+    // ONLY OVERWRITE WHEN THE ANSWER CARRIES THE FIELD. A read that omits `devbind` (an older relay, or a
+    // bundled endpoint that forgot to enrich it — the 2026-09-17 Hello-prompt bug) is not evidence that the
+    // binding is gone, and treating it as such is what sent a permanently-bound identity into a device prompt.
+    if (acc && "devbind" in acc) state.devbind = acc.devbind || null;
+  } catch (e) { /* keep the last answer */ }
+  return !!(state.devbind && state.devbind.mode === "perm" && state.devbind.live);
+}
+function bindDeviceName(cls) {
+  return cls === "ledger" ? "Ledger" : cls === "trezor" ? "Trezor" : cls === "tpm" ? "Windows PC" : cls === "ek" ? "TPM chip" : cls === "android-key" ? "phone" : (cls || "device");
+}
+/// The freshest usable proof the enrolment helper left for THIS address on the current relay, or null.
+///
+/// ONE READER, TWO CALLERS. The registration flow polled for a dropped proof; the lease RENEWAL flow did
+/// not, so an owner whose chip was enrolled by the helper pressed "Renew" and got a Windows Hello prompt —
+/// a ceremony that chip cannot answer, that cannot be dismissed, and that was never going to succeed. The
+/// proof they had just produced was sitting on the relay unread. Both paths now ask the same question here.
+///
+/// A drop is not a credential: consensus re-verifies the certify against the on-chain enrolment record and
+/// the register is still signed by this wallet alone, so collecting one is safe in any mode. The worst a
+/// junk drop can do is build a register that validation refuses — which is why every LIVE candidate is
+/// returned newest-first rather than only the newest (a stray drop parked on top used to block the real
+/// one underneath it).
+async function helperDrops(tipHint) {
+  try {
+    const r = await fetch(relayBase() + "/node_attest_pickup?sender=" + encodeURIComponent(state.wallet.address),
+                          { cache: "no-store" });
+    const d = await r.json();
+    const tipNow = Number(d.tip || tipHint || state.latest || 0);
+    const cands = Array.isArray(d.drops) ? d.drops : (d.drop ? [d.drop] : []);
+    // A drop is usable only while its max_block is still ahead of the tip: `register` lands EXACTLY at
+    // max_block, so one that has passed can never be included and must not be built on.
+    const live = cands.filter((b) => b && b.device && Number(b.max_block) > tipNow + 2);
+    live.reverse();
+    return live;
+  } catch (e) { return []; }
+}
+// THE AUTOMATIC RENEWAL NEVER OPENS A DEVICE PROMPT ON ITS OWN (found 2026-10-27 by
+// tests/test_every_identity_class_can_renew.py). maybeRenewLease fires on a timer, with no user gesture; when neither
+// the statement-free, the signature nor the helper path applied it fell through to attestDevice — a create() the browser
+// refuses without a gesture (so the lease simply lapsed: "unable to renew"), or, on a vouched-for wallet whose voucher
+// had not dropped a proof yet, this device's own prompt or a device.required error every few minutes. Now the timer
+// stops before the prompt with RenewNeedsTap and tells the owner the one thing that renews it: press Renew, or attest
+// on the vouching device. A press (renewLeaseManually) arms the tap and goes through as before.
+class RenewNeedsTap extends Error { constructor(m) { super(m); this.name = "RenewNeedsTap"; } }
+
+async function computeRegisterTx(targetBlock, onProgress, requiredT, opts) {   // opts: { noPrompt } (the renewal timer)
+  // gen 25: the registration proof IS the device attestation (doc/device-attestation.md). The sequential-work
+  // proof was retired at the betanet-7 reroll; `requiredT` and `onProgress` stay in the signature for callers.
   const anchorNum = Math.max(0, targetBlock - POSW_ANCHOR_OFFSET);
-  const r = await fetch(relayBase() + "/get_block_number?number=" + anchorNum, { cache: "no-store" });
-  const b = await r.json().catch(() => null);
+  // A slow link (Cloudflare adds 1-4 s, a mobile carrier more) must not cost the user a device tap: the anchor read
+  // gets rpcJSON's retry and a 25 s budget instead of a bare fetch (a Nigerian Android user got "relay unavailable"
+  // five times in a row on 2026-09-08 while the relay was fine and his phone attested perfectly each time).
+  let b = null;
+  try { b = (await rpcJSON("/get_block?number=" + anchorNum, { timeout: 25000 })).data; } catch (e) { b = null; }
   const anchorHash = b && b.block_hash;
-  if (!anchorHash) throw new Error("registration anchor block unavailable");
-  // Prove at the CONSENSUS required step count (base × difficulty). During a registration flood this is higher,
-  // and the node rejects a proof made with fewer steps — so match it or the registration is invalid.
-  const T = (requiredT && requiredT >= POSW_T && requiredT % POSW_S === 0) ? requiredT : POSW_T;
-  const proof = await poswProveAsync(challengeBytes(state.wallet.address, anchorHash),
-    T, POSW_S, POSW_K, await miningHashDeps(), onProgress);
-  return buildRegisterTx(state.wallet, targetBlock, proof, nowSeconds());
+  if (!anchorHash) throw new RelayUnreachable("registration anchor block unavailable");
+  if (onProgress) { try { onProgress(1, 1); } catch (e) {} }
+  // BOUND FOR LIFE (doc/device-attestation.md §"Binding modes"): an identity whose devbind row is a live permanent binding
+  // (Ledger / Trezor) renews its presence lease with a register tx that carries NO statement — the account key signs, no
+  // cable, no prompt. The chain refuses it the moment the device is rebound elsewhere, and the next pass falls back to
+  // the normal Register gate (a fresh statement is then the only way).
+  if (await bindIsPermanent()) {
+    log("ok", i18("bind.renewNoTap", "Renewed without a prompt — this identity is bound for life to its hardware wallet."));
+    return buildRegisterTx(state.wallet, targetBlock, null, nowSeconds(), null);
+  }
+  // SIGNATURE RENEWAL (protocol.LEASE_ASSERT_CLASSES — a Windows Hello identity): the credential the statement bound signs
+  // this block's challenge (navigator.credentials.get), ~200 bytes and no attestation prompt. The relay says whether the
+  // chain holds the credential (`devbind.assert_ok`); the credential id was kept beside the wallet at the statement. Any
+  // failure — no id, a cancelled prompt, a credential the OS forgot — falls through to a full statement below.
+  if (state.devbind && state.devbind.assert_ok) {
+    const credId = storedCredentialId(state.wallet.address);
+    if (credId) {
+      const a = await assertCredential(state.wallet.address, anchorHash, targetBlock, credId);
+      if (a) {
+        log("ok", i18("bind.renewSig", "Renewed with a Windows Hello confirmation — no attestation needed."));
+        return buildRegisterTx(state.wallet, targetBlock, null, nowSeconds(), a);
+      }
+    }
+  }
+  // THE HELPER'S PROOF COUNTS FOR A RENEWAL, NOT ONLY A FIRST REGISTRATION. A chip enrolled by the
+  // enrolment helper is a LEASED binding, so it is not covered by the permanent branch above and used to
+  // fall straight through to WebAuthn — summoning a Windows Hello prompt that the chip cannot answer, on
+  // a machine whose owner had just produced a perfectly good proof with the helper. Ask for it first.
+  const drops = await helperDrops(targetBlock);
+  if (drops.length) {
+    const fresh = drops[0];
+    state.pendingDrops = drops.slice(1);
+    log("ok", i18("bind.renewFromHelper",
+        "Renewing with the proof from the enrolment helper — no prompt needed."));
+    return buildRegisterTx(state.wallet, Number(fresh.max_block), null, nowSeconds(), fresh.device);
+  }
+  if (opts && opts.noPrompt && !state.tapArmed) throw new RenewNeedsTap("a device prompt needs a tap");
+  const device = await attestDevice(state.wallet.address, anchorHash, targetBlock);
+  if (!device) {
+    // SAY THE REAL REASON. attestDevice() has just stored the verdict (fmt none under Windows Hello VBS, no chain,
+    // unbindable class, cancelled…); the generic sentence below buried it and a Windows user was told to "use a
+    // Windows PC with a TPM" on a Windows PC (2026-09-07). The banner gets the specific hint whenever one exists.
+    let st = null; try { st = readDeviceStatus(); } catch (e) {}
+    const hint = (st && !st.ok) ? deviceHint(st) : "";
+    throw new Error(hint || i18("device.required", "This device could not attest itself. The free lane and the dividend need an Android phone (12+), a Windows PC with a TPM, a Ledger or Trezor — or a statement from another device. Savings collecting needs no device at all: bond NADO and you produce blocks without one."));
+  }
+  return buildRegisterTx(state.wallet, targetBlock, null, nowSeconds(), device);
 }
 
-// Current registration difficulty from the relay: {reqT, mult, recent}. Falls back to base (1× normal load).
-async function registrationDifficulty() {
+// THE CREDENTIAL ID, kept beside the wallet so a later renewal can ask THAT credential to sign (allowCredentials).
+// Per-viewer convenience only: the chain overrules it — the relay's assert_ok says whether the credential exists on chain,
+// and a get() that fails for any reason falls back to a full statement.
+//
+// SAVED ONLY WHEN A STATEMENT MADE WITH IT IS ACCEPTED (2026-10-22). It used to be saved the moment create() returned —
+// before the pre-flight, before any relay saw it. A statement that never landed (cancelled, refused by the pre-flight or
+// a node, expired) left this browser remembering a credential the chain never stored, and every later signature renewal
+// signed with it: "signature renewal rejected: ES256 signature does not verify", on every renewal, with no way out. Held
+// in memory until acceptedRegisterTx() sees the very statement (matched by its attestationObject) accepted. A statement
+// accepted but never incorporated can still leave the two apart — healSignatureRenewal() below is the net for that.
+let _pendingCred = null;
+function storedCredentialId(address) {
+  try { return localStorage.getItem("nado_cred_" + address) || null; } catch (e) { return null; }
+}
+function rememberCredentialId(address, rawId, att) {
+  _pendingCred = { address, id: btoa(String.fromCharCode(...new Uint8Array(rawId))), att };
+}
+function acceptedRegisterTx(tx) {
+  if (!_pendingCred || !tx || !tx.device || tx.device.att !== _pendingCred.att || tx.sender !== _pendingCred.address) return;
+  try { localStorage.setItem("nado_cred_" + _pendingCred.address, _pendingCred.id); } catch (e) {}
+  _pendingCred = null;
+}
+// THE CHAIN REFUSED A SIGNATURE RENEWAL (tx_validate "signature renewal …"): the saved credential is not the one the chain
+// holds — any of the ways above, or a statement made since on another device. Forget it, so the next attempt attests
+// with a full statement (which, once accepted, saves the credential that is then on chain). Returns true when it did.
+function healSignatureRenewal(tx, message) {
+  if (!tx || !tx.device || !tx.device.sig || !/signature renewal/i.test(message || "")) return false;
+  try { localStorage.removeItem("nado_cred_" + tx.sender); } catch (e) {}
+  log("warn", i18("bind.sigStale", "This browser's saved Windows Hello credential is not the one the chain holds — renewing with a full attestation instead."));
+  return true;
+}
+async function assertCredential(sender, anchorHash, maxBlock, credIdB64) {
+  if (!window.PublicKeyCredential || !navigator.credentials || !navigator.credentials.get) return null;
   try {
-    const r = await fetch(relayBase() + "/posw_difficulty", { cache: "no-store" });
+    const chalHex = blake2bHash([CHAIN_ID, sender, anchorHash, maxBlock]);   // the same challenge derivation as a statement
+    const chal = new Uint8Array(chalHex.match(/../g).map((h) => parseInt(h, 16)));
+    const id = Uint8Array.from(atob(credIdB64), (c) => c.charCodeAt(0));
+    const cred = await navigator.credentials.get({ publicKey: {
+      challenge: chal, rpId: location.hostname, timeout: 120000, userVerification: "preferred",
+      allowCredentials: [{ type: "public-key", id }] } });
+    const b64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
+    return { ad: b64(cred.response.authenticatorData), cdj: b64(cred.response.clientDataJSON), sig: b64(cred.response.signature), rp: location.hostname };
+  } catch (e) {
+    log("info", i18("bind.sigFallback", "The saved credential could not sign — attesting with a full statement instead."));
+    return null;
+  }
+}
+
+// Ask the PLATFORM authenticator first (phone secure element, Windows Hello TPM, Touch ID) so a device that has one
+// gets its own prompt instead of a chooser; if the platform refuses (no Windows Hello set up, no secure element),
+// fall back to any authenticator (a security key still answers, but the network refuses its batch certificate — the hint says so).
+// PLATFORMS THAT CANNOT ATTEST, DECIDED BEFORE ANY PROMPT (operator 2026-09-09: "the Mac ceremony"). Apple's platform
+// authenticator returns a passkey with fmt "none" — no chain, refused by every node — and a browser with no platform
+// authenticator would only offer a cross-device QR that cannot attest either. Both are STATIC verdicts: the ceremony
+// can only waste the user's time and then fail. "" = go ahead and prompt.
+async function platformAttestVerdict() {
+  const ua = navigator.userAgent || "";
+  const isIos = /iPhone|iPad|iPod/i.test(ua) || (/Macintosh/i.test(ua) && navigator.maxTouchPoints > 1);
+  if (isIos || /Macintosh|Mac OS X/i.test(ua)) return "apple";
+  try {
+    if (window.PublicKeyCredential && PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable
+        && !(await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable())) return "unsupported";
+  } catch (e) { /* the probe itself failing is not a verdict — let the prompt decide */ }
+  return "";
+}
+
+async function createAttestedCredential(publicKey) {
+  // THE ONE CHOKE POINT: registration, renewal and the setup-time "verify this device" all come through here, so the
+  // refusal lives here too — a guard in only one caller left the setup path still opening a Touch ID prompt on a Mac.
+  const verdict = await platformAttestVerdict();
+  if (verdict) { const e = new Error(verdict); e.nadoVerdict = verdict; throw e; }
+  // `hints: ["client-device"]` (WebAuthn L3) asks the browser for THIS machine's built-in authenticator — Windows
+  // Hello, the phone's secure element — rather than a phone over hybrid or a roaming key. Advisory and ignored by
+  // browsers that predate it, and it agrees with authenticatorAttachment "platform", so it can only ever narrow.
+  // It does NOT stop a desktop password manager from claiming the ceremony (see passkeyManagerName): nothing in
+  // WebAuthn lets a site say "not the password manager", which is why the refusal below has to explain itself.
+  return await navigator.credentials.create({ publicKey: { ...publicKey, hints: ["client-device"],
+    authenticatorSelection: { authenticatorAttachment: "platform", residentKey: "discouraged", userVerification: "preferred" } } });
+  // NO CROSS-PLATFORM RETRY (2026-09-10). This used to fall back to a create() with NO authenticatorAttachment when
+  // the platform attempt threw — the full browser chooser. Every credential that chooser can produce is refused by
+  // the network: a FIDO2 security key attests `packed` (a batch certificate, unbindable), a phone over hybrid and a
+  // password manager attest nothing at all (fmt "none"). So it could only ever cost the user a second prompt and
+  // then fail — the very thing platformAttestVerdict() exists to prevent for Apple. A hardware wallet has its own
+  // path (attestVia ledger|trezor) and "Attest from another device" covers the phone.
+}
+
+// The well-known passkey MANAGERS, by AAGUID (verified against the passkey-authenticator-aaguids registry,
+// 2026-09-10). None of them attests hardware — every sample we hold from all four is fmt "none", 125 of them — so a
+// credential from one can never register, and the owner has to be told WHICH thing took the ceremony. All three
+// Windows Hello AAGUIDs (08987058, 9ddd1817, 6028b017) are listed there under the single name "Windows Hello",
+// which is the ecosystem agreeing with the consensus rule: the flavour split is not a real distinction.
+const PASSKEY_MANAGERS = {
+  "ea9b8d66": "Google Password Manager", "fbfc3007": "Apple Passwords",
+  "d3452668": "Microsoft Password Manager", "d548826e": "Bitwarden",
+};
+function isWindowsHelloAaguid(ag) {
+  return ag.startsWith("08987058") || ag.startsWith("9ddd1817") || ag.startsWith("6028b017");
+}
+function passkeyManagerName(ag) { return PASSKEY_MANAGERS[String(ag || "").slice(0, 8)] || ""; }
+
+// GUIDE: the specific reasoning + exact steps for a verdict, shown under the Mining page's device line (2026-09-07,
+// user: "we must add specific reasoning and guide to the web wallet"). One-line hints (deviceHint) stay for logs.
+// THE ENROLMENT HELPER, OFFERED WHEREVER THE DIAGNOSIS IS. Returns the download block for THIS wallet's
+// address, or "" when there is no address yet. The address rides in the filename the server sends, so the
+// owner pastes nothing; the checksums are published beside it so verification does not depend on someone
+// quoting a hash in a chat.
+// ONE ACTION, NAMED FOR WHAT IT DOES, FOR THE PLATFORM IN FRONT OF US. A card that offers every option
+// at once is a card that decides nothing: the owner of a Windows PC does not need to be told that Ledger
+// and Trezor also exist before being shown the thing that will work on the machine they are holding.
+// The other platform stays reachable, one line down and in small type, because being wrong about the
+// platform must cost a glance rather than a dead end.
+function renderMineFix(st) {
+  const el = $("mineFix");
+  if (!el) return false;
+  const w = state.wallet;
+  if (!w || !w.address || (st && st.ok)) { show("mineFix", false); el.innerHTML = ""; return false; }
+  const ua = navigator.userAgent || "";
+  const isWin = /Windows/i.test(ua);
+  const isLinux = /Linux/i.test(ua) && !/Android/i.test(ua);
+  // A phone or a Mac cannot run the helper at all — offering it there would be the same mistake in a
+  // different direction, so those keep the existing guidance and this card stays hidden.
+  if (!isWin && !isLinux) { show("mineFix", false); el.innerHTML = ""; return false; }
+  const base = enrolBase() + "/download_enrol?address=" + encodeURIComponent(w.address);
+  const primary = isWin ? base : base + "&os=linux";
+  const otherHref = isWin ? base + "&os=linux" : base;
+  const primaryLabel = isWin ? i18("fix.win", "Download for Windows") : i18("fix.linux", "Download for Linux");
+  const otherLabel = isWin ? i18("fix.otherLinux", "Linux version") : i18("fix.otherWin", "Windows version");
+  el.innerHTML =
+    '<div class="card" style="text-align:left">'
+    + '<b>' + escapeHtml(i18("fix.h", "Use this computer's security chip instead")) + '</b>'
+    + '<div class="small faint" style="margin:4px 0 10px">'
+    + escapeHtml(i18("fix.p", "Windows Hello cannot vouch for this PC, but its TPM still can. The helper proves the chip and leaves the proof here for you to confirm — nothing to paste, and your key never leaves this browser."))
+    + '</div>'
+    // FULL WIDTH, LIKE EVERY OTHER PRIMARY ACTION HERE (2026-09-18). As an inline-block it sat hugging the left
+    // edge, sized to its own label, directly under a full-width "Start collecting" — so the one control that
+    // unblocks a refused owner read as a minor link beside the button that had just failed them.
+    + '<a class="btn primary" style="display:block;width:100%;box-sizing:border-box;text-align:center;text-decoration:none" href="' + escapeHtml(primary) + '" rel="noopener">'
+    + escapeHtml(primaryLabel) + '</a>'
+    + '<div class="small faint" style="margin-top:8px">'
+    + '<a href="' + escapeHtml(otherHref) + '" rel="noopener">' + escapeHtml(otherLabel) + '</a>'
+    + ' · <a href="' + escapeHtml(enrolBase() + "/static/nado-tpm-enrol.sha256") + '" rel="noopener">'
+    + escapeHtml(i18("remote.dlHash", "checksums")) + '</a></div>'
+    + '</div>';
+  show("mineFix", true);
+  return true;
+}
+
+function tpmHelperLinks() {
+  if (!state.wallet || !state.wallet.address) return "";
+  const base = enrolBase() + "/download_enrol?address=" + encodeURIComponent(state.wallet.address);
+  return '<b>' + escapeHtml(i18("tpm.dlTitle", "This PC's security chip can vouch for you instead")) + '</b><br>'
+    + escapeHtml(i18("remote.tpmOffer", "Or use this PC's security chip: if Windows Hello will not attest here, the enrolment helper proves the TPM directly and leaves the proof for this wallet to confirm.")) + '<br>'
+    + '<a href="' + escapeHtml(base) + '" rel="noopener">' + escapeHtml(i18("remote.dlWin", "Download for Windows")) + '</a>'
+    + ' · <a href="' + escapeHtml(base + "&os=linux") + '" rel="noopener">' + escapeHtml(i18("remote.dlLinux", "Download for Linux")) + '</a>'
+    + ' · <a href="' + escapeHtml(enrolBase() + "/static/nado-tpm-enrol.sha256") + '" rel="noopener">' + escapeHtml(i18("remote.dlHash", "checksums")) + '</a>';
+}
+
+function deviceGuide(st) {
+  if (!st || st.ok) return "";
+  const ag = String(st.aaguid || "").replace(/-/g, "").toLowerCase();
+  const fmt = st.fmt;
+  // order matters (review 2026-09-07): a hardware wallet's own error, an unsupported browser and a cancelled prompt
+  // are not "no attestation" cases and must not fall into the Windows/Android/Apple guides below
+  if (fmt === "ledger") return (st.reason || "") + "\n\n" + i18("hw.guide.ledger", "");
+  if (fmt === "trezor") return (st.reason || "") + "\n\n" + i18("hw.guide.trezor", "");
+  if (st.reason === "unsupported") return i18("device.guide.none", "What happened: the credential came without a hardware attestation chain, so the network cannot verify the device or bind it to one identity.\n\nWhat is accepted: an Android 12+ phone (locked bootloader, Chrome) or a Windows PC whose Windows Hello key lives in a TPM 2.0.");
+  if (/NotAllowedError|AbortError|cancel|abort/i.test(st.reason || "")) return i18("device.guide.cancelled", "The prompt was cancelled or timed out before the device answered. Press Start again and confirm the prompt on the device within a minute.");
+  const ua = navigator.userAgent || "";
+  const isWin = /Windows/i.test(ua), isAndroid = /Android/i.test(ua);
+  const isIos = /iPhone|iPad|iPod/i.test(ua) || (/Macintosh/i.test(ua) && navigator.maxTouchPoints > 1), isMac = /Macintosh/i.test(ua) && !isIos;
+  // A REAL `tpm` STATEMENT OUTRANKS ITS AAGUID (2026-09-10). The two branches below key on the AAGUID alone, and an
+  // Intel-PTT PC that produced a fully valid TPM statement under the "VBS" AAGUID 9ddd1817 was shown the Credential
+  // Guard guide anyway — for two evenings, while the real refusal came from the node's (now widened) AAGUID rule.
+  // fmt "tpm" means the TPM certified the credential key: never tell that owner their key is software or VBS.
+  if (fmt === "tpm") return i18("device.guide.tpmRefused",
+    "What happened: your TPM did vouch for this key — the statement carries a certificate chain to Microsoft's TPM root — but the network still refused it: {r}\n\n" +
+    "If it says \"not the Windows Hello hardware authenticator\", the node has not updated to the rule that judges the TPM proof instead of the authenticator label; wait for the network to update and press Start again. Anything else (an expired certificate, a virtual TPM) is in the reason above.",
+    { r: st.reason || "—" });
+  // WHICH AUTHENTICATOR ANSWERED DECIDES WHICH GUIDE IS RIGHT (2026-09-10, second pass). A Windows PC with no chain
+  // is NOT automatically an AIK problem: if a password manager claimed the ceremony, Windows Hello and the TPM were
+  // never involved at all, and the AIK guide below sends the owner to run certreq over and over while Chrome keeps
+  // handing the credential to Google Password Manager. Split on the AAGUID — Windows Hello (any flavour) means the
+  // AIK guide, a known manager or any other id means this one.
+  if (isWin && (fmt === "none" || !st.x5c) && ag && !isWindowsHelloAaguid(ag)) return i18("device.guide.pwManager",
+    "What happened: the passkey was created by {m}, not by Windows Hello — so your TPM was never asked and the credential carries no hardware attestation. A password manager syncs its passkeys between devices, which is exactly what the network cannot accept: it has to see one machine's own chip vouch for the key. Your TPM is probably fine; nothing here is a TPM problem.\n\n" +
+    "Fix A (easiest): open this wallet in Microsoft Edge and press Start there. Edge uses Windows Hello for passkeys by default.\n\n" +
+    "Fix B (stay in Chrome): press Start, and when Chrome offers to save the passkey, do NOT accept the default. Look for \"Save another way\", \"Other options\" or the settings icon in that dialog and choose the entry that mentions Windows Hello (it may read \"Windows Hello or external security key\"). Confirm with your PIN or fingerprint.\n\n" +
+    "If Chrome keeps going straight to the manager, delete this site's saved passkey from it first ({m}), then try again — Chrome re-offers whichever provider already holds a passkey for the site.\n\n" +
+    "Note: this is not something the page can decide for you. WebAuthn gives a website no way to say \"not the password manager\", so the choice has to be made in the browser's own dialog.",
+    { m: passkeyManagerName(ag) || i18("device.pwManagerGeneric", "a password manager") });
+  // WINDOWS + NO CHAIN: THE AIK CERTIFICATE FIRST, VBS LAST (2026-09-10, measured). 146 of the stored Windows samples
+  // came back fmt "none" — 86 of them under the HARDWARE AAGUID 08987058, i.e. Hello was on the TPM and Windows still
+  // had nothing to attest with. Windows can only produce a `tpm` statement once Microsoft's AIK CA has issued a
+  // certificate for that TPM; it fetches one silently when the PIN is created, so a PC that was offline, proxied or
+  // firewalled at that moment returns "none" forever and no amount of BIOS or Credential Guard fiddling changes it.
+  // `certreq -enrollaik` is the one command that forces the fetch, and it is what actually fixed the case that opened
+  // this note. It therefore has to be step 2, ABOVE the AAGUID branches — which used to swallow every 9ddd1817 PC into
+  // the "disable Credential Guard" guide (a real security downgrade) before this line existed.
+  // THE VBS AUTHENTICATOR (9ddd1817) IS ACCEPTED — the TPM certify proof decides, not the AAGUID (doc/device-attestation.md
+  // §Windows). Its old guide told owners to switch off virtualization-based security and Credential Guard in the registry:
+  // wrong premise, and it weakened their PC (2026-09-29 site review). It gets the no-AIK guide, which is the real cause.
+  if ((isWin && (fmt === "none" || !st.x5c)) || ag.startsWith("9ddd1817")) return i18("device.guide.winAik",
+    "Fastest path if you just want to collect now: press \"Attest from another device\" and confirm on your Android phone or another PC — that vouches for THIS wallet and takes a minute. The steps below are for fixing this PC itself.\n\nWhat happened: Windows Hello answered, but the credential came with NO attestation ({a}), so there is nothing for the network to verify. On Windows that almost always means one thing: Microsoft has never issued this PC's TPM its identity certificate (the AIK). Windows fetches it silently the moment you create a Hello PIN, so a PC that was offline, behind a proxy or on a filtered network at that moment keeps answering without attestation forever.\n\n1. Check the TPM: run tpm.msc. It must say \"The TPM is ready for use\", specification version 2.0. If not, enable AMD fTPM / Intel PTT in the BIOS first.\n\n2. Fetch the certificate. Open Command Prompt and run exactly:\ncertreq -enrollaik -config \"\"\nSuccess looks like \"PkiStatus(0): SCEPDispositionSuccess\", \"EnrollStatus(1): Enrolled\" and \"EnrollDone\".\n\nImportant: this is a TEST. certreq enrols a \"TestAIK\" in the Local System context, so \"EnrollDone\" proves Microsoft's service answers for this TPM — it does NOT hand Windows Hello a certificate, because Hello runs in your user's context. Read the result, don't expect it to fix anything: 404 means Microsoft has no authority for this chip; success means the chip is fine and the problem is on the Windows Hello side.\n\nIf it returns 404, Microsoft has no certificate authority for this TPM's endorsement key. Check what the chip actually holds, in an elevated PowerShell:\nGet-TpmEndorsementKeyInfo -Hash Sha256\nIf ManufacturerCertificates is EMPTY, the chip never got an endorsement certificate and this PC cannot attest through Windows Hello at all. If a certificate IS listed and certreq still returns 404, the chip is fine and the gap is on Microsoft's side: their AIK service has no certificate authority registered for this TPM's KeyId — it literally answers \"The authority ... does not exist\". Microsoft has confirmed this as a service-side issue and states that KeyIds cannot be registered by end users and that there is no supported way to change their AIK trust database. Nothing you do on the PC fixes it: not a BIOS update, and certainly not clearing the TPM (that only destroys BitLocker recovery material). Use Attest from another device, a Ledger or a Trezor; report it to your PC's maker and via Feedback Hub if you want it fixed upstream. If certreq instead times out or cannot resolve the host, the PC simply cannot reach Microsoft's AIK service: try another network, such as a phone hotspot.\n\n3. Come back here and press Start. If certreq printed \"EnrollDone\", Windows now holds the certificate and nothing else is needed — you do NOT have to touch the Hello PIN. Re-creating the PIN only makes Windows retry the same enrolment certreq just did, and on an account with no password Windows will not let you remove the PIN at all.\n\n4. Only if it still comes back with no attestation: Windows may be putting the Hello key in virtualization-based security. Run msinfo32 — if \"Virtualization-based security\" says Running, that is the remaining cause. In an elevated PowerShell:\n" +
+    "New-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Lsa' -Name LsaCfgFlags -Value 0 -PropertyType DWord -Force\nSet-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\DeviceGuard' -Name EnableVirtualizationBasedSecurity -Value 0\n" +
+    "then reboot, confirm msinfo32 shows VBS \"Not enabled\", and press Start again. This lowers kernel/credential protection on that PC and is reversible (set both back to 1); a domain, Entra or MDM policy will simply re-enable it.\n\nNotes: BitLocker is unrelated, and memory integrity is not the cause. Which Windows Hello authenticator answered does NOT decide this — the network judges the TPM's own proof, not the authenticator's label.",
+    { a: ag ? ag.slice(0, 8) : "no authenticator id" });
+  if (ag.startsWith("6028b017")) return i18("device.guide.software",
+    "What happened: Windows Hello is running as a software key on this PC (authenticator 6028b017) — no TPM was available when the PIN was created, so there is no certificate chain to verify or bind.\n\n" +
+    "Fix: enable the TPM 2.0 in the BIOS (AMD fTPM or Intel PTT), confirm tpm.msc says the TPM is ready, remove the Hello PIN and create it again while online, then press Start here again. If the pre-flight then reports 9ddd1817 instead, follow the VBS guide.");
+  if (fmt === "none" || !st.x5c) {
+    // Windows is handled above by device.guide.winAik — it needs the AIK-certificate steps, not "set a PIN".
+    if (isAndroid) return i18("device.guide.androidNone",
+      "What happened: the credential came without hardware attestation. Android gives one only from Chrome on an unrooted phone with a locked bootloader, when the phone itself (not a password manager or a synced passkey) creates the key.\n\nFix: use Chrome, choose \"this device\" / screen lock when prompted (not Google Password Manager sync, not a third-party manager), make sure the bootloader is locked and the phone is not rooted, then press Start again. Phones from before Android 12 carry a shared batch certificate and cannot be bound: they are refused.");
+    if (isIos || isMac) return i18("device.guide.apple",
+      "What happened: Apple passkeys (iOS 16+, macOS 13+) carry no attestation, so an iPhone, iPad or Mac cannot vouch for itself through a web page.\n\nWhat works: on a Mac, a Ledger or Trezor in Chrome, Edge or Brave. On an iPhone or iPad, press Attest from another device and confirm on the wallet of an Android phone, a Windows PC or a Mac with a hardware wallet.");
+    return i18("device.guide.none",
+      "What happened: the credential came without a hardware attestation chain, so the network cannot verify the device or bind it to one identity.\n\nWhat is accepted: an Android 12+ phone (locked bootloader, Chrome) or a Windows PC whose Windows Hello key lives in a TPM 2.0.");
+  }
+  if (st.reason === "unbindable" || fmt === "packed")
+    return i18("device.guide.unbindable",
+      "What happened: this authenticator proves it is genuine hardware but carries only a batch certificate shared by 100,000+ units. Without a per-device certificate the network cannot enforce one device, one identity, so it is refused.\n\nWhat works: an Android phone (12+), a Windows PC with a TPM, a Ledger or Trezor \u2014 or Attest from another device.");
+  if (/NotAllowed|cancel|abort/i.test(st.reason || ""))
+    return i18("device.guide.cancelled", "The prompt was cancelled or timed out before the device answered. Press Start again and confirm the prompt on the device within a minute.");
+  return "";
+}
+
+// HINTS: what to do next, from the verdict. AAGUIDs are the FIDO metadata's: Windows Hello 08987058…, "VBS" 9ddd1817…,
+// "software" 6028b017…; fmt "none" is a passkey without hardware attestation. The AAGUID names the Hello FLAVOUR only —
+// it does NOT say where the key lives (a 9ddd1817 PC produced valid TPM statements), so `fmt` is checked first below.
+function deviceHint(st) {
+  const ag = String((st && st.aaguid) || "").replace(/-/g, "").toLowerCase();
+  const fmt = st && st.fmt;
+  if (st && !st.ok && (fmt === "ledger" || fmt === "trezor")) return st.reason || "";   // the device's own words (review 2026-09-07)
+  const ua = navigator.userAgent || "";
+  const isWin = /Windows/i.test(ua), isIos = /iPhone|iPad|iPod/i.test(ua) || (/Macintosh/i.test(ua) && navigator.maxTouchPoints > 1), isAndroid = /Android/i.test(ua), isLinux = /Linux/i.test(ua) && !isAndroid, isMac = /Macintosh/i.test(ua) && !isIos;
+  if (st && st.ok) return "";
+  // fmt BEFORE aaguid, both here and in deviceGuide (2026-09-10): a statement that IS a `tpm` statement was certified by
+  // the TPM, whichever Hello flavour the AAGUID names — telling that owner "not using a TPM" sent a real user chasing
+  // Credential Guard for two evenings while the node's AAGUID rule was what refused them.
+  if (fmt === "tpm") return i18("device.hint.tpmRefused", "The TPM did vouch for this key; the network refused the statement for another reason ({r}). If it names the \"hardware authenticator\", the relay has not updated yet — retry shortly.", { r: (st && st.reason) || "—" });
+  // THE HELPER IS THE ANSWER, NOT A FOOTNOTE (2026-09-18). Measured on the relay: of 26 sources refused in a week,
+  // 11 were Windows PCs whose Hello will not attest — every one of them has a chip the enrolment helper can prove,
+  // and only two identities on the whole chain are helper-bound. The hints below sent those owners to run
+  // `certreq -enrollaik`, to hunt through a BIOS for fTPM, or to fight Chrome's save dialog, while a download that
+  // needs none of that sat in a card on the same page. renderMineFix() puts that card directly above the banner
+  // this sentence lands in, so on a machine that can RUN the helper it is the one thing worth saying. The detailed
+  // remedies are not lost — deviceGuide() still carries them, one tap away, for whoever wants them.
+  // Not for: a hardware wallet's own error and a cancelled prompt (handled above / below — neither is the chip's
+  // fault), nor a verdict of fmt "tpm" (the chip DID vouch; the helper would prove the same thing twice).
+  if (st && !st.ok && (isWin || isLinux) && !/NotAllowedError|AbortError|cancel|abort/i.test(String(st.reason || "")))
+    return i18("device.hint.useHelper", "This browser could not attest this computer, but its security chip (TPM) can. Use the enrolment helper on this page: one download, run it once, then confirm here — no Windows Hello, no PIN and no command line.");
+  if (isWin && (fmt === "none" || (st && !st.x5c)) && ag && !isWindowsHelloAaguid(ag))
+    return i18("device.hint.pwManager", "{m} created this passkey, not Windows Hello — a synced passkey carries no hardware attestation, so your TPM was never asked. Open the wallet in Microsoft Edge, or in Chrome's save dialog pick \"Save another way\" \u2192 Windows Hello. Steps below.",
+               { m: passkeyManagerName(ag) || i18("device.pwManagerGeneric", "A password manager") });
+  if (isWin && (fmt === "none" || (st && !st.x5c))) return i18("device.hint.winAik", "Windows answered without attestation: this PC's TPM has no identity certificate from Microsoft yet. In Command Prompt run  certreq -enrollaik -config \"\"  then remove and re-create the Windows Hello PIN while online, and retry. See the steps below.");
+  // THE VBS AAGUID IS ACCEPTED (protocol: the TPM certify proof decides, not the AAGUID — doc/device-attestation.md
+  // §Windows). Reaching here means Hello answered WITHOUT a TPM statement, so "not using a TPM" was false and sent
+  // owners into the BIOS; the chip itself can still prove it through the enrolment helper (2026-09-29 site review).
+  if (ag.startsWith("9ddd1817")) return i18("device.hint.useHelper", "This browser could not attest this computer, but its security chip (TPM) can. Use the enrolment helper on this page: one download, run it once, then confirm here — no Windows Hello, no PIN and no command line.");
+  if (ag.startsWith("6028b017")) return i18("device.hint.winSoftware", "Windows Hello is running as a software key here. Set the PIN up with a TPM 2.0 available (tpm.msc), or use a Ledger, a Trezor, or Attest from another device.");
+  if (st && st.reason === "expired") return i18("device.hint.expired", "This phone's attestation certificate has expired. On Android 12+ with Google Play services it refreshes by itself when online — reboot, wait a few minutes and retry. An older phone with a factory certificate cannot be bound: use another device.");
+  if (st && st.reason === "batch") return i18("device.hint.batch", "This phone carries a batch attestation certificate shared by many units (no remote key provisioning), so the network cannot bind it to one identity. Use an Android 12+ phone with Google Play services, a Windows PC with a TPM, a Ledger or Trezor — or Attest from another device.");
+  if (st && st.reason === "unbindable") return i18("device.hint.unbindable", "A security key or a batch-attested phone carries no per-device certificate, so the network cannot bind it to one identity and refuses it. Use an Android phone (12+), a Windows PC with a TPM, a Ledger or Trezor — or Attest from another device.");
+  if (st && st.reason === "unsupported") {
+    if (isLinux) return i18("device.hint.linux", "This browser cannot attest on Linux. If this machine has a TPM, the enrolment helper proves it directly — otherwise connect a Ledger or Trezor (Chrome, Edge or Brave), or use Attest from another device.");
+    if (isWin) return i18("device.hint.winSetup", "Set up Windows Hello (Settings → Accounts → Sign-in options → PIN) on a PC with a TPM 2.0, then retry.");
+    return i18("device.hint.generic", "Use an Android phone (12+), a Windows PC with a TPM, a Ledger or Trezor — or Attest from another device.");
+  }
+  if (fmt === "none") {
+    if (isWin) return i18("device.hint.winSetup", "Set up Windows Hello (Settings → Accounts → Sign-in options → PIN) on a PC with a TPM 2.0, then retry.");
+    if (isAndroid) return i18("device.hint.androidNone", "This credential came without hardware attestation. Use Chrome on an unrooted phone with a locked bootloader, choose the phone itself (not a synced passkey), and retry.");
+    if (isIos) return i18("device.hint.iosNone", "An iPhone or iPad passkey carries no attestation. Use Attest from another device: a phone, a Windows PC or a Mac with a Ledger or Trezor vouches for this wallet.");
+    if (isMac) return i18("device.hint.mac", "A Mac's Touch ID passkey carries no attestation: connect a Ledger or Trezor (Chrome, Edge or Brave), or use Attest from another device.");
+    return i18("device.hint.generic", "Use an Android phone (12+), a Windows PC with a TPM, a Ledger or Trezor — or Attest from another device.");
+  }
+  if (fmt && !st.format_accepted) return i18("device.hint.format", "Attestation format {f} is not accepted: use an Android phone (12+), a Windows PC with a TPM, a Ledger or Trezor — or Attest from another device.", { f: fmt });
+  if (st && st.root_pinned === false) return i18("device.hint.root", "The maker's root certificate is not in the pinned set. Accepted: an Android phone (12+), a Windows PC with a TPM, a Ledger or Trezor. Security keys are not.");
+  if (st && /NotAllowed|cancel|abort/i.test(st.reason || "")) return i18("device.hint.cancelled", "The prompt was cancelled. Retry and confirm on the device.");
+  return i18("device.hint.generic", "Use an Android phone (12+), a Windows PC with a TPM, a Ledger or Trezor — or Attest from another device.");
+}
+
+// What this device last proved (persisted so the mining page can say it before the first registration).
+// PER IDENTITY, NOT PER BROWSER. This was one key for the whole browser, so the verdict of the last
+// attestation on this machine was shown for whatever wallet happened to be open. Someone who attested a
+// Trezor for one address and then switched to an address attested by its own TPM was told
+// "attested ✓ (trezor)" about an identity the Trezor had never touched — a wrong statement about which
+// hardware vouches for what, which is the one thing this line exists to say, and it reads as though a
+// second device had taken over the identity.
+//
+// A wallet with no entry of its own now reads as unknown rather than inheriting its neighbour's: the
+// chain is asked, and renderDeviceStatus already prefers what the relay says over anything stored here.
+const LS_DEVICE_STATUS_BASE = "nado_device_status";
+/// What vouches for an identity, from the CHAIN — the only place that actually knows.
+///
+/// Not from localStorage. A wallet opened in a fresh browser has no local record, and a local copy of a
+/// fact the chain already holds is a second source that can disagree with the first — which it did:
+/// one browser-wide key captioned a TPM-bound identity with the class of whatever was attested last.
+/// The register transaction carries its device statement, so the relay derives the class and the handle
+/// consensus binds by (ops/device_attest.device_binding_key) and answers from committed blocks.
+///
+/// Cached per address for the session because it cannot change without a new registration, and that
+/// changes the recert epoch the relay keys its own cache on.
+/// What a device statement says about ITSELF: its class, and the handle consensus binds it by.
+///
+/// The relay cannot tell us this for a leased class — `devkey` is stamped on the account only for
+/// PERMANENT classes (Ledger, Trezor), so a TPM, an endorsement key or an Android phone leaves
+/// /get_account reporting cls: null. The wallet knows it here, at the moment it builds the
+/// registration, which is the one place the statement and the identity are in hand together.
+///
+/// The handle is the same value consensus binds on — see ops/device_attest.device_binding_key — so what
+/// is shown to a reader is checkable against the chain rather than something to take on trust.
+function deviceIdentity(device) {
+  const d = device || {};
+  if (d.ek) return { fmt: "ek", bindId: "ek:" + String(d.ek) };
+  if (d.rp) return { fmt: "webauthn", bindId: "" };
+  return { fmt: "device", bindId: "" };
+}
+
+/// The stored verdict for THIS identity, or null. One reader and one writer, because six inline
+/// JSON.parse calls is how the shape drifts and how a failure gets swallowed in a bare catch.
+function readDeviceStatus() {
+  // READ THE STORE, NOT OURSELVES (2026-09-17). This called itself: every read blew the stack, the bare catch
+  // swallowed it, and the stored verdict has been unreadable since 2026-09-12 — so the device line fell back to
+  // "not verified yet" and deviceHint()/deviceGuide() lost the reason a statement was refused, which is the one
+  // thing that tells a Windows owner WHY Hello will not attest.
+  try { return JSON.parse(localStorage.getItem(deviceStatusKey()) || "null"); }
+  catch (e) { return null; }          // absent or unreadable storage is "unknown", never an error path
+}
+function writeDeviceStatus(st) {
+  try { localStorage.setItem(deviceStatusKey(), JSON.stringify({ ...st, at: Date.now() })); }
+  catch (e) { /* private mode / quota: the chain is still the authority, so this is not fatal */ }
+}
+
+function deviceStatusKey() {
+  const a = state.wallet && state.wallet.address;
+  return a ? LS_DEVICE_STATUS_BASE + ":" + a : LS_DEVICE_STATUS_BASE;
+}
+function setDeviceStatus(st) {
+  try { writeDeviceStatus(st); } catch (e) {}
+  renderDeviceStatus();
+}
+function renderDeviceStatus() {
+  const el = $("mineDevice"); if (!el) return;
+  renderDeviceCartouche();
+  let st = null; try { st = readDeviceStatus(); } catch (e) {}
+  show("mineDeviceGuide", false);                    // shown again below only for a failed verdict
+  if (!st) {
+    // NO LOCAL MEMORY IS NOT "NOT ATTESTED". This wallet may have been attested from another browser,
+    // another machine, or by the enrolment helper — and it is exactly what an existing user sees the
+    // first time the status is read per-identity instead of per-browser. The relay knows; ask it before
+    // telling someone who is mining that they are not verified.
+    if (state.lastMs && state.lastMs.registered_present === true) {
+      el.textContent = i18("device.mineOkChain", "Real device: attested ✓ — the relay confirms a device vouches for this identity.");
+      el.className = "small mt ok"; return;
+    }
+    el.textContent = i18("device.mineUnknown", "Real device: not verified yet — the wallet attests your phone when you start collecting.");
+    el.className = "small mt faint"; return;
+  }
+  // THE CHAIN OVERRULES A STORED FAILURE, exactly as it overrules a stored success below. A failed
+  // verdict is a memory of one attempt on one device; it is not a fact about this identity. Someone whose
+  // Windows Hello cannot attest — the case this whole TPM path exists for — fails here, then enrols
+  // through the chip or from another device and succeeds, and was still told "attestation failed" by a
+  // line reading a localStorage entry from before. If the relay says this identity is attested and
+  // present, it is, whatever the last prompt on this machine did.
+  if (!st.ok && state.lastMs && state.lastMs.registered_present === true) {
+    st = { ...st, ok: true, reason: "ok", fmt: st.fmt && st.fmt !== "none" ? st.fmt : "device" };
+    try { writeDeviceStatus(st); } catch (e) {}
+  }
+  if (st.ok) { renderMineFix(st); }
+  if (st.ok) {
+    // THE CHAIN, NOT THE LAST TAP, decides what this line says (2026-09-08: a wallet whose Ledger had moved to a node and
+    // whose stake was delegated still read "attested ✓ (ledger)"). If the relay has answered and this identity is not
+    // present, the device that vouched for it no longer does — say that and point at Register.
+    const ms = state.lastMs, db = state.devbind;
+    const msKnown = ms && typeof ms.registered_present === "boolean";
+    if (msKnown && !ms.registered_present) {
+      el.textContent = i18("device.mineStale", "Real device: the {f} that vouched for this identity no longer does — it moved to another identity or the lease lapsed. Press Register to attest again.", { f: st.fmt || "device" });
+      el.className = "small mt warn"; return;
+    }
+    if (db && db.mode === "perm" && db.live) {
+      el.textContent = i18("device.mineOkPerm", "Real device: attested ✓ ({f}) — bound to this identity for life; renewals need no prompt.", { f: bindDeviceName(db.cls || st.fmt) });
+      el.className = "small mt ok"; return;
+    }
+    // NAME THE HANDLE, SHORTENED, AND KEEP THE WHOLE THING AVAILABLE. "attested ✓" with nothing beside it
+    // is unverifiable by the person reading it — and when the stored verdict was wrong (it was, for a
+    // while: one localStorage key served every address in the browser) there was no way to notice. The
+    // handle shown is what consensus binds on, so it can be checked against the chain rather than trusted.
+    const _bid = typeof st.bindId === "string" && st.bindId ? st.bindId : "";
+    const _short = _bid ? _bid.slice(0, _bid.startsWith("ek:") ? 15 : 12) + "…" : "";
+    el.textContent = i18("device.mineOk", "Real device: attested ✓ ({f}) — this phone's secure element vouched for this identity.", { f: st.fmt || "" })
+      + (_short ? "  " + i18("device.bindId", "Device {id}", { id: _short }) : "");
+    if (_bid) el.title = _bid;                  // the full handle, for anyone who wants to check it
+    el.className = "small mt ok"; return;
+  }
+  if (st.reason === "apple" || st.reason === "unsupported") {
+    el.textContent = st.reason === "apple"
+      ? i18("device.mineApple", "An iPhone, iPad or Mac cannot vouch for itself — Apple passkeys carry no attestation, so no prompt is shown. Use a Ledger or Trezor Safe in Chrome, Edge or Brave, or Attest from another device.")
+      : i18("device.noPlatformAuth", "This browser has no built-in secure hardware to attest with, so no prompt is shown. Use a Ledger or Trezor Safe in Chrome, Edge or Brave, an Android phone (12+), a Windows or Linux PC with a TPM 2.0 through the enrolment helper, or Attest from another device.");
+    el.className = "small mt warn";
+    if (state.lastMs && state.lastMs.bonded_producing)
+      el.textContent += " " + i18("device.savingsNote", "Your savings are already collecting on their own — a device only adds the free lane and the dividend.");
+    const gA = $("mineDeviceGuide"), gbA = $("mineDeviceGuideBody");
+    if (gA && gbA) { const t = deviceGuide(st); gbA.textContent = t; show("mineDeviceGuide", !!t); }
+    // ONE SENTENCE WHEN THERE IS A BUTTON. The long enumeration of every accepted device is guidance for
+    // someone with no way forward; it is noise directly above a control that IS the way forward.
+    if (renderMineFix(st)) el.textContent = i18("device.mineFixable", "This device cannot vouch for itself yet.");
+    return;
+  }
+  el.textContent = st.reason === "unsupported"
+    ? i18("device.mineUnsupported", "Real device: this browser cannot attest hardware. Use an Android phone (12+), a Windows or Linux PC with a TPM 2.0 through the enrolment helper, a Ledger or Trezor — or Attest from another device.")
+    : i18("device.mineFailed", "Real device: attestation failed ({e}). The free lane and the dividend need an Android phone (12+), a Windows PC with a TPM, a Ledger or Trezor — or Attest from another device. Savings collecting needs no device at all: bond NADO and you produce blocks without one.", { e: st.reason || "" });
+  if (state.lastMs && state.lastMs.bonded_producing)
+    el.textContent += " " + i18("device.savingsNote", "Your savings are already collecting on their own — a device only adds the free lane and the dividend.");
+  el.className = "small mt warn";
+  // the specific reasoning + steps for this verdict, right under the line (deviceGuide)
+  const g = $("mineDeviceGuide"), gb = $("mineDeviceGuideBody");
+  // Collapsed by default (2026-09-08 UX pass): the status line says it failed, the summary says help is one tap away.
+  if (g && gb) { const txt = deviceGuide(st); gb.textContent = txt; show("mineDeviceGuide", !!txt); }
+  if (renderMineFix(st)) el.textContent = i18("device.mineFixable", "This device cannot vouch for itself yet.");
+}
+
+// DEVICE ATTESTATION (doc/device-attestation.md). The phone's secure element attests a credential over the
+// SAME challenge the node recomputes: blake2b([chain_id, sender, anchor_hash, max_block]) — bound to this
+// identity and this lease, so it can never be replayed. One tap per lease. Returns null where the browser has
+// no platform authenticator (a desktop, a VM, a script): the node rejects such a registration once the
+// DEVICE_ATTEST_HEIGHT gate is active, and that is the point — the wallet says so instead of pretending.
+// ---- ATTEST A NODE (ops/node_attest, doc/device-attestation.md §"Attesting a node") --------------------------------
+// A headless node cannot attest itself; its operator does, here, for the node's ADDRESS. The challenge binds only
+// (chain id, sender, anchor hash, max_block) — nothing node-specific — so this page can attest for any address and
+// DROP the statement on the relay; the node polls its peers for a drop addressed to itself, builds and SIGNS its own
+// register tx. Nobody else can use the blob (the tx needs the node's key). One tap per lease, like every miner.
+const LS_NODE_ATTEST_ADDR = "nado_node_attest_addr";
+let _nodeAttestBound = false, _nodeAttestBusy = false;
+
+function nodeAttestInit() {
+  const inp = $("nodeAttestAddr"), btn = $("btnNodeAttest");
+  if (!inp || !btn) return;
+  if (!_nodeAttestBound) {
+    _nodeAttestBound = true;
+    try { inp.value = localStorage.getItem(LS_NODE_ATTEST_ADDR) || ""; } catch (e) {}
+    inp.addEventListener("change", () => {
+      try { localStorage.setItem(LS_NODE_ATTEST_ADDR, inp.value.trim()); } catch (e) {}
+      nodeAttestRefresh().catch(() => {});
+    });
+    btn.addEventListener("click", () => { nodeAttestTap().catch((e) => log("err", String(e && e.message || e))); });
+    $("nodeAttestWrap").addEventListener("toggle", () => { if ($("nodeAttestWrap").open) { nodeAttestRefresh().catch(() => {}); renderVouched().catch(() => {}); } });
+  }
+  if ($("nodeAttestWrap").open) nodeAttestRefresh().catch(() => {});
+  renderVouched().catch(() => {});                 // the badge counts the ones due even while the panel is collapsed
+}
+
+// THE VOUCHED LIST: addresses this device attested (node-local), each with its lease state. Refreshed when the panel
+// opens and once a minute from the dashboard; the summary badge says how many are due so the reminder survives collapse.
+const LS_VOUCHED = "nado_vouched";
+function vouchedList() { try { const l = JSON.parse(localStorage.getItem(LS_VOUCHED) || "[]"); return Array.isArray(l) ? l.filter((a) => ADDR_RE.test(a)) : []; } catch (e) { return []; } }
+function vouchedAdd(addr) { const l = vouchedList(); if (!l.includes(addr)) { l.push(addr); try { localStorage.setItem(LS_VOUCHED, JSON.stringify(l)); } catch (e) {} } }
+function vouchedRemove(addr) { try { localStorage.setItem(LS_VOUCHED, JSON.stringify(vouchedList().filter((a) => a !== addr))); } catch (e) {} renderVouched().catch(() => {}); }
+async function renderVouched() {
+  const box = $("nodeAttestList"), badge = $("nodeAttestDue"); if (!box) return;
+  const list = vouchedList();
+  if (!list.length) { show("nodeAttestList", false); if (badge) show("nodeAttestDue", false); return; }
+  let epoch = null, secsPerEpoch = EPOCH_LENGTH * (state.blockTime || 6.8);
+  try { const l = await fetch(relayBase() + "/get_latest_block", { cache: "no-store" }).then((x) => x.json()); epoch = Math.floor(Number(l.block_number) / EPOCH_LENGTH); } catch (e) {}
+  const rows = await Promise.all(list.map(async (a) => {
+    try {
+      const [acc, ms] = await Promise.all([
+        fetch(relayBase() + "/get_account?address=" + a, { cache: "no-store" }).then((x) => x.json()),
+        fetch(relayBase() + "/mining_status?address=" + a, { cache: "no-store" }).then((x) => x.json()).catch(() => null)]);
+      return [a, acc, ms];
+    } catch (e) { return [a, null, null]; }
+  }));
+  let due = 0; box.innerHTML = "";
+  for (const [a, acc, ms] of rows) {
+    // PRESENCE, not the account flag: an evicted identity keeps registered=1 (its device moved on) — the chain says absent
+    const present = !(ms && typeof ms.registered_present === "boolean") || ms.registered_present;
+    const reg = acc && Number(acc.registered) === 1 && present ? Number(acc.reg_epoch) : -1;
+    const db = acc && acc.devbind;
+    let state_, cls = "";
+    if (db && db.mode === "perm" && db.live) state_ = i18("node.item.perm", "bound for life to a {d} — renews on its own", { d: bindDeviceName(db.cls) });
+    else if (reg < 0 || epoch == null || epoch - reg >= leaseEpochsOf(acc)) { state_ = i18("node.item.expired", "no live lease — attest again"); cls = "warn"; due++; }
+    else {
+      const left = (reg + leaseEpochsOf(acc) - epoch) * secsPerEpoch, since = epoch - reg;
+      if (since >= FIDELITY_MIN_GAP_EPOCHS) { state_ = i18("node.item.renewable", "renewable now — lease ends in {t} (≈ {c})", { t: humanizeSeconds(left), c: _fmtClock(left) }); cls = "warn"; due++; }
+      else state_ = i18("node.item.held", "lease held — renewal earns from ≈ {c}; ends in {t}", { c: _fmtClock((reg + FIDELITY_MIN_GAP_EPOCHS - epoch) * secsPerEpoch), t: humanizeSeconds(left) });
+    }
+    const row = document.createElement("div"); row.className = "opt"; row.style.cursor = "default";
+    row.innerHTML = `<b class="mono" style="font-size:12px">${escapeHtml(a.slice(0, 14))}… <span class="small faint">${escapeHtml(i18("node.item.fid", "fidelity {f}", { f: Number((acc && acc.fidelity) || 0) }))}</span></b>` +
+      `<small class="${cls}">${escapeHtml(state_)}</small>` +
+      `<div class="row" style="margin-top:6px;gap:6px"><button class="ghost small" data-again="${a}" style="padding:6px 10px;border-color:var(--accent)">${escapeHtml(i18("node.item.again", "Attest again"))}</button>` +
+      `<button class="ghost small" data-remove="${a}" style="padding:6px 10px;flex:0 0 auto">${escapeHtml(i18("node.item.remove", "Forget"))}</button></div>`;
+    box.appendChild(row);
+  }
+  box.querySelectorAll("[data-again]").forEach((b) => b.onclick = () => { $("nodeAttestAddr").value = b.dataset.again; nodeAttestTap().catch((e) => log("err", String(e && e.message || e))); });
+  box.querySelectorAll("[data-remove]").forEach((b) => b.onclick = () => vouchedRemove(b.dataset.remove));
+  show("nodeAttestList", true);
+  if (badge) { badge.textContent = i18("node.due", "{n} due", { n: due }); show("nodeAttestDue", due > 0); }
+}
+function nodeAttestAddr() {
+  const v = ($("nodeAttestAddr") && $("nodeAttestAddr").value || "").trim().toLowerCase();
+  return ADDR_RE.test(v) ? v : "";
+}
+
+// What a tap would do for that address right now, from the relay's view of the account: no lease → needs a tap;
+// lease older than FIDELITY_MIN_GAP epochs → a timely renewal is possible; otherwise nothing to do yet.
+async function nodeAttestRefresh() {
+  const el = $("nodeAttestStatus"); if (!el) return;
+  const addr = nodeAttestAddr();
+  if (!addr) { el.textContent = i18("node.status.addr", "Enter the node's address to see its lease."); return; }
+  const r = await fetch(relayBase() + "/get_account?address=" + addr, { cache: "no-store" });
+  const acc = await r.json().catch(() => null);
+  const latest = await fetch(relayBase() + "/get_latest_block", { cache: "no-store" }).then((x) => x.json()).catch(() => null);
+  const epoch = latest ? Math.floor(Number(latest.block_number) / 60) : null;
+  const registered = acc && Number(acc.registered) === 1, regEp = acc ? Number(acc.reg_epoch) : -1;
+  const since = (epoch != null && regEp >= 0) ? epoch - regEp : null;
+  const db = acc && acc.devbind;
+  if (!registered) {
+    el.textContent = i18("node.status.needsTap", "No open-lane lease — press the button to register the node.");
+  } else if (db && db.mode === "perm" && db.live) {
+    el.textContent = i18("node.status.perm", "Bound for life to a {d} (fidelity {f}) — it renews on its own, nothing to do.", { d: bindDeviceName(db.cls), f: Number(acc.fidelity || 0) });
+  } else if (since != null && since >= 192) {
+    el.textContent = i18("node.status.renewable", "Lease held (fidelity {f}) — renewable now.", { f: Number(acc.fidelity || 0) });
+  } else {
+    el.textContent = i18("node.status.held", "Lease held (fidelity {f}) — renewal earns from epoch {e}; nothing to do yet.",
+                         { f: Number(acc.fidelity || 0), e: regEp >= 0 ? regEp + 192 : "?" });
+  }
+}
+
+async function nodeAttestTap() {
+  if (_nodeAttestBusy) return;
+  const addr = nodeAttestAddr();
+  if (!addr) { log("err", i18("node.err.addr", "That is not a NADO address (46 hex characters).")); return; }
+  _nodeAttestBusy = true;
+  const btn = $("btnNodeAttest"); if (btn) btn.disabled = true;
+  try {
+    const latest = await fetch(relayBase() + "/get_latest_block", { cache: "no-store" }).then((x) => x.json());
+    const targetBlock = Number(latest.block_number) + REG_TARGET_MARGIN;
+    const anchorNum = Math.max(0, targetBlock - POSW_ANCHOR_OFFSET);
+    const b = await fetch(relayBase() + "/get_block?number=" + anchorNum, { cache: "no-store" }).then((x) => x.json()).catch(() => null);
+    const anchorHash = b && b.block_hash;
+    if (!anchorHash) throw new Error("registration anchor block unavailable");
+    log("info", i18("node.log.attesting", "Attesting node {a}… — approve the prompt on this device.", { a: addr.slice(0, 12) + "…" }));
+    const device = await attestDevice(addr, anchorHash, targetBlock);
+    if (!device) throw new Error(i18("device.required", "This device could not attest itself. The free lane and the dividend need an Android phone (12+), a Windows PC with a TPM, a Ledger or Trezor — or a statement from another device. Savings collecting needs no device at all: bond NADO and you produce blocks without one."));
+    const r = await fetch(relayBase() + "/node_attest_drop", { method: "POST", headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({ sender: addr, max_block: targetBlock, device }) });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || !d.ok) throw new Error(i18("node.log.dropFailed", "The relay refused the attestation: {e}", { e: d.reason || r.status }));
+    log("ok", i18("node.log.dropped", "Attestation delivered to the network — the node registers itself within ~1 min (target block {b}).", { b: targetBlock }));
+    // watch the account until the lease appears (a fresh recert epoch), for up to ~3 minutes
+    const before = await fetch(relayBase() + "/get_account?address=" + addr, { cache: "no-store" }).then((x) => x.json()).catch(() => null);
+    const beforeEp = before ? Number(before.reg_epoch) : -1;
+    // a register lands EXACTLY at its target block: watch until the chain is ~10 blocks past it (not a fixed 3 min,
+    // which expired seconds before the lease appeared — review 2026-09-07)
+    for (let i = 0; i < 120; i++) {
+      await new Promise((res) => setTimeout(res, 5000));
+      const tipNow = await fetch(relayBase() + "/get_latest_block", { cache: "no-store" }).then((x) => x.json()).then((j) => Number(j.block_number)).catch(() => 0);
+      const acc = await fetch(relayBase() + "/get_account?address=" + addr, { cache: "no-store" }).then((x) => x.json()).catch(() => null);
+      if (acc && Number(acc.registered) === 1 && Number(acc.reg_epoch) !== beforeEp) {
+        log("ok", i18("node.log.registered", "Node {a} is registered — fidelity {f}.", { a: addr.slice(0, 12) + "…", f: Number(acc.fidelity || 0) }));
+        vouchedAdd(addr); renderVouched().catch(() => {});
+        await nodeAttestRefresh().catch(() => {});
+        return;
+      }
+      if (tipNow >= targetBlock + 10) break;     // the landing block is well past: the node did not register
+    }
+    log("warn", i18("node.log.timeout", "No lease seen yet — the node may be offline, on another chain, or not polling; check its /node_attest_status."));
+  } finally {
+    _nodeAttestBusy = false;
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function attestDevice(sender, anchorHash, maxBlock) {
+  const chalHex = blake2bHash([CHAIN_ID, sender, anchorHash, maxBlock]);
+  const chal = new Uint8Array(chalHex.match(/../g).map((h) => parseInt(h, 16)));
+  state.tapArmed = false;                        // the one armed prompt is being spent now
+  // HARDWARE WALLET (Ledger over WebHID, Trezor Safe over WebUSB — static/hwattest.js): the user connected it with
+  // the button under Start (the connect needs the click), the vendor's own genuineness protocol signs OUR challenge
+  // here, and the same {att, cdj, rp} envelope goes into the register tx. The kernel verifies and binds the device.
+  if (state.hwDevice && (state.attestVia === "ledger" || state.attestVia === "trezor")) {
+    try {
+      const hw = await import("./hwattest.js");   // never a literal version: the server stamps it (ops/static_versions.py)
+      log("info", i18("hw.confirm", "Confirm on the {n} — it is vouching for this identity.", { n: state.hwDevice.name }));
+      const device = await hw.attestHardware(state.hwDevice, chal);
+      // REBIND (doc/device-attestation.md §"Binding modes"): ask the relay what this device vouches for BEFORE the tap is
+      // spent. Another account + cooldown over → the user confirms the move (the other account stops mining); cooldown
+      // still running → say when; nothing bound or our own account → submit.
+      try {
+        const lr = await fetch(relayBase() + "/devbind_lookup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ att: device.att }) });
+        const lj = await lr.json().catch(() => null);
+        if (lj && lj.ok && lj.bound_to && lj.bound_to !== sender) {
+          const epochNow = state.latest != null ? Math.floor(state.latest / EPOCH_LENGTH) : null;
+          const epochSecs = EPOCH_LENGTH * (state.blockTime || 8);
+          if (epochNow != null && lj.movable_at_epoch != null && epochNow < lj.movable_at_epoch) {
+            const wait = (lj.movable_at_epoch - epochNow) * epochSecs;
+            const msg = i18("bind.rebindWait", "This {n} vouches for another account and moved less than a lease ago — it can be rebound from epoch {e} (in about {t}).",
+              { n: state.hwDevice.name, e: lj.movable_at_epoch, t: humanizeSeconds(wait) });
+            setDeviceStatus({ ok: false, fmt: state.attestVia, reason: msg });
+            log("err", msg);
+            return null;
+          }
+          const ok = await uiConfirm({ title: i18("bind.rebindTitle", "Rebind this device?"),
+            body: i18("bind.rebindAsk", "This {n} vouches for another account ({a}). Rebind it to this account? The other account stops collecting and cannot renew without a device.", { n: state.hwDevice.name, a: lj.bound_to.slice(0, 12) + "…" }),
+            confirmText: i18("bind.rebindOk", "Rebind here") });
+          if (!ok) { log("info", i18("bind.rebindDeclined", "Kept the existing binding — nothing was submitted.")); return null; }
+        }
+      } catch (e) { /* relay without the lookup: the chain's own verdict still applies at submit */ }
+      setDeviceStatus({ ok: true, fmt: state.attestVia, reason: "ok" });
+      log("ok", i18("device.attestedForReg", "Real device attested for this registration."));
+      return device;
+    } catch (e) {
+      const stF = { ok: false, fmt: state.attestVia, reason: (e && e.message) || String(e) };
+      setDeviceStatus(stF);
+      log("err", i18("hw.failed", "{n}: {e}", { n: state.hwDevice.name, e: stF.reason }));
+      return null;
+    }
+  }
+  if (!window.PublicKeyCredential || !navigator.credentials || !navigator.credentials.create) return null;
+  // NEVER OPEN A CEREMONY THAT CANNOT SUCCEED (operator 2026-09-09: "the Mac ceremony"). A macOS / iOS / iPadOS
+  // platform authenticator returns a passkey with fmt "none" — no attestation chain, refused by every node — so the
+  // Touch ID / device-password prompt can only ever waste the user's time and then fail. Apple is a STATIC verdict:
+  // decide it here, before navigator.credentials.create(), never from the failure afterwards. A Ledger or Trezor
+  // (handled above, attestVia ledger|trezor) or "Attest from another device" are the paths that do work on a Mac,
+  // and deviceGuide() already carries that text. Same for a browser with no platform authenticator at all: the
+  // prompt would be a cross-device QR dance that cannot produce an attestation either.
+  const _verdict = await platformAttestVerdict();     // same helper the prompt itself gates on — never diverge
+  if (_verdict) {
+    setDeviceStatus({ ok: false, fmt: "none", x5c: 0, reason: _verdict });
+    log("err", _verdict === "apple"
+      ? i18("device.mineApple", "An iPhone, iPad or Mac cannot vouch for itself — Apple passkeys carry no attestation, so no prompt is shown. Use a Ledger or Trezor Safe in Chrome, Edge or Brave, or Attest from another device.")
+      : i18("device.noPlatformAuth", "This browser has no built-in secure hardware to attest with, so no prompt is shown. Use a Ledger or Trezor Safe in Chrome, Edge or Brave, an Android phone (12+), a Windows or Linux PC with a TPM 2.0 through the enrolment helper, or Attest from another device."));
+    return null;
+  }
+  try {
+    const uid = new Uint8Array(16); crypto.getRandomValues(uid);
+    const cred = await createAttestedCredential({
+      challenge: chal, rp: { name: "NADO", id: location.hostname },
+      user: { id: uid, name: sender, displayName: "NADO identity" },
+      // KEY TYPE IS NOT THE LEVER (2026-09-10, tested on a live machine and REVERTED the same hour). Over 202 stored
+      // Windows Hello samples, RSA credentials attested 17/17 and ECC ones 23/185, which looked like ES256-first was
+      // choosing the failing branch. It was a CONFOUND: the machines that pick RSA are the ones whose TPM cannot make
+      // an ECC Hello key at all, and they happen to be the ones with working AIK attestation. Asking a machine that
+      // returns fmt "none" for ECC to make an RSA key instead got fmt "packed" with NO x5c — self-attestation, no
+      // chain, refused just the same. Reordering could only have broken the 23 ECC statements that do verify. ES256
+      // stays first everywhere: it is the better key on Android and Apple and it is not what is wrong on Windows.
+      pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -257 }],
+      attestation: "direct", timeout: 120000 });
+    const b64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
+    const att = b64(cred.response.attestationObject), cdj = b64(cred.response.clientDataJSON);
+    rememberCredentialId(sender, cred.rawId, att);  // held until a statement made with it is ACCEPTED (acceptedRegisterTx)
+    // PRE-FLIGHT (2026-09-07): have the relay PARSE the statement before anything is submitted. fmt "none" (Windows
+    // Hello under VBS or a software key, an Apple passkey), no certificate chain, an unpinned root, or a class the
+    // network cannot bind to one identity (FIDO2 batch key) is refused by every node anyway — a user saw the raw
+    // "attStmt has no x5c" instead of the reason. Say WHY here, with the device hint, and do not submit.
+    // KEEP WHAT THE PROBE SAW even when it passes: submitRegisterTx() turns a NODE-side refusal back into a failed
+    // verdict, and deviceGuide()/deviceHint() can only give real steps if they still know the format and AAGUID
+    // (2026-09-10 — "attested ✓ (attested)" on screen while the log carried the chain's actual reason).
+    let seen = null;
+    try {
+      const pr = await fetch(relayBase() + "/device_attest_probe", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ att, cdj }) });
+      const pj = await pr.json().catch(() => null);
+      const s = pj && pj.summary;
+      if (s) {
+        const ad = s.auth_data || {};
+        const bindable = s.fmt === "android-key" || s.fmt === "tpm" || s.fmt === "trezor" || s.fmt === "ledger";
+        const st = { ok: false, fmt: s.fmt || "none", aaguid: ad.aaguid, format_accepted: s.format_accepted, root_pinned: s.root_pinned, x5c: s.x5c_count || (s.fmt === "ledger" ? 1 : 0) };
+        seen = { fmt: st.fmt, aaguid: st.aaguid, x5c: st.x5c };
+        // NO ROOT JUDGEMENT HERE. The probe only parses; a TPM chain ends at an intermediate (the pinned Microsoft
+        // root is never inside x5c), so "last cert pinned?" is false for EVERY valid Windows statement — this
+        // pre-flight refused a working TPM registration for 20 minutes on 2026-09-07. The kernel resolves the
+        // root at submit; the pre-flight only rules out what has no chain at all or no per-device certificate.
+        if (!s.fmt || s.fmt === "none" || !s.x5c_count) st.reason = "none";
+        else if (!bindable) st.reason = "unbindable";
+        else if (s.fmt === "android-key" && Array.isArray(s.x5c_validity) && s.x5c_validity[1] && s.x5c_validity[1][1]) {
+          // the per-device certificate x5c[1]: expired -> the phone cannot attest until Android refreshes it (or never, on
+          // a factory-batch keybox); valid > 90 days -> a batch certificate shared by many units, refused as unbindable
+          const nb = Number(s.x5c_validity[1][0] || 0), na = Number(s.x5c_validity[1][1] || 0), nowS = Date.now() / 1000;
+          if (na < nowS) st.reason = "expired";
+          else if (na - nb > 90 * 86400) st.reason = "batch";
+        }
+        if (st.reason) {
+          setDeviceStatus(st);
+          log("err", i18("device.refused", "This device cannot register ({f}): ", { f: st.fmt }) + deviceHint(st));
+          return null;
+        }
+      }
+    } catch (e) { /* relay without the probe: the node's own verdict still applies at submit */ }
+    setDeviceStatus({ ...(seen || {}), ok: true, fmt: (seen && seen.fmt) || "attested", reason: "ok" });
+    log("ok", i18("device.attestedForReg", "Real device attested for this registration."));
+    return { att, cdj, rp: location.hostname };
+  } catch (e) {
+    // keep the error NAME: Chrome's NotAllowedError message never says "cancel"; the hints/guides match on the name
+    const stF = { ok: false, reason: (e && e.name ? e.name + ": " : "") + ((e && e.message) || String(e)) };
+    setDeviceStatus(stF);
+    log("warn", i18("device.attestSkipped", "Device attestation unavailable: {e}", { e: stF.reason }) + " " + deviceHint(stF));
+    return null;
+  }
+}
+
+// Current registration difficulty from the relay: {reqT, mult, recent, entryMult}. Falls back to base.
+//
+// THE ADDRESS MATTERS. required_t now folds in the ENTRY multiplier — a first registration (or one after
+// the lease lapsed) must prove POSW_ENTRY_MULT× more sequential work than a renewal. That is a function of
+// THIS address's recert history, so the relay cannot answer it without being told who is asking; called
+// bare it reports the rate multiplier only, and a new miner proving at that would under-work its very
+// first proof and be rejected by every node. Renewals get entry_multiplier 1 and are unchanged.
+// `maxBlock` matters for the same reason `address` does: the rate multiplier is read at the anchor epoch
+// (maxBlock - POSW_ANCHOR_OFFSET). An answer computed for a DIFFERENT landing block is only accidentally
+// the one validation will apply, and posw.verify is EXACT-T — so on any height where the two straddle an
+// epoch boundary the wallet would prove the wrong T and every node would reject an honest registration.
+async function registrationDifficulty(address, maxBlock) {
+  try {
+    const p = new URLSearchParams();
+    if (address) p.set("address", address);
+    if (maxBlock) p.set("max_block", String(maxBlock));
+    const q = p.toString() ? "?" + p.toString() : "";
+    const r = await fetch(relayBase() + "/posw_difficulty" + q, { cache: "no-store" });
     const d = await r.json();
     const t = Number(d.required_t);
-    if (t >= POSW_T && t % POSW_S === 0) return { reqT: t, mult: Number(d.multiplier) || 1, recent: Number(d.recent_registrations) || 0 };
+    if (t >= POSW_T && t % POSW_S === 0) return { reqT: t, mult: Number(d.multiplier) || 1,
+                                                  entryMult: Number(d.entry_multiplier) || 1,
+                                                  recent: Number(d.recent_registrations) || 0 };
   } catch (e) { /* older node / offline → base difficulty */ }
-  return { reqT: POSW_T, mult: 1, recent: 0 };
+  return { reqT: POSW_T, mult: 1, entryMult: 1, recent: 0 };
 }
 // Rolling estimate of this device's sequential-hash rate (hashes/sec), so the wait ETA is device-calibrated.
-function poswRate() { const r = parseFloat(localStorage.getItem("nado_posw_rate") || ""); return (r > 0 && isFinite(r)) ? r : 700000; }
+// The FALLBACK matters: the flat 700,000 guess was wrong in both directions and by a lot — measured here,
+// the WASM blake2b runs ~3.2M/s while the pure-JS fallback manages ~0.07M/s, a 45× cliff. Guessing 700k
+// told a WASM user a 30s proof would take 137s, and a JS-fallback user that a 23-minute proof would take
+// 137s. Seed from the backend that is actually going to run, then let the measured rate take over.
+function poswRate() {
+  const r = parseFloat(localStorage.getItem("nado_posw_rate") || "");
+  if (r > 0 && isFinite(r)) return r;
+  return _wasmB2b ? 2_000_000 : 100_000;
+}
 function savePoswRate(hashes, ms) { if (hashes > 0 && ms > 200) { try { localStorage.setItem("nado_posw_rate", String(Math.round(hashes / (ms / 1000)))); } catch (e) {} } }
 
 
@@ -544,14 +1690,18 @@ function buildTransferTx(wallet, recipient, rawAmount, fee, targetBlock, data, t
   // node ignores it for exact-landing reserved recipients. See TX_INCLUSION_DELAY.
   if (minBlock) draft.min_block = minBlock;
   if (includePubkey) draft.public_key = wallet.publicKey;
-  return finalizeTransaction(draft, wallet.privateKey, fee);
+  return finalizeTransaction(draft, wallet, fee);
 }
 
 // PUBKEY-ONCE (#19): is the sender's pubkey already recorded on-chain? The node stores it on an
 // address's FIRST on-chain tx (register OR any transfer), after which later txs may omit it. If we
 // can't tell (no account doc / relay hiccup) return false so we include the key — always safe.
+// ONLY the stored public_key counts: `registered === 1` used to imply it, but genesis-seeded
+// open-lane identities (genesis.py) carry registered=1 with NO pubkey — after a reroll, an address
+// that hadn't yet sent a tx this generation then omitted the key and every bond/transfer died with
+// "Missing public_key and no on-chain pubkey for sender" (reported 2026-08-23).
 function pubkeyEstablished(acc) {
-  return !!(acc && (acc.public_key || acc.registered === 1));
+  return !!(acc && acc.public_key);
 }
 
 /* ----------------------------------------------------------------------------------------------
@@ -575,21 +1725,325 @@ const state = {
   recommendedFee: null,
   // AUTO-BOND (client-side, opt-in): compound a % of newly-mined earnings straight into bonded stake
   // while mining, at most once per epoch. baseline = last balance we've accounted for.
-  autoBondPct: 80,     // AUTO_BOND_DEFAULT_PCT (const declared below); boot overwrites w/ saved pref
+  autoBondPct: P.AUTO_BOND_DEFAULT_PERCENT,     // AUTO_BOND_DEFAULT_PCT (const declared below); boot overwrites w/ saved pref
   autoBondBaseline: null,
+  // A DIVIDEND IS EARNINGS TOO (2026-09-19). The baseline below counts `produced`, the chain's MINED
+  // counter — correct for keeping transfers/faucet/bridge/withdrawals out, but the presence dividend is
+  // neither: it credits `balance` and never touches `produced`, so auto-save at ANY percentage swept none
+  // of it and the spendable balance grew regardless. Measured on the operator's own account: 1.594 NADO of
+  // dividend arrived in 5.7 h while its 50 auto-bonds covered only the mined slice. This tally holds
+  // dividend that has been CLAIMED (a dividend_withdraw we submitted) and not yet swept into savings.
+  autoBondDividend: 0n,
   autoBondPending: null,   // {target, epoch} while an auto-bond is in flight — prevents stacking bonds
   lastAutoBondEpoch: null,
 };
 
-function relayBase() { return (state.relay || location.origin).replace(/\/+$/, ""); }
-// Execution node (presence dividend + contracts) — same host as the relay, exec port 9273 (overridable).
+/* RELAY POOL — automatic relay switching.
+ * The wallet has ONE home relay: the origin it was served from, or the URL the user typed in Settings. Every
+ * miner on get.nadochain.com therefore hangs off one box, and when that box stalls (a restart, an update
+ * wave, a state walk hogging the GIL) 800 wallets go "relay offline" together with nowhere to go. The pool
+ * is the wallet's second option: /relays on the home relay lists the other nodes on this chain (each peer's
+ * live height, and — when its operator published one — the TLS origin a browser can actually reach; see
+ * doc/relays.md). After RELAY_FAIL_THRESHOLD consecutive hard failures of the current relay the wallet
+ * PROBES the candidates (best height first, home first when it is the one we left), refuses any that is on
+ * a different chain_id or trails the best-known tip by more than RELAY_HEIGHT_TOLERANCE blocks, and adopts
+ * the first that passes. The exec node follows automatically (execBase derives from relayBase). While away
+ * it re-probes home every RELAY_HOME_RETRY_MS and goes back the moment home answers — the user's choice of
+ * relay is never silently replaced for good, only bridged over. The list is persisted so a browser whose
+ * home relay is down AT BOOT still has somewhere to look. Nothing in the list is trusted: a candidate is
+ * only ever adopted after its own /status passed the chain + height checks, and the node's own
+ * "Wrong or missing chain id" rejection still backstops every signed tx. */
+const LS_RELAY_POOL = "nado_relay_pool";
+const RELAY_FAIL_THRESHOLD = 3;              // consecutive hard failures (not 429s) before looking elsewhere
+const RELAY_POOL_REFRESH_MS = 5 * 60 * 1000; // /relays is rate-limited 60/min per IP; 5 min is plenty
+const RELAY_HOME_RETRY_MS = 2 * 60 * 1000;   // while on an auto relay, how often home is re-probed
+const RELAY_BAD_MS = 5 * 60 * 1000;          // a candidate that failed a probe is skipped for this long
+const RELAY_PROBE_TIMEOUT = 6000;
+const RELAY_HEIGHT_TOLERANCE = 20;           // a candidate may trail the best-known tip by this many blocks
+// SLOW IS ALSO DOWN (2026-09-06). The pool only ever rotated on hard failures (timeouts / 5xx), and every
+// answered request reset the counter — so a home relay answering every call in 3-10 s (a GIL-bound node) was
+// "healthy" all evening while psychz sat idle 20 blocks fresh. A relay whose recent answers are mostly slower
+// than RELAY_SLOW_MS is treated like an unreachable one; going back home then requires home to answer a probe
+// FAST (RELAY_HOME_FAST_MS), not merely to answer, or the wallet would ping-pong between the two.
+const RELAY_SLOW_MS = 4000;                  // a single answer slower than this is a "slow" sample
+const RELAY_SLOW_WINDOW = 6;                 // ... over the last N answers ...
+const RELAY_SLOW_MIN = 4;                    // ... and this many slow ones rotate (4 of 6)
+const RELAY_HOME_FAST_MS = 2000;             // home must answer its probe this fast to win the wallet back
+const relayPool = {
+  // The saved list restores URLs only, never HEIGHTS: a height from an earlier session is from an earlier chain after
+  // a reroll (betanet-7's ~233000 against betanet-8's hundreds), and guardFrom takes the pool MAX, so every tx built
+  // before the first /relays refresh carried an unreachable min_block, and relayNoteHeight judged the healthy home
+  // relay 232,000 blocks stale against the median and switched away from it. refreshRelayPool fills live heights.
+  list: (() => { try { const l = JSON.parse(localStorage.getItem(LS_RELAY_POOL) || "[]"); return Array.isArray(l) ? l.filter((c) => c && typeof c.url === "string").map((c) => ({ url: c.url, height: 0 })) : []; } catch (e) { return []; } })(),
+  auto: null,          // the relay we switched to, or null = on the home relay
+  fails: 0,            // consecutive hard failures of the CURRENT relay
+  bad: new Map(),      // url -> time of last failed probe
+  lastRefresh: 0,
+  switchedAt: 0,       // when we last moved (also rate-limits the home re-probe)
+  switching: null,     // in-flight rotateRelay() promise (re-entrancy guard)
+};
+function homeRelay() { return (state.relay || location.origin).replace(/\/+$/, ""); }
+function relayBase() { return relayPool.auto || homeRelay(); }
+// A PROGRAM THE USER RUNS comes from the relay they chose, never a failover one (audit 2026-09-25): a pool relay is
+// adopted on its own word when home is down, and the enrolment helper and its checksum were built from relayBase(),
+// so a hostile relay that got adopted could hand out its own binary with a matching checksum.
+function enrolBase() { return homeRelay(); }
+function relayHost(url) { try { return new URL(url).host; } catch (e) { return String(url || ""); } }
+// A candidate this PAGE can use: http(s) origin, and https when the page itself is https (a browser blocks
+// an http:// fetch from an https page — mixed content — so a bare ip:port peer only helps a wallet that was
+// loaded over plain http, e.g. from the miner's own node).
+function relayUsable(url) {
+  if (typeof url !== "string" || !/^https?:\/\/\S+$/i.test(url)) return false;
+  if (location.protocol === "https:" && !/^https:/i.test(url)) return false;
+  try { new URL(url); } catch (e) { return false; }
+  return true;
+}
+// Pin a relay (or "" = the page's own origin, automatic failover). Shared by the Save button, the dropdown and the
+// unlock screen's field: the typed/picked relay is home; any failover is forgotten; the chain is re-adopted from it.
+async function applyRelay(v) {
+  v = (v || "").trim();
+  // a pinned relay is checked against the page's own origin (the code you are running came from there) before it is used
+  if (v && v.replace(/\/+$/, "") !== location.origin.replace(/\/+$/, "") && relayUsable(v)) {
+    let tip = 0; try { tip = Number((await probeRelay(v.replace(/\/+$/, ""))).latest_block_height) || 0; } catch (e) { tip = 0; }
+    const prevHome = state.relay; state.relay = null;          // compare against the page origin, not the previous pin
+    const ok = await relayAgreesWithHome(v.replace(/\/+$/, ""), tip);
+    state.relay = prevHome;
+    if (!ok) { renderRelaySelect(); return; }
+  }
+  state.relay = v || null;
+  try { if (v) localStorage.setItem(LS_RELAY, v); else localStorage.removeItem(LS_RELAY); } catch (e) {}
+  relayPool.auto = null; relayPool.fails = 0; renderRelayTag(); renderRelaySelect();
+  log("info", i18("log.relaySet", "Relay set to {u}", { u: relayBase() }));
+  netAdopted = false; refreshNetIdentity().catch(() => {});
+  refreshRelayPool(true).then(() => renderRelaySelect()).catch(() => {});
+  pollOnce().catch(() => {});
+}
+// The dropdown: "Automatic (home)" + every advertised relay usable from this page, with its last measured round trip.
+function renderRelaySelect() {
+  const sel = $("relaySel"); if (!sel) return;
+  const origin = location.origin.replace(/\/+$/, "");
+  const pinned = (state.relay || "").replace(/\/+$/, "");
+  const opts = [{ url: "", label: i18("relay.optAuto", "Automatic — {h}", { h: relayHost(origin) }) }];
+  const seen = new Set([origin]);
+  for (const c of relayPool.list || []) {
+    if (!c || !c.url || seen.has(c.url)) continue; seen.add(c.url);
+    const ms = relayPool.probe && relayPool.probe.get(c.url);
+    opts.push({ url: c.url, label: relayHost(c.url) + (typeof ms === "number" ? ` · ${ms} ms` : (ms === "down" ? " · " + i18("relay.optDown", "no answer") : "")) });
+  }
+  if (pinned && !seen.has(pinned)) opts.push({ url: pinned, label: relayHost(pinned) });
+  sel.innerHTML = "";
+  for (const o of opts) { const e = document.createElement("option"); e.value = o.url; e.textContent = o.label; sel.appendChild(e); }
+  sel.value = pinned && seen.has(pinned) ? pinned : (pinned || "");
+}
+// Measure each advertised relay once (4 s budget, in parallel) so the dropdown can show "· 340 ms".
+async function probeRelayList() {
+  await refreshRelayPool(true).catch(() => {});
+  relayPool.probe = relayPool.probe || new Map();
+  await Promise.all((relayPool.list || []).map(async (c) => {
+    const t0 = Date.now();
+    try { await fetchWithTimeout(c.url + "/status", { method: "GET", cache: "no-store" }, 4000); relayPool.probe.set(c.url, Date.now() - t0); }
+    catch (e) { relayPool.probe.set(c.url, "down"); }
+  }));
+  renderRelaySelect();
+}
+try { window.__nadoRelay = { pool: relayPool, render: renderRelaySelect, probe: probeRelayList }; } catch (e) {}   // console access for support
+function renderRelayTag() {
+  const el = $("relayTag"); if (!el) return;
+  const auto = !!relayPool.auto;
+  el.textContent = i18("relay.via", "via {h}", { h: relayHost(relayBase()) }) + (auto ? " · " + i18("relay.autoMark", "auto") : "");
+  el.title = auto
+    ? i18("relay.autoTip", "Your usual relay ({h}) stopped answering, so the wallet switched to another node on the same chain. It goes back automatically once {h} is reachable again.", { h: relayHost(homeRelay()) })
+    : i18("relay.homeTip", "The node this wallet reads from and sends through.");
+}
+function relayNoteSuccess(ms) {
+  relayPool.fails = 0;
+  if (typeof ms !== "number") return;
+  const lat = relayPool.lat || (relayPool.lat = []);
+  lat.push(ms); if (lat.length > RELAY_SLOW_WINDOW) lat.shift();
+  const slow = lat.filter((x) => x >= RELAY_SLOW_MS).length;
+  if (lat.length >= RELAY_SLOW_WINDOW && slow >= RELAY_SLOW_MIN && !relayPool.switching && relayPool.list.length) {
+    relayPool.lat = [];
+    log("warn", i18("log.relaySlow", "Relay {a} is answering slowly ({n} of the last {w} calls over {s}s) — looking for a faster node.",
+        { a: relayHost(relayBase()), n: slow, w: lat.length, s: RELAY_SLOW_MS / 1000 }));
+    relayPool.switching = rotateRelay().catch(() => false).finally(() => { relayPool.switching = null; });
+  }
+}
+// STALE IS ALSO DOWN (2026-09-13). The pool rotated on hard failures and on slowness, and a relay that is
+// simply NOT MOVING is neither: it answers every call instantly, with well-formed JSON, about a chain state
+// from hours ago. relayAcceptable() already refuses to fail over ONTO such a node — the same tolerance was
+// never applied to the relay we are already using, so the one case it was written for was the one it missed.
+// Measured live: get.nadochain.com, the wallet's default relay, wedged at block 69284 for 11 hours while the
+// fleet passed 74500. Every wallet on it kept polling happily, 5,200 blocks behind, and none rotated.
+//
+// MEDIAN, NOT MAX, of the candidates' heights. `best` for adoption is a max because adopting the most
+// current node is right; for "am I stale" a max lets ONE peer claiming an absurd height declare every honest
+// relay stale and send the wallet rotating forever. The median says "most of the network is past me", which
+// is the actual question, and a single liar cannot move it.
+const RELAY_STALE_BLOCKS = 120;              // ~14 min of blocks: far beyond propagation, far short of a wedge
+function relayMedianHeight() {
+  const hs = relayPool.list.map((c) => Number(c.height) || 0).filter((h) => h > 0).sort((a, b) => a - b);
+  return hs.length ? hs[Math.floor(hs.length / 2)] : 0;
+}
+function relayMaxHeight() { return relayPool.list.reduce((m, c) => Math.max(m, Number(c.height) || 0), 0); }
+// THE NETWORK TIP, AS FAR AS ONE LIAR CAN MOVE IT (audit 2026-09-25). Pool heights are SELF-REPORTED through /relays,
+// so the plain max let one relay claiming an absurd height push every guard past its max_block (no tx could land) and
+// rank itself first for failover. The max is used only up to RELAY_LEAD_MAX above the median: an honest node a few
+// blocks ahead still counts; a liar cannot move the estimate further than that.
+const RELAY_LEAD_MAX = 30;
+function relayTipEstimate() {
+  const med = relayMedianHeight();
+  return med ? Math.min(relayMaxHeight(), med + RELAY_LEAD_MAX) : 0;
+}
+/* A PROPAGATION GUARD IS COMPUTED FROM THE HIGHEST TIP THIS WALLET KNOWS (2026-09-22). Every guarded
+ * transaction set min_block = (the relay's tip) + TX_INCLUSION_DELAY. During an update wave a relay that has
+ * just restarted serves a tip several blocks behind the network while it catches up, so a wallet on it
+ * built a guard that was already in the past everywhere else: a dividend-collect blob built 9 s before
+ * block 193750 carried min_block 193748, the nodes that had it built it in, the rest had not received it,
+ * and five nodes rolled back one block. The pool's heights are already tracked (relayNoteHeight); the guard
+ * now starts from the best of the relay's tip, the pool's highest tip and the last tip this page saw. A
+ * guard that is a few blocks LATER than necessary only delays landing; one that is earlier splits. */
+function guardFrom(h) { return Math.max(Number(h) || 0, relayTipEstimate(), Number(state.latest) || 0) + TX_INCLUSION_DELAY; }
+function relayNoteHeight(h) {
+  h = Number(h);
+  if (!Number.isFinite(h) || h <= 0) return;
+  if (!relayAutoAllowed() || relayPool.switching || !relayPool.list.length) return;
+  const med = relayMedianHeight();
+  if (!med || h >= med - RELAY_STALE_BLOCKS) return;
+  log("warn", i18("log.relayStale",
+      "Relay {a} is {n} blocks behind the rest of the network — looking for a current node.",
+      { a: relayHost(relayBase()), n: med - h }));
+  relayPool.switching = rotateRelay().catch(() => false).finally(() => { relayPool.switching = null; });
+}
+const LS_RELAY_AUTO = "nado_relay_auto";           // "0" = never switch relays automatically (operator 2026-09-08)
+function relayAutoAllowed() { try { return localStorage.getItem(LS_RELAY_AUTO) !== "0"; } catch (e) { return true; } }
+function relayNoteFailure() {
+  relayPool.fails++;
+  if (!relayAutoAllowed()) return;               // the user chose: stay on the home relay, show "offline" instead
+  if (relayPool.fails >= RELAY_FAIL_THRESHOLD && !relayPool.switching) {
+    relayPool.switching = rotateRelay().catch(() => false).finally(() => { relayPool.switching = null; });
+  }
+}
+// Refresh the candidate list from the CURRENT relay's /relays (time-gated). Home is never listed — it is
+// implicitly first — and a candidate on another chain is dropped here, before it can ever be probed.
+async function refreshRelayPool(force = false) {
+  const now = Date.now();
+  if (!force && now - relayPool.lastRefresh < RELAY_POOL_REFRESH_MS) return;
+  relayPool.lastRefresh = now;
+  let r;
+  try { r = await rpcJSON("/relays", { retry: false }); } catch (e) { return; }
+  const d = r && r.data;
+  if (!d || !Array.isArray(d.relays)) return;
+  const list = [];
+  for (const e of d.relays) {
+    if (!e || typeof e !== "object") continue;
+    const url = relayUsable(e.url) ? e.url.replace(/\/+$/, "") : (relayUsable(e.api) ? e.api.replace(/\/+$/, "") : null);
+    if (!url || url === homeRelay() || list.some((c) => c.url === url)) continue;
+    if (typeof e.chain_id === "string" && CHAIN_ID && e.chain_id !== CHAIN_ID) continue;
+    list.push({ url, height: Number(e.height) || 0 });
+  }
+  relayPool.list = list;
+  try { localStorage.setItem(LS_RELAY_POOL, JSON.stringify(list)); } catch (e) {}
+  renderRelaySelect();                       // the dropdown follows the list (the first render at boot saw an empty one)
+}
+async function probeRelay(url) {
+  const t0 = Date.now();
+  const res = await fetchWithTimeout(url + "/status", { method: "GET", cache: "no-store" }, RELAY_PROBE_TIMEOUT);
+  if (!res.ok) throw new RelayUnreachable("relay returned HTTP " + res.status);
+  let st; try { st = await res.json(); } catch (e) { throw new RelayUnreachable("relay returned no JSON"); }
+  if (!st || typeof st.chain_id !== "string" || !st.chain_id) throw new RelayUnreachable("relay status has no chain_id");
+  st._probeMs = Date.now() - t0;                 // how fast it answered — the slow-relay rotation reads this
+  return st;
+}
+// Would we sign against this node? Same chain (never silently cross chains), and at — or within tolerance
+// of — the best tip we know about, so we never "fail over" onto a node that is itself stuck.
+function relayAcceptable(st) {
+  if (CHAIN_ID && netAdopted && st.chain_id !== CHAIN_ID) return false;
+  if (typeof st.chain_id === "string" && st.chain_id && st.chain_id !== PAGE_CHAIN) return false;   // a stale tab never moves onto another chain
+  const h = Number(st.latest_block_height);
+  if (!Number.isFinite(h)) return false;
+  // the MEDIAN, which one lying relay cannot move (the estimate may sit RELAY_LEAD_MAX above it — more than this
+  // tolerance — so honest relays would fail a bar a liar raised)
+  const best = Math.max(Number(state.latest) || 0, relayMedianHeight());
+  return h >= best - RELAY_HEIGHT_TOLERANCE;
+}
+function adoptRelay(url, st) {
+  const before = relayBase();
+  relayPool.auto = url; relayPool.fails = 0; relayPool.switchedAt = Date.now();
+  noteRelayExecPort(relayBase(), st);
+  if (st && typeof st.chain_id === "string" && st.chain_id && relayOnPageChain(st.chain_id)) {
+    CHAIN_ID = st.chain_id; netAdopted = true;
+    try { localStorage.setItem(LS_CHAIN_ID, CHAIN_ID); } catch (e) {}
+    const el = $("netTag"); if (el) el.textContent = CHAIN_ID;
+  }
+  if (st && Number.isInteger(st.finality_depth) && st.finality_depth > 0) FINALITY_DEPTH = st.finality_depth;
+  renderRelayTag();
+  const after = relayBase();
+  if (after === before) return;
+  log("info", url
+    ? i18("log.relaySwitched", "Relay {a} is not answering — switched to {b} (same chain, tip {h}). The wallet returns to {a} automatically once it is back.", { a: relayHost(before), b: relayHost(after), h: st.latest_block_height })
+    : i18("log.relayHome", "Relay {a} is reachable again — switched back.", { a: relayHost(after) }));
+  pollOnce().catch(() => {});
+}
+// The current relay is gone: try home first if we had left it, then the pool by height. Returns true if
+// a relay was adopted. Candidates that just failed a probe are skipped for RELAY_BAD_MS so a dead list
+// costs one probe each, not one per tick.
+async function rotateRelay() {
+  const now = Date.now();
+  const cur = relayBase();
+  relayPool.bad.set(cur, now);
+  const cands = [];
+  if (relayPool.auto) cands.push({ url: homeRelay(), home: true });
+  const _cap = relayTipEstimate() || Infinity;          // rank by height only as far as it is credible (see above)
+  const _rank = (c) => Math.min(Number(c.height) || 0, _cap);
+  for (const c of [...relayPool.list].sort((a, b) => _rank(b) - _rank(a))) {
+    if (c.url === cur || c.url === homeRelay()) continue;
+    if ((relayPool.bad.get(c.url) || 0) > now - RELAY_BAD_MS) continue;
+    cands.push(c);
+  }
+  for (const c of cands) {
+    let st;
+    try { st = await probeRelay(c.url); } catch (e) { relayPool.bad.set(c.url, Date.now()); continue; }
+    if (!relayAcceptable(st)) { relayPool.bad.set(c.url, Date.now()); continue; }
+    if (!c.home && !(await relayAgreesWithHome(c.url, st.latest_block_height))) { relayPool.bad.set(c.url, Date.now()); continue; }
+    adoptRelay(c.home ? null : c.url, st);
+    return true;
+  }
+  return false;
+}
+// Once per poll tick: keep the list fresh, and drift back home when we are away and home is back.
+async function relayMaintain() {
+  await refreshRelayPool();
+  // WHILE AWAY FROM HOME, RE-CHECK THE CHAIN every 5 min: the adoption-time finalized-hash check is repeated, so a relay
+  // that forks after being adopted is dropped too (operator 2026-09-08: "it completely switches ... NOT SECURE").
+  if (relayPool.auto && Date.now() - (relayPool.recheckedAt || relayPool.switchedAt) > 300000) {
+    relayPool.recheckedAt = Date.now();
+    try {
+      const st = await probeRelay(relayPool.auto);
+      if (!(await relayAgreesWithHome(relayPool.auto, st.latest_block_height))) { relayPool.bad.set(relayPool.auto, Date.now()); adoptRelay(null, null); }
+    } catch (e) { /* unreachable: the failure counter handles it */ }
+  }
+  if (relayPool.auto && Date.now() - relayPool.switchedAt > RELAY_HOME_RETRY_MS && !relayPool.switching) {
+    relayPool.switchedAt = Date.now();
+    // home must be acceptable AND fast: a slow-but-alive home is exactly what we left (RELAY_HOME_FAST_MS)
+    try { const st = await probeRelay(homeRelay()); if (relayAcceptable(st) && st._probeMs <= RELAY_HOME_FAST_MS) adoptRelay(null, st); } catch (e) {}
+  }
+}
+// Execution node (presence dividend + contracts) — same host as the relay, on the exec port THAT RELAY names.
+// relayExecPort: relay url -> the `exec_port` its /status advertises (nado.py, NADO_EXEC_PORT). The wallet assumed
+// 9273 for every relay, so a node on another exec port served a wallet reading SOME OTHER exec node on 9273 of the same
+// host (the gen-29 rehearsal's loopback walk read the live fleet's pool this way). 9273 when the relay names none.
+const relayExecPort = new Map();
+function noteRelayExecPort(url, st) {
+  const p = st && st.exec_port;
+  if (url && Number.isInteger(p) && p > 0 && p < 65536) relayExecPort.set(url, p);
+}
 function execBase() {
   if (state.execUrl) return state.execUrl.replace(/\/+$/, "");
   const b = relayBase();
-  // Relay reached on an explicit port (a direct node, e.g. http://ip:9173) -> the exec node is on :9273 of the
-  // same host. Relay reached with NO port (served behind a reverse proxy on 80/443, e.g. https://get.nadochain.com)
-  // -> the exec node is proxied at /exec on the SAME origin, so keep the origin as-is.
-  return /:\d+$/.test(b) ? b.replace(/:\d+$/, ":9273") : b;
+  // Relay reached on an explicit port (a direct node, e.g. http://ip:9173) -> the exec node is on the port it names
+  // (default 9273) of the same host. Relay reached with NO port (served behind a reverse proxy on 80/443, e.g.
+  // https://get.nadochain.com) -> the exec node is proxied at /exec on the SAME origin, so keep the origin as-is.
+  return /:\d+$/.test(b) ? b.replace(/:\d+$/, ":" + (relayExecPort.get(b) || 9273)) : b;
 }
 
 /* PRESENCE DIVIDEND (doc/presence-dividend.md). accrued lives off-L1 on the execution node; "Collect" submits
@@ -599,7 +2053,7 @@ function buildBlobTx(wallet, payload, targetBlock, fee, timestamp, minBlock) {
   const draft = { sender: wallet.address, recipient: "blob", amount: 0, timestamp, data: payload,
     nonce: randNonce(), public_key: wallet.publicKey, max_block: targetBlock, chain_id: CHAIN_ID };
   if (minBlock) draft.min_block = minBlock;   // earliest-inclusion (propagation delay) — see TX_INCLUSION_DELAY
-  return finalizeTransaction(draft, wallet.privateKey, fee);
+  return finalizeTransaction(draft, wallet, fee);
 }
 // ML-DSA-44 signing is HEDGED (randomized): a rare signature verifies locally yet is rejected by the node /
 // peers as "Invalid signature" (the JS and native verifiers disagree on a boundary case). Each rebuild
@@ -625,11 +2079,14 @@ async function submitResilient(buildTxFn, tries = 8) {
   }
   return { res: last, tx };
 }
-function buildDividendWithdrawTx(wallet, addr, amount, nonce, proof, targetBlock, timestamp) {
+function buildDividendWithdrawTx(wallet, addr, amount, nonce, proof, targetBlock, timestamp, minBlock) {
   const draft = { sender: wallet.address, recipient: "dividend_withdraw", amount: 0, timestamp,
     data: { addr, amount, nonce, proof }, nonce: randNonce(), public_key: wallet.publicKey,
     max_block: targetBlock, chain_id: CHAIN_ID };
-  return finalizeTransaction(draft, wallet.privateKey, 0);   // fee-exempt
+  // flexibly-landing: min_block is the propagation guard (fork seed h66894 — a claim included by its own
+  // node before gossip delivered it). minBlock optional for compatibility with existing callers.
+  if (minBlock) draft.min_block = minBlock;
+  return finalizeTransaction(draft, wallet, 0);   // fee-exempt
 }
 
 /* ----------------------------------------------------------------------------------------------
@@ -653,11 +2110,14 @@ function buildWithdrawUnbondTx(wallet, amount, releaseBlock, targetBlock, timest
   // data is SELF-DESCRIBING and must match the pending record exactly; max_block must be >= release_block
   // because max_block IS the landing block the maturity check is made against. Fee-exempt like unbond, so
   // a fully-bonded wallet with nothing spendable can always get out.
+  // amount is a BigInt, NOT a String: validation compares data["amount"] to the pending record's int with
+  // ==, and in Python "20000000000" != 20000000000, so a stringified amount rejects EVERY withdraw. The
+  // canonical encoder emits a BigInt as a bare JSON integer, so it round-trips to the int the node expects.
   const draft = { sender: wallet.address, recipient: "withdraw", amount: 0, timestamp,
-    data: { amount: String(amount), release_block: Number(releaseBlock) },
+    data: { amount: BigInt(amount), release_block: Number(releaseBlock) },
     nonce: randNonce(), max_block: targetBlock, chain_id: CHAIN_ID };
   if (includePubkey) draft.public_key = wallet.publicKey;
-  return finalizeTransaction(draft, wallet.privateKey, 0);
+  return finalizeTransaction(draft, wallet, 0);
 }
 
 async function claimMaturedUnbond(pending, auto) {
@@ -667,6 +2127,15 @@ async function claimMaturedUnbond(pending, auto) {
     const acc = await getAccount(state.wallet.address);
     const targetBlock = await nextTargetBlock();
     if (targetBlock < pending.release_block) return;         // not matured at the landing block yet
+    // ONE claim per landing window. The poll re-enters here every tick while /get_unbond still shows
+    // the pending record — i.e. for the whole submit->landing gap — and every tick used to submit
+    // ANOTHER withdraw (fresh nonce -> fresh txid). ~20 duplicates sat in the mempool at once, the
+    // history pane showed them all as incoming credit (+200 "pending" for a 10-NADO unbond,
+    // 2026-08-19), and every copy but the winner died "no pending unbond to withdraw". The claim is
+    // EXACT-landing at targetBlock, so it is decided (landed or dead) once the tip passes it:
+    // re-arm only then. (targetBlock - 8 == the tip nextTargetBlock() just read.)
+    if (state._unbondClaimTarget && state._unbondClaimTarget > targetBlock - 8) return;
+    state._unbondClaimTarget = targetBlock;
     const tx = buildWithdrawUnbondTx(state.wallet, pending.amount, pending.release_block, targetBlock,
                                      nowSeconds(), !pubkeyEstablished(acc));
     await submitAndReport(tx, "Withdraw", "stakeMsg");
@@ -679,7 +2148,9 @@ async function refreshUnbond() {
   const panel = $("unbondPanel");
   if (!panel || !state.wallet) return;
   let d = null;
-  try {
+  const v = viewFresh(state.wallet.address);
+  if (v && v.unbond) d = v.unbond;
+  else try {
     const r = await rpcJSON("/get_unbond?address=" + encodeURIComponent(state.wallet.address), { retry: false });
     if (r.ok && r.data) d = r.data;
   } catch (e) { return; }                                     // relay blip — leave the panel as it was
@@ -731,19 +2202,58 @@ async function refreshDividend() {
   if (pending.length && !state._claiming) { state._claiming = true; try { await claimPendingDividends(pending); } finally { state._claiming = false; } }
 }
 
+// Claims submitted per refresh tick. A wallet can hold dozens of unclaimed nonces (53 on one address,
+// 2026-08-24); each claim is its own fee-exempt L1 tx, so the burst is bounded here rather than dumped
+// into the mempool at once. Every claim is gated by _divClaimGate until it has had time to land, so the
+// backlog drains at DIV_CLAIMS_PER_TICK per tick without ever duplicating a nonce.
+const DIV_CLAIMS_PER_TICK = 10;
+
 async function claimPendingDividends(pending) {
   let settled;
   try { settled = await (await fetch(relayBase() + "/get_settled", { cache: "no-store" })).json(); } catch { return; }
   const settledRoot = settled && settled.state_root;
   if (!settledRoot) return;
   const latest = await getLatestBlock(); if (!latest) return;
-  for (const p of pending) {
+  // ONE claim per landing attempt (same bug as the unbond auto-claim, 2026-08-19): the exec node
+  // lists the dividend as unclaimed until the claim LANDS on L1, so every refresh tick in the
+  // submit->landing gap rebuilt the same claim with a fresh txid — 19 duplicates of one nonce sat
+  // in the mempool as phantom pending credit. Hold each nonce until the submitted claim has had
+  // min_block + one more inclusion delay to land; if it still shows pending after that, resubmit.
+  if (!state._divClaimGate) state._divClaimGate = {};
+  const due = pending.filter(p => { const g = state._divClaimGate[p.nonce]; return !(g && latest.block_number < g); });
+  if (!due.length) return;
+  // ONE round trip for every proof (/exec/dividend_proofs), AGAINST the settled root (root=): the exec
+  // node's live root keeps moving (accruals every epoch + any contract call), so waiting for it to
+  // coincide with a settled root stalled claims for hours on a busy chain. Per-nonce fetches — one
+  // request per pending nonce per tick — were what pinned the exec node on 2026-08-24, so the batch
+  // is the primary path; the per-nonce endpoint is kept only for an exec node that predates it.
+  let proofs = null;
+  try {
+    const b = await (await fetch(execBase() + "/exec/dividend_proofs?address=" + encodeURIComponent(state.wallet.address) + "&root=" + encodeURIComponent(settledRoot), { cache: "no-store" })).json();
+    if (b && Array.isArray(b.proofs)) proofs = new Map(b.proofs.map(pr => [String(pr.nonce), pr]));
+  } catch (e) { proofs = null; }
+  let submitted = 0;
+  for (const p of due) {
+    if (submitted >= DIV_CLAIMS_PER_TICK) break;
     try {
-      const pr = await (await fetch(execBase() + "/exec/dividend_proof?nonce=" + encodeURIComponent(p.nonce), { cache: "no-store" })).json();
+      let pr = proofs ? proofs.get(String(p.nonce)) : null;
+      if (!pr && !proofs) {      // old exec node: no batch endpoint — fall back to one fetch per nonce
+        pr = await (await fetch(execBase() + "/exec/dividend_proof?nonce=" + encodeURIComponent(p.nonce) + "&root=" + encodeURIComponent(settledRoot), { cache: "no-store" })).json();
+      }
       if (!pr || pr.state_root !== settledRoot) continue;   // proof must be against the SETTLED root; else wait
-      const tx = buildDividendWithdrawTx(state.wallet, state.wallet.address, p.amount, p.nonce, pr.proof, latest.block_number + TX_TARGET_MARGIN, nowSeconds());
+      // minBlock: the SAME anti-reorg propagation delay every other flexibly-landing tx uses. A claim
+      // without it seeded the h67961 fork split (min_block: None, straight from this call site).
+      const tx = buildDividendWithdrawTx(state.wallet, state.wallet.address, p.amount, p.nonce, pr.proof, latest.block_number + TX_TARGET_MARGIN, nowSeconds(),
+        guardFrom(latest.block_number));
       const res = await submitTransaction(tx);
-      if (res.data && res.data.result) log("ok", i18("log.divCollected", "Dividend collected: +{a} NADO to your balance.", {a: rawToNado(BigInt(p.amount))}));
+      state._divClaimGate[p.nonce] = latest.block_number + TX_INCLUSION_DELAY * 2;
+      submitted++;
+      if (res.data && res.data.result) {
+        // the claim is what puts these coins in `balance`, so this is the moment auto-save learns they are
+        // earnings; if the claim never lands, maybeAutoBond's balance guard simply declines and re-accrues
+        state.autoBondDividend += BigInt(p.amount);
+        log("ok", i18("log.divCollected", "Dividend collected: +{a} NADO to your balance.", {a: rawToNado(BigInt(p.amount))}));
+      }
     } catch (e) { /* not claimable yet (unsettled) — retry next refresh */ }
   }
 }
@@ -757,16 +2267,207 @@ async function collectDividend() {
     const latest = await getLatestBlock();
     if (!latest) throw new RelayUnreachable("relay unavailable");
     const tx = buildBlobTx(state.wallet, { op: "collect_dividend" }, latest.block_number + TX_TARGET_MARGIN, MIN_TX_FEE, nowSeconds(),
-      latest.block_number + TX_INCLUSION_DELAY);   // propagation delay -> identical producer mempools (anti-reorg)
+      guardFrom(latest.block_number));   // propagation delay -> identical producer mempools (anti-reorg)
     const res = await submitTransaction(tx);
     if (res.data && res.data.result) {
       state._divInFlight = { accrued: (state._divAccruedNow || "0"), ts: Date.now() };
       log("ok", i18("div.collecting", "Dividend collection submitted — it lands in your balance automatically once the exec root is settled (a few minutes)."));
     }
     else log("err", i18("log.collectRejected", "Collect rejected: {m}", {m: (res.data && (res.data.message || ""))}));
-  } catch (e) { log("err", i18("log.collectFailed", "Collect failed: {m}", {m: e.message})); }
+  } catch (e) { log(isTransient(e) ? "warn" : "err", i18("log.collectFailed", "Collect failed: {m}", {m: e.message})); }
   finally { state._collecting = false; }
 }
+
+/* CASH OUT playable tokens (exec -> L1), from the WALLET.
+ *
+ * The Playable row has always shown the balance and its tooltip has always promised "cash out any time to
+ * get NADO back" — but the only cash-out control lived in the GAME pages (nadodapp.wireWallet's ⬇ Cash out
+ * slider). So a player who won, opened their wallet and looked, saw a number they could not act on, and had
+ * to guess that the way out was back through a game. Exactly the pending-unbond gap this file already fixed
+ * once: "an exit begun here could never be finished from here".
+ *
+ * Same op the SDK submits (`bridge_withdraw`, nadodapp.js:1105), so both paths stay one mechanism. The
+ * amount is asked for rather than assumed — cashing out everything by default would be a surprise for
+ * someone mid-session with a table still staked. Blank/short-hand "all" is offered as the default value. */
+async function cashOutExec() {
+  if (!state.wallet || state._cashingOut) return;
+  const btn = $("btnExecCashOut");
+  let bal = 0n;
+  try {
+    const b = await (await fetch(execBase() + "/exec/bridge?provisional=1", { cache: "no-store" })).json();
+    bal = BigInt((b.balances || {})[state.wallet.address] || 0);
+  } catch (e) { log("err", i18("exec.balUnreachable", "Exec node unreachable — can't read your playable balance right now.")); return; }
+  if (bal <= 0n) { log("err", i18("exec.nothingToCashOut", "Nothing to cash out — your playable balance is 0.")); return; }
+
+  const entered = await uiPrompt({
+    title: i18("exec.cashOutHow", "Cash out how much? (you have {a} NADO playable)", { a: rawToNado(bal) }),
+    value: rawToNado(bal),
+  });
+  if (entered == null) return;
+  let raw;
+  try { raw = nadoToRaw(String(entered).trim()); } catch (e) { raw = 0n; }
+  if (!raw || raw <= 0n) { log("err", i18("exec.badAmount", "Enter an amount to cash out.")); return; }
+  // Re-check against the balance we just read: the games spend from this same balance, so a stale number
+  // here would submit a withdraw the exec layer rejects.
+  if (raw > bal) { log("err", i18("exec.cashOutShort", "You only have {a} NADO playable.", { a: rawToNado(bal) })); return; }
+
+  const okc = await uiConfirm({
+    title: i18("exec.cashOutTitle", "Cash out playable tokens"),
+    body: i18("exec.cashOutBody", "Move {a} NADO from your playable (game) balance back to your L1 wallet. It lands automatically once the execution layer settles — usually well under a minute.", { a: rawToNado(raw) }),
+    confirmText: i18("exec.cashOutGo", "Cash out"),
+  });
+  if (!okc) return;
+
+  state._cashingOut = true;
+  if (btn) btn.disabled = true;
+  try {
+    const { res } = await submitResilient(async () => {
+      const latest = await getLatestBlock();
+      if (!latest) throw new RelayUnreachable("relay unavailable");
+      return buildBlobTx(state.wallet, { op: "bridge_withdraw", amount: raw }, latest.block_number + TX_TARGET_MARGIN,
+        MIN_TX_FEE, nowSeconds(), guardFrom(latest.block_number));
+    });
+    if (res && res.data && res.data.result)
+      log("ok", i18("exec.cashOutSent", "Cash-out submitted — {a} NADO returns to your wallet once it settles.", { a: rawToNado(raw) }));
+    else
+      log("err", i18("exec.cashOutRejected", "Cash-out rejected: {m}", { m: (res && res.data && (res.data.message || "")) || "" }));
+  } catch (e) { log("err", i18("exec.cashOutFailed", "Cash-out failed: {m}", { m: e.message })); }
+  finally { state._cashingOut = false; if (btn) btn.disabled = false; refreshCashOuts().catch(() => {}); }
+}
+
+/* ==== CASH-OUT CLAIM (exec -> L1, the second half) ====
+ *
+ * A cash-out blob only DEBITS the playable balance and records a withdrawal on the exec layer. The coins reach L1
+ * when an L1 `bridge_withdraw` tx proves that record against a SETTLED exec root (ops/transaction_ops.py, recipient
+ * "bridge_withdraw"). Nothing in the product ever built that tx: every cash-out from the wallet and from every game
+ * stopped halfway, and on 2026-10-10 four of them (10.06 NADO) sat debited and unpaid while the confirm dialog
+ * promised "it lands automatically". This finishes them: /exec/withdrawals lists this address's records with a proof
+ * once L1's settled root covers them, and each is claimed AUTOMATICALLY — from the wallet's poll, and from a game page
+ * through the background signer (resumePendingExecSign, call.bridge_claim). The claim is fee-exempt and must be
+ * self-claimed (sender == addr), so it can only ever pay this wallet: no confirm, nothing to decide.
+ *
+ * Landed = the record is GONE: the exec node drops it only when the claim FINALIZES on L1 (state.drop_claimed). That is
+ * the only moment this says "received" — a submit that returned ok is "confirming", never success. */
+const CASH_CLAIMS_PER_TICK = 4;
+
+// The L1 claim, field for field what construct_bridge_withdraw_tx builds (default namespace, so no `ns`), plus the
+// min_block propagation guard every flexibly-landing tx carries (bridge_withdraw lands flexibly — block_ops
+// _lands_flexibly; construct_bridge_withdraw_tx omits it, the only difference). amount is a BigInt so it rides as a
+// bare JSON integer of any size: validation asserts an int and the proof binds the exact value. INVARIANT: tests/test_bridge_claim_js_matches_node.py builds this in node and has L1's
+// validate_transaction accept it — change a field here and that test is what tells you.
+// how long a submitted claim is held before it may be re-sent — a local resend hold, NOT a landing guard (that is
+// guardFrom, on the tx itself)
+const CASH_RESEND_HOLD_BLOCKS = TX_INCLUSION_DELAY * 4;
+function buildBridgeClaimTx(wallet, addr, amount, nonce, proof, targetBlock, timestamp, minBlock) {
+  const draft = { sender: wallet.address, recipient: "bridge_withdraw", amount: 0, timestamp,
+    data: { addr, amount: BigInt(amount), nonce: String(nonce), proof }, nonce: randNonce(), public_key: wallet.publicKey,
+    max_block: targetBlock, chain_id: CHAIN_ID };
+  if (minBlock) draft.min_block = minBlock;
+  return finalizeTransaction(draft, wallet, 0);   // fee-exempt
+}
+
+/** this address's unclaimed cash-outs from the exec node, or null (unreachable / an exec node without the route) */
+async function fetchCashOuts(root) {
+  const q = "/exec/withdrawals?address=" + encodeURIComponent(state.wallet.address) + (root ? "&root=" + encodeURIComponent(root) : "");
+  try {
+    const r = await fetch(execBase() + q, { cache: "no-store" });
+    if (!r.ok) return null;
+    const d = await r.json();
+    return d && Array.isArray(d.pending) ? d : null;
+  } catch (e) { return null; }
+}
+
+/** blocks until the next settle is expected to cover a record made now (settle cadence minus how far into it we are,
+ *  plus the landing of the claim itself); a settle that is already overdue reads as the minimum, not a negative */
+function cashOutWaitBlocks(d) {
+  const every = Number(d && d.settle_every) || 30, cur = Number(d && d.cursor), sc = Number(d && d.settled_cursor);
+  const into = Number.isFinite(cur) && Number.isFinite(sc) && sc >= 0 ? Math.max(0, cur - sc) : 0;
+  return Math.max(0, every - into) + TX_INCLUSION_DELAY * 2;
+}
+
+/** Claim every provable, not-in-flight record in `d` (opts.only: one nonce). Each submitted nonce is held until its claim
+ *  has had time to land (the record stays listed until the claim FINALIZES, so without the gate every poll would
+ *  rebuild it with a fresh txid — the duplicate-claim bug the dividend and unbond claims both shipped once). Returns
+ *  {submitted, txid, err}. */
+async function claimCashOuts(d, opts = {}) {
+  const out = { submitted: 0, txid: "", err: "" };
+  if (!state.wallet || !d || !d.pending.length) return out;
+  if (state._cashClaiming) { out.err = "busy"; return out; }
+  state._cashClaiming = true;
+  try {
+    // the proof must be against the root L1 holds as SETTLED — the relay's answer is the one the claim is validated
+    // against, so it overrules the exec node's (6 s cached) hint; ask again against the relay's root if they differ
+    let settled = null;
+    try { settled = await (await fetch(relayBase() + "/get_settled", { cache: "no-store" })).json(); } catch (e) {}
+    const settledRoot = settled && settled.state_root;
+    if (!settledRoot) { out.err = "no settled root"; return out; }
+    if (d.pending.some((p) => p.proof && p.state_root !== settledRoot)) d = (await fetchCashOuts(settledRoot)) || d;
+    const latest = await getLatestBlock();
+    if (!latest) { out.err = "relay unavailable"; return out; }
+    if (!state._cashGate) state._cashGate = {};
+    for (const p of d.pending) {
+      if (out.submitted >= CASH_CLAIMS_PER_TICK) break;
+      if (opts.only && String(p.nonce) !== String(opts.only)) continue;
+      if (!p.proof || p.state_root !== settledRoot) { if (opts.only) out.err = "not settled yet"; continue; }
+      const g = state._cashGate[p.nonce];
+      if (g && latest.block_number < g.until) { if (opts.only) { out.txid = g.txid; out.submitted++; } continue; }   // already on its way
+      const { res, tx } = await submitResilient(async () => buildBridgeClaimTx(state.wallet, state.wallet.address, p.amount,
+        p.nonce, p.proof, latest.block_number + TX_TARGET_MARGIN, nowSeconds(), guardFrom(latest.block_number)));
+      if (res && res.data && res.data.result) {
+        state._cashGate[p.nonce] = { until: latest.block_number + CASH_RESEND_HOLD_BLOCKS, txid: tx.txid, amount: String(p.amount) };
+        out.submitted++; out.txid = tx.txid;
+      } else {
+        out.err = (res && res.data && res.data.message) || "rejected";
+      }
+    }
+  } finally { state._cashClaiming = false; }
+  if (out.err) state._cashLastErr = out.err; else if (out.submitted) state._cashLastErr = "";
+  return out;
+}
+
+async function refreshCashOuts() {
+  const panel = $("cashOutPanel");
+  if (!panel || !state.wallet) return;
+  const d = await fetchCashOuts();
+  if (!d) return;                                              // exec blip — leave the panel as it was
+  const pending = d.pending;
+  // LANDED: a nonce we claimed that the exec node no longer lists finalized on L1 — the first true "received"
+  const listed = new Set(pending.map((p) => String(p.nonce)));
+  for (const [n, g] of Object.entries(state._cashGate || {})) {
+    if (listed.has(String(n))) continue;
+    log("ok", i18("cash.received", "Cash-out received: +{a} NADO is in your spendable balance.", { a: rawToNado(BigInt(g.amount || 0)) }));
+    delete state._cashGate[n];
+  }
+  panel.classList.toggle("hidden", !pending.length);
+  if (!pending.length) return;
+  let total = 0n; for (const p of pending) total += BigInt(p.amount || 0);
+  $("cashOutAmt").textContent = rawToNado(total) + " NADO";
+  if (pending.some((p) => p.proof)) await claimCashOuts(d).catch(() => {});
+  const tip = Number(state.latest) || 0;
+  const inflight = pending.filter((p) => { const g = (state._cashGate || {})[p.nonce]; return g && tip < g.until; });
+  const ready = pending.filter((p) => p.proof && !inflight.includes(p));
+  const btn = $("btnClaimCashOut");
+  let line;
+  if (inflight.length) line = i18("cash.confirming", "Claim sent — confirming in a block. It shows in your balance as soon as it lands.");
+  else if (ready.length) line = state._cashLastErr
+    ? i18("cash.retrying", "Claim not accepted yet ({m}) — retrying automatically.", { m: state._cashLastErr })
+    : i18("cash.ready", "Settled — moving it to your spendable balance now.");
+  else line = i18("cash.waiting", "Waiting for the next settlement (~{t}). It then moves to your spendable balance automatically.",
+    { t: blocksToEta(cashOutWaitBlocks(d)) });
+  $("cashOutWhen").textContent = line;
+  if (btn) {
+    btn.classList.toggle("hidden", !(ready.length && !inflight.length));
+    btn.disabled = !!state._cashClaiming;
+    btn.onclick = async () => {
+      btn.disabled = true;
+      const fresh = await fetchCashOuts();
+      const r = fresh ? await claimCashOuts(fresh, { manual: true }) : { err: "exec node unreachable" };
+      if (r.err && !r.submitted) log("err", i18("cash.claimFailed", "Claim failed: {m}", { m: r.err }));
+      refreshCashOuts().catch(() => {});
+    };
+  }
+}
+/* ==== end CASH-OUT CLAIM ==== */
 
 // A relay that is momentarily unreachable — a fetch reject (offline/DNS/TLS), a request timeout, an
 // HTTP 5xx/429, or a non-JSON body (a proxy 502 HTML page). This is EXPECTED and transient: the node
@@ -775,7 +2476,15 @@ async function collectDividend() {
 class RelayUnreachable extends Error {
   constructor(msg) { super(msg); this.name = "RelayUnreachable"; this.transient = true; }
 }
-function isTransient(e) { return !!(e && e.transient); }
+// Transient = the relay is momentarily unreachable, NOT a registration failure. fetchWithTimeout tags its errors, but
+// the registration path also uses bare fetch(): a node restart there surfaced as "Registration error: Failed to fetch"
+// (2026-09-07 13:09, during an update wave). Browsers spell that TypeError three ways — match all of them.
+function isTransient(e) {
+  if (!e) return false;
+  if (e.transient) return true;
+  const m = String(e.message || e);
+  return e.name === "TypeError" && /failed to fetch|networkerror|load failed|network request failed/i.test(m);
+}
 
 async function fetchWithTimeout(url, opts, ms) {
   const ctrl = new AbortController();
@@ -798,6 +2507,7 @@ async function rpcJSON(path, { timeout = 12000, retry = true } = {}) {
   const url = relayBase() + path;
   let lastTransient;
   for (let attempt = 0; attempt <= (retry ? 1 : 0); attempt++) {
+    const t0 = Date.now();
     try {
       const res = await fetchWithTimeout(url, { method: "GET", cache: "no-store" }, timeout);
       const text = await res.text();
@@ -806,30 +2516,152 @@ async function rpcJSON(path, { timeout = 12000, retry = true } = {}) {
       // A 5xx/429, or a 200 whose body isn't JSON, is a proxy/relay blip — retry rather than trust it.
       if (res.status >= 500 || res.status === 429 || !parsed) {
         lastTransient = new RelayUnreachable("relay returned HTTP " + res.status);
+        lastTransient.status = res.status;
         continue;
       }
+      relayNoteSuccess(Date.now() - t0);
       return { ok: res.ok, status: res.status, data };
     } catch (e) {
       if (!isTransient(e)) throw e;      // a real bug in our code, not a reachability blip
       lastTransient = e;
     }
   }
+  // A rate limit means THIS wallet is asking too often — switching relays to dodge it would be exactly the
+  // wrong lesson, so it never counts toward failover. Everything else (timeouts, 5xx, HTML error pages) does.
+  // Likewise a 4xx with an HTML body (an older node without the endpoint we asked for) is a missing
+  // feature, not a dead relay. Only unreachable/timeout (no status) and 5xx count.
+  if (!(lastTransient && lastTransient.status != null && lastTransient.status < 500)) relayNoteFailure();
   throw lastTransient || new RelayUnreachable("relay unreachable");
 }
 
 // The latest block, or null when the relay is momentarily unreachable (never throws for a blip, so the
 // poll loop just shows "disconnected" and retries next tick instead of logging an error).
+// EXEC-NODE JSON, with rpcJSON's contract. nado-exec is a SEPARATE service, so it restarts, 502s and
+// goes away independently of the relay — and every shielded-pool call reached it as a bare
+// `(await fetch(...)).json()`. On an HTML error page (a restart, a proxy 502, an outage) `.json()` throws
+// a SyntaxError, and the caller's catch printed its raw text:
+//
+//     Shielded-pool error: Unexpected token '<', "<!DOCTYPE "... is not valid JSON
+//
+// which names neither the service that is down nor whether it is worth retrying. rpcJSON has handled
+// exactly this for the relay all along; the exec node simply had no equivalent.
+async function execJSON(path, { base = null, method = "GET", body = null, timeout = 15000 } = {}) {
+  const url = (base || execBase()) + path;
+  const opts = method === "GET"
+    ? { method, cache: "no-store" }
+    : { method, cache: "no-store", headers: { "Content-Type": "application/json" }, body };
+  let res;
+  try {
+    res = await fetchWithTimeout(url, opts, timeout);        // already throws RelayUnreachable on network/timeout
+  } catch (e) {
+    throw new RelayUnreachable(i18("exec.unreachable",
+      "the exec node is unreachable right now — try again in a moment"));
+  }
+  const text = await res.text();
+  try { return JSON.parse(text); }
+  catch {
+    throw new RelayUnreachable(i18("exec.notJson",
+      "the exec node returned no data (HTTP {s}) — it may be restarting; try again in a moment",
+      { s: res.status || "?" }));
+  }
+}
+
+/* WALLET VIEW — one round trip per poll tick (2026-09-06). Every tick used to fan out into six relay calls
+ * (get_latest_block, get_account ×2, mining_status, get_unbond, get_account_mempool); with ~100 open wallets
+ * that was ~110 req/s and the relay's largest remaining cost was per-request overhead, not the reads.
+ * pollOnce fetches /wallet_view once and the getters below answer from it while it is fresh (VIEW_FRESH_MS).
+ * A relay without the route (404) marks it unsupported for a while and the getters fall back to their own
+ * endpoints, so an old node keeps working exactly as before. Never cache across addresses. */
+const VIEW_FRESH_MS = 4000;
+const VIEW_UNSUPPORTED_MS = 10 * 60 * 1000;
+const walletView = { at: 0, addr: null, data: null, unsupportedAt: 0 };
+async function fetchWalletView(addr) {
+  if (Date.now() - walletView.unsupportedAt < VIEW_UNSUPPORTED_MS) return null;
+  try {
+    const r = await rpcJSON("/wallet_view?address=" + encodeURIComponent(addr) + "&since=" + msgCursor(), { retry: false });
+    if (r.status === 404) { walletView.unsupportedAt = Date.now(); return null; }
+    if (!r.ok || !r.data || typeof r.data !== "object" || !r.data.latest) return null;
+    walletView.at = Date.now(); walletView.addr = addr; walletView.data = r.data;
+    return r.data;
+  } catch (e) { if (isTransient(e)) return null; throw e; }
+}
+/* AN OPEN WALLET FOLLOWS THE BUILD IT IS SERVED FROM (2026-09-22). Nothing reloaded a tab when its relay
+ * moved to a new commit, so a validator who left the wallet open for days kept running the old duty code
+ * long after the fix that mattered to them shipped — every wallet fix this month reached external users
+ * only on their next manual reload. Once a minute the page asks its OWN origin (the node that served this
+ * file, so its commit and this file move together) which commit it runs. The first answer after load is
+ * the baseline; a commit never seen in this browser session means a new build is live, and the page
+ * reloads at the next idle moment: no modal open, no field focused, nothing in flight. The seen-set in
+ * sessionStorage is what stops a reload loop if the served file ever lags the reported commit. */
+const BUILD_CHECK_MS = 60000;
+let _bootCommit = null, _reloadArmed = false;
+function _seenBuilds() { try { return JSON.parse(sessionStorage.getItem("nado_builds_seen") || "[]"); } catch (e) { return []; } }
+function _rememberBuild(c) { try { const s = _seenBuilds(); if (!s.includes(c)) { s.push(c); sessionStorage.setItem("nado_builds_seen", JSON.stringify(s.slice(-8))); } } catch (e) {} }
+function noteBuild(commit) {
+  if (!commit || typeof commit !== "string") return false;
+  if (_bootCommit === null) { _bootCommit = commit; _rememberBuild(commit); return false; }
+  if (commit === _bootCommit || _reloadArmed || _seenBuilds().includes(commit)) return false;
+  _rememberBuild(commit);
+  _reloadArmed = true;
+  log("info", i18("log.newBuild", "A new wallet build is live — this page will reload when idle."));
+  reloadWhenIdle();
+  return true;
+}
+function walletIdle() {
+  const el = document.activeElement;
+  const typing = !!(el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable));
+  const modal = !!(_modalEl && !_modalEl.classList.contains("hidden"));
+  return !typing && !modal && !_randaoBusy && !state._collecting && !state._cashingOut
+    && !state.registering && !state.pendingRegisterTx && !state.autoBondPending;
+}
+function reloadWhenIdle() {
+  if (walletIdle()) { location.reload(); return; }
+  setTimeout(reloadWhenIdle, 5000);
+}
+function staleChainMsg(other) {
+  return i18("net.staleTab", "This page was loaded for {a}, and the network is now {b}. Nothing was sent: reload the page (it reloads by itself when idle).", { a: PAGE_CHAIN, b: other });
+}
+// the current relay's chain (refreshNetIdentity, adoptRelay): true when it is this page's; otherwise the page goes stale
+// once, says so, and reloads when idle IF its own origin now serves the other chain (a reload then brings the matching
+// code; when only a chosen relay is elsewhere, reloading would change nothing). Back on PAGE_CHAIN clears it.
+function relayOnPageChain(cid) {
+  if (cid === PAGE_CHAIN) { staleChain = ""; return true; }
+  if (staleChain !== cid) {
+    staleChain = cid;
+    log("err", staleChainMsg(cid));
+    if (/^https?:/.test(location.protocol)) {
+      fetch(location.origin + "/status", { cache: "no-store" }).then((r) => r.json()).then((st) => {
+        if (st && typeof st.chain_id === "string" && st.chain_id && st.chain_id !== PAGE_CHAIN && !_reloadArmed) { _reloadArmed = true; reloadWhenIdle(); }
+      }).catch(() => {});
+    }
+  }
+  return false;
+}
+async function checkBuild() {
+  if (!/^https?:/.test(location.protocol)) return;
+  try {
+    const st = await (await fetch(location.origin + "/status", { cache: "no-store" })).json();
+    noteBuild(st && st.running_commit);
+  } catch (e) { /* origin unreachable for a moment — next minute */ }
+}
+function viewFresh(addr) {
+  const v = walletView;
+  return (v.data && Date.now() - v.at < VIEW_FRESH_MS && (!addr || v.addr === addr)) ? v.data : null;
+}
 async function getLatestBlock() {
+  const v = viewFresh(null); if (v && v.latest) return v.latest;
   try { return (await rpcJSON("/get_latest_block")).data; }
   catch (e) { if (isTransient(e)) return null; throw e; }
 }
 async function getAccount(address) {
+  const v = viewFresh(address); if (v && "account" in v && !v.account_error) return v.account;
   try {
     const r = await rpcJSON("/get_account?address=" + encodeURIComponent(address));
     return r.ok ? r.data : null;
   } catch (e) { if (isTransient(e)) return null; throw e; }   // relay blip -> unknown, not an error
 }
 async function getMiningStatus(address) {
+  const v = viewFresh(address); if (v && v.mining_status) return v.mining_status;
   try {
     const r = await rpcJSON("/mining_status?address=" + encodeURIComponent(address));
     return r.ok ? r.data : null;
@@ -838,7 +2670,49 @@ async function getMiningStatus(address) {
 
 /* Submit a transaction. A post-quantum (ML-DSA-44) tx is ~7.8 KB — far past a URL's safe length —
  * so we POST the canonical JSON body (BigInt-safe; the node json.loads() it back to the identical dict). */
+// OUTBOX: every transaction this wallet was told "accepted" for is remembered until it is MINED or past
+// its max_block, and re-broadcast meanwhile. A relay that restarts (its mempool is not durable) or
+// simply drops a tx can no longer make it vanish after saying yes — inclusion is verified, not assumed.
+const LS_OUTBOX = "nado_outbox";
+const outboxLoad = () => { try { return JSON.parse(localStorage.getItem(LS_OUTBOX) || "[]"); } catch (e) { return []; } };
+const outboxSave = (a) => { try { localStorage.setItem(LS_OUTBOX, JSON.stringify(a.slice(-20))); } catch (e) {} };
+function outboxAdd(tx) {
+  if (!tx || !tx.txid) return;
+  const a = outboxLoad().filter((e) => e.txid !== tx.txid);
+  a.push({ txid: tx.txid, max_block: Number(tx.max_block || 0), tx, at: Date.now(), tries: 0 });
+  outboxSave(a);
+}
+async function outboxTick(latest) {
+  const a = outboxLoad(); if (!a.length) return;
+  const keep = [];
+  for (const e of a) {
+    try {
+      const r = await fetch(relayBase() + "/get_transaction?txid=" + encodeURIComponent(e.txid), { cache: "no-store" });
+      if (r.ok) continue;                                                     // mined — done
+      if (e.max_block && latest > e.max_block) {                              // window closed, never mined
+        log("err", i18("outbox.expired", "Transaction {t}… was accepted but never included before its target block — it did not happen; send it again.", { t: e.txid.slice(0, 12) }));
+        continue;
+      }
+      if (Date.now() - (e.last || e.at) > 45000) {                            // still in its window: re-broadcast (idempotent)
+        e.last = Date.now(); e.tries = (e.tries || 0) + 1;
+        try { await _submitTransactionRaw(e.tx); } catch (x) {}
+      }
+    } catch (x) {}
+    keep.push(e);
+  }
+  outboxSave(keep);
+}
 async function submitTransaction(tx) {
+  const out = await _submitTransactionRaw(tx);
+  if (out && out.data && out.data.result) outboxAdd(tx);
+  return out;
+}
+async function _submitTransactionRaw(tx) {
+  // THE ONE SUBMIT PATH refuses for a stale tab (see PAGE_CHAIN): nothing signed under this page's rules reaches a chain
+  // whose rules differ, whatever built it
+  if (staleChain || (tx && tx.chain_id !== undefined && tx.chain_id !== PAGE_CHAIN)) {
+    return { ok: false, status: 0, data: { result: false, message: staleChainMsg(staleChain || String(tx.chain_id)) } };
+  }
   const payload = canonicalize(tx);
   // POST the canonical JSON body — the only submit path (a PQ tx is far too large for a GET URL).
   const res = await fetch(relayBase() + "/submit_transaction", {
@@ -861,7 +2735,7 @@ async function submitTransaction(tx) {
  * UI helpers
  * -------------------------------------------------------------------------------------------- */
 const $ = (id) => document.getElementById(id);
-const show = (id, on = true) => $(id).classList.toggle("hidden", !on);
+const show = (id, on = true) => { const el = $(id); if (el) el.classList.toggle("hidden", !on); };
 
 function log(kind, msg) {
   const el = $("log");
@@ -871,7 +2745,7 @@ function log(kind, msg) {
   line.innerHTML = `<span class="t">${t}</span> <span class="${kind}">${escapeHtml(msg)}</span>`;
   el.appendChild(line);
   el.scrollTop = el.scrollHeight;
-  show("logCard", true);
+  if (state.wallet) show("logCard", true);              // the activity log is part of the wallet, not of onboarding
 }
 function escapeHtml(s) {
   return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -904,8 +2778,30 @@ function rawToNado(raw) {
   const frac = (raw % DENOMINATION).toString().padStart(10, "0").replace(/0+$/, "");
   return (neg ? "-" : "") + whole.toString() + (frac ? "." + frac : "");
 }
+// DECIMAL SEPARATOR: accept BOTH "." and ",". Most of Europe types "0,5" — on a phone that is not even a
+// choice, because iOS/Android render the decimal key from the DEVICE LOCALE, so a European keyboard offers
+// a comma and no dot at all. This function used to reject that outright ("invalid amount"), which made the
+// wallet unusable for depositing/sending from those phones. The dApp SDK (nadodapp.js nadoToRaw) already
+// accepted commas; the wallet did not, so the two disagreed.
+//
+// The ambiguous case is a group separator: "1,000" could be one thousand (EU grouping) or 1.0 (comma as
+// decimal). The rule here, in order:
+//   * spaces / NBSP / apostrophes are ALWAYS grouping — stripped.
+//   * if BOTH separators appear, the LAST one is the decimal and the other is grouping ("1.234,56", "1,234.56").
+//   * if only ONE appears, it is the DECIMAL separator ("1,5" -> 1.5, "1,000" -> 1.0).
+// The last rule is deliberate: reading a lone separator as decimal can only UNDER-state an amount, while
+// reading it as grouping could silently send a thousand times more than the user meant. Under-sending is an
+// annoyance; over-sending is a loss. This also matches the SDK, so both paths agree on every input.
 function nadoToRaw(amountStr) {
-  const m = String(amountStr).trim().match(/^(\d+)(?:\.(\d{1,10}))?$/);
+  let s = String(amountStr).trim().replace(/[\s  ']/g, "");
+  const lastDot = s.lastIndexOf("."), lastCom = s.lastIndexOf(",");
+  if (lastDot >= 0 && lastCom >= 0) {
+    const dec = Math.max(lastDot, lastCom);
+    s = s.slice(0, dec).replace(/[.,]/g, "") + "." + s.slice(dec + 1);
+  } else {
+    s = s.replace(",", ".");
+  }
+  const m = s.match(/^(\d+)(?:\.(\d{1,10}))?$/);
   if (!m) throw new Error("invalid amount");
   const whole = BigInt(m[1]);
   const frac = BigInt((m[2] || "").padEnd(10, "0"));
@@ -913,13 +2809,18 @@ function nadoToRaw(amountStr) {
 }
 
 // Estimate the bonded ("savings") lane APY from recent on-chain performance, plus the presence dividend.
-// Reward model (protocol.py): a bonded block pays the producer 70% (dividend 20%, treasury 10%); an open block
+// Reward model (protocol.py): a bonded block pays the producer 50% (dividend 40%, treasury 10%); an open block
 // pays the producer 20% (dividend 70%, treasury 10%). The bonded lane mints (epoch_length - k_open)/epoch_length
-// of blocks (~80%). Bonded rewards are shared across all bonded shares (B_MIN = 1,000 NADO each), so the APY on
+// of blocks (70%). Bonded rewards are shared across the lane's producing weight (curved shares of B_MIN = 10 NADO), so the APY on
 // staked capital ≈ (annual bonded producer reward ÷ total bonded shares) ÷ B_MIN. The dividend is paid to
 // PRESENT open-lane miners (not to stake), so it's shown separately as a capital-free bonus.
-const B_MIN_RAW = 100_000_000_000n;        // protocol.py B_MIN: 10 NADO per bonded selection share — MUST track the node
-const BASE_SUBSIDY_RAW = 1_000_000_000n;   // protocol.py: 0.1 NADO/block reward floor
+const B_MIN_RAW = BigInt(P.B_MIN);         // protocol.B_MIN: 10 NADO per bonded selection share
+const BASE_SUBSIDY_RAW = BigInt(P.BASE_SUBSIDY);   // protocol.BASE_SUBSIDY: 0.1 NADO/block, the max emission per block
+// FIDELITY_CAP (imported): continuous recerts to fully ramp the open bonus.
+let FIDELITY_MIN_GAP_EPOCHS = P.FIDELITY_MIN_GAP_EPOCHS;   // a recert earns +1 only this far after the previous one (adopted from /status)
+// Reward split per lane (protocol.py, basis points) — shown on the Selection lanes card: TREASURY_BPS (every block's
+// treasury cut), OPEN_TIP_BPS (open-lane producer's tip; the rest minus treasury is the presence pot) and
+// BONDED_DIVIDEND_BPS (savings-lane slice into the presence pot) are imported from /protocol.js above.
 async function estimateSavingsApy() {
   const box = $("apyResult");
   if (!box) return;
@@ -932,7 +2833,7 @@ async function estimateSavingsApy() {
     const tip = (await rpcJSON("/get_latest_block")).data || {};
     const n = num(tip.block_number);
     const nums = []; for (let i = 0; i < 30 && n - i > 0; i++) nums.push(n - i);
-    const blks = await Promise.all(nums.map((x) => rpcJSON("/get_block_number?number=" + x).then((r) => r.data).catch(() => null)));
+    const blks = await Promise.all(nums.map((x) => rpcJSON("/get_block?number=" + x).then((r) => r.data).catch(() => null)));
     const rewards = blks.filter(Boolean).map((b) => { try { return BigInt(b.block_reward || 0); } catch { return 0n; } }).filter((r) => r > 0n);
     const avgReward = rewards.length ? Number(rewards.reduce((a, b) => a + b, 0n) / BigInt(rewards.length)) : Number(BASE_SUBSIDY_RAW);
     const blockTime = num(ms.block_time) || state.blockTime || 8;
@@ -955,7 +2856,9 @@ async function estimateSavingsApy() {
 
     let head;
     if (effTotal > 0) {
-      const perShareYearRaw = (avgReward * bondedBlocksYear * 0.70) / effTotal;   // raw/yr per bonded share
+      // producer keeps what is left after the dividend slice and the treasury: 50 % (was hard-coded 0.70 until 2026-09-08)
+      const producerFrac = (10000 - TREASURY_BPS - BONDED_DIVIDEND_BPS) / 10000;
+      const perShareYearRaw = (avgReward * bondedBlocksYear * producerFrac) / effTotal;   // raw/yr per bonded share
       const apy = (perShareYearRaw / Number(B_MIN_RAW)) * 100;
       const shown = apy >= 1000 ? Math.round(apy).toLocaleString() : apy.toFixed(1);
       head = `<b class="ok">${shown}% ${i18("apy.savings", "APY on bonded stake")}</b>`
@@ -969,9 +2872,98 @@ async function estimateSavingsApy() {
     const divNado = rawToNado(BigInt(Math.max(0, Math.round(annualDivRaw / openMiners))));
     box.innerHTML = head
       + `<span class="faint"> · ${i18("apy.from", "from the last {n} blocks", { n: rewards.length })}</span>`
-      + `<div class="faint mt">${i18("apy.divNote", "+ presence dividend ≈ {a} NADO/yr per present open-lane miner (a capital-free bonus if you also mine the open lane).", { a: divNado })}</div>`;
+      + `<div class="faint mt">${i18("apy.divNote", "+ presence dividend ≈ {a} NADO/yr per present open-lane collector (a capital-free bonus if you also collect from the open lane).", { a: divNado })}</div>`;
   } catch (e) {
     box.innerHTML = `<span class="warn">${i18("apy.err", "Couldn't estimate APY:")} ${escapeHtml(e.message)}</span>`;
+  }
+}
+
+/* EARNING PER DAY — ONE figure for everything the identity earns, on the Collecting card (#minePerDay): collecting
+ * (open-lane block rewards), the dividend, and savings (bonded-lane production). The savings tile no longer shows its own
+ * per-day figure, so the same money is never shown twice. Pure, so tests/test_collect_per_day.mjs can lift it.
+ * Raw units in, raw units out (1 NADO = 10^10 raw); a part the identity does not earn is null; null overall when it
+ * earns none (not present and not producing).
+ *   blocks   = 86400 / blockTime × kOpen / epochLength × myOpenWeight / totalOpenWeight × avgReward × tipBps / 10000
+ *   dividend = mean(inflows) × 86400 / (blockTime × epochLength) × myWeight / sumWeights
+ *   savings  = 86400 / blockTime × (epochLength − kOpen) / epochLength × myBondedShares / totalBondedShares × bondedCut
+ * Each lane uses its OWN share (never the combined expected time between wins, which would count a collector-saver twice).
+ * The committed weights are ×10 since block 107000 (REFERRAL_SCALE); only the ratio is used, so that cancels. */
+function collectPerDay(inp) {
+  if (!inp || (!inp.present && !inp.bondedProducing)) return null;
+  const bt = Number(inp.blockTime) || 0, el = Number(inp.epochLength) || 0;
+  if (bt <= 0 || el <= 0) return null;
+  const share = (a, b) => (Number(b) > 0 ? Number(a) / Number(b) : 0);
+  const blocksPerDay = 86400 / bt;
+  let blocks = null, dividend = null, savings = null;
+  if (inp.present) {
+    blocks = blocksPerDay * (Number(inp.kOpen) / el) * share(inp.myOpenWeight, inp.totalOpenWeight)
+      * Number(inp.avgRewardRaw) * Number(inp.tipBps) / 10000;
+    const inflows = (inp.inflowsRaw || []).map(Number).filter((x) => Number.isFinite(x));
+    const meanInflow = inflows.length ? inflows.reduce((x, y) => x + y, 0) / inflows.length : 0;
+    dividend = meanInflow * (86400 / (bt * el)) * share(inp.myWeight, inp.sumWeights);
+  }
+  if (inp.bondedProducing) {
+    savings = blocksPerDay * ((el - Number(inp.kOpen)) / el) * share(inp.myBondedShares, inp.totalBondedShares)
+      * Number(inp.bondedCutRaw);
+  }
+  return { blocks, dividend, savings, total: (blocks || 0) + (dividend || 0) + (savings || 0) };
+}
+const fmtPerDay = (raw) => { const x = Number(raw) / 1e10; return x >= 1 ? x.toFixed(2) : x.toFixed(4); };   // as renderDelegationLine
+
+const _perDayCache = { reward: null, rewardAt: 0, weightsEpoch: null, weights: null, inflows: {} };
+async function refreshCollectPerDay(ms) {
+  const val = $("minePerDay"), split = $("minePerDaySplit");
+  if (!val) return;
+  const addr = state.wallet && state.wallet.address;
+  if (!ms || (!ms.registered_present && !ms.bonded_producing) || !addr) { val.textContent = "—"; if (split) split.textContent = ""; return; }
+  try {
+    // average block_reward of recent blocks, as estimateSavingsApy does — refetched at most every 5 minutes
+    if (_perDayCache.reward == null || Date.now() - _perDayCache.rewardAt > 300000) {
+      const tip = (await rpcJSON("/get_latest_block")).data || {};
+      const n = num(tip.block_number), nums = [];
+      for (let i = 0; i < 30 && n - i > 0; i++) nums.push(n - i);
+      const blks = await Promise.all(nums.map((x) => rpcJSON("/get_block?number=" + x).then((r) => r.data).catch(() => null)));
+      const rewards = blks.filter(Boolean).map((b) => { try { return BigInt(b.block_reward || 0); } catch { return 0n; } }).filter((r) => r > 0n);
+      _perDayCache.reward = rewards.length ? Number(rewards.reduce((a, b) => a + b, 0n) / BigInt(rewards.length)) : Number(BASE_SUBSIDY_RAW);
+      _perDayCache.rewardAt = Date.now();
+    }
+    // the latest COMMITTED epoch's weights (the first block of epoch ms.epoch commits epoch ms.epoch - 1), once per epoch
+    const E = num(ms.epoch) - 1;
+    if (_perDayCache.weightsEpoch !== E) {
+      const w = (await rpcJSON("/get_open_weights?epoch=" + E)).data || {};
+      _perDayCache.weights = w.weights || {};
+      _perDayCache.weightsEpoch = E;
+    }
+    const weights = _perDayCache.weights;
+    const sumW = Object.values(weights).reduce((a, b) => a + Number(b || 0), 0);
+    // mean dividend inflow over the last few committed epochs (each epoch fetched once)
+    const eps = [E, E - 1, E - 2, E - 3].filter((e) => e >= 0);
+    for (const e of eps) {
+      if (_perDayCache.inflows[e] === undefined) {
+        const d = (await rpcJSON("/get_dividend_inflow?epoch=" + e)).data || {};
+        _perDayCache.inflows[e] = d.inflow != null ? Number(d.inflow) : null;
+      }
+    }
+    const r = collectPerDay({
+      present: !!ms.registered_present, bondedProducing: !!ms.bonded_producing,
+      myBondedShares: num(ms.my_bonded_shares), totalBondedShares: num(ms.total_bonded_shares), bondedCutRaw: num(ms.bonded_producer_cut),
+      blockTime: num(ms.block_time) || state.blockTime, epochLength: num(ms.epoch_length) || EPOCH_LENGTH,
+      kOpen: num(ms.k_open), myOpenWeight: num(ms.my_open_weight), totalOpenWeight: num(ms.total_open_weight),
+      avgRewardRaw: _perDayCache.reward, tipBps: OPEN_TIP_BPS,
+      inflowsRaw: eps.map((e) => _perDayCache.inflows[e]).filter((x) => x != null),
+      myWeight: Number(weights[addr] || 0), sumWeights: sumW,
+    });
+    if (!r) { val.textContent = "—"; if (split) split.textContent = ""; return; }
+    val.textContent = i18("mine.perDayValue", "≈ {x} NADO/day", { x: fmtPerDay(r.total) });
+    if (split) {
+      const parts = [];
+      if (r.blocks != null) parts.push(i18("mine.earnCollect", "collecting {x}", { x: fmtPerDay(r.blocks) }));
+      if (r.dividend != null) parts.push(i18("mine.earnDividend", "dividend {x}", { x: fmtPerDay(r.dividend) }));
+      if (r.savings != null) parts.push(i18("mine.earnSavings", "savings {x}", { x: fmtPerDay(r.savings) }));
+      split.textContent = parts.join(" · ");
+    }
+  } catch (e) {
+    val.textContent = "—"; if (split) split.textContent = "";
   }
 }
 
@@ -979,23 +2971,109 @@ async function estimateSavingsApy() {
  * Wallet persistence
  * -------------------------------------------------------------------------------------------- */
 const LS_WALLET = "nado_miner_wallet";
+// A wallet the page created on first visit, without the save ceremony (boot()). The landing note stays
+// until the owner has SEEN a backup — opened Reveal / export or downloaded the key file — never on a timer.
+const LS_AUTO_WALLET = "nado_auto_wallet";
+const LS_BACKUP_DONE = "nado_backup_seen";
 const LS_RELAY = "nado_miner_relay";
 const LS_AUTOBOND = "nado_autobond_pct";   // persisted auto-bond percentage (0..100)
+const LS_THEME = "nado_theme";              // persisted accent theme id ("" / "teal" = the default)
+
+/* THEMES. Each entry is only an accent pair; surfaces, text and borders are shared with the base theme,
+ * so a theme cannot change any contrast ratio the interface was designed against. The swatch previews the
+ * exact gradient the buttons will use, which is why the picker renders the colours rather than naming
+ * them — "ocean" means nothing until you see it, and the label would need translating in 16 languages to
+ * say less than the circle does. */
+const THEMES = [
+  { id: "teal",   a: "#00ad93", b: "#00c9a7", bg: "#0b0f14" },   // the default — no data-theme attribute
+  { id: "aqua",   a: "#40e0d0", b: "#7ceee3", bg: "#06120f" },
+  { id: "toxic",   a: "#39ff14", b: "#7cff5a", bg: "#060806" },
+  { id: "hazard",  a: "#ffe600", b: "#fff45c", bg: "#0a0800" },
+  { id: "alarm",   a: "#ff1f1f", b: "#ff6161", bg: "#0a0303" },
+  { id: "violet",  a: "#7c5cff", b: "#a78bfa", bg: "#0d0a16" },
+  { id: "ocean",   a: "#2f81f7", b: "#58a6ff", bg: "#080f18" },
+  { id: "ember",   a: "#f0883e", b: "#ffab70", bg: "#150d08" },
+  { id: "rose",    a: "#db61a2", b: "#f778ba", bg: "#150a11" },
+  { id: "forest",  a: "#3fb950", b: "#56d364", bg: "#08120b" },
+  { id: "gold",    a: "#d29922", b: "#e3b341", bg: "#121006" },
+];
+
+/* Apply a theme id. Unknown/absent -> the default teal, which carries NO data-theme attribute so the
+ * :root block stays authoritative and a stale stored value can never leave the interface half-styled. */
+/* THEMED FAVICON. The SVG favicon renders in its OWN document, so it cannot see the page's CSS variables
+ * — the inlined header logo follows the theme and the tab icon would stay brand teal beside it. Swapping
+ * the <link href> for a data: URI with the ramp baked in is the only way to move it, and it is cheap: the
+ * mark is already five var(--logo-N) fills, so this substitutes the same ramp the stylesheet uses.
+ * Best-effort — a browser that ignores SVG favicons simply keeps favicon.ico, which is the fallback the
+ * page already ships for exactly that case. */
+let _faviconSrc = null;
+async function applyThemedFavicon(id) {
+  try {
+    const link = document.querySelector('link[rel="icon"][type="image/svg+xml"]');
+    if (!link) return;
+    if (_faviconSrc == null) {
+      const r = await fetch("/static/logo.svg", { cache: "force-cache" });
+      _faviconSrc = await r.text();
+    }
+    // read the ramp the CSS resolved for this theme, so the tab icon and the header mark cannot disagree
+    const cs = getComputedStyle(document.documentElement);
+    let svg = _faviconSrc;
+    for (let i = 1; i <= 5; i++) {
+      const c = cs.getPropertyValue(`--logo-${i}`).trim();
+      if (c) svg = svg.replace(new RegExp(`var\\(--logo-${i},\\s*(#[0-9a-fA-F]{6})\\)`, "g"), c);
+    }
+    link.href = "data:image/svg+xml," + encodeURIComponent(svg);
+  } catch (e) { /* keep the shipped icon */ }
+}
+
+function applyTheme(id) {
+  const t = THEMES.find((x) => x.id === id) || THEMES[0];
+  if (t.id === "teal") document.documentElement.removeAttribute("data-theme");
+  else document.documentElement.setAttribute("data-theme", t.id);
+  try { localStorage.setItem(LS_THEME, t.id); } catch (e) {}
+  const grid = document.getElementById("themeGrid");
+  if (grid) for (const b of grid.children) b.setAttribute("aria-pressed", String(b.dataset.theme === t.id));
+  applyThemedFavicon(t.id);   // after the attribute, so getComputedStyle reads the NEW ramp
+  return t.id;
+}
+
+/* Build the picker once. Each swatch IS its theme's button gradient, so choosing is visual. */
+function renderThemePicker() {
+  const grid = document.getElementById("themeGrid");
+  if (!grid || grid.children.length) return;
+  const cur = (() => { try { return localStorage.getItem(LS_THEME) || "teal"; } catch (e) { return "teal"; } })();
+  for (const t of THEMES) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "themedot";
+    b.dataset.theme = t.id;
+    // Preview the WHOLE palette, not just the button: the accent gradient sits on the theme's own page
+    // ground, so a swatch shows both the colour you get and the surface it will sit on.
+    b.style.background = `linear-gradient(135deg, ${t.a} 0%, ${t.b} 45%, ${t.bg} 46%, ${t.bg} 100%)`;
+    b.title = t.id;
+    b.setAttribute("aria-label", t.id);
+    b.setAttribute("aria-pressed", String(t.id === cur));
+    b.onclick = () => applyTheme(t.id);
+    grid.appendChild(b);
+  }
+}
 const LS_MINING = "nado_mining";           // "1" while mining, so a browser refresh auto-resumes (no re-click)
-const AUTO_BOND_DEFAULT_PCT = 80;          // default when the user has never set one (matches protocol.AUTO_BOND_DEFAULT_PERCENT)
+// The default when the user has never set one: protocol.AUTO_BOND_DEFAULT_PERCENT (99). This literal sat at 80 while
+// protocol.py had moved to 99 — a fresh browser compounded at a different rate than a fresh node.
+const AUTO_BOND_DEFAULT_PCT = P.AUTO_BOND_DEFAULT_PERCENT;
 const LS_PENDING_PAY = "nado_pending_pay"; // sessionStorage: a pay-request awaiting wallet setup
 const LS_PENDING_CLAIM = "nado_pending_claim"; // sessionStorage: a banknote claim link awaiting wallet setup
 
 function persistWallet(w) { localStorage.setItem(LS_WALLET, JSON.stringify(w)); }
 function loadWallet() {
-  let w;
-  try { w = JSON.parse(localStorage.getItem(LS_WALLET)); } catch { return null; }
-  if (!w) return null;
-  // SELF-HEAL across an address-format change (e.g. the ndo -> mldsa44 debrand reroll): the persisted
-  // wallet keeps a plaintext `address`, but the address is a pure function of the pubkey — so re-derive it
-  // and, if the stored one is stale (old prefix/checksum), correct + re-persist it. Without this a wallet
-  // saved under the old format keeps signing/mining/registering with an address the new chain rejects
-  // ("Invalid sender"), and a hard refresh can't fix it because the stale address lives in localStorage.
+ let w;
+ try { w = JSON.parse(localStorage.getItem(LS_WALLET)); } catch { return null; }
+ if (!w) return null;
+ // SELF-HEAL across an address-format change (e.g. the ndo -> debrand reroll): the persisted
+ // wallet keeps a plaintext `address`, but the address is a pure function of the pubkey — so re-derive it
+ // and, if the stored one is stale (old prefix/checksum), correct + re-persist it. Without this a wallet
+ // saved under the old format keeps signing/mining/registering with an address the new chain rejects
+ // ("Invalid sender"), and a hard refresh can't fix it because the stale address lives in localStorage.
   try {
     if (w.publicKey) {
       const fresh = makeAddress(w.publicKey);
@@ -1109,6 +3187,7 @@ function showUnlock() {
   if ($("unlockRelayUrl")) { $("unlockRelayUrl").value = state.relay || ""; $("unlockRelayUrl").placeholder = location.origin; }
   if ($("unlockPass")) $("unlockPass").value = "";
   if ($("unlockErr")) $("unlockErr").textContent = "";
+  show("booting", false);
   show("unlockCard", true);
   // A locked wallet is still MINING on-chain until its PoSW lease lapses — show how much presence is left
   // (we know the address even while locked). Refresh it periodically so the countdown stays live.
@@ -1129,9 +3208,9 @@ async function refreshUnlockLease() {
     const present = !!(ms && ms.registered_present);
     if (present && regEpoch >= 0 && ms && typeof ms.epoch === "number") {
       const epochSecs = EPOCH_LENGTH * (ms.block_time || state.blockTime || 8);
-      const secsLeft = Math.max(0, (regEpoch + POSW_LEASE_EPOCHS - ms.epoch) * epochSecs);
+      const secsLeft = Math.max(0, (regEpoch + leaseEpochsOf(acc) - ms.epoch) * epochSecs);
       box.innerHTML = "⛏ " + escapeHtml(i18("unlock.mining",
-        "Still mining while locked — about {t} of presence left. Reopen before it runs out to auto-renew.",
+        "Still collecting while locked — about {t} of presence left. Reopen before it runs out to auto-renew.",
         { t: humanizeSeconds(secsLeft) }));
       show("unlockLease", true);
     } else {
@@ -1152,6 +3231,7 @@ function lockWallet() {
 // stays present on-chain (the PoSW lease), and unlock/refresh auto-resumes renewal from the intent flag.
 function pauseMining() {
   state.mining = false; state.starting = false;
+  renderMiningIndicator();
   if (state.powJob) state.powJob.cancelled = true;
   state.registering = false;
   stopPollLoop();
@@ -1205,7 +3285,7 @@ function renderAllowedOrigins() {
     + strip(o) + (rm ? ' <a href="#" data-rm="' + encodeURIComponent(o) + '" title="remove" style="text-decoration:none;color:var(--danger,#f85149)">✕</a>' : '') + '</span>';
   const user = userAllowedOrigins();
   el.innerHTML =
-    '<div class="faint">' + i18("settings.officialGames", "Official games (always allowed):") + '</div>'
+    '<div class="faint">' + i18("settings.officialGames", "Official apps (always allowed):") + '</div>'
     + '<div style="margin:4px 0 8px">' + EXEC_SIGN_ALLOW.map((o) => chip(o, false)).join("") + '</div>'
     + '<div class="faint" style="margin:0 0 8px">' + i18("settings.officialWildcard", "…and every official *.nadochain.com subdomain is trusted automatically.") + '</div>'
     + '<div class="faint">' + i18("settings.yourSites", "Your added sites:") + '</div>'
@@ -1217,7 +3297,287 @@ function renderAllowedOrigins() {
     renderAllowedOrigins();
   });
 }
+/* ----------------------------------------------------------------------------------------------
+ * ACCOUNT AUTHENTICATION (doc/key-rotation.md) — the wallet half.
+ *
+ * The chain lets an address carry an auth config: authenticators + a SIGNING policy + a RECONFIG policy.
+ * This wallet exposes two presets and never the policy language:
+ *   single key  — today's account: keys=[hot], sign=ID(0), reconf=ID(0)
+ *   protected   — keys=[hot, recovery], sign=ID(0), reconf=THRESHOLD(2,[ID(0),ID(1)])
+ * The account ADDRESS is always the HD account's derived address (accountKeypair(master, idx)). The key that
+ * SIGNS for it may be a later HD child: authSignerKeypair(master, idx, k) with k>=1 — deterministic from the
+ * seed phrase, so a wiped device re-finds its signing key by scanning k=1..AUTH_SCAN against the on-chain
+ * config. The binding {account -> k} is cached chain-scoped in localStorage; losing it costs a scan, nothing
+ * more. The recovery key is a SEPARATE 24-word phrase, shown once, never stored; it is pasted only when an
+ * action needs it (rotating with the full policy, cancelling a thief's pending change).
+ * Wire shape mirrors ops/auth_ops.py + ops/multisig_ops.py: `signature` = [{public_key, signature}, ...].
+ * AN ACCOUNT OF ANOTHER SCHEME PROTECTS ITSELF IN ITS OWN SCHEME (protocol SIG_SCHEME_KEYS_HEIGHT, operator 2026-11-04):
+ * its signer children and its recovery key are keys of that scheme, a config names them [alg, pubkey], and each entry
+ * carries its `alg` — so a hash-based account is never guarded by a lattice key. An ML-DSA-44 account is unchanged.
+ * ---------------------------------------------------------------------------------------------- */
+const DOMAIN_HD_AUTH = "hd-auth-signer-v1";       // signer-child derivation: blake2b([DOMAIN, master, acctIdx, k], 32)
+const AUTH_SCAN = 48;                              // how many signer children a wiped device scans to re-find its key
+const LS_AUTH_SIGNER = "nado_auth_signer_v1";     // chain-scoped {account: k}
+const AUTH_FEE_PER_ENTRY = MIN_TX_FEE;
+
+// the scheme of the active account's own keys (Main and every unmarked child: ML-DSA-44)
+function authAlg() { return hdAlg(state.activeIdx || 0); }
+// a signer child of another scheme takes its seed from [domain, master, index, k, alg] — no seed serves two schemes, and
+// an ML-DSA-44 signer keeps exactly the seed it always had (as accountChildSeed does for accounts)
+function authSignerKeypair(master, acctIdx, k) {
+  if (!k) return accountKeypair(master, acctIdx);
+  const alg = hdAlg(acctIdx);
+  return keypairFromPriv(blake2bHash(alg ? [DOMAIN_HD_AUTH, master, acctIdx, k, alg] : [DOMAIN_HD_AUTH, master, acctIdx, k], 32), alg);
+}
+// how a config names a key (ops/auth_ops.key_pair): a bare pubkey for ML-DSA-44, [alg, pubkey] for another scheme
+function authKey(kp) { return kp.alg && kp.alg !== SIG_ML44 ? [kp.alg, kp.publicKey] : kp.publicKey; }
+function authKeyIn(keys, kp) { const want = JSON.stringify(authKey(kp)); return (keys || []).some((k) => JSON.stringify(k) === want); }
+function schemeKeysLive() {
+  const h = Number(P.SIG_SCHEME_KEYS_HEIGHT);
+  return Number.isFinite(h) && state.latest != null && state.latest >= h;
+}
+// One signature entry by keypair `kp` (its `alg` names a scheme other than ML-DSA-44) over msgBytes, verified before it
+// is returned — hedged signing can rarely produce one that does not verify (see finalizeTransaction).
+function schemeSignEntry(kp, msgBytes) {
+  const alg = kp.alg && kp.alg !== SIG_ML44 ? kp.alg : undefined;
+  const { publicKey, secretKey } = schemeKeygen(alg, hexToBytes(kp.privateKey));
+  for (let i = 0; i < 8; i++) {
+    const sig = schemeSign(alg, secretKey, msgBytes);
+    if (schemeVerify(alg, publicKey, msgBytes, sig)) {
+      const e = { public_key: bytesToHex(publicKey), signature: bytesToHex(sig) };
+      if (alg) e.alg = alg;
+      return e;
+    }
+  }
+  throw new Error("could not produce a verifying signature — please retry");
+}
+function policySatisfied(p, signers) {
+  if (p[0] === "ID") return signers.has(p[1]);
+  let n = 0; for (const sp of p[2]) if (policySatisfied(sp, signers)) n++;
+  return n >= p[1];
+}
+function policyKeys(p, out = new Set()) {
+  if (p[0] === "ID") out.add(p[1]); else for (const sp of p[2]) policyKeys(sp, out);
+  return out;
+}
+function authEffective(acc, tipHeight) {
+  // mirrors auth_ops.effective_config: a matured pending config IS the live one, else the installed one
+  const pend = acc && acc.auth_pending;
+  if (pend && tipHeight != null && Number(pend.eff) <= tipHeight) return pend.cfg;
+  return (acc && acc.auth) || null;
+}
+function mldsaSignHex(privHex, msgBytes) {
+  const { publicKey, secretKey } = ml_dsa44.keygen(hexToBytes(privHex));
+  for (let i = 0; i < 8; i++) {                    // hedged signing: verify + retry (see finalizeTransaction)
+    const sig = ml_dsa44.sign(secretKey, msgBytes);
+    if (ml_dsa44.verify(publicKey, msgBytes, sig)) return { public_key: bytesToHex(publicKey), signature: bytesToHex(sig) };
+  }
+  throw new Error("could not produce a verifying signature — please retry");
+}
+function authPop(sender, cfg, kp) {
+  // ops/auth_ops.pop_message: blake2b(["auth-pop-v1", CHAIN_ID, sender, cfg]) — canonical JSON, sorted keys
+  return schemeSignEntry(kp, hexToBytes(blake2bHash(["auth-pop-v1", CHAIN_ID, sender, cfg]))).signature;
+}
+// Below SIG_SCHEME_KEYS_HEIGHT an auth config's keys, and the account it configures, are ML-DSA-44 (ops/auth_ops):
+// an account of another scheme is told so instead of signing a change no node accepts. True = blocked.
+function authSchemeBlocked() {
+  return !schemeKeysLive() && ml44Only({ alg: authAlg() }, i18("sig.whatAuth", "Key rotation"));
+}
+function authBuildTx(sender, signers, data, tipHeight) {
+  // each entry at its scheme's fee multiple (transaction_ops._entry_units): a paying list pays the whole sum
+  const units = signers.reduce((n, kp) => n + ((P.SIG_SCHEME_SIZES || {})[kp.alg || SIG_ML44] || [0, 0, 1])[2], 0);
+  const body = { sender, recipient: "auth", amount: 0, timestamp: nowSeconds(), data, nonce: randNonce(),
+                 max_block: tipHeight + 40, chain_id: CHAIN_ID, fee: AUTH_FEE_PER_ENTRY * Math.max(1, units),
+                 min_block: guardFrom(tipHeight) };
+  const txid = createTxid(body);
+  const m = hexToBytes(txid);
+  return { ...body, txid, signature: signers.map((kp) => schemeSignEntry(kp, m)) };
+}
+function authProtectedCfg(v, hot, rec) {
+  return { v, keys: [authKey(hot), authKey(rec)], sign: ["ID", 0], reconf: ["THRESHOLD", 2, [["ID", 0], ["ID", 1]]] };
+}
+function authBindingGet() { return lsChainGet(LS_AUTH_SIGNER, {}) || {}; }
+function authBindingSet(account, k) { const b = authBindingGet(); b[account] = k; lsChainSet(LS_AUTH_SIGNER, b); }
+
+/* Re-anchor state.wallet to the key that currently authorizes the active HD account. Cheap when the account
+ * is unconfigured (nothing to do). Called after every wallet load / account switch / dashboard refresh. */
+// A PROTECTED ACCOUNT SIGNS WITH ITS HD SIGNER CHILD, NOT THE BASE KEY, and authSync is what swaps state.wallet to it —
+// asynchronously (it reads the account's auth config first). A signer captured before it settles is the base key, which
+// every relay refuses ("signature by a key that does not authorize this account"): a protected account could not mint
+// an NFT through the dApp redirect (2026-11-03), and the hidden background signer never ran authSync at all. Every path
+// that SIGNS awaits authReady() before it picks its key; showWalletUI starts it, an account switch resets it.
+function authReady() { if (!state._authReady) state._authReady = authSync().catch(() => {}); return state._authReady; }
+async function authSync(acc) {
+  const master = masterSeedOf();
+  if (!master || !state.wallet) return;
+  if (state._authActive == null) {                  // once per session: is the feature live on this chain?
+    try { const st = await (await fetch(relayBase() + "/status", { cache: "no-store" })).json(); state._authActive = !!st.auth_active; }
+    catch (e) { state._authActive = false; }
+  }
+  const idx = state.activeIdx || 0;
+  const base = accountKeypair(master, idx);
+  const account = base.address;
+  try { if (!acc) acc = await getAccount(account); } catch (e) { return; }
+  state.authAcct = { address: account, cfg: (acc && acc.auth) || null, pending: (acc && acc.auth_pending) || null,
+                     freeze: Number((acc && acc.auth_freeze) || 0), active: !!state._authActive };
+  const cfg = authEffective(acc, state.latest);
+  if (!cfg) {                                       // legacy account: the base key signs
+    if (state.wallet.address !== account || state.wallet.publicKey !== base.publicKey) { state.wallet = base; state._hdExpectedAddr = account; }
+    state.authAcct.signerIdx = 0;
+    return;
+  }
+  const sole = cfg.keys.filter((k, i) => policySatisfied(cfg.sign, new Set([i])));
+  const tryK = (k) => { const kp = authSignerKeypair(master, idx, k); return authKeyIn(sole, kp) ? kp : null; };
+  let k = authBindingGet()[account], kp = (k != null) ? tryK(k) : null;
+  if (!kp) { for (k = 0; k <= AUTH_SCAN; k++) { kp = tryK(k); if (kp) break; } }
+  if (!kp) {                                         // no key of this seed can spend: the recovery phrase is needed
+    state.authAcct.signerIdx = null; state.authAcct.orphan = true;
+    return;
+  }
+  authBindingSet(account, k);
+  state.authAcct.signerIdx = k;
+  if (state.wallet.publicKey !== kp.publicKey || state.wallet.address !== account) {
+    // the signer keeps its scheme: a protected account of another scheme sends tagged txs with its signer child's key
+    state.wallet = { privateKey: kp.privateKey, publicKey: kp.publicKey, address: account, ...(kp.alg ? { alg: kp.alg } : {}) };
+    state._hdExpectedAddr = account;
+  }
+}
+
+async function authWaitLanded(account, pred, label) {
+  for (let i = 0; i < 40; i++) {
+    await new Promise((r) => setTimeout(r, 6000));
+    let acc = null; try { acc = await getAccount(account); } catch (e) {}
+    if (acc && pred(acc)) { await authSync(acc); renderAuth(); return true; }
+  }
+  log("err", i18("auth.notLanded", "{l}: the change did not land in time — check the Explore tab and retry.", { l: label }));
+  return false;
+}
+
+function renderAuth() {
+  const wrap = $("authWrap");
+  if (!wrap) return;
+  const a = state.authAcct;
+  const active = a && a.active !== false;
+  show("authWrap", !!(state.wallet && a && active));
+  if (!state.wallet || !a || !active) return;
+  const cfg = a.cfg, pend = a.pending;
+  const prot = !!(cfg && cfg.keys && cfg.keys.length === 2 && cfg.reconf && cfg.reconf[0] === "THRESHOLD");
+  let s = prot ? '<b class="ok">' + i18("auth.protected", "Protected ✓ — a recovery phrase guards key changes") + "</b>"
+               : (cfg ? escapeHtml(i18("auth.single", "Single key (custom policy v{v})", { v: cfg.v }))
+                      : '<span class="faint">' + i18("auth.legacy", "Single key — anyone holding this device's key holds the account.") + "</span>");
+  if (a.signerIdx != null && a.signerIdx > 0) s += ' <span class="faint">' + escapeHtml(i18("auth.signer", "(signing key #{k})", { k: a.signerIdx })) + "</span>";
+  if (a.orphan) s = '<b class="warn">' + i18("auth.orphan", "This device's keys no longer sign for this account — use your recovery phrase to rotate to this device.") + "</b>";
+  $("authStatus").innerHTML = s;
+  if (pend) {
+    const eff = Number(pend.eff), left = state.latest != null ? Math.max(0, eff - state.latest) : null;
+    $("authPending").innerHTML = "⏳ " + escapeHtml(i18("auth.pendingMsg", "A key change is pending and takes effect at block {b}{t}. If you did not start it, cancel it with your recovery phrase now.",
+      { b: eff, t: left != null ? " (" + humanizeSeconds(left * (state.blockTime || 8)) + ")" : "" }));
+    show("authPending", true);
+  } else show("authPending", false);
+  const frozen = a.freeze && state.latest != null && state.latest < a.freeze;
+  show("btnAuthProtect", !cfg && !pend);
+  show("btnAuthRotate", !!cfg || !!pend || true);
+  $("btnAuthRotate").disabled = !!a.orphan && !prot;
+  show("btnAuthCancel", !!pend);
+  if (frozen) $("authStatus").innerHTML += '<div class="small faint">' + escapeHtml(i18("auth.frozen", "Partial key changes are frozen until block {b} (a recovery cancel happened).", { b: a.freeze })) + "</div>";
+}
+
+let _authAction = null;
+function authAskRecovery(kind) {
+  _authAction = kind;
+  $("authRecoveryPhrase").value = "";
+  show("authRecoveryBox", true);
+  $("authRecoveryPhrase").focus();
+}
+async function authRecoveryKeypair() {
+  const seed = await mnemonicToSeed($("authRecoveryPhrase").value);
+  return keypairFromPriv(bytesToHex(seed), authAlg());      // the recovery key is a key of the account's own scheme
+}
+
+/* PROTECT: generate the recovery phrase, show it once, then install [hot, recovery] with reconf = both. */
+let _authNewRec = null;
+async function authProtectStart() {
+  if (!state.wallet || !state.authAcct || authSchemeBlocked()) return;
+  const seed = new Uint8Array(32); crypto.getRandomValues(seed);
+  _authNewRec = keypairFromPriv(bytesToHex(seed), authAlg());
+  $("authNewPhrase").textContent = await seedToMnemonic(seed);
+  $("authPhraseAck").checked = false; $("btnAuthPhraseGo").disabled = true;
+  show("authPhraseReveal", true);
+}
+async function authProtectGo() {
+  if (!_authNewRec || !state.wallet) return;
+  const account = state.authAcct.address;
+  const latest = await getLatestBlock(); if (!latest) return;
+  const cur = authEffective(await getAccount(account), latest.block_number);
+  const v = (cur ? cur.v : 0) + 1;
+  const cfg = authProtectedCfg(v, state.wallet, _authNewRec);
+  const data = { op: "set", cfg, pop: { [_authNewRec.publicKey]: authPop(account, cfg, _authNewRec) } };
+  const tx = authBuildTx(account, [state.wallet], data, latest.block_number);
+  show("authPhraseReveal", false); $("authNewPhrase").textContent = ""; _authNewRec = null;   // the phrase leaves memory here
+  const res = await submitTransaction(tx);
+  if (!(res.data && res.data.result)) { log("err", i18("auth.refused", "Key change refused: {m}", { m: (res.data && res.data.message) || "" })); return; }
+  log("info", i18("auth.submitted", "Key change submitted — waiting for it to land…"));
+  await authWaitLanded(account, (acc) => acc.auth && acc.auth.v === v, i18("auth.protect", "Protect this account"));
+  log("ok", i18("auth.protectedOk", "Account protected ✓ — key changes now need your recovery phrase."));
+}
+
+/* ROTATE: move signing to the next HD signer child. Protected accounts rotate immediately with hot + recovery;
+ * without the phrase (or on a single-key account) the change pends for ~a day and the old key keeps working. */
+async function authRotateGo(withRecovery) {
+  const master = masterSeedOf(); if (!master || !state.wallet || !state.authAcct || authSchemeBlocked()) return;
+  const account = state.authAcct.address, idx = state.activeIdx || 0;
+  const latest = await getLatestBlock(); if (!latest) return;
+  const acc = await getAccount(account);
+  const cur = authEffective(acc, latest.block_number);
+  let k = (state.authAcct.signerIdx || 0) + 1, nk = authSignerKeypair(master, idx, k);
+  while (cur && authKeyIn(cur.keys, nk)) { k++; nk = authSignerKeypair(master, idx, k); }
+  const keys = cur ? [authKey(nk), ...cur.keys.slice(1)] : [authKey(nk)];
+  const cfg = cur ? { v: cur.v + 1, keys, sign: cur.sign, reconf: cur.reconf } : { v: 1, keys, sign: ["ID", 0], reconf: ["ID", 0] };
+  const signers = [state.authAcct.orphan ? null : state.wallet];
+  if (withRecovery) { const rk = await authRecoveryKeypair(); if (!cur || !authKeyIn(cur.keys, rk)) throw new Error(i18("auth.wrongPhrase", "That recovery phrase does not belong to this account.")); signers.push(rk); }
+  const data = { op: "set", cfg, pop: { [nk.publicKey]: authPop(account, cfg, nk) } };
+  const tx = authBuildTx(account, signers.filter(Boolean), data, latest.block_number);
+  const res = await submitTransaction(tx);
+  if (!(res.data && res.data.result)) { log("err", i18("auth.refused", "Key change refused: {m}", { m: (res.data && res.data.message) || "" })); return; }
+  log("info", i18("auth.submitted", "Key change submitted — waiting for it to land…"));
+  const ok = await authWaitLanded(account, (a2) => (a2.auth && a2.auth.v === cfg.v) || (a2.auth_pending && a2.auth_pending.cfg && a2.auth_pending.cfg.v === cfg.v), i18("auth.rotate", "Rotate signing key"));
+  if (ok) { authBindingSet(account, k); await authSync(); renderAuth(); showWalletUI(); }
+}
+
+async function authCancelGo(withRecovery) {
+  if (!state.wallet || !state.authAcct || authSchemeBlocked()) return;
+  const account = state.authAcct.address;
+  const latest = await getLatestBlock(); if (!latest) return;
+  const kp = withRecovery ? await authRecoveryKeypair() : state.wallet;
+  const tx = authBuildTx(account, [kp], { op: "cancel" }, latest.block_number);
+  const res = await submitTransaction(tx);
+  if (!(res.data && res.data.result)) { log("err", i18("auth.refused", "Key change refused: {m}", { m: (res.data && res.data.message) || "" })); return; }
+  await authWaitLanded(account, (a2) => !a2.auth_pending, i18("auth.cancel", "Cancel pending change"));
+}
+
+function wireAuthButtons() {
+  if ($("btnAuthProtect")) $("btnAuthProtect").onclick = () => authProtectStart().catch((e) => log("err", e.message));
+  if ($("authPhraseAck")) $("authPhraseAck").onchange = () => { $("btnAuthPhraseGo").disabled = !$("authPhraseAck").checked; };
+  if ($("btnAuthPhraseGo")) $("btnAuthPhraseGo").onclick = () => authProtectGo().catch((e) => log("err", e.message));
+  if ($("btnAuthPhraseAbort")) $("btnAuthPhraseAbort").onclick = () => { show("authPhraseReveal", false); $("authNewPhrase").textContent = ""; _authNewRec = null; };
+  if ($("btnAuthRotate")) $("btnAuthRotate").onclick = () => {
+    const a = state.authAcct; const prot = a && a.cfg && a.cfg.keys && a.cfg.keys.length > 1;
+    if (prot || (a && a.orphan)) authAskRecovery("rotate"); else authRotateGo(false).catch((e) => log("err", e.message));
+  };
+  if ($("btnAuthCancel")) $("btnAuthCancel").onclick = () => {
+    const a = state.authAcct; const prot = a && a.cfg && a.cfg.keys && a.cfg.keys.length > 1;
+    if (prot) authAskRecovery("cancel"); else authCancelGo(false).catch((e) => log("err", e.message));
+  };
+  if ($("btnAuthGo")) $("btnAuthGo").onclick = () => {
+    const kind = _authAction; show("authRecoveryBox", false);
+    const p = kind === "rotate" ? authRotateGo(true) : authCancelGo(true);
+    p.catch((e) => log("err", e.message)).finally(() => { $("authRecoveryPhrase").value = ""; });
+  };
+  if ($("btnAuthAbort")) $("btnAuthAbort").onclick = () => { show("authRecoveryBox", false); $("authRecoveryPhrase").value = ""; };
+}
+
 function renderSecurity() {
+  renderAuth();
   const enc = walletIsEncrypted();
   if ($("secStatus")) $("secStatus").innerHTML = enc
     ? '<b class="ok">' + i18("sec.on", "Encrypted at rest ✓") + "</b>"
@@ -1229,32 +3589,6 @@ function renderSecurity() {
   if ($("autolockSel")) $("autolockSel").value = String(autolockMinutes());
 }
 
-/* ----------------------------------------------------------------------------------------------
- * Registration PoW — chunked async so the UI stays responsive (and is cancellable).
- * -------------------------------------------------------------------------------------------- */
-function solveRegistrationPow(address, { onProgress, signal } = {}) {
-  const target = powTarget();
-  const start = performance.now();
-  let nonce = 0;
-  const CHUNK = 1500;
-  return new Promise((resolve, reject) => {
-    function step() {
-      if (signal && signal.cancelled) return reject(new Error("cancelled"));
-      const end = nonce + CHUNK;
-      for (; nonce < end; nonce++) {
-        if (powHashInt(address, nonce) < target) {
-          return resolve({ nonce, hashes: nonce + 1, seconds: (performance.now() - start) / 1000 });
-        }
-      }
-      if (onProgress) {
-        const secs = (performance.now() - start) / 1000;
-        onProgress({ hashes: nonce, seconds: secs, rate: nonce / Math.max(secs, 0.001) });
-      }
-      setTimeout(step, 0); // yield to the event loop / repaint
-    }
-    step();
-  });
-}
 
 /* ----------------------------------------------------------------------------------------------
  * Mining engine
@@ -1278,33 +3612,134 @@ function setStartBtnMining() {
   const b = $("btnMine");
   b.disabled = false;
   b.classList.remove("primary"); b.classList.add("danger");
-  b.textContent = i18("btn.stopMine", "Stop mining");
+  b.textContent = i18("btn.stopMine", "Stop collecting");
+}
+// The loop is running but NOTHING is being mined yet (waiting for the Register press, for another device's statement,
+// or for a kept registration to land): the button must still stop the loop, but it must not claim mining is happening
+// (an unregistered PC read "Stop mining" while mining nothing — 2026-09-08).
+function setStartBtnWaitingReg() {
+  const b = $("btnMine");
+  // SETTLED, CLICKABLE STATE: nothing is in flight any more, so `starting` must be cleared — the click handler
+  // ignores presses while it is set, which left this enabled "Stop" button dead (operator 2026-09-09:
+  // "clicking zastavit does nothing").
+  state.starting = false;
+  b.disabled = false;
+  b.classList.remove("primary"); b.classList.add("danger");
+  b.textContent = i18("btn.stopWait", "Stop");
+  if ($("mineState")) $("mineState").textContent = (state.lastMs && state.lastMs.bonded_producing)
+    ? i18("mine.savingsOnly", "Savings collecting — a device is needed only for the free lane and the dividend")
+    : i18("mine.notMiningReg", "Not collecting — registration needed");
+}
+// REGISTRATION GATE: nothing is mined until a registration lands, so the loop does not run and the main button is the
+// idle "Start mining" — only the Register button (and the banner saying why) stay. Pressing Register starts the loop
+// (that press is the one that opens the device prompt). No "Stop" while nothing runs (2026-09-08).
+function haltForRegister() {
+  state.mining = false;
+  renderMiningIndicator();
+  state.starting = false;
+  state.registering = false;
+  stopPollLoop();
+  releaseWakeLock();
+  clearRegProgress();
+  // the ONE button says what the next press does (it arms the prompt and starts)
+  setStartBtnIdle(i18("btn.registerStart", "Register & start collecting"));
+  if ($("mineState")) $("mineState").textContent = (state.lastMs && state.lastMs.bonded_producing)
+    ? i18("mine.savingsOnly", "Savings collecting — a device is needed only for the free lane and the dividend")
+    : i18("mine.notMiningReg", "Not collecting — registration needed");
 }
 function setStartBtnIdle(label) {
   const b = $("btnMine");
   b.disabled = false;
   b.classList.remove("danger"); b.classList.add("primary");
-  b.textContent = label || i18("btn.startMining", "Start mining");
+  b.textContent = label || i18("btn.startMining", "Start collecting");
 }
 // Update the staged status banner. `html` is built only from our own constant strings plus
 // escapeHtml()'d dynamic values, so innerHTML is safe here. kind: "ok" | "warn" | undefined (info).
-function setRegBanner(html, kind) {
+//
+// `tag` marks a PROBLEM banner — one whose condition can end on its own with no further stage ever
+// running to overwrite it. The narration banners (computing/submitting/waiting) are each superseded by
+// the next stage, so they can never go stale; "relay unreachable" and "didn't confirm" have no next
+// stage, and both were left on screen indefinitely after the thing they warned about had healed. The
+// tag is what lets the poll loop retract exactly the stale one and never a live message.
+let _regBannerTag = null;
+function setRegBanner(html, kind, tag) {
   const el = $("regBanner");
   if (!el) return;
   el.className = "hint-banner mt" + (kind ? " " + kind : "");
-  $("regBannerMsg").innerHTML = html;
-  show("regBanner", true);
+  $("regBannerMsg").innerHTML = html || "";
+  _regBannerTag = html ? (tag || null) : null;
+  // EMPTY TEXT MEANS HIDE IT. This showed the banner unconditionally, and markMiningActive() clears the
+  // banner by calling setRegBanner("") — so the panel stayed visible with no message in it while the
+  // spinner element beside the text kept turning. That is the permanent circle over an empty section:
+  // not the progress widget at all, a second one, found by driving the live DOM rather than reading the
+  // code. A banner with nothing to say is not a banner.
+  show("regBanner", !!html);
+  const sp = $("regBannerSpin");
+  if (sp) sp.hidden = !html;          // never a circle without a sentence beside it
 }
-function hideRegBannerSoon(ms = 6000) {
-  setTimeout(() => { if (state.mining && !state.starting) show("regBanner", false); }, ms);
+// Retract a problem banner IF it is still the one showing. Passing the tag matters: by the time this
+// runs the banner may have been replaced by live narration, and hiding that would erase real progress.
+function clearRegBanner(tag) {
+  // `!tag` first, or the untagged case matches itself: narration carries tag null, so a bare
+  // clearRegBanner() would satisfy `_regBannerTag !== tag` as false and hide live progress. Retraction
+  // is only ever meaningful for a NAMED problem.
+  if (!tag || _regBannerTag !== tag) return;
+  _regBannerTag = null;
+  show("regBanner", false);
 }
-const REASSURE = ' <b>' + i18("reassure", "One-time setup — no need to click again.") + '</b>';
+// REMOVED (2026-09-12): hideRegBannerSoon retracted the confirmation after six seconds. A banner that
+// deletes itself on a timer is telling the user their success was provisional; it was also the reason
+// people reported the mining confirmation "disappearing". Banners are retracted by the condition that
+// contradicts them — clearRegBanner(tag) — and by nothing else.
+// gen 25: registration is NOT one-time any more — every lease renews (a tap for a phone, a Hello confirmation for a PC, nothing for a hardware wallet), so say so.
+const REASSURE = "";   // no reassurance appendix: the banner text stands alone
 
 // Mining is confirmed live (registered on chain + heartbeating): flip the button to the Stop toggle.
+// WHAT VOUCHES FOR THIS IDENTITY, as a fixed cartouche beside Status and Epoch. An icon distinguishes the
+// classes at a glance; the handle beneath is the value consensus binds on
+// (ops/device_attest.device_binding_key), so a reader can check it against the chain instead of taking
+// "attested ✓" on trust. Hidden only when there is genuinely nothing to say.
+const DEVICE_ICON = { ek: "\u{1F5A5}\uFE0F", tpm: "\u{1F5A5}\uFE0F", "android-key": "\u{1F4F1}",
+                      ledger: "\u{1F510}", trezor: "\u{1F511}", packed: "\u{1F511}" };
+function deviceClassName(cls) {
+  return { ek: i18("dev.cls.ek", "TPM chip"), tpm: i18("dev.cls.tpm", "Windows Hello"),
+           "android-key": i18("dev.cls.android", "Android phone"),
+           ledger: "Ledger", trezor: "Trezor", packed: i18("dev.cls.webauthn", "Security key") }[cls] || "";
+}
+
+/// NO PLACEHOLDER. The cartouche names the hardware and shows the handle it is bound by, or it is not
+/// there at all. "Attested device" with a tick and no identifier tells a reader nothing they can check,
+/// and it is indistinguishable from the wallet simply not knowing — which is what it actually meant.
+function renderDeviceCartouche() {
+  const box = $("statDevice");
+  if (!box) return;
+  // state.devbind is the account's own binding, refreshed by the poll loop from /get_account — the same
+  // response the rest of this page already reads. One source, and it is the chain.
+  const bind = state.devbind;
+  if (!bind || !bind.cls || !DEVICE_ICON[bind.cls]) { box.hidden = true; return; }
+  $("mineDevIcon").textContent = DEVICE_ICON[bind.cls];
+  $("mineDevCls").textContent = deviceClassName(bind.cls);
+  const h = bind.handle || "";
+  $("mineDevId").textContent = h ? h.slice(0, h.indexOf(":") + 9) + "\u2026" : "";
+  $("mineDevId").title = h;
+  box.hidden = false;
+}
+
+// THE INDICATOR IS DERIVED FROM STATE, in one place, so it cannot be left on by a path that forgot to
+// turn it off — the failure every other widget on this card has had. Called wherever state.mining moves.
+function renderMiningIndicator() {
+  const el = $("mineState");
+  if (el) el.classList.toggle("mining-now", !!state.mining);
+}
+
 function markMiningActive() {
   state.starting = false;
   setStartBtnMining();
-  $("mineState").textContent = i18("mine.mining", "Mining");
+  $("mineState").textContent = i18("mine.mining", "Collecting");
+  state.mining = true;
+  renderMiningIndicator();
+  renderDeviceCartouche();
+  setRegBanner("");                     // a registration banner never sits next to "Mining"
 }
 
 // Registration could not be confirmed (relay rejected it, or the relay was unreachable). Stop the
@@ -1318,15 +3753,16 @@ function markMiningActive() {
 let _failRecheckTimer = null;
 function failStart(reason) {
   state.mining = false;
+  renderMiningIndicator();
   state.starting = false;
   state.registering = false;
   if (state.powJob) state.powJob.cancelled = true;
   stopPollLoop();
-  show("powWrap", false);
+  clearRegProgress();
   setStartBtnIdle();
   $("mineState").textContent = i18("mine.idle", "Idle");
   setRegBanner(i18("reg.retry", "Registration didn't confirm — tap Start to retry.") +
-    (reason ? ' <span class="faint">(' + escapeHtml(reason) + ')</span>' : ""), "warn");
+    (reason ? ' <span class="faint">(' + escapeHtml(reason) + ')</span>' : ""), "warn", "failed");
   clearTimeout(_failRecheckTimer);
   let tries = 0;
   const recheck = async () => {
@@ -1337,8 +3773,8 @@ function failStart(reason) {
       const epochNow = tip != null ? Math.floor((tip + 8) / EPOCH_LENGTH) : null;
       const regEpoch = (acc && typeof acc.reg_epoch === "number") ? acc.reg_epoch : -1;
       if (acc && acc.registered === 1 && epochNow != null && regEpoch >= 0
-          && (epochNow - regEpoch) < POSW_LEASE_EPOCHS) {
-        log("ok", i18("log.regHealed", "Registration confirmed on chain after all ✓ — resuming mining automatically."));
+          && (epochNow - regEpoch) < leaseEpochsOf(acc)) {
+        log("ok", i18("log.regHealed", "Registration confirmed on chain after all ✓ — resuming collecting automatically."));
         state.mining = true;
         startPollLoop();
         pollOnce();                                       // confirms, flips the button, starts heartbeats
@@ -1356,31 +3792,231 @@ function failStart(reason) {
 // what makes mining a SINGLE click: registration, on-chain confirmation and heartbeats are all handled
 // in the background without the user ever clicking "Start mining" a second time.
 let _renewingLease = false;
-async function maybeRenewLease(acc) {
+// How long an automatic renewal waits after a FAILED attempt before trying again. Only the automatic
+// path backs off — pressing Renew is a deliberate act and is never rate-limited by this.
+const RENEW_RETRY_MS = 5 * 60 * 1000;
+let _renewFailedAt = 0;
+// A renewal ALREADY BROADCAST and not yet landed: {targetBlock, atEpoch}. Without this the renewal is
+// re-broadcast on every poll for as long as the tx is in flight, because the only "have I renewed?"
+// signal is acc.reg_epoch — which is ON-CHAIN state and cannot move until the tx is mined. `register`
+// is EXACT-LANDING, so the in-flight window is the whole target margin: 3 min at the old margin of 30,
+// 9 min once it became 90, and the retries scale with it. Measured on betanet-3 the day the margin
+// changed: 552 stuck registers from 37 senders, ~27 attempts each, every one rejected "sender already
+// recerted this epoch" — the FIRST renewal had landed and all the rest were noise the user experienced
+// as renewal being broken. _renewingLease alone could never catch this: it is cleared as soon as the
+// SUBMIT returns, not when the tx lands.
+let _renewSubmitted = null;
+async function maybeRenewLease(acc) {   // the timer: { noPrompt } — see RenewNeedsTap
   if (_renewingLease || state.registering || state.regSubmitted || !state.mining) return;
   const epochNow = state.latest != null ? Math.floor((state.latest + 8) / EPOCH_LENGTH) : null;
   const regEpoch = (acc && typeof acc.reg_epoch === "number") ? acc.reg_epoch : -1;
   if (epochNow == null || regEpoch < 0) return;
-  if ((epochNow - regEpoch) < Math.floor(POSW_LEASE_EPOCHS * 0.8)) return;   // lease still healthy
+  if (_renewSubmitted) {
+    // landed (the chain's recert epoch moved past what it was when we broadcast) -> done
+    if (regEpoch > _renewSubmitted.atEpoch) { _renewSubmitted = null; return; }
+    // still inside its landing window -> wait; only a MISSED target frees us to try again
+    if (state.latest == null || state.latest <= _renewSubmitted.targetBlock) return;
+    _renewSubmitted = null;
+  }
+  if ((epochNow - regEpoch) < Math.floor(leaseEpochsOf(acc) * 0.8)) return;   // lease still healthy (80 % of ITS grant)
+  // BACK OFF AFTER A FAILURE, OR THIS RETRIES ON EVERY TICK. _renewSubmitted is set only when the relay
+  // ACCEPTS the transaction, so an attempt that throws before that — a cancelled device prompt, a
+  // ceremony this hardware cannot answer, a relay that will not serve the anchor — left every guard clear
+  // and the next poll started again immediately. The owner saw "Presence lease expiring — renewing…"
+  // repeat every few seconds for as long as the wallet was open, with a device prompt behind each one.
+  // The lease has hours of headroom at this point (renewal begins at 80% of it), so waiting minutes
+  // between attempts costs nothing and is the difference between a retry and a spin.
+  if (_renewFailedAt && Date.now() - _renewFailedAt < RENEW_RETRY_MS) return;
+  const ok = await broadcastLeaseRenewal(regEpoch, { noPrompt: true });
+  _renewFailedAt = ok ? 0 : Date.now();
+}
+
+// The renewal itself — shared by the automatic path above and the manual button below. Returns true once a
+// register tx was accepted by the relay (it then lands EXACTLY at its target block; _renewSubmitted holds
+// off any re-broadcast until it does).
+async function broadcastLeaseRenewal(regEpoch, opts) {   // opts: passed to computeRegisterTx
+  if (_renewingLease) return false;
   _renewingLease = true;
   try {
-    log("info", i18("log.leaseRenewing", "Presence lease expiring — renewing (fresh sequential proof)…"));
+    // NO SEQUENTIAL PROOF SINCE GEN 25. /posw_difficulty answers {"required_t": 0, "retired": true,
+    // "reason": "device attestation replaced PoSW at gen 25"} — the renewal signs a `register` and does
+    // no work at all. The message described retired machinery to the user, in sixteen languages.
+    log("info", i18("log.leaseRenewing", "Presence lease expiring — renewing…"));
     // Up to 2 attempts: if the chain outran max_block while the (pure-JS) PoW was computing, recompute
     // against a fresh tip. Each attempt targets tip + POSW_TARGET_MARGIN (max headroom for the proof).
-    let lastMsg = "";
+    let lastMsg = "", healed = false;
     for (let attempt = 0; attempt < 2; attempt++) {
       const latest = await getLatestBlock();
-      if (!latest || typeof latest.block_number !== "number") return;
-      const tx = await computeRegisterTx(latest.block_number + POSW_TARGET_MARGIN, null,
-        (await registrationDifficulty()).reqT);   // quiet: no UI takeover; still prove at the required difficulty
+      if (!latest || typeof latest.block_number !== "number") return false;
+      // SIZE THE MARGIN TO THE ACTUAL WORK, not to the worst case. POSW_TARGET_MARGIN (90 blocks, 9 min)
+      // is budgeted for the most expensive ENTRY proof; a renewal is base difficulty — ~0.3 s of WASM
+      // hashing — and paying a 9-minute landing window for it is pure latency, made worse by `register`
+      // landing EXACTLY at max_block, so the whole margin is time the tx sits in the mempool.
+      const _d = await registrationDifficulty(state.wallet.address);
+      const tb = latest.block_number + REG_TARGET_MARGIN;
+      const tx = await computeRegisterTx(tb, null, _d.reqT, opts);   // quiet: no UI takeover; still prove at the required difficulty
       const res = await submitTransaction(tx);
-      if (res.data && res.data.result) { log("ok", i18("log.leaseRenewed", "Presence lease renewed ✓")); return; }
+      if (res.data && res.data.result) {
+        acceptedRegisterTx(tx);
+        _renewSubmitted = { targetBlock: tb, atEpoch: regEpoch };   // don't re-broadcast until it lands
+        log("ok", i18("log.leaseRenewed", "Presence lease renewed ✓"));
+        return true;
+      }
       lastMsg = (res.data && res.data.message) || "";
+      // a refused SIGNATURE renewal is fixed by retrying — with a full statement, once (healSignatureRenewal)
+      if (!healed && healSignatureRenewal(tx, lastMsg)) { healed = true; attempt--; continue; }
       if (!/too low/i.test(lastMsg)) break;   // a different rejection won't be fixed by retrying
     }
     log("err", i18("log.leaseRejected", "Lease renewal rejected: {m}", { m: lastMsg }));
-  } catch (e) { log("err", i18("log.leaseError", "Lease renewal error: {m}", { m: e.message })); }
+  } catch (e) {
+    if (e && e.name === "RenewNeedsTap") {
+      // say the one thing that renews it (the timer backs off; the Renew button stays live)
+      log("info", state.attestVia === "remote"
+        ? i18("lease.remoteRenew", "Renewal earns now: on the other device open Collecting → \"Attest another wallet or node\" (it lists this address) and press Attest again. Nothing to press here.")
+        : i18("lease.tapToRenew", "Your presence lease needs renewing: press Renew and confirm the device prompt."));
+    } else {
+      log("err", i18("log.leaseError", "Lease renewal error: {m}", { m: e.message }));
+    }
+  }
   finally { _renewingLease = false; }
+  return false;
+}
+
+/* ----------------------------------------------------------------------------------------------
+ * MANUAL "RENEW PRESENCE" — the lease panel on the wallet card.
+ *
+ * WHY. The automatic renewal fires at 80% of the lease (288 of the 360 epochs; a recert earns fidelity from
+ * FIDELITY_MIN_GAP_EPOCHS = 192 on). Every automatic renewal therefore lands ~7.2 h EARLIER in
+ * the day than the previous expiry, so over a few days the expiry walks right around the clock — and when it
+ * reaches the middle of the night with the wallet closed, the lease lapses and the fidelity streak resets
+ * (reported 2026-08-25). Renewing by hand inside the earning window lets the user pin the expiry to a time
+ * of day they will actually be awake for.
+ *
+ * NO NEW RULE, NO FARM. The button is enabled only when epochNow − regEpoch ≥ FIDELITY_MIN_GAP_EPOCHS, i.e.
+ * exactly when the chain would credit the renewal (+1 fidelity, one per ≥19.2 h — the same cadence honest
+ * automatic renewal already earns). The protocol accepts an earlier `register` too, but it earns nothing and
+ * pushes the NEXT earning point out (apply_register moves the recert anchor), so the panel says when the
+ * window opens instead of offering a renewal that would cost the user a day of ramp.
+ * ---------------------------------------------------------------------------------------------- */
+function _fmtClock(secsFromNow) {
+  try { return new Date(Date.now() + secsFromNow * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }); }
+  catch (e) { return ""; }
+}
+// SAVINGS AT WORK ON THE OVERVIEW (operator 2026-09-08): producing ≈ NADO/day, or idle. From /mining_status: this
+// identity's expected time between bonded wins and the producer cut of a bonded block. Estimate only, never a promise.
+// (The staking-pool states — delegated / pool idle / pools retired — went with the pool code after the betanet-8
+// reroll: no account can hold `pool_to` on a chain where pools never ran.)
+function renderDelegationLine(acc, ms) {
+  const wrap = $("walDelegStat"), val = $("walDelegValue"), el = $("walDelegLine"); if (!wrap || !val || !el) return;
+  const bonded = BigInt((acc && acc.bonded) || 0);
+  if (!acc || bonded <= 0n) { show("walDelegStat", false); return; }
+  show("walDelegStat", true);
+  const badge = (cls, txt) => { val.innerHTML = `<span class="badge ${cls}">${escapeHtml(txt)}</span>`; };
+  if (ms && ms.bonded_producing && ms.expected_seconds_between_wins) {
+    badge("ok", i18("ovw.producing", "Producing"));
+    // the per-day figure lives in ONE place, the Collecting card's Earning total (collectPerDay)
+    el.textContent = i18("ovw.producingStake", "{e} NADO counting", { e: nadoShort(ms.my_bonded_effective) });
+    return;
+  }
+  badge("no", i18("ovw.idle", "Idle"));
+  el.textContent = i18("ovw.idleSoon", "enters the draw on its own");   // savings need no device (bond_attest_required is always false)
+}
+function refreshLeasePanel(acc, ms) {
+  const wrap = $("leaseWrap"), btn = $("btnRenewLease");
+  if (!wrap || !btn) return;
+  const regEpoch = (acc && typeof acc.reg_epoch === "number") ? acc.reg_epoch : -1;
+  const epochNow = (ms && typeof ms.epoch === "number") ? ms.epoch
+    : (state.latest != null ? Math.floor((state.latest + 8) / EPOCH_LENGTH) : null);
+  // THE CHAIN'S PRESENCE, not the account flag: the flag stays 1 after an eviction (the device moved to another identity),
+  // and a wallet in exactly that state offered a live "Renew" button while "Present: absent" (operator, 2026-09-08).
+  // There is no lease to renew — the panel hides and the one Start button registers afresh.
+  const msKnown = ms && typeof ms.registered_present === "boolean";
+  const registered = !!(acc && acc.registered === 1) && (!msKnown || ms.registered_present);
+  if (!registered || regEpoch < 0 || epochNow == null || (epochNow - regEpoch) >= leaseEpochsOf(acc)) {
+    show("leaseWrap", false);
+    btn.style.display = "none"; btn.disabled = true;   // Renew lives beside Start now, outside the panel
+    return;
+  }
+  const epochSecs = EPOCH_LENGTH * ((ms && ms.block_time) || state.blockTime || 8);
+  const epochsLeft = regEpoch + leaseEpochsOf(acc) - epochNow;
+  const secsLeft = Math.max(0, epochsLeft * epochSecs);
+  const gap = epochNow - regEpoch;
+  const earnsIn = Math.max(0, (regEpoch + FIDELITY_MIN_GAP_EPOCHS - epochNow) * epochSecs);
+  $("leaseLeft").textContent = i18("lease.left", "expires in about {t} (≈ {c})", { t: humanizeSeconds(secsLeft), c: _fmtClock(secsLeft) });
+  // BINDING MODE, visible: "bound for life" (Ledger/Trezor — renews without a prompt) vs "leased" (phone/TPM — a statement
+  // every renewal). Read from the account's devbind field; a wallet talking to an older relay shows nothing.
+  const bm = $("bindModeLine");
+  if (bm) {
+    const db = acc && acc.devbind;
+    state.devbind = db || state.devbind;
+    if (db && db.mode === "perm" && db.live) bm.textContent = i18("bind.perm", "Bound for life to a {d} — renews without a prompt.", { d: bindDeviceName(db.cls) });
+    else if (state.attestVia === "remote") bm.textContent = i18("bind.remote", "Vouched for by another device — that device must attest this address again before the lease ends.");
+    else if (db && db.assert_ok) bm.textContent = i18("bind.assert", "Leased — renews every {t} with a Windows Hello confirmation, no attestation prompt.", { t: leaseText(acc, epochSecs) });
+    else if (db) bm.textContent = i18("bind.lease", "Leased — re-attests every {t} with a statement from this device.", { t: leaseText(acc, epochSecs) });
+    else bm.textContent = "";
+  }
+  // THE HELPER, WHEREVER RENEWAL IS. A LEASED binding re-attests on every renewal, and for a chip that
+  // statement comes from the enrolment helper — but its download rendered only from renderMineFix(),
+  // which hides itself as soon as the device verdict is ok. So the owner who needs it most, every lease,
+  // could not reach it at all: no card, no URL, nothing to type. Renewal and the means of renewal now
+  // live in the same place. Permanent bindings renew with no prompt and are deliberately not offered it.
+  const lh = $("leaseHelper");
+  if (lh) {
+    const ua = navigator.userAgent || "";
+    const canRunHelper = /Windows/i.test(ua) || (/Linux/i.test(ua) && !/Android/i.test(ua));
+    // Read the binding from the ACCOUNT, not from state.devbind: that mirror is assigned inside the
+    // bindModeLine block above, so it is only current when that element happens to exist. A DOM node's
+    // presence must not decide whether a download link appears.
+    const db2 = (acc && acc.devbind) || state.devbind;
+    const perm = !!(db2 && db2.mode === "perm" && db2.live);
+    lh.innerHTML = (canRunHelper && !perm && state.wallet && state.wallet.address) ? tpmHelperLinks() : "";
+  }
+  const landing = !!_renewSubmitted && regEpoch <= _renewSubmitted.atEpoch;
+  let note, enabled;
+  if (landing) {
+    note = i18("lease.landing", "Renewal submitted — waiting for it to land on chain…");
+    enabled = false;
+  } else if (gap >= FIDELITY_MIN_GAP_EPOCHS && state.attestVia === "remote") {
+    note = i18("lease.remoteRenew", "Renewal earns now: on the other device open Collecting → \"Attest another wallet or node\" (it lists this address) and press Attest again. Nothing to press here.");
+    enabled = false;
+  } else if (gap >= FIDELITY_MIN_GAP_EPOCHS) {
+    // fidelity pays per ~19 h of gap since the gate (protocol.fidelity_step): a weekly renewal earns 8, a 36-hour one 1
+    note = i18("lease.canRenew", "Renewing now earns +{n} fidelity and moves your expiry to about {c}.",
+      { n: Math.max(1, Math.floor(gap / FIDELITY_MIN_GAP_EPOCHS)), c: _fmtClock(leaseEpochsOf(acc) * epochSecs) });
+    enabled = !!state.wallet && !_renewingLease && !state.registering;
+  } else {
+    note = i18("lease.tooEarly", "The +1 fidelity for this renewal is available from about {c} (in {t}). Your fidelity is safe until the lease expires.",
+      { c: _fmtClock(earnsIn), t: humanizeSeconds(earnsIn) });
+    enabled = false;
+  }
+  $("leaseNote").textContent = note;
+  btn.disabled = !enabled;
+  btn.style.display = enabled ? "" : "none";     // a disabled full-width accent button is noise; the note says when
+  show("leaseWrap", true);
+}
+async function renewLeaseManually() {
+  if (!state.wallet || _renewingLease || state.registering) return;
+  state.tapArmed = true;                        // the user pressed Renew: one attestation prompt may follow
+  const btn = $("btnRenewLease");
+  if (btn) btn.disabled = true;
+  try {
+    const [acc, ms] = await Promise.all([getAccount(state.wallet.address), getMiningStatus(state.wallet.address)]);
+    const regEpoch = (acc && typeof acc.reg_epoch === "number") ? acc.reg_epoch : -1;
+    const epochNow = (ms && typeof ms.epoch === "number") ? ms.epoch : null;
+    if (regEpoch < 0 || epochNow == null) return;
+    if ((epochNow - regEpoch) < FIDELITY_MIN_GAP_EPOCHS) {          // re-check against the chain, not the panel
+      log("info", i18("log.leaseTooEarly", "Not yet — the +1 for this renewal is available from the time shown in the panel. Your fidelity is safe until the lease expires."));
+      return;
+    }
+    if (_renewSubmitted && regEpoch <= _renewSubmitted.atEpoch && state.latest != null && state.latest <= _renewSubmitted.targetBlock) return;
+    // A failed press also quiets the AUTOMATIC path: whatever stopped it here (a cancelled prompt,
+    // hardware that cannot answer) will stop it again a few seconds later, and the owner should not be
+    // handed the same failing ceremony on a timer because they tried once by hand. The button itself
+    // stays live — a deliberate press is never rate-limited.
+    _renewFailedAt = (await broadcastLeaseRenewal(regEpoch)) ? 0 : Date.now();
+    refreshDashboard().catch(() => {});
+  } catch (e) { log("err", i18("log.leaseError", "Lease renewal error: {m}", { m: e.message })); }
+  finally { refreshDashboard().catch(() => {}); }
 }
 
 async function maybeRegister() {
@@ -1391,16 +4027,109 @@ async function maybeRegister() {
       log("err", i18("log.regExpired", "Registration tx expired before inclusion — re-registering automatically."));
       state.regSubmitted = null;                 // fall through and broadcast a fresh one
     } else {
-      const away = state.latest != null ? Math.max(0, state.regSubmitted.targetBlock - state.latest) : null;
+      // HOW FAR IS "FAR"? The tx was built as tip + REG_TARGET_MARGIN (a fixed 30 since gen 25), so the remaining
+      // distance can never legitimately exceed POSW_TARGET_MARGIN. A larger number does not mean a long wait — it means
+      // OUR view of the tip is wrong, which happens whenever the relay is still syncing and reports a low
+      // tip. The old guard was `state.latest != null`, and `0 != null` is TRUE, so a relay at height 0
+      // turned "blocks to go" into the absolute target height: a user was shown "25913 blocks to register"
+      // and reasonably concluded it was broken. Show a number only when it is credible, and say plainly
+      // that we are waiting on the relay when it is not.
+      const tipKnown = typeof state.latest === "number" && state.latest > 0;
+      const rawAway = tipKnown ? state.regSubmitted.targetBlock - state.latest : null;
+      const away = (rawAway != null && rawAway >= 0 && rawAway <= POSW_TARGET_MARGIN) ? rawAway : null;
+      const tgt = state.regSubmitted.targetBlock;
       showRegProgress(i18("reg.pending", "Registration in progress — waiting for it to be included in a block…"),
-        away != null ? `~${away} block(s) until target ${state.regSubmitted.targetBlock}`
-                     : `target block ${state.regSubmitted.targetBlock}`);
+        away != null ? i18("reg.untilTarget", "~{n} block(s) to go — target block {b}", {n: away, b: tgt})
+                     : i18("reg.targetOnly", "target block {b} — syncing with the relay…", {b: tgt}));
       setRegBanner(i18("reg.waiting", "Waiting for on-chain confirmation — this can take a few blocks") +
-        (away != null ? " (~" + escapeHtml(String(away)) + " to go, target block " + escapeHtml(String(state.regSubmitted.targetBlock)) + ")" : "") +
+        (away != null ? " " + escapeHtml(i18("reg.toGo", "(~{n} to go, target block {b})", {n: away, b: tgt}))
+                      : "") +
         "…" + REASSURE);
       return;                                     // still pending; let the poll loop keep checking
     }
   }
+  // GEN 25: A REGISTRATION IS A TAP, AND A TAP IS NEVER SILENT. The poll loop reaches here on its own (first
+  // registration, an expired lease, a presence mismatch); firing navigator.credentials.create() without a user
+  // gesture yields nothing on most platforms and produced the misleading "could not attest itself" line. Only a
+  // Start/Renew press arms ONE prompt; otherwise say what is needed and wait for the press.
+  // ATTEST FROM ANOTHER DEVICE (Linux, Mac, iPhone…): a phone / TPM PC / hardware wallet attests THIS address on its own
+  // wallet (the "Attest another wallet or node" card) and drops the statement on the relay; this wallet picks it up,
+  // wraps it in its own signed register tx and submits — no prompt here, the OTHER device is the one bound.
+  // A PROOF LEFT FOR THIS ADDRESS IS COLLECTED WHATEVER MODE THE WALLET IS IN. This used to require
+  // state.attestVia === "remote", i.e. the owner had to have already chosen "another device" from a menu
+  // before the wallet would even look. A TPM owner who ran the enrolment helper had no reason to know
+  // that: the helper leaves a finished proof addressed to THEIR wallet, and the wallet sat next to it
+  // asking them to attest on a second physical machine. Driving the real UI is what found this — every
+  // option under "attest another way" was clicked and not one issued a pickup request.
+  //
+  // Collecting is safe in any mode because the proof is not a credential: consensus re-verifies the
+  // certify against the on-chain enrolment record, and the register is still signed by this wallet and
+  // nobody else. The worst a junk drop can do is produce a register that validation refuses.
+  if (!state.pendingRegisterTx && !state.regSubmitted) {
+    try {
+      const r = await fetch(relayBase() + "/node_attest_pickup?sender=" + encodeURIComponent(state.wallet.address), { cache: "no-store" });
+      const d = await r.json();
+      const tipNow = Number(d.tip || state.latest || 0);
+      const cands = Array.isArray(d.drops) ? d.drops : (d.drop ? [d.drop] : []);
+      // TRY EVERY LIVE CANDIDATE, NEWEST FIRST — not just the newest. Anyone may drop a statement for any
+      // address, so one junk drop parked on top used to block every attempt: a stray test statement did
+      // exactly that here, and the owner's registration failed with "no such enrolment" on a made-up id
+      // while their real proof sat underneath it.
+      const live = cands.filter((b) => b && b.device && Number(b.max_block) > tipNow + 2);
+      live.reverse();
+      const fresh = live[0];
+      if (fresh) {
+        state.pendingDrops = live.slice(1);
+        // RECORD WHAT VOUCHED, AND ITS HANDLE. The relay cannot tell us: `devkey` is stamped on the
+        // account only for PERMANENT classes (Ledger, Trezor), so a leased class — a TPM, an endorsement
+        // key, an Android phone — leaves /get_account reporting cls: null, and the wallet had nothing to
+        // name. It does have the device here, at the moment it builds the registration, which is the one
+        // place the two are known together. The handle is the same value consensus binds on
+        // (ops/device_attest.device_binding_key): "ek:" + the endorsement identity for a chip enrolment.
+        writeDeviceStatus({ ...(readDeviceStatus() || {}), ok: true, reason: "ok" });
+        const tx = buildRegisterTx(state.wallet, Number(fresh.max_block), null, nowSeconds(), fresh.device);
+        state.pendingRegisterTx = { tx, targetBlock: Number(fresh.max_block) };
+        log("ok", i18("remote.got", "A statement from another device arrived — submitting the registration."));
+      } else if (state.attestVia === "remote") {
+        // ONLY NARRATE THE WAIT IN REMOTE MODE. The pickup above now runs in every mode, but this branch
+        // parks the UI on "waiting for another device" and hides the proving panel — correct for someone
+        // who chose that route, wrong for everyone else, who would be told to go and find a second
+        // machine they never asked about.
+        // OFFER THE TPM HELPER RIGHT HERE. A PC whose Windows Hello cannot attest (no AIK certificate —
+        // Microsoft's CA returns 404 for that chip, or the PIN was created offline) has no WebAuthn route
+        // at all, and the only way through is the enrolment helper. It used to be reachable solely by
+        // knowing a query string, which meant it reached exactly the people who had already been told it
+        // by hand. The address is baked into the filename the download sends, so nothing is pasted.
+        const _dlBase = enrolBase() + "/download_enrol?address=" + encodeURIComponent(state.wallet.address);
+        const _help = '<div class="mt">'
+          + escapeHtml(i18("remote.tpmOffer", "Or use this PC's security chip: if Windows Hello will not attest here, the enrolment helper proves the TPM directly and leaves the proof for this wallet to confirm.")) + ' '
+          + '<a href="' + escapeHtml(_dlBase) + '" rel="noopener">' + escapeHtml(i18("remote.dlWin", "Download for Windows")) + '</a>'
+          + ' · <a href="' + escapeHtml(_dlBase + "&os=linux") + '" rel="noopener">' + escapeHtml(i18("remote.dlLinux", "Download for Linux")) + '</a>'
+          + ' · <a href="' + escapeHtml(enrolBase() + "/static/nado-tpm-enrol.sha256") + '" rel="noopener">' + escapeHtml(i18("remote.dlHash", "checksums")) + '</a>'
+          + '</div>';
+        setRegBanner(i18("remote.switchBack", "To go back to attesting on this device instead, open \"Attest another way\" below and pick \"This device\". ") +
+          i18("remote.waiting", "Waiting for another device to vouch: on that device's wallet open Collecting → \"Attest another wallet or node\", paste this address and confirm there: {a}", { a: state.wallet.address }) + _help, "warn", "remote");
+        clearRegProgress();
+        setStartBtnWaitingReg();
+        if ($("mineState")) $("mineState").textContent = (state.lastMs && state.lastMs.bonded_producing)
+          ? i18("mine.savingsOnly", "Savings collecting — a device is needed only for the free lane and the dividend")
+          : i18("mine.waitingOther", "Not collecting — waiting for another device to vouch");
+        return;
+      }
+    } catch (e) { /* relay blip: next tick */ }
+  }
+  const permLive = await bindIsPermanent();            // bound for life: no prompt exists to arm, renew straight away
+  if (!state.tapArmed && !state.pendingRegisterTx && !permLive) {   // a kept (already attested) tx needs no new tap
+    setRegBanner((state.lastMs && state.lastMs.bonded_producing)
+      ? i18("reg.tapNeededSavings", "Your savings are collecting already. To add the free lane and the dividend, register a real device: press Start collecting and confirm the prompt.")
+      : i18("reg.tapNeeded2", "Your identity needs a registration: press Start collecting and confirm the device prompt."), "warn", "tap");
+    clearRegProgress();
+    haltForRegister();                           // the loop stops; the Register button is the only thing that opens a prompt
+    return;
+  }
+ 
+  // tapArmed is consumed inside attestDevice(), when a prompt actually opens — not here (a transient error before the
+  // prompt used to eat the tap and leave "Registering…" with a "press Register" banner)
   state.registering = true;
   let accepted = false, failed = null;
   try {
@@ -1411,10 +4140,10 @@ async function maybeRegister() {
     // logging an error or tearing down mining, so a 5 s node bounce never scares the user.
     if (isTransient(e)) {                          // finally{} below clears state.registering
       setConn(false);
-      setRegBanner(i18("reg.reconnecting", "Relay momentarily unreachable — reconnecting…"), "warn");
+      setRegBanner(i18("reg.reconnecting", "Relay momentarily unreachable — reconnecting…"), "warn", "unreachable");
       return;
     }
-    if (e.message !== "cancelled") { log("err", "Auto-register error: " + e.message); failed = e.message; }
+    if (e.message !== "cancelled") { log("err", i18("reg.error", "Registration error: {e}", { e: e.message })); failed = e.message; }
   } finally {
     state.registering = false;
   }
@@ -1423,10 +4152,18 @@ async function maybeRegister() {
     // A rejection/error is often STALE: a re-register gets refused as a duplicate precisely because
     // the earlier tx just landed (or presence is already established). Ask the chain before scaring
     // the user — if we're in fact registered, keep the loop alive and let pollOnce confirm quietly.
+    // PRESENCE, not the account flag: registered stays 1 after an eviction, and a Mac whose attestation had just failed
+    // was left "mining" with a Stop button because of it (operator 2026-09-09: "there is no mining going on without
+    // the attestation").
     try {
-      const acc2 = await getAccount(state.wallet.address);
-      if (acc2 && acc2.registered === 1) { show("powWrap", false); return; }
+      const ms2 = await getMiningStatus(state.wallet.address);
+      if (ms2 && ms2.registered_present === true) { clearRegProgress(); return; }
     } catch (e) { /* fall through to the real failure path */ }
+    // THE DEVICE ITSELF FAILED (no attestation chain, unsupported browser, prompt refused): retrying would only re-prompt.
+    // Stop the loop, put the one button back to Start, and let the status say what is true (savings mine on chain if
+    // bonded; nothing else does).
+    let devFailed = false; try { const st = readDeviceStatus(); devFailed = !!(st && st.ok === false); } catch (e) {}
+    if (devFailed) { haltForRegister(); setStartBtnIdle(); return; }
     failStart(failed || "the relay rejected the registration"); // genuine failure → retry, no spam
   }
 }
@@ -1435,70 +4172,172 @@ async function maybeRegister() {
 // indeterminate bar) for the WHOLE pending period — PoW, submit, and the wait for on-chain inclusion —
 // so the user always sees that something is happening, not just a tiny "Registering…" stat. The Cancel
 // button only aborts the PoW, so hide it once PoW is done (the user stops the wait via "Stop mining").
-function showRegProgress(label, stats) {
+// THE PROGRESS WIDGET IS ONE PIECE OF STATE, RENDERED ONCE — not a visibility flag toggled from nine
+// places. It was shown by three call sites and hidden by six, each re-evaluated on a ~1 s poll, with its
+// label and stats written separately from the show/hide. Any disagreement between those decisions is
+// visible as exactly what was reported: an empty panel with a turning circle, a section that vanishes
+// and comes back, content that appears and then does not.
+//
+// Now: `state.regProgress` is either null or {label, stats}, one function renders it, and the widget is
+// NEVER visible without a label. An empty spinner is not a state this can reach.
+function setRegProgress(label, stats) {
+  if (!label) { state.regProgress = null; }
+  else { state.regProgress = { label, stats: stats == null ? (state.regProgress && state.regProgress.stats) || "" : stats }; }
+  renderRegProgress();
+}
+
+function clearRegProgress() { setRegProgress(null); }
+
+function renderRegProgress() {
+  const p = state.regProgress;
+  const el = $("powWrap");
+  if (!el) return;
+  if (!p || !p.label) { show("powWrap", false); return; }
+  $("powLabel").textContent = p.label;
+  $("powStats").textContent = p.stats || "";
   show("powWrap", true);
-  $("powLabel").textContent = label;
-  if (stats != null) $("powStats").textContent = stats;
-  // The main Start/Mine button stays DISABLED during registration, so keep this Cancel button visible
-  // the whole time as the escape hatch (it calls stopMining — aborting PoW and the on-chain wait).
   if ($("btnCancelPow")) show("btnCancelPow", true);
   if (state.mining) $("mineState").textContent = i18("mine.registering", "Registering…");
 }
+
+// Kept as the name the flows already call. The Cancel button and the "Registering…" status live in
+// renderRegProgress now, so they cannot be set while the widget itself is hidden.
+function showRegProgress(label, stats) { setRegProgress(label, stats); }
 
 // Solve the one-time registration PoW and broadcast the register tx. Records state.regSubmitted on
 // acceptance. Does NOT wait for on-chain confirmation (the poll loop owns that). Returns true if the
 // tx was accepted into the mempool, false if the relay rejected it.
 async function submitRegistration() {
-  // need latest block for max_block
-  const latest = await getLatestBlock();
+  // need latest block for max_block — and if the relay is slow right now, the tip the poll loop read a moment ago is
+  // good enough for a target REG_TARGET_MARGIN blocks out (a stale target only costs a "window passed" retry, never a tap)
+  let latest = await getLatestBlock();
+  if ((!latest || typeof latest.block_number !== "number") && typeof state.latest === "number" && state.latest > 0
+      && state.latestAt && Date.now() - state.latestAt < 90000) {
+    latest = { block_number: state.latest };
+    log("warn", i18("reg.tipFallback", "The relay is slow — using the last known tip ({n}) for this registration.", { n: state.latest }));
+  }
   if (!latest || typeof latest.block_number !== "number") throw new RelayUnreachable("relay /get_latest_block unavailable");
-  state.latest = latest.block_number;
-  const targetBlock = latest.block_number + POSW_TARGET_MARGIN;  // headroom so the tx lands before its target block
-
-  // compute the registration Proof of SEQUENTIAL Work (non-parallelizable ~1 s chain, replaces hashcash)
-  // Registration difficulty (consensus, scales with load) + a device-calibrated wait estimate, shown up front.
-  const diff = await registrationDifficulty();
-  const etaSec = Math.max(1, Math.ceil(diff.reqT / poswRate()));
+  state.latest = latest.block_number; state.latestAt = Date.now();
+  // gen 25: the registration proof is the device attestation (one tap) — no sequential work, no difficulty
+  // lookup. `register` lands EXACTLY at max_block, so the margin is just propagation headroom.
+  const diff = { reqT: 0, mult: 1, entryMult: 1, recent: 0 };
+  // A SIGNED, ATTESTED REGISTRATION IS KEPT UNTIL IT LANDS OR EXPIRES. If the relay dropped the submission (a
+  // restart, a body cap, a proxy hiccup), the tx built around the tap is resubmitted on the next pass — the user
+  // is never asked for a second tap for the same lease (2026-09-07: a TPM user got "reconnecting…" then "needs a
+  // tap" with the button stuck on "Registering…").
+  const pend = state.pendingRegisterTx;
+  if (pend && latest.block_number < pend.targetBlock) {
+    setStartBtnBusy(i18("mine.registering", "Registering…"));
+    setRegBanner(i18("reg.resubmitting", "Resubmitting the attested registration…") + REASSURE);
+    return await submitRegisterTx(pend.tx, pend.targetBlock);
+  }
+  if (pend) {
+    // the kept tx can no longer land: drop it and go back through the Register gate — never straight into a
+    // new device prompt from the poll loop (review 2026-09-07)
+    state.pendingRegisterTx = null;
+    if (!state.tapArmed) { haltForRegister(); return false; }
+  }
+  state.pendingRegisterTx = null;
+  const targetBlock = latest.block_number + REG_TARGET_MARGIN;
+  const etaSec = 5;
   setStartBtnBusy(i18("mine.registering", "Registering…"));
-  const busyNote = diff.mult > 1
-    ? " " + i18("reg.difficultyHigh", "Network is busy — ×{m} difficulty from {n} recent registrations.", { m: diff.mult, n: diff.recent })
-    : "";
-  setRegBanner(i18("reg.computingEta", "Computing your one-time registration proof — about {s}s on this device.", { s: etaSec }) + busyNote + REASSURE);
-  showRegProgress(i18("reg.computingLabel", "Registering — computing sequential proof-of-work…"), i18("reg.starting", "starting…"));
+  const busyNote = "";
+  const entryNote = "";
+  const permNow = !!(state.devbind && state.devbind.mode === "perm" && state.devbind.live);
+  const attestingMsg = permNow ? i18("bind.renewing", "Renewing — bound for life to a {d}, no prompt needed.", { d: bindDeviceName(state.devbind.cls) })
+                               : i18("reg.attesting", "Proving this is a real device — confirm the prompt on your device.");
+  setRegBanner(attestingMsg + busyNote + entryNote + REASSURE);
+  // gen 25: no proof is computed, so no "about N seconds" estimate — the only wait is the device prompt.
+  showRegProgress(attestingMsg, "");
   let tx;
   const t0 = Date.now();
   try {
-    tx = await computeRegisterTx(targetBlock, (done, total) => {
-      const el = (Date.now() - t0) / 1000;
-      const rate = (done > 0 && el > 0) ? done / el : poswRate();
-      const remain = Math.max(0, Math.ceil((total - done) / rate));
-      $("powStats").textContent = i18("reg.progress", "{done} / {total} · {el}s · ~{remain}s left",
-        { done: done.toLocaleString(), total: total.toLocaleString(), el: el.toFixed(1), remain });
-    }, diff.reqT);
+    // gen 25: nothing is computed, so no "{done}/{total} · ~Ns left" — the only wait is the device prompt.
+    tx = await computeRegisterTx(targetBlock, null, diff.reqT);
   } finally {
-    show("powWrap", false);
+    clearRegProgress();
   }
-  savePoswRate(diff.reqT, Date.now() - t0);
-  log("ok", `Sequential PoW computed in ${((Date.now() - t0) / 1000).toFixed(1)}s (${diff.reqT.toLocaleString()} hashes${diff.mult > 1 ? `, ×${diff.mult} difficulty` : ""}).`);
+  const proveMs = Date.now() - t0;                    // gen 25: the "proof" is the tap; attestDevice() already logged it
+  // DID THE PROOF OUTLIVE ITS OWN WINDOW? `register` is EXACT-LANDING at max_block, and max_block is
+  // pinned to tip+POSW_TARGET_MARGIN at the START of proving — the anchor (max_block-POSW_ANCHOR_OFFSET)
+  // has to already exist, so the budget is hard-capped at POSW_TARGET_MARGIN blocks no matter how much
+  // work the difficulty demands. A device slower than that finishes a perfectly VALID proof for a block
+  // the chain has already passed, and the submit comes back as a flat rejection — which is what users
+  // reported as "the relay rejected the registration", with nothing on screen connecting it to speed.
+  // Say it plainly instead, with the device's measured rate, and let the retry aim at a fresh tip.
+  try {
+    const now = await getLatestBlock();
+    if (now && typeof now.block_number === "number") {
+      state.latest = now.block_number; state.latestAt = Date.now();
+      if (now.block_number >= targetBlock) {
+        // gen 25: no hashing, no rate — the tap simply took longer than the window (or the relay's tip jumped).
+        log("warn", i18("log.regWindowPassed",
+          "The device prompt took {s}s and the chain passed the target block — retrying with a fresh one.",
+          { s: (proveMs / 1000).toFixed(0) }));
+        return false;
+      }
+    }
+  } catch (e) { /* tip unreadable — just submit and let the relay answer */ }
+  return await submitRegisterTx(tx, targetBlock);
+}
+
+// Submit an already built + attested register tx and interpret the relay's answer. Split out of submitRegistration
+// so a KEPT tx (state.pendingRegisterTx, after a transient relay failure) is resubmitted through the same path.
+async function submitRegisterTx(tx, targetBlock) {
   setRegBanner(i18("reg.submitting", "Submitting registration to the network…") + REASSURE);
-  log("info", `Submitting register tx ${tx.txid.slice(0, 16)}… (max_block ${targetBlock}).`);
-  const res = await submitTransaction(tx);
+  log("info", `Submitting register tx ${tx.txid.slice(0, 16)}… (max_block ${targetBlock}) via ${relayBase()}.`);
+  if (!state.mining) return false;                // Stop was pressed while the device prompt was open: do not submit
+  let res;
+  try {
+    res = await submitTransaction(tx);
+  } catch (e) {
+    if (isTransient(e)) {
+      state.pendingRegisterTx = { tx, targetBlock };
+      log("warn", i18("reg.submitKept", "The relay did not take the submission ({e}) — the attested registration is kept and resubmitted on reconnect.", { e: e.message }));
+    }
+    throw e;
+  }
+  // an HTTP 5xx / 429 / 0 from the relay or proxy is NOT a rejection of the tx (review 2026-09-07): keep it too
+  if (!res.ok && (!res.status || res.status >= 500 || res.status === 429)) {
+    state.pendingRegisterTx = { tx, targetBlock };
+    log("warn", i18("reg.submitKept", "The relay did not take the submission ({e}) — the attested registration is kept and resubmitted on reconnect.", { e: "HTTP " + (res.status || 0) }));
+    throw new RelayUnreachable("relay HTTP " + (res.status || 0));
+  }
+  state.pendingRegisterTx = null;
   const m = res.data && (res.data.message || JSON.stringify(res.data));
   if (!(res.data && res.data.result)) {
+    // ALREADY REGISTERED this epoch is SUCCESS, not failure. The one-per-epoch guard rejects a duplicate
+    // recert ("sender already recerted this epoch") — which can only happen because the presence lease is
+    // ALREADY active (e.g. the node auto-registered this address, or a prior start this epoch). Proceed to
+    // mine instead of aborting; re-registering only renews the lease, which isn't needed again this epoch.
+    if (/already recerted|one register per epoch|already registered/i.test(m || "")) {
+      log("ok", i18("log.alreadyRegistered", "Already registered this epoch — presence lease active, collecting."));
+      return true;
+    }
     // surface the relay's exact reason (e.g. "Empty account") so the user isn't blind.
     log("err", i18("log.regRejected", "Register rejected by relay: {m}", {m}));
+    healSignatureRenewal(tx, m);            // the next attempt then attests with a full statement
+    // THE DEVICE LINE MUST NOT KEEP SAYING "attested ✓" AFTER THE CHAIN REFUSED THE STATEMENT (2026-09-10). attestDevice()
+    // sets ok:true as soon as the pre-flight parses, so a statement the NODE rejects (its rule set is the one that
+    // decides, and it is stricter than the probe) left the Mining page claiming success while the log said otherwise —
+    // and deviceGuide() never ran, so the owner got no steps at all. Carry the relay's own reason into the verdict.
+    if (/attestation|device|aaguid|tpm|authenticator/i.test(m || "")) {
+      let prev = null; try { prev = readDeviceStatus(); } catch (e) {}
+      setDeviceStatus({ ...(prev || {}), ok: false, reason: String(m || "").slice(0, 300) });
+    }
     if (/empty account/i.test(m || "")) {
       log("err", "This relay only accepts transactions from accounts that already exist on chain. " +
         "A brand-new address may need the relay operator to seed/allow it (node-side behavior).");
     }
     return false;
   }
+  acceptedRegisterTx(tx);
   state.regSubmitted = { targetBlock, txid: tx.txid };
   log("ok", i18("log.regAccepted", "Register tx accepted into mempool: {m}", {m}));
   // Registration only takes effect once the tx is INCORPORATED into a block. We DON'T block here —
   // the poll loop watches for it and starts heartbeating automatically. No second click needed. Keep
   // the in-progress widget visible (the poll loop refreshes its "blocks remaining" each tick).
-  log("info", i18("log.regWaiting", "Waiting for the registration to be included in a block — mining will start automatically then."));
+  log("info", i18("log.regWaiting", "Waiting for the registration to be included in a block — collecting will start automatically then."));
   showRegProgress(i18("reg.submitted", "Registration submitted — waiting for it to be included in a block…"),
     `target block ${targetBlock}`);
   setRegBanner(i18("reg.waiting", "Waiting for on-chain confirmation — this can take a few blocks") + " (" +
@@ -1509,12 +4348,23 @@ async function submitRegistration() {
 function nowSeconds() { return Math.floor(Date.now() / 1000); }
 
 
+const HIDDEN_POLL_EVERY = 5;   // a background tab polls every Nth tick: ~100 wallets × 6 calls per 8 s was the relay's whole load
+let _hiddenTicks = 0;
 async function pollOnce() {
+  if (document.visibilityState === "hidden" && !state.mining) {
+    if (++_hiddenTicks % HIDDEN_POLL_EVERY) return;    // nobody is looking; a miner keeps its lease cadence
+  } else { _hiddenTicks = 0; }
+  if (!netAdopted) refreshNetIdentity().catch(() => {});   // boot fetch lost to a blip: keep trying until adopted
+  relayMaintain().catch(() => {});                          // pool refresh (time-gated) + drift back home
+  if (state.wallet) { try { await fetchWalletView(state.wallet.address); } catch (e) { /* getters fall back */ } }
   try {
     const latest = await getLatestBlock();
     if (latest && typeof latest.block_number === "number") {
-      state.latest = latest.block_number;
+      state.latest = latest.block_number; state.latestAt = Date.now();
       setConn(true, latest.block_number);
+      // A relay that answers but does not ADVANCE is still down for our purposes — see relayNoteHeight.
+      relayNoteHeight(latest.block_number);
+      outboxTick(latest.block_number).catch(() => {});
     } else {
       setConn(false);                 // null = relay momentarily unreachable (getLatestBlock ate the blip)
     }
@@ -1522,8 +4372,21 @@ async function pollOnce() {
 
   // refresh dashboard
   try { await refreshDashboard(); } catch (e) { /* non-fatal */ }
+  // FUNDED INVITES: claim a pending invite once this identity is a present device identity, and keep "Your invites"
+  // current. Not awaited and not inside the mining branch below: that branch returns early while a registration is
+  // landing, and an identity that registered elsewhere (another tab, a phone) must still receive its gift.
+  maybeInviteClaim().catch(() => {});
+  inviteTick().catch(() => {});
 
   if (state.mining) {
+    // NOTHING IN FLIGHT MEANS NOTHING ON SCREEN. Every path that raises the progress widget can die
+    // without lowering it — an exception, a relay blip, a cancelled tap, a reload — and the widget then
+    // outlives the work it described. This is the invariant that makes the panel self-healing rather
+    // than something that has to be cleared correctly from nine places: if no registration is actually
+    // pending, the widget is not shown, whatever anyone forgot.
+    if (state.regProgress && !state.registering && !state.regSubmitted && !state.pendingRegisterTx) {
+      clearRegProgress();
+    }
     // Presence IS the PoSW lease — there is no separate heartbeat. Registration/renewal is fully AUTOMATIC
     // + self-healing: if we're not eligible (no recert, or the lease has lapsed), (re)register in the
     // background and wait. One ~1 s PoSW = a full lease of eligibility, locked phone or not. One click.
@@ -1532,14 +4395,21 @@ async function pollOnce() {
     const epochNow = state.latest != null ? Math.floor((state.latest + 8) / EPOCH_LENGTH) : null;
     const regEpoch = (acc && typeof acc.reg_epoch === "number") ? acc.reg_epoch : -1;
     // OPEN-lane eligibility = a PoSW recert within POSW_LEASE_EPOCHS (the recert is the single presence signal).
-    const leaseValid = epochNow != null && regEpoch >= 0 && (epochNow - regEpoch) < POSW_LEASE_EPOCHS;
+    const leaseValid = epochNow != null && regEpoch >= 0 && (epochNow - regEpoch) < leaseEpochsOf(acc);
     // AUTHORITATIVE presence: the node's open-registry membership (mining_status.registered_present) is ground
     // truth. If the node says we're NOT present — even when the local reg_epoch heuristic thinks the lease is
     // fine — we (re)register. Otherwise a state/index skew or a dropped registration tx leaves us stuck
     // "absent" forever (the local heuristic never triggers a retry). Fall back to the heuristic only when the
     // node's status isn't available yet, so a relay hiccup doesn't cause spurious re-registration.
     const msKnown = state.lastMs && typeof state.lastMs.registered_present === "boolean";
-    const present = msKnown ? state.lastMs.registered_present : leaseValid;
+    if (!msKnown) {
+      // NEVER announce "Mining" on the local guess alone. The local lease arithmetic cannot see an eviction (a device
+      // that moved on), a refused statement or a relay that dropped the lease — the node's registered_present is the
+      // only truth, and until it has answered the honest state is "starting" (2026-09-08: an evicted wallet showed
+      // "Mining" next to "Your identity needs a registration").
+      return;
+    }
+    const present = state.lastMs.registered_present;
     if (!acc || acc.registered !== 1 || !leaseValid || !present) {
       await maybeRegister();          // first registration, an expired lease, OR a node-vs-local presence mismatch
       return;                         // wait for the recert to land
@@ -1547,12 +4417,31 @@ async function pollOnce() {
     // eligible: quietly renew the lease (a fresh ~1 s PoSW) once ~80% spent, so the identity never lapses.
     maybeRenewLease(acc).catch(() => {});
     const wasStarting = state.starting || $("btnMine").disabled; // were we still in the setup phase?
-    if (state.regSubmitted) { state.regSubmitted = null; show("powWrap", false); log("ok", i18("log.regConfirmed", "Registration confirmed on chain ✓")); }
+    // NOTHING IS IN PROGRESS ONCE WE ARE PRESENT. The progress widget was hidden only when
+    // state.regSubmitted happened to be set, so every route that reaches this point another way — a
+    // proof collected from another device or the TPM helper, a registration that landed while the tab
+    // was in the background, a reload mid-flight — left the indeterminate bar spinning above an empty
+    // panel for as long as the page stayed open. Hiding it is unconditional now: we are registered,
+    // present, and the relay has just said so.
+    clearRegProgress();
+    const justLanded = !!(state.regSubmitted || state.pendingRegisterTx);
+    if (state.regSubmitted) { state.regSubmitted = null; log("ok", i18("log.regConfirmed", "Registration confirmed on chain ✓")); }
+    if (state.pendingRegisterTx) state.pendingRegisterTx = null;
     markMiningActive();                       // flip the button to the working Stop/Mining toggle
-    if (wasStarting) {
-      setRegBanner(i18("reg.confirmed", "Registered ✓ — mining now."), "ok");
-      hideRegBannerSoon();
-    }
+    // We are registered, present and the relay just answered — so any problem banner is now describing a
+    // condition that has healed. Retract it. Only `wasStarting` used to touch the banner here, which is
+    // why these went stale: a blip during STEADY mining, or a failStart that self-healed back into
+    // mining, both land here with wasStarting false and nothing ever cleared the warning. Retracting is
+    // safe to do every poll — it is a no-op unless that exact banner is still the one on screen, and if
+    // the problem recurs the next poll puts it straight back.
+    clearRegBanner("unreachable");
+    clearRegBanner("failed");
+    // NO BANNER FOR THIS. The Status cartouche already says Mining, permanently, with a pulse for as long
+    // as it is true — so announcing the same fact a second time in a floating panel meant one story told
+    // in two places, and the panel then had to be taken away again. A box that appears and disappears is
+    // worse than no box: it teaches the reader that what it says is provisional. State that is true
+    // continuously belongs in a fixed element, not in something that arrives and leaves.
+    if (wasStarting || justLanded) log("ok", i18("reg.confirmed", "Registered ✓ — collecting now."));
     // AUTO-BOND: compound a % of new mining rewards into bonded stake (once/epoch). `acc` is fresh here.
     try { await maybeAutoBond(acc, null); } catch (e) { /* best-effort; never break the loop */ }
   }
@@ -1561,12 +4450,17 @@ async function pollOnce() {
   // epoch it didn't reveal for (mandatory RANDAO), so any unlocked wallet holding >= B_MIN bonded
   // participates while the tab is open. No-op for everyone else (one cheap /get_account check).
   try { await maybeRandao(); } catch (e) { /* best-effort */ }
+  // TPM CHALLENGER DUTY — the same population as the epoch duty (an unlocked wallet holding >= B_MIN bonded): a
+  // bonded wallet can be DRAWN to challenge a stranger's TPM enrolment, and an enrolment whose drawn challenger
+  // never answers expires unproven. One /tpm_duty fetch per poll; a no-op for everyone else.
+  try { await maybeTpmChallenge(); } catch (e) { /* best-effort */ }
 }
 
 function startPollLoop() {
   stopPollLoop();
   const periodMs = Math.max(8000, Math.min(state.blockTime, 60) * 1000);
   state.pollTimer = setInterval(pollOnce, periodMs);
+  if (!state._buildTimer) { checkBuild().catch(() => {}); state._buildTimer = setInterval(() => { checkBuild().catch(() => {}); }, BUILD_CHECK_MS); }
   // seamless shielded withdrawals: quietly sweep any settled unshield into the balance in the background
   if (!state.claimTimer) state.claimTimer = setInterval(() => {
     if (state.wallet && !state.locked && loadNotes().length) claimUnshields(true).catch(() => {});
@@ -1587,7 +4481,7 @@ async function acquireWakeLock() {
     state.wakeLock = await navigator.wakeLock.request("screen");
     // the browser auto-releases the lock whenever the page is hidden; drop our handle so we re-request
     state.wakeLock.addEventListener("release", () => { state.wakeLock = null; });
-    log("info", i18("log.wakeLock", "Screen kept awake so mining continues while the phone is idle."));
+    log("info", i18("log.wakeLock", "Screen kept awake so collecting continues while the phone is idle."));
   } catch (e) { /* unsupported / denied — mining still runs while the tab is foregrounded */ }
 }
 async function releaseWakeLock() {
@@ -1601,7 +4495,6 @@ async function releaseWakeLock() {
 if (typeof document !== "undefined") {
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState !== "visible" || !state.mining) return;
-    acquireWakeLock();
     startPollLoop();
     pollOnce().catch(() => {});
   });
@@ -1655,6 +4548,10 @@ if (typeof document !== "undefined") {
 async function startMining() {
   if (!state.wallet) return;
   if (state.starting || state.mining) return;   // idempotency guard: a start is already in flight
+  // a validator identity signs blocks and attestations with ML-DSA-44 (protocol SIG_ML44_ONLY_RECIPIENTS)
+  if (ml44Only(state.wallet, i18("sig.whatMining", "Mining"))) return;
+  // gen 25: Start does NOT arm an attestation prompt — only the explicit Register / Renew / hardware buttons do
+  // (user 2026-09-07: "the attestation window should only pop up after one clicks register").
   state.mining = true;
   try { localStorage.setItem(LS_MINING, "1"); } catch (e) {}   // remember intent so a refresh auto-resumes
   state.starting = true;                          // button stays DISABLED until mining is live or fails
@@ -1663,15 +4560,20 @@ async function startMining() {
   setStartBtnBusy(i18("mine.starting", "Starting…"));                   // disabled spinner button — can't be re-clicked
   setRegBanner(i18("reg.startup", "Starting up — checking your registration with the relay…") + REASSURE);
   $("mineState").textContent = i18("mine.starting", "Starting…");
-  log("ok", i18("log.miningStarted", "Mining started — auto-registering / renewing your PoSW lease."));
+  log("ok", i18("log.miningStarted", "Collecting loop started — the relay confirms your registration first; blocks are collected only after that."));
   startPollLoop();
-  acquireWakeLock();   // keep the screen awake so mining doesn't stall when the phone would auto-lock
+  // No screen wake lock (2026-09-08): nothing in this page hashes any more — the presence lease lives on chain, savings
+  // need no page at all, and a renewal only needs the wallet open at that moment. Holding the screen on drained phones
+  // for nothing and the log line claimed mining depended on it.
   // kick off the first cycle immediately (registration / heartbeat / refresh) without blocking the UI
-  pollOnce().catch((e) => log("err", i18("log.miningLoopError", "Mining loop error: {m}", {m: e.message})));
+  pollOnce().catch((e) => { if (isTransient(e)) { setConn(false); return; } log("err", i18("log.miningLoopError", "Collecting loop error: {m}", {m: e.message})); });
 }
 
 function stopMining() {
   state.mining = false;
+  renderMiningIndicator();
+  state.tapArmed = false;
+ 
   try { localStorage.removeItem(LS_MINING); } catch (e) {}   // explicit stop -> don't auto-resume on refresh
   clearTimeout(_failRecheckTimer);                           // an explicit stop must not self-heal back to mining
   state.starting = false;
@@ -1680,11 +4582,14 @@ function stopMining() {
   state.autoBondBaseline = null; state.autoBondPending = null;   // re-arm auto-bond baseline for the next start
   stopPollLoop();
   releaseWakeLock();                                   // let the screen sleep again once mining stops
-  show("powWrap", false);
+  clearRegProgress();
+  // "Registered ✓ — mining now" must not outlive the mining. It persists while true, so stopping is one
+  // of the things that makes it untrue.
+  clearRegBanner("confirmed");
   show("regBanner", false);
   setStartBtnIdle();
   $("mineState").textContent = i18("mine.idle", "Idle");
-  log("info", i18("log.miningStopped", "Mining stopped."));
+  log("info", i18("log.miningStopped", "Collecting stopped."));
 }
 
 /* ----------------------------------------------------------------------------------------------
@@ -1692,7 +4597,7 @@ function stopMining() {
  * -------------------------------------------------------------------------------------------- */
 /* ------------------------------------------------------------------------------------------------
  * A LITTLE TOUCH — a pile of coins that grows with your wallet, scaled to the richest wallet on the
- * network (from /get_richest). Pure SVG, no assets. Richest → full heap + crown; empty → no coins.
+ * network (from /wealth_stats). Pure SVG, no assets. Richest → full heap + crown; empty → no coins.
  * ---------------------------------------------------------------------------------------------- */
 let _wealthCache = { at: 0, stats: null };
 async function getWealthStats() {
@@ -1701,9 +4606,17 @@ async function getWealthStats() {
   try {
     const r = await fetch(relayBase() + "/wealth_stats", { cache: "no-store" });
     const d = await r.json();
+    // `ranks`: the relay's DESCENDING non-zero totals (complete on a small chain, evenly sampled on a large
+    // one) — the exact ranking the caption is built from; relays on an older build omit it and the
+    // log-normal model below stays as the fallback
+    let ranks = null;
+    if (Array.isArray(d.ranks) && d.ranks.length) {
+      try { ranks = d.ranks.map((t) => BigInt(t)); } catch (x) { ranks = null; }
+    }
     _wealthCache = { at: now, stats: {
       count: num(d.count) || 0, richest: BigInt(d.richest || 0),
       logMean: Number(d.log_mean) || 0, logStd: Number(d.log_std) || 0,
+      ranks,
     } };
   } catch (e) { /* keep last */ }
   return _wealthCache.stats;
@@ -1755,15 +4668,23 @@ function renderCoinPile(totalRaw, stats) {
     // nothing to draw yet — collapse the SVG so an empty/new wallet doesn't reserve the pile's height,
     // leaving just the one-line hint.
     svg.style.display = "none";
-    cap.textContent = i18("pile.none", "No coins yet — start mining to grow your pile.");
+    cap.textContent = i18("pile.none", "No coins yet — start collecting to grow your pile.");
     return;
   }
   svg.style.display = "";
   const rich = (stats && stats.richest > 0n) ? stats.richest : 0n;
   const isTop = totalRaw > 0n && rich > 0n && totalRaw >= rich;    // you're the richest (or tied / network unknown)
   // log-normal percentile: the fraction of wallets this total is richer than (Φ of its z-score on ln(total)).
-  let pctile;
-  if (stats && stats.count > 1 && stats.logStd > 1e-9) {
+  let pctile, exactRank = null;
+  if (stats && stats.count > 1 && stats.ranks && stats.ranks.length) {
+    // EXACT: how many of the relay's ranked totals sit strictly above ours (list is descending)
+    const l = stats.ranks;
+    let lo = 0, hi = l.length;                                     // first index with l[i] <= totalRaw
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (l[mid] > totalRaw) lo = mid + 1; else hi = mid; }
+    const above = lo, complete = l.length >= stats.count;
+    if (complete) exactRank = above + 1;
+    pctile = Math.max(0, Math.min(1, 1 - above / Math.max(1, complete ? stats.count : l.length)));
+  } else if (stats && stats.count > 1 && stats.logStd > 1e-9) {
     pctile = Math.max(0, Math.min(1, _normalCdf((Math.log(Number(totalRaw)) - stats.logMean) / stats.logStd)));
   } else {
     pctile = isTop ? 1 : 0.5;                                      // degenerate/unknown population -> neutral
@@ -1789,7 +4710,37 @@ function renderCoinPile(totalRaw, stats) {
   svg.innerHTML = defs + body + crown;
   const tierName = i18(m.key, m.en);
   if (isTop) cap.textContent = i18("pile.richest", "👑 Richest wallet on the network!") + " · " + tierName;
-  else { const p = Math.round(pctile * 100); cap.textContent = i18("pile.richerThan", "richer than {p}% of wallets", { p }) + " · " + tierName; }
+  else {
+    // The log-normal rank rounds to "100%" for everything above ~35 NADO on a 900-wallet chain — which reads as
+    // nonsense ("richer than 100% of wallets"). Cap the percentile caption at 99, and for a wallet that sits in
+    // the top 100 replace it with its EXACT rank from the rich list ("#12 of 900 wallets"), fetched lazily.
+    // PERCENTILE is the caption (exact now that the relay ranks every wallet — see getWealthStats); the
+    // exact position is the tooltip. A caption cannot say "100%" for a wallet that is not the richest.
+    const p = Math.min(99, Math.round(pctile * 100));
+    cap.textContent = i18("pile.richerThan", "richer than {p}% of wallets", { p }) + " · " + tierName;
+    cap.title = "";
+    if (exactRank) {
+      cap.title = i18("pile.rank", "#{n} of {c} wallets", { n: exactRank, c: stats.count });
+    } else if (pctile >= 0.95 && stats && stats.count > 1) {
+      _exactRank(totalRaw, stats.count).then((n) => {
+        if (n) cap.title = i18("pile.rank", "#{n} of {c} wallets", { n, c: stats.count });
+      }).catch(() => {});
+    }
+  }
+}
+// Exact rank from the relay's top-100 rich list (cached 15 s), or null when this wallet is not in it.
+let _rankCache = { at: 0, list: null };
+async function _exactRank(totalRaw, count) {
+  const now = Date.now();
+  if (!_rankCache.list || now - _rankCache.at > 15000) {
+    const r = await rpcJSON("/get_rich_list", { retry: false });
+    const l = r && r.data && Array.isArray(r.data.rich_list) ? r.data.rich_list : null;
+    if (!l) return null;
+    _rankCache = { at: now, list: l.map((e) => { try { return BigInt(e.total); } catch (x) { return 0n; } }).sort((a, b) => (a > b ? -1 : a < b ? 1 : 0)) };
+  }
+  const l = _rankCache.list;
+  const above = l.filter((t) => t > totalRaw).length;
+  return above < l.length ? above + 1 : null;      // in the list's range -> exact rank; below its tail -> unknown
 }
 async function updateCoinPile(totalRaw) {
   try { renderCoinPile(totalRaw, await getWealthStats()); } catch (e) { /* non-fatal cosmetic */ }
@@ -1933,7 +4884,7 @@ function drawMiningChart(d) {
   const yOf = (v) => padT + plotH - (v / top) * plotH;
   const todayIdx = rows.length - 1;
 
-  let svg = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${i18("mine.aria", "Mined rewards per day over the past week")}">`;
+  let svg = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${i18("mine.aria", "Collected rewards per day over the past week")}">`;
   for (let g = 0; g <= 2; g++) {                       // baseline + two dashed gridlines, with y labels
     const v = (top / 2) * g, y = yOf(v);
     svg += `<line class="grid" x1="${padL}" y1="${y.toFixed(1)}" x2="${W - padR}" y2="${y.toFixed(1)}"`
@@ -2003,7 +4954,7 @@ function drawMiningChart(d) {
     note.textContent = i18("mine.none", "No blocks won in the past week. Rewards appear here the day you produce one.");
   } else {
     note.className = "mine-note";
-    note.textContent = i18("mine.src", "Per UTC day, replayed from blocks: both mining lanes, plus presence dividend on the day it was collected.")
+    note.textContent = i18("mine.src", "Per UTC day, replayed from blocks: both collecting lanes, plus presence dividend on the day it was collected.")
       + (d.covered_from > 0 ? " " + i18("mine.from", "History covers blocks from #{h}.").replace("{h}", d.covered_from) : "");
   }
   // A day the chart cannot SEE must never read as a day you earned nothing. The per-day breakdown is
@@ -2016,7 +4967,7 @@ function drawMiningChart(d) {
     miss.classList.toggle("hidden", !show);
     if (show) {
       miss.textContent = i18("mine.unattributed",
-        "Plus {a} NADO mined earlier that this node can no longer break down by day — its block history was replaced when the node re-synced from a snapshot. The chain still credits it: {t} NADO mined in total.",
+        "Plus {a} NADO collected earlier that this node can no longer break down by day — its block history was replaced when the node re-synced from a snapshot. The chain still credits it: {t} NADO collected in total.",
         { a: _mineAmt(gap), t: _mineAmt(d.produced_total) });
     }
   }
@@ -2066,26 +5017,76 @@ async function refreshMiningChart(addr, acc, ms) {
   if (_mineData) drawMiningChart(_mineData);
 }
 
+// LEGACY CLAIM (gen 28, recipient "legacy_claim"; operator: "sign with your old key and get the coins"). An account
+// whose key no chain ever saw was carried at its OLD 46-character address, which the new address format refuses as a
+// sender. This wallet holds the key, so it derives that old address (legacyAddress) and, if coins are still there, signs a
+// legacy_claim that moves the whole balance to this account's new address — no prompt: the coins only ever move from this
+// key's own old address to this key's own new one. Only from the BASE key (a rotated signer would claim for the wrong
+// key). Throttled; the chain refuses a second claim, so a retry costs nothing.
+function buildLegacyClaimTx(wallet, legacy, amount, targetBlock, timestamp) {
+  const draft = {
+    sender: wallet.address, recipient: "legacy_claim", amount: 0, timestamp,
+    data: { legacy, amount }, nonce: randNonce(), public_key: wallet.publicKey,
+    max_block: targetBlock, chain_id: CHAIN_ID,
+  };
+  return finalizeTransaction(draft, wallet, 0);
+}
+async function claimLegacy(acc) {
+  const w = state.wallet;
+  if (!w || !w.privateKey || makeAddress(w.publicKey) !== w.address) return;
+  const legacy = legacyAddress(w.publicKey);
+  if (legacy === w.address) return;
+  const at = (state._legacyClaimAt ||= {});
+  if (Date.now() - (at[legacy] || 0) < 60000) return;
+  at[legacy] = Date.now();
+  const old = await getAccount(legacy);
+  const bal = old && !old.public_key ? BigInt(old.balance || 0) : 0n;
+  if (bal <= 0n) return;
+  if (bal > BigInt(Number.MAX_SAFE_INTEGER)) return;   // a JSON number above 2^53 would lose precision (no such account exists)
+  const nado = (Number(bal) / 1e10).toString();
+  const out = await submitTransaction(buildLegacyClaimTx(w, legacy, Number(bal), await nextTargetBlock(), nowSeconds()));
+  if (out && out.data && out.data.result)
+    log("ok", i18("legacy.claiming", "Moving {n} NADO from your old address to this one — it arrives with the next blocks.", { n: nado }));
+}
+
 async function refreshDashboard() {
   if (!state.wallet) return;
   const addr = state.wallet.address;
   const [acc, ms] = await Promise.all([getAccount(addr), getMiningStatus(addr)]);
   state.lastMs = ms;   // cache the authoritative mining status (pollOnce reads registered_present from it)
+  // The device line is drawn from localStorage at boot, BEFORE the relay has answered; it was never redrawn once the
+  // chain's view arrived, so a wallet whose Ledger had moved to a node kept reading "attested ✓ (ledger)" for the whole
+  // session (operator, 2026-09-08). Redraw on every dashboard cycle: the chain, not the last tap, decides.
+  try { renderDeviceStatus(); } catch (e) {}
+  if (!refreshDashboard._vouchedAt || Date.now() - refreshDashboard._vouchedAt > 60000) { refreshDashboard._vouchedAt = Date.now(); renderVouched().catch(() => {}); }
   refreshMiningChart(addr, acc, ms).catch(() => {});   // mined-per-day chart under the menu (never blocks the card)
   refreshUnbond().catch(() => {});                     // surface + auto-finish a matured savings exit
+  refreshCashOuts().catch(() => {});                   // surface + auto-claim on L1 every cash-out the exec layer recorded
+  claimLegacy(acc).catch(() => {});                    // coins still at this key's OLD address move here (gen 28)
 
   // wallet card + send/stake panels (balances are shared across tabs)
   if (acc) {
     const freeRaw = BigInt(acc.balance ?? 0);          // /get_account: balance == free/spendable
     const bondedRaw = BigInt(acc.bonded ?? 0);         //              bonded  == locked stake
     const bal = rawToNado(freeRaw), bonded = rawToNado(bondedRaw);
-    $("walBalance").textContent = bal + " NADO";
-    $("walBonded").textContent = bonded + " NADO";
-    $("walTotal").textContent = rawToNado(freeRaw + bondedRaw) + " NADO";
+    // two decimals on the cards (operator 2026-09-08: "leave out a few decimals to reduce space"); the exact figure is the tooltip
+    $("walBalance").textContent = nadoShort(freeRaw) + " NADO"; $("walBalance").title = bal + " NADO";
+    $("walBonded").textContent = nadoShort(bondedRaw) + " NADO"; $("walBonded").title = bonded + " NADO";
+    $("walTotal").textContent = nadoShort(freeRaw + bondedRaw) + " NADO"; $("walTotal").title = rawToNado(freeRaw + bondedRaw) + " NADO";
+    renderDelegationLine(acc, ms);                     // "Producing · ≈ X NADO/day" right under the Bonded figure
     updateCoinPile(freeRaw + bondedRaw);               // a little touch: pile sized vs the richest wallet
     refreshDividend().catch(() => {});                 // presence dividend accrued off-L1 + auto-claim settled
-    $("walReg").innerHTML = acc.registered === 1 ? `<span class="badge ok">${i18("badge.yes","yes")}</span>` : `<span class="badge no">${i18("badge.no","no")}</span>`;
+    // REGISTERED follows the chain's PRESENCE, not the account flag: the flag stays 1 after an eviction (the device moved
+    // on) or a lapsed lease, and a wallet in exactly that state read "Registered: yes" (2026-09-08).
+    const _msK = state.lastMs && typeof state.lastMs.registered_present === "boolean";
+    $("walReg").innerHTML = (acc.registered === 1 && (!_msK || state.lastMs.registered_present)) ? `<span class="badge ok">${i18("badge.yes","yes")}</span>`
+      : (acc.registered === 1 ? `<span class="badge no">${i18("badge.lapsed","no — lease gone")}</span>` : `<span class="badge no">${i18("badge.no","no")}</span>`);
     $("walFidelity").textContent = acc.fidelity ?? 0;
+    // Probation was RETIRED at gen 25 (real-device reroll): an attested identity earns the dividend from its first
+    // lease at weight 1, one clean line to 30 — so the "probation" line under the fidelity number stays empty.
+    if ($("walProbation")) { $("walProbation").textContent = ""; $("walProbation").title = ""; }
+    refreshLeasePanel(acc, ms);                         // lease countdown + manual renew inside the earning window
+    authSync(acc).then(renderAuth).catch(() => {});      // re-anchor the signing key if the account's config moved
     $("sendAvail").textContent = bal + " NADO";
     $("stkAvail").textContent = bal + " NADO";
     $("stkBonded").textContent = bonded + " NADO";
@@ -2113,13 +5114,14 @@ async function refreshDashboard() {
 
     $("mineEpoch").textContent = ms.epoch;
     $("mineEta").textContent = humanizeSeconds(ms.expected_seconds_between_wins);
+    refreshCollectPerDay(ms).catch(() => {});
 
     // How long a LOCKED phone keeps mining before you must reopen the app: the PoSW lease itself (one
     // recert = a full lease of eligibility, no relay/heartbeats). Reopen before this and it auto-renews.
     const regEpoch = (acc && typeof acc.reg_epoch === "number") ? acc.reg_epoch : -1;
     if (regEpoch >= 0) {
       const epochSecs = EPOCH_LENGTH * (ms.block_time || state.blockTime || 8);
-      const leaseEnd = regEpoch + POSW_LEASE_EPOCHS;
+      const leaseEnd = regEpoch + leaseEpochsOf(acc);
       $("mineLocked").textContent = humanizeSeconds(Math.max(0, (leaseEnd - ms.epoch) * epochSecs));
     } else {
       $("mineLocked").textContent = "—";
@@ -2129,6 +5131,7 @@ async function refreshDashboard() {
     // visibility of the lanes card is owned by the tab system (it lives on the Wallet tab)
   } else {
     $("walPresent").textContent = "—";
+    if ($("minePerDay")) { $("minePerDay").textContent = "—"; $("minePerDaySplit").textContent = ""; }
   }
 }
 
@@ -2140,7 +5143,9 @@ async function refreshDashboard() {
  * the games use, so the wallet and the games never show two disagreeing token balances. */
 async function refreshPending(addr) {
   let mp = null;
-  try { const r = await rpcJSON("/get_account_mempool?address=" + encodeURIComponent(addr), { retry: false }); if (r.ok && r.data && typeof r.data === "object") mp = r.data; } catch (e) { /* relay blip / old node */ }
+  const v = viewFresh(addr);
+  if (v && v.mempool) mp = v.mempool;
+  else try { const r = await rpcJSON("/get_account_mempool?address=" + encodeURIComponent(addr), { retry: false }); if (r.ok && r.data && typeof r.data === "object") mp = r.data; } catch (e) { /* relay blip / old node */ }
   const freeIn = BigInt((mp && mp.free_in) || 0), freeOut = BigInt((mp && mp.free_out) || 0);
   const execIn = BigInt((mp && mp.exec_in) || 0), execOut = BigInt((mp && mp.exec_out) || 0);
 
@@ -2192,8 +5197,9 @@ function renderLanes(ms) {
   $("laneBondedShares").textContent = totBond;
 
   $("myShare").innerHTML =
+    (ms.open_excluded_bonded ? escapeHtml(i18("myshare.excludedBonded", "Your savings put this identity in the bonded lane: free-lane blocks go to device-only collectors (unbond below 10 NADO to switch). The presence dividend is unaffected.")) + " " : "") +
     `${i18("myshare.weight", "Your open-lane weight:")} <b>${myOpen}</b> / ${totOpen} (${sharePct}% ${i18("myshare.ofFree", "of the free lane")}). ` +
-    `${i18("myshare.openReg", "Open registry:")} ${openReg} ${i18("lane.miners", "miners")} · ${i18("myshare.bondShares", "Savings shares:")} ${myBond}/${totBond} · ` +
+    `${i18("myshare.openReg", "Open registry:")} ${openReg} ${i18("lane.miners", "collectors")} · ${i18("myshare.bondShares", "Savings shares:")} ${myBond}/${totBond} · ` +
     `${i18("myshare.bondReg", "Savings registry:")} ${bondReg}.`;
 
   // Dynamic "(you)" marker: you're in the FREE lane iff you have open-lane weight (registered + present),
@@ -2214,6 +5220,58 @@ function setConn(ok, tip) {
  * Onboarding / wallet UI
  * -------------------------------------------------------------------------------------------- */
 let pendingWallet = null;
+
+// ---- LAND LOGIN: land.nadochain.com bounces the player here to sign its one-time challenge, the forum SSO's pattern
+// (resumePendingForumLogin below): shown before signing, signed by the ACTIVE account in ITS OWN scheme (the world server
+// verifies every offered scheme, scripts/land_server.py login), domain-tagged so the signature is good for nothing but a
+// Land login, and sent ONLY to an allowlisted origin as a top-level form POST. It cannot move funds; the server binds the
+// challenge to the browser that started it (its login cookie) and accepts it once.
+// INVARIANT: every origin here is also in interface.html's CSP form-action, or the browser blocks the signed POST after
+// the user approved it (tests/test_the_wallet_may_post_every_login_it_signs.py).
+const LAND_ORIGIN_ALLOW = ["https://land.nadochain.com"];
+let pendingLandLogin = (() => {
+  try {
+    const p = new URLSearchParams(location.search);
+    if (p.get("land_login") !== "1") return null;
+    return { nonce: p.get("nonce") || "", site: p.get("site") || "", issued: parseInt(p.get("issued") || "0", 10) };
+  } catch (e) { return null; }
+})();
+async function resumePendingLandLogin() {
+  const req = pendingLandLogin;
+  if (!req || !state.wallet) return;
+  pendingLandLogin = null;                         // consume — don't re-prompt on later showWalletUI calls
+  try { history.replaceState(null, "", location.pathname + location.hash); } catch (e) {}
+  if (!LAND_ORIGIN_ALLOW.includes(req.site)) {
+    uiAlert(i18("landlogin.badOrigin", "Ignored a sign-in request for an unrecognised site.") + " (" + req.site + ")");
+    return;
+  }
+  const okc = await uiConfirm({
+    title: i18("landlogin.title", "Sign in to NADO Land"),
+    body: i18("landlogin.body", "Prove you own this wallet to build on {f} as {a}. This cannot move funds.",
+      { f: req.site.replace(/^https?:\/\//, ""), a: _abShort(signerFor(req.site).address) }),
+    confirmText: i18("landlogin.signin", "Sign in"),
+  });
+  if (!okc) return;
+  try {
+    // A PRIVATE ACCOUNT FOR LAND (#190, approved by the operator 2026-11-14): the login is signed by signerFor(site) — the
+    // game's shadow account when the player uses Land privately, else the active account — the same signer every
+    // contract call from Land already uses (resumePendingExecSign), so a plot bought privately belongs to the address the
+    // player builds as. It signed as the active account always, which is why Land could not be offered privately.
+    const who = signerFor(req.site);
+    const msg = blake2bHash([DOMAIN_LAND_LOGIN, req.site, who.address, req.nonce, req.issued], 32);
+    const e = schemeSignEntry(who, hexToBytes(msg));
+    const form = document.createElement("form");
+    form.method = "POST"; form.action = req.site + "/land/api/login_callback";
+    for (const [n, v] of [["address", who.address], ["public_key", e.public_key], ["alg", e.alg || ""],
+                          ["signature", e.signature], ["nonce", req.nonce]]) {
+      const i = document.createElement("input"); i.type = "hidden"; i.name = n; i.value = v; form.appendChild(i);
+    }
+    document.body.appendChild(form);
+    form.submit();                                 // navigates to Land, which verifies + sets its session cookie
+  } catch (e) {
+    uiAlert(i18("landlogin.failed", "Land sign-in failed:") + " " + (e && e.message ? e.message : e));
+  }
+}
 
 // ---- FORUM SSO: forum.nadochain.com bounces the user here to sign a one-time login challenge with their
 // wallet. We show exactly what they're signing, sign with the ACTIVE account (so HD accounts pick their forum
@@ -2238,10 +5296,11 @@ async function resumePendingForumLogin() {
     uiAlert(i18("forum.badOrigin", "Ignored a sign-in request for an unrecognised site.") + " (" + req.forum + ")");
     return;
   }
+  if (ml44Only(state.wallet, i18("sig.whatForum", "Forum sign-in"))) return;   // forum/server.py verifies ML-DSA-44
   const okc = await uiConfirm({
     title: i18("forum.title", "Sign in to NADO Forum"),
     body: i18("forum.body", "Prove you own this wallet to sign in to {f} as {a}. This cannot move funds.",
-      { f: req.forum.replace(/^https?:\/\//, ""), a: state.wallet.address.slice(0, 14) + "…" }),
+      { f: req.forum.replace(/^https?:\/\//, ""), a: _abShort(state.wallet.address) }),
     confirmText: i18("forum.signin", "Sign in"),
   });
   if (!okc) return;
@@ -2272,7 +5331,11 @@ async function resumePendingForumLogin() {
 // ONE execution-layer contract call with their wallet, then returns. Same redirect pattern as the forum SSO,
 // but this signs a REAL (fee-only) blob tx — so we confirm explicitly, only return to an ALLOWLISTED dApp
 // origin, and it can never move funds beyond the network fee (a `blob` tx has amount 0).
-const EXEC_SIGN_ALLOW = ["https://coinflip.nadochain.com", "https://roulette.nadochain.com", "https://dice.nadochain.com", "https://chess.nadochain.com", "https://poker.nadochain.com", "https://farkle.nadochain.com", "https://pets.nadochain.com", "https://slots.nadochain.com", "https://tictactoe.nadochain.com", "https://bet.nadochain.com", "https://battleship.nadochain.com", "https://mines.nadochain.com", "https://blackjack.nadochain.com", "https://connect4.nadochain.com", "https://reversi.nadochain.com", "https://scrapline.nadochain.com", "https://stormhold.nadochain.com"];
+// EVERY OFFICIAL APP THAT SIGNS THROUGH THIS WALLET (2026-11-01). The Shadow Accounts card offers exactly this list and the
+// restore scan reads it, so an app left off it has no private account: the DEX and lending (and five games) were
+// missing until tests/test_every_official_app_offers_a_shadow_account.py pinned it to every static page that loads
+// nadodapp.js.
+const EXEC_SIGN_ALLOW = ["https://coinflip.nadochain.com", "https://roulette.nadochain.com", "https://dice.nadochain.com", "https://chess.nadochain.com", "https://poker.nadochain.com", "https://farkle.nadochain.com", "https://pets.nadochain.com", "https://slots.nadochain.com", "https://tictactoe.nadochain.com", "https://bet.nadochain.com", "https://battleship.nadochain.com", "https://mines.nadochain.com", "https://blackjack.nadochain.com", "https://connect4.nadochain.com", "https://reversi.nadochain.com", "https://scrapline.nadochain.com", "https://stormhold.nadochain.com", "https://autogame.nadochain.com", "https://hamster.nadochain.com", "https://hexholm.nadochain.com", "https://pool.nadochain.com", "https://sovereign.nadochain.com", "https://dex.nadochain.com", "https://lend.nadochain.com", "https://nft.nadochain.com", "https://land.nadochain.com"];
 // USER-CONFIGURABLE allowlist (Settings → "Allowed dApp sites"): extra origins the user trusts to request
 // signatures, on TOP of the built-in official games above. Stored as a JSON array of "https://host" origins.
 const ALLOW_LS = "nado_allowed_origins";
@@ -2294,11 +5357,18 @@ const OFFICIAL_ORIGIN = /^https:\/\/([a-z0-9-]+\.)*nadochain\.com$/;
 // an origin the user may sign for: an official nadochain.com game, a built-in entry, OR one they added in
 // Settings (NOT the blanket "trust any site" bypass — callers add that so an unknown 3rd-party gets a louder path).
 const originAllowed = (origin) => OFFICIAL_ORIGIN.test(origin) || EXEC_SIGN_ALLOW.includes(origin) || userAllowedOrigins().includes(origin);
+// WHO ASKED is not WHERE TO ANSWER (audit 2026-09-25, HIGH). `ret` is part of the request, so any page, email or chat
+// link can name https://chess.nadochain.com/ as `ret` — and silent signing used to trust exactly that. The CALLER is
+// what the browser vouches for: e.origin on a postMessage, and on the URL path the origin of document.referrer (the
+// page that navigated here, or the page embedding the hidden frame). A missing referrer (an email link, noreferrer)
+// is an unknown caller: the request still works, but only through a visible confirm, never a silent sign.
+function _referrerOrigin() { try { return document.referrer ? new URL(document.referrer).origin : ""; } catch (e) { return ""; } }
 let pendingExecSign = (() => {
   try {
     const p = new URLSearchParams(location.search);
     const b = p.get("exec_sign");
-    return b ? { payload: b, ret: p.get("ret") || "", app: p.get("app") || "a dApp", bg: p.get("bg") === "1" } : null;
+    return b ? { payload: b, ret: p.get("ret") || "", app: p.get("app") || "a dApp", bg: p.get("bg") === "1",
+                 caller: _referrerOrigin() } : null;
   } catch (e) { return null; }
 })();
 // EARLY background-sign triage: a hidden-iframe (bg=1) request that CAN'T be signed silently must bounce the
@@ -2332,15 +5402,25 @@ async function resumePendingExecSign() {
   // background signing is a user setting (default ON). Turned off → always fall back to the visible redirect.
   if (bg && localStorage.getItem("nado_bg_sign") === "0") { pendingExecSign = null; needUI("off"); return; }
   if (!state.wallet) { pendingExecSign = null; needUI("locked"); return; }   // a hidden iframe can't show the unlock screen
-  pendingExecSign = null;
+  pendingExecSign = null;                // consumed BEFORE the await, so a second resume cannot sign it twice
+  await authReady();                     // a protected account's signer, never its base key (authReady)
   if (!bg) { try { history.replaceState(null, "", location.pathname + location.hash); } catch (e) {} }
   let call, retUrl;
-  try { call = JSON.parse(decodeURIComponent(escape(atob(req.payload)))); retUrl = new URL(req.ret); }
+  try {
+    call = JSON.parse(decodeURIComponent(escape(atob(req.payload)))); retUrl = new URL(req.ret);
+    // A `ret` of javascript:/data: parses as a URL with origin "null" and back() would NAVIGATE to it — script on the
+    // wallet's origin, next to the seed (audit 2026-09-25). Only a web page can be answered.
+    if (retUrl.protocol !== "https:" && retUrl.protocol !== "http:") throw new Error("ret is not a web page");
+  }
   catch (e) { if (bg) return needUI(); uiAlert(i18("dapp.bad", "Ignored a malformed signing request.")); return; }
   // The origin allowlist is the default guard. A user can opt to skip it (Settings → "Trust any site that
   // asks me to sign") — unknown origins then get a LOUDER confirm that names the origin, never a silent pass.
   const skipOriginCheck = localStorage.getItem("nado_skip_origin_check") === "1";
   const trustedOrigin = originAllowed(retUrl.origin);
+  // SILENT signing needs the trusted site to be the one ASKING (see _referrerOrigin). Every autosign below reads
+  // `silentOk`, never `trustedOrigin` alone — a crafted link naming a trusted `ret` gets the visible confirm.
+  const fromRet = !!req.caller && req.caller === retUrl.origin;
+  const silentOk = trustedOrigin && fromRet;
   if (!trustedOrigin && !skipOriginCheck) {
     if (bg) return needUI("untrusted");   // don't silently sign for an unknown site in a hidden frame — redirect so the warning shows
     uiAlert(i18("dapp.badOrigin", "Ignored a signing request for an unrecognised site.") + " (" + retUrl.origin + ")");
@@ -2348,24 +5428,53 @@ async function resumePendingExecSign() {
   }
   // In background mode the result is postMessaged to the game (parsed from the same "ok=1&…" string the
   // redirect would carry); otherwise it navigates back as before.
+  // THE SIGNER FOR THIS SITE (shadow accounts): its private account when the user plays it privately (signerFor), else
+  // the active account. INVARIANT: every signature and every address answered below uses `signer`, never state.wallet,
+  // so a private game never sees or gets a signature from the wallet's real account.
+  const signer = signerFor(retUrl.origin);
   const back = bg
     ? (params) => { const o = { nadoExecSign: 1 }; try { new URLSearchParams(params).forEach((v, k) => { o[k] = v; }); } catch (e) {} try { window.parent.postMessage(o, retUrl.origin); } catch (e) {} }
-    : (params) => { location.href = req.ret + (req.ret.includes("?") ? "&" : "?") + params; };
-  if (bg && (call.connect || call.deposit)) return needUI();   // sign-in / deposit always need the visible confirm
+    : (params) => { const r = retUrl.href; location.href = r + (r.includes("?") ? "&" : "?") + params; };
+  // A STALE GAME PAGE IS REFUSED (G6; see PAGE_CHAIN). A game builds its call with ITS OWN /protocol.js — the commitments
+  // it hashes follow that module's VM — and the SDK names that chain in every request (nadodapp `chain`). A request for
+  // another chain than this wallet's page is answered "reload", never signed. A request naming no chain comes from a
+  // page older than the field (G6), which on a chain past generation 28 can only be a tab kept open across the reroll.
+  if (call.chain !== undefined ? call.chain !== PAGE_CHAIN : Number(P.CHAIN_GENERATION || 0) >= 29) {
+    back("ok=0&err=" + encodeURIComponent(i18("dapp.stalePage", "This game page is out of date for the network. Reload it and try again.").slice(0, 120)));
+    return;
+  }
+  // an htlc_claim is value-free and can only pay THIS wallet, so it rides the same auto-sign switch as a
+  // game move; everything else that moves or commits money always opens the visible confirm
+  const claimSilently = !!call.htlc_claim && localStorage.getItem("nado_autosign_dapp") !== "0" && silentOk;
+  if (bg && (call.connect || call.deposit || call.htlc_lock || call.htlc_refund || (call.htlc_claim && !claimSilently))) return needUI();   // sign-in / deposit / swap-lock always need the visible confirm
   if (call.connect) {   // lightweight "sign in": just return the wallet address, no transaction, no fee
     const c = await uiConfirm({
       title: i18("dapp.connectTitle", "Sign in"),
       body: i18("dapp.connectBody", "{app} wants your wallet address ({a}) to sign you in. No transaction — nothing moves.",
-        { app: req.app, a: state.wallet.address.slice(0, 14) + "…" }),
+        { app: req.app, a: _abShort(signer.address) }),
       confirmText: i18("dapp.connect", "Sign in"),
     });
-    back(c ? "ok=1&addr=" + state.wallet.address : "ok=0");
+    back(c ? "ok=1&addr=" + signer.address : "ok=0");
     return;
   }
   // Everything below BUILDS A SIGNED TX, so adopt the relay's CURRENT chain_id first (a tx signed with a stale
   // chain_id is rejected "wrong chain id"; the boot initNetTag can still be racing). Sign-in (connect) above
   // needs no tx and must never be blocked by this /status fetch.
   await initNetTag().catch(() => {});
+  if (call.bridge_claim) {   // CASH-OUT CLAIM: finish this wallet's own cash-out on L1 (see "CASH-OUT CLAIM")
+    // No confirm, silent in the background signer: the claim is fee-exempt and consensus requires sender == addr, so it
+    // can only move this wallet's own recorded cash-out into this wallet. The game names only a nonce; the record, its
+    // amount and its proof are read from the exec node HERE, never taken from the request.
+    const nonce = String((call.bridge_claim || {}).nonce || "");
+    if (!/^[0-9]{1,20}$/.test(nonce)) { back("ok=0&err=bad+claim"); return; }
+    try {
+      const d = await fetchCashOuts();
+      const r = d ? await claimCashOuts(d, { only: nonce }) : { submitted: 0, err: "exec node unreachable" };
+      back(r.submitted ? "ok=1&txid=" + r.txid + "&addr=" + signer.address
+                       : "ok=0&err=" + encodeURIComponent(String(r.err || "nothing to claim").slice(0, 80)));
+    } catch (e) { back("ok=0&err=" + encodeURIComponent(String(e.message || e).slice(0, 80))); }
+    return;
+  }
   if (call.deposit) {   // BRIDGE DEPOSIT: move the user's OWN L1 funds into their OWN exec balance (safe, bounded — no third-party recipient)
     let amt; try { amt = BigInt(call.deposit.amount); } catch (e) { back("ok=0&err=bad+amount"); return; }
     if (amt <= 0n) { back("ok=0"); return; }
@@ -2381,12 +5490,99 @@ async function resumePendingExecSign() {
       const { res, tx } = await submitResilient(async () => {
         const latest = await getLatestBlock();
         if (!latest) throw new Error("relay unavailable");
-        const draft = { sender: state.wallet.address, recipient: "bridge", amount: amt, timestamp: nowSeconds(),
-          data: "", nonce: randNonce(), public_key: state.wallet.publicKey, max_block: latest.block_number + TX_TARGET_MARGIN,
-          min_block: latest.block_number + TX_INCLUSION_DELAY, chain_id: CHAIN_ID };
-        return finalizeTransaction(draft, state.wallet.privateKey, MIN_TX_FEE);
+        const draft = { sender: signer.address, recipient: "bridge", amount: amt, timestamp: nowSeconds(),
+          data: "", nonce: randNonce(), public_key: signer.publicKey, max_block: latest.block_number + TX_TARGET_MARGIN,
+          min_block: guardFrom(latest.block_number), chain_id: CHAIN_ID };
+        return finalizeTransaction(draft, signer, MIN_TX_FEE);
       });
-      back(res && res.data && res.data.result ? "ok=1&txid=" + tx.txid + "&addr=" + state.wallet.address
+      back(res && res.data && res.data.result ? "ok=1&txid=" + tx.txid + "&addr=" + signer.address
+                                       : "ok=0&err=" + encodeURIComponent(((res && res.data && res.data.message) || "rejected").slice(0, 80)));
+    } catch (e) { back("ok=0&err=" + encodeURIComponent(String(e.message || e).slice(0, 80))); }
+    return;
+  }
+  if (call.htlc_lock) {   // ATOMIC-SWAP LOCK: escrow L1 NADO under a SHA-256 hashlock for a named claimant.
+    // This is the NADO leg of a cross-chain swap. It lives on L1 because L1 verifies SHA-256 natively, so
+    // this lock and the foreign chain's lock carry the SAME hashlock and one secret opens both.
+    const L = call.htlc_lock || {};
+    let amt; try { amt = BigInt(L.amount); } catch (e) { back("ok=0&err=bad+amount"); return; }
+    const claimant = String(L.claimant || ""), hashlock = String(L.hashlock || "").toLowerCase();
+    const blocks = Math.floor(Number(L.blocks) || 0);
+    if (!ADDR_RE_I.test(claimant) || !/^[0-9a-f]{64}$/.test(hashlock) || amt <= 0n || !(blocks > 0)) {
+      back("ok=0&err=bad+swap+lock"); return;
+    }
+    const okc = await uiConfirm({
+      title: i18("dapp.swapTitle", "Lock NADO for an atomic swap"),
+      body: i18("dapp.swapBody", "{app} is asking you to escrow {n} NADO on the main chain. Only someone who knows the swap secret can take it, and only before it expires — after that you reclaim it yourself.", { app: req.app, n: rawToNado(amt) }),
+      rows: [{ k: i18("dapp.amount", "Amount"), v: rawToNado(amt) + " NADO" },
+             { k: i18("dapp.swapClaimant", "Claimable by"), v: claimant },
+             { k: i18("dapp.swapHash", "Hashlock"), v: hashlock.slice(0, 20) + "…" },
+             { k: i18("dapp.swapExpiry", "You can reclaim after"), v: blocks + " blocks" }],
+      confirmText: i18("dapp.swapLock", "Lock"),
+    });
+    if (!okc) { back("ok=0"); return; }
+    try {
+      const { res, tx } = await submitResilient(async () => {
+        const latest = await getLatestBlock();
+        if (!latest) throw new Error("relay unavailable");
+        const target = latest.block_number + TX_TARGET_MARGIN;
+        return buildTransferTx(signer, "htlc_lock", amt, MIN_TX_FEE, target,
+                               { claimant, hashlock, expiry: target + blocks }, nowSeconds());
+      });
+      back(res && res.data && res.data.result ? "ok=1&txid=" + tx.txid + "&addr=" + signer.address
+                                       : "ok=0&err=" + encodeURIComponent(((res && res.data && res.data.message) || "rejected").slice(0, 80)));
+    } catch (e) { back("ok=0&err=" + encodeURIComponent(String(e.message || e).slice(0, 80))); }
+    return;
+  }
+  if (call.htlc_refund) {   // ATOMIC-SWAP REFUND: reclaim this wallet's own expired L1 lock
+    const hid = String((call.htlc_refund || {}).htlc_id || "");
+    let doc = null;
+    try { doc = (await rpcJSON("/get_htlc?id=" + encodeURIComponent(hid))).htlc; } catch (e) {}
+    if (!doc) { back("ok=0&err=" + encodeURIComponent("no such swap lock")); return; }
+    if (doc.sender !== signer.address) { back("ok=0&err=" + encodeURIComponent("that lock was not funded by this wallet")); return; }
+    const okr = await uiConfirm({
+      title: i18("dapp.swapRefundTitle", "Reclaim an expired swap lock"),
+      body: i18("dapp.swapRefundBody", "{app} is asking you to take back {n} NADO from an atomic-swap lock that has expired unclaimed.", { app: req.app, n: rawToNado(BigInt(doc.amount)) }),
+      rows: [{ k: i18("dapp.amount", "Amount"), v: rawToNado(BigInt(doc.amount)) + " NADO" }, { k: i18("dapp.swapLockId", "Lock"), v: hid.slice(0, 20) + "…" }],
+      confirmText: i18("dapp.swapRefund", "Reclaim"),
+    });
+    if (!okr) { back("ok=0"); return; }
+    try {
+      const { res, tx } = await submitResilient(async () => {
+        const latest = await getLatestBlock();
+        if (!latest) throw new Error("relay unavailable");
+        return buildTransferTx(signer, "htlc_refund", 0n, 0, latest.block_number + TX_TARGET_MARGIN, { htlc_id: hid }, nowSeconds());
+      });
+      back(res && res.data && res.data.result ? "ok=1&txid=" + tx.txid + "&addr=" + signer.address
+                                       : "ok=0&err=" + encodeURIComponent(((res && res.data && res.data.message) || "rejected").slice(0, 80)));
+    } catch (e) { back("ok=0&err=" + encodeURIComponent(String(e.message || e).slice(0, 80))); }
+    return;
+  }
+  if (call.htlc_claim) {   // ATOMIC-SWAP CLAIM: take an L1 HTLC's NADO with the secret. Reveals the secret on chain.
+    const L = call.htlc_claim || {};
+    const hid = String(L.htlc_id || ""), preimage = String(L.preimage || "").toLowerCase();
+    if (!/^[0-9a-f]{16,}$/.test(hid) || !/^[0-9a-f]{64}$/.test(preimage)) { back("ok=0&err=bad+swap+claim"); return; }
+    let doc = null;
+    try { doc = (await rpcJSON("/get_htlc?id=" + encodeURIComponent(hid))).htlc; } catch (e) {}
+    if (!doc) { back("ok=0&err=" + encodeURIComponent("no such swap lock")); return; }
+    if (doc.claimant !== signer.address) { back("ok=0&err=" + encodeURIComponent("that lock is claimable by " + doc.claimant.slice(0, 12) + "…, not this wallet")); return; }
+    if ((await _sha256hex(Uint8Array.from(preimage.match(/../g), (x) => parseInt(x, 16)))) !== String(doc.hashlock).toLowerCase()) { back("ok=0&err=" + encodeURIComponent("secret does not match the lock's hashlock")); return; }
+    const okc = (bg && claimSilently) || await uiConfirm({
+      title: i18("dapp.swapClaimTitle", "Claim NADO from an atomic swap"),
+      body: i18("dapp.swapClaimBody", "{app} is asking you to claim {n} NADO escrowed for you on the main chain. This PUBLISHES the swap secret — the other side of the swap becomes claimable by your counterparty the moment it lands.", { app: req.app, n: rawToNado(BigInt(doc.amount)) }),
+      rows: [{ k: i18("dapp.amount", "Amount"), v: rawToNado(BigInt(doc.amount)) + " NADO" },
+             { k: i18("dapp.swapLockId", "Lock"), v: hid.slice(0, 20) + "…" },
+             { k: i18("dapp.swapExpiry2", "Claimable until block"), v: String(doc.expiry) }],
+      confirmText: i18("dapp.swapClaim", "Claim"),
+    });
+    if (!okc) { back("ok=0"); return; }
+    try {
+      const { res, tx } = await submitResilient(async () => {
+        const latest = await getLatestBlock();
+        if (!latest) throw new Error("relay unavailable");
+        return buildTransferTx(signer, "htlc_claim", 0n, 0, latest.block_number + TX_TARGET_MARGIN,
+                               { htlc_id: hid, preimage }, nowSeconds());
+      });
+      back(res && res.data && res.data.result ? "ok=1&txid=" + tx.txid + "&addr=" + signer.address
                                        : "ok=0&err=" + encodeURIComponent(((res && res.data && res.data.message) || "rejected").slice(0, 80)));
     } catch (e) { back("ok=0&err=" + encodeURIComponent(String(e.message || e).slice(0, 80))); }
     return;
@@ -2398,17 +5594,45 @@ async function resumePendingExecSign() {
   // the dApp may send a FULL blob payload (call.blob) or the legacy {cid,method,args} call shape
   const blob = decodeDeep(call.blob || { op: "call", contract: call.cid, method: call.method, args: call.args || [] });
   if (call.ns && call.ns !== "default" && blob.ns === undefined) blob.ns = call.ns;
+  // ONE APPROVAL, TWO STEPS (`then`, nadodapp signBlob opts.then): a dApp action that is two transactions — the NFT
+  // mint and its royalty registration — signs both from this one confirm instead of a second popup minutes later, which
+  // is how creators lost their royalty (2026-11-04). The follow-up is held to a VALUE-FREE contract call: no value, no
+  // asset, no amount, no recipient. So nothing it does can move money the confirm did not show. It is shown as its own
+  // row, it always needs the visible confirm (never autosign, never the hidden frame), and it is submitted only after
+  // the first transaction is accepted.
+  let thenBlob = null;
+  if (call.then !== undefined) {
+    thenBlob = decodeDeep(call.then);
+    const okThen = thenBlob && typeof thenBlob === "object" && thenBlob.op === "call" && typeof thenBlob.contract === "string"
+      && typeof thenBlob.method === "string" && Array.isArray(thenBlob.args)
+      && ["value", "asset", "amount", "to", "spender"].every((k) => thenBlob[k] === undefined);
+    if (!okThen) { back("ok=0&err=" + encodeURIComponent("bad follow-up call")); return; }
+    if (call.ns && call.ns !== "default" && thenBlob.ns === undefined) thenBlob.ns = call.ns;
+    if (bg) return needUI();
+  }
   // AUDIT FIX: show the REAL action (op + key fields), never just the dApp's free-text label, so the confirm can't be spoofed
   const rows = [{ k: i18("dapp.action", "Action"), v: String(blob.op || "call") }];
   if (blob.contract) rows.push({ k: i18("dapp.contract", "Contract"), v: String(blob.contract).slice(0, 22) });
   if (blob.method)   rows.push({ k: i18("dapp.method", "Method"), v: String(blob.method) });
   if (blob.game !== undefined)  rows.push({ k: i18("dapp.game", "Game"), v: String(blob.game) });
   try { if (blob.stake  !== undefined) rows.push({ k: i18("dapp.stake", "Stake"),  v: rawToNado(BigInt(blob.stake)) + " NADO" }); } catch (e) {}
-  try { if (blob.amount !== undefined && blob.amount) rows.push({ k: i18("dapp.amount", "Amount"), v: rawToNado(BigInt(blob.amount)) + " NADO" }); } catch (e) {}
+  // SHOW WHERE IT GOES (audit 2026-09-25): an asset_transfer used to show "Amount N NADO" and nothing else — not the
+  // recipient, not which asset, and in the wrong unit. Every op's counterparty and asset are rows now.
+  const _assetId = blob.asset ? String(blob.asset) : "";
+  const _unit = (v) => _assetId ? String(v) + " " + i18("dapp.assetUnits", "units of asset {a}", { a: _assetId.slice(0, 12) + "…" })
+                                : rawToNado(BigInt(v)) + " NADO";
+  try { if (blob.amount !== undefined && blob.amount) rows.push({ k: i18("dapp.amount", "Amount"), v: _unit(blob.amount) }); } catch (e) {}
+  if (_assetId) rows.push({ k: i18("dapp.asset", "Asset"), v: _assetId });
+  if (blob.to !== undefined) rows.push({ k: i18("dlg.to", "To"), v: String(blob.to) });
+  if (blob.spender !== undefined) rows.push({ k: i18("dapp.spender", "Spender"), v: String(blob.spender) });
+  if (Array.isArray(blob.args) && blob.args.length)
+    rows.push({ k: i18("dapp.args", "Arguments"), v: blob.args.map((a) => typeof a === "bigint" ? a.toString() : JSON.stringify(a)).join(", ").slice(0, 200) });
   // A `call` can carry VALUE — real NADO escrowed from YOUR exec balance into the contract. Show it prominently
   // (it can't be spoofed by the dApp's label) so signing a staking call is always an informed choice.
   let escrow = 0n; try { escrow = blob.value ? BigInt(blob.value) : 0n; } catch (e) { escrow = 0n; }
-  if (escrow > 0n) rows.push({ k: i18("dapp.escrows", "Escrows from your exec balance"), v: rawToNado(escrow) + " NADO" });
+  if (escrow > 0n) rows.push({ k: i18("dapp.escrows", "Escrows from your exec balance"), v: _unit(escrow) });
+  if (thenBlob) rows.push({ k: i18("dapp.then", "Then, in the same approval"),
+    v: (String(thenBlob.contract).slice(0, 22) + " · " + thenBlob.method + "(" + thenBlob.args.map((a) => typeof a === "bigint" ? a.toString() : JSON.stringify(a)).join(", ") + ")").slice(0, 240) });
   // AUTOSIGN (opt-in): value-free contract calls from APPROVED game origins (chess moves, settles, reveals —
   // nothing escrows, nothing moves beyond the network fee) can sign+submit without the confirm tap, so a game
   // isn't interrupted on every action. Anything that moves NADO (value/deposit/withdraw) ALWAYS confirms.
@@ -2418,26 +5642,42 @@ async function resumePendingExecSign() {
   // user-set ceiling, so a game can never quietly drain more than you allow. 0 (default) = always confirm
   // bets. The escrow is from the bounded EXEC/playable balance, never L1, and only from trusted origins.
   let betCap = 0n; try { betCap = BigInt(localStorage.getItem("nado_autosign_bet_cap_raw") || "0"); } catch (e) { betCap = 0n; }
-  const smallBet = escrow > 0n && escrow <= betCap && (blob.op || "call") === "call" && blob.amount === undefined && !call.confirm;
+  // The cap is in NADO raw units, so an ASSET-valued call never rides it (it would pull cap-many units of any token).
+  const smallBet = silentOk && !_assetId && escrow > 0n && escrow <= betCap && (blob.op || "call") === "call" && blob.amount === undefined && !call.confirm;
   const submitBlob = async () => {
     const { res, tx } = await submitResilient(async () => {
       const latest = await getLatestBlock();
       if (!latest) throw new Error("relay unavailable");
-      return buildBlobTx(state.wallet, blob, latest.block_number + 300, MIN_TX_FEE, nowSeconds(), latest.block_number + TX_INCLUSION_DELAY);
+      return buildBlobTx(signer, blob, latest.block_number + 300, MIN_TX_FEE, nowSeconds(), guardFrom(latest.block_number));
     });
-    if (res && res.data && res.data.result) back("ok=1&txid=" + tx.txid + "&addr=" + state.wallet.address);
-    else back("ok=0&err=" + encodeURIComponent(((res && res.data && res.data.message) || "rejected").slice(0, 80)));
+    if (!(res && res.data && res.data.result)) { back("ok=0&err=" + encodeURIComponent(((res && res.data && res.data.message) || "rejected").slice(0, 80))); return; }
+    if (!thenBlob) { back("ok=1&txid=" + tx.txid + "&addr=" + signer.address); return; }
+    // the follow-up (`then`): the first is accepted whatever happens here, so a failed follow-up still answers ok=1,
+    // naming its error in err2 for the dApp to offer the step again (nft.js: Register on the NFT's page)
+    let tail = "";
+    try {
+      const r2 = await submitResilient(async () => {
+        const latest = await getLatestBlock();
+        if (!latest) throw new Error("relay unavailable");
+        return buildBlobTx(signer, thenBlob, latest.block_number + 300, MIN_TX_FEE, nowSeconds(), guardFrom(latest.block_number));
+      });
+      tail = r2.res && r2.res.data && r2.res.data.result ? "&txid2=" + r2.tx.txid
+        : "&err2=" + encodeURIComponent(((r2.res && r2.res.data && r2.res.data.message) || "rejected").slice(0, 80));
+    } catch (e) { tail = "&err2=" + encodeURIComponent(String(e.message || e).slice(0, 80)); }
+    back("ok=1&txid=" + tx.txid + tail + "&addr=" + signer.address);
   };
   // AUTOSIGN IS DEFAULT-ON for value-free moves (user ask: zero friction for non-monetary actions). Only
   // an explicit "0" (turned off in Settings) disables it. Anything moving NADO never autosigns.
   // never autosign for an origin that isn't on the trusted allowlist (even if the user enabled skip) —
   // an untrusted site always gets an explicit confirm that names it.
-  const autosignOn = localStorage.getItem(AUTOSIGN_KEY) !== "0" && trustedOrigin;
+  const autosignOn = localStorage.getItem(AUTOSIGN_KEY) !== "0" && silentOk;
   // AUTO-SIGN EVERYTHING (opt-in): sign ANY contract call from a trusted game \u2014 bets included \u2014 with no
   // tap. Off by default; the user turns it on in Settings or straight from a sign dialog. Untrusted
   // origins are still never auto-signed.
-  const autosignAll = localStorage.getItem("nado_autosign_all") === "1" && trustedOrigin;
-  if (autosignAll || (valueFree && autosignOn) || smallBet) {
+  // Held to what its label promises — exec-layer contract CALLS — so it never signs an asset_transfer, asset_approve
+  // or transfer_contract, and never an asset-valued call (audit 2026-09-25).
+  const autosignAll = localStorage.getItem("nado_autosign_all") === "1" && silentOk && (blob.op || "call") === "call" && !_assetId;
+  if (!thenBlob && (autosignAll || (valueFree && autosignOn) || smallBet)) {   // two steps always confirm (thenBlob)
     if (!bg) signSplash(req.app);   // full-screen "signing\u2026" cover so the dashboard never flashes before the bounce (not needed in a hidden frame)
     try { await submitBlob(); } catch (e) { back("ok=0&err=" + encodeURIComponent(String(e.message || e).slice(0, 80))); }
     return;
@@ -2445,20 +5685,28 @@ async function resumePendingExecSign() {
   if (bg) return needUI();   // this call needs a manual confirm \u2014 can't show a dialog in a hidden frame \u2192 redirect
   const okc = await uiConfirm({
     title: i18("dapp.title", "Sign a contract call"),
-    body: escrow > 0n
+    // AN ASSET-VALUED CALL ESCROWS UNITS OF THAT ASSET, not NADO (live NFT walk 2026-11-02: listing one edition read
+    // "It ESCROWS 0.0000000001 NADO" — the edition count printed as raw NADO). The rows already used _unit; the
+    // sentence above them must say the same thing.
+    body: escrow > 0n && _assetId
+      ? i18("dapp.bodyAsset", "{app} wants to sign & submit this from your wallet ({a}). It ESCROWS {v} from your exec balance into the contract (no L1 funds move beyond the network fee).",
+          { app: req.app, a: _abShort(signer.address), v: _unit(escrow) })
+      : escrow > 0n
       ? i18("dapp.bodyValue", "{app} wants to sign & submit this from your wallet ({a}). It ESCROWS {v} NADO from your exec balance into the contract (no L1 funds move beyond the network fee).",
-          { app: req.app, a: state.wallet.address.slice(0, 14) + "…", v: rawToNado(escrow) })
+          { app: req.app, a: _abShort(signer.address), v: rawToNado(escrow) })
       : i18("dapp.body2", "{app} wants to sign & submit this from your wallet ({a}). It moves no L1 funds beyond the network fee.",
-          { app: req.app, a: state.wallet.address.slice(0, 14) + "…" }),
+          { app: req.app, a: _abShort(signer.address) }),
     rows,
+    // A trusted site's name in `ret` is not proof the site asked: say so when the caller is not that site.
+    warn: (trustedOrigin && !fromRet) ? i18("dapp.notFromSite", "This request did not come from {site} itself — a link or another page opened it. Sign only if you just asked {site} for this.", { site: retUrl.origin }) : undefined,
     // One opt-in on every trusted-game dialog: auto-sign ALL exec-layer calls from now on. These only ever
     // escrow from your playable (exec/VM) balance — never your L1 wallet — so ticking it lets bets/spins and
     // moves alike sign with no tap. Only shown for trusted origins.
-    checkbox: trustedOrigin ? { label: i18("dapp.autoExecOptIn", "Auto-sign exec-layer game calls from now on (escrow from your playable balance, never L1)"), checked: false } : null,
+    checkbox: silentOk ? { label: i18("dapp.autoExecOptIn", "Auto-sign exec-layer game calls from now on (escrow from your playable balance, never L1)"), checked: false } : null,
     confirmText: i18("dapp.sign", "Sign & submit"),
   });
   if (!okc) { back("ok=0"); return; }
-  if (trustedOrigin && modalCheckValue()) { try { localStorage.setItem("nado_autosign_all", "1"); } catch (e) {} }
+  if (silentOk && modalCheckValue()) { try { localStorage.setItem("nado_autosign_all", "1"); } catch (e) {} }
   try {
     // short expiry; flexible landing mines it in the next produced block. submitResilient re-signs + resubmits
     // on the rare hedged "Invalid signature" rejection so a contract call isn't lost to a bad signature draw.
@@ -2519,13 +5767,50 @@ function signSplash(app) {
     document.body.appendChild(d);
   } catch (e) {}
 }
+// The owner has SEEN a backup: they opened Reveal / export, or downloaded the key file. That, and only
+// that, retires the first-visit note — never a timer, never a dismiss button that hides the one fact a
+// newcomer must hear once (the coins are real and the key is the only way back to them).
+function markBackupSeen() {
+  try { localStorage.setItem(LS_BACKUP_DONE, "1"); } catch (e) {}
+  show("autoWalletNote", false);
+}
+function renderAutoWalletNote() {
+  const el = $("autoWalletNote");
+  if (!el) return;
+  let auto = false, seen = false;
+  try { auto = localStorage.getItem(LS_AUTO_WALLET) === "1"; seen = localStorage.getItem(LS_BACKUP_DONE) === "1"; } catch (e) {}
+  if (!auto || seen) { show("autoWalletNote", false); return; }
+  el.innerHTML = escapeHtml(i18("onboard.autoNote",
+      "This wallet was created for you on this device. Back up its recovery phrase before it earns anything you would miss."))
+    + ' <a href="#" id="autoWalletBackup">' + escapeHtml(i18("onboard.autoNoteLink", "Show backup")) + '</a>'
+    // THE FIRST-RUN DOOR TO IMPORT: a person who already owns a wallet lands HERE holding an auto-created one. Without
+    // this link their only way to their own key was Settings -> Forget wallet (destroy this one first).
+    + ' · <a href="#" id="autoWalletImport">' + escapeHtml(i18("onboard.autoNoteImport", "I already have a wallet")) + '</a>';
+  const imp = $("autoWalletImport");
+  if (imp) imp.onclick = (e) => { e.preventDefault(); openImportExisting(); };
+  const a = $("autoWalletBackup");
+  if (a) a.onclick = (e) => {
+    e.preventDefault();
+    const d = $("walReveal");
+    if (d) { d.open = true; d.scrollIntoView({ block: "start", behavior: "smooth" }); }
+    markBackupSeen();
+  };
+  show("autoWalletNote", true);
+}
+
 function showWalletUI() {
+  try { renderDeviceStatus(); } catch (e) {}          // mining page: what this device proved (device attestation)
+  try { nodeAttestInit(); } catch (e) {}              // mining page: "Attest a node you run" (ops/node_attest)
+  show("booting", false);
   wireAutosignToggle();
   show("onboard", false);
   show("savePrompt", false);
   show("unlockCard", false);
   show("tabbar", true);
+  renderAutoWalletNote();
   hdSync();                                          // anchor the HD layer to the loaded wallet (Main on a fresh load)
+  state._authReady = null;                           // a (re)loaded wallet: find its signer afresh (authReady)
+  authReady().then(() => { renderAccountBar(); renderAuth(); if (state.wallet) { $("walAddr").innerHTML = exLink("a", state.wallet.address, state.wallet.address); $("recvAddr").textContent = state.wallet.address; } }).catch(() => {});
   renderAccountBar();
   $("walAddr").innerHTML = exLink("a", state.wallet.address, state.wallet.address);   // the ACTIVE account's address — click-through to its Explore view
   // The "Reveal / export private key" section is the BACKUP surface — always the MASTER seed + phrase, which
@@ -2552,7 +5837,9 @@ function showWalletUI() {
   msgInitBackground().catch(() => {});   // derive identity + poll so the Messages badge works anywhere
   resumePendingPay();   // if a #pay link was opened before this wallet existed, prefill the Send now
   resumePendingClaim(); // if a #claim link was opened before this wallet existed, receive the banknote now
+  renderInviteBanner(); // a pending #invite link: say what is waiting and the next step (claimed from pollOnce)
   resumePendingForumLogin(); // if the forum bounced us here to sign a login challenge, prompt + sign now
+  resumePendingLandLogin();  // the same for Land (land.nadochain.com)
   resumePendingExecSign();   // if a dApp (e.g. coinflip) bounced us here to sign a contract call, prompt + sign
 }
 
@@ -2569,17 +5856,27 @@ function adoptWallet(w, { needsSavePrompt }) {
     $("btnConfirmSave").disabled = true;
     // fresh save screen -> restart the onboarding pulse chain at the Download button
     $("btnDlKeySave").classList.add("pulse-ready");
-    const _tr = document.querySelector("#savePrompt .tgl-track");
-    if (_tr) _tr.classList.remove("pulse-ready");
+    $("ackSave").classList.remove("pulse-ready");
     show("onboard", false);
     show("savePrompt", true);
   } else {
     state.wallet = w;
     persistWallet(w);
+    // AN IMPORTED WALLET IS NOT AN AUTO-CREATED ONE: the "created for you on this device" backup hint must go
+    try { localStorage.removeItem(LS_AUTO_WALLET); } catch (e) {}
     showWalletUI();
+    walletAdopted();
     log("info", i18("log.walletLoaded", "Wallet loaded: {a}", {a: w.address}));
     refreshDashboard().catch(() => {});
   }
+}
+// AFTER A WALLET IS ADOPTED IN-PAGE (restore from Settings, or the save screen's Continue). Forget stops mining and with
+// it the poll loop, and nothing restarted it: a restored wallet's dashboard froze — measured 2026-09-28 in the gen-28
+// legacy-claim walk, "0 NADO" for 5 minutes after its claimed coins had landed, until a page reload — and the person was
+// left on the Settings tab they imported from. Show them their wallet, live.
+function walletAdopted() {
+  if (!state.pollTimer) startPollLoop();                 // idempotent; the boot path starts it the same way
+  showTab("wallet");
 }
 
 /* ----------------------------------------------------------------------------------------------
@@ -2587,29 +5884,25 @@ function adoptWallet(w, { needsSavePrompt }) {
  * Vectors generated from the live repo (hashing.py / ops/*.py / signatures.py).
  * -------------------------------------------------------------------------------------------- */
 const VEC = {
-  hash_register_list: "105d0518c85e8bf5a99702f1f26cb1a2ca98fdec706aab5d4e59e0dcc98fab1a",
-  checksum_string_size2: "ae09",
+  hash_register_list: "9d34a3f6039828c1a02847f121cb7b57f26fc0573f38a4b164b1039711cd26cb",
+  checksum_string_size2: "f962",
   checksum_body: "18c3afa286439e7ebcb284710dbd4ae42bdaf21b80",
   make_address_pub: "96381e3725f85cfe0ab8de17623957b4565ca9b04d37b903075f2723600c21e3",
-  make_address_out: "mldsa4496381e3725f85cfe0ab8de17623957b4565ca9b04dbb32",
+  make_address_out: "b0e88ff36b8f854399837798697113f59078b55bcbf4ec9a6b",
   hash_link_a_b: "d803f13f94cb4546f8f9d50368dfbb44ea46aa3db56fecfa2570a3ebf90f3a13",
   torture_canonical: "{\"a\":\"h\\u00e9llo \\\"x\\\"\\n\\t/end\",\"m\":[3,2,{\"big\":12345678901234567890,\"k\":true}],\"n\":null,\"unicode_key_\\u00fc\":\"\\u2603 snowman\",\"z\":1}",
   torture_hash: "69029840259d7c85d5c3e61f09abc352d0554c9b4320ef7d59bb6942647b840c",
   bigobj_canonical: "{\"amount\":99999999999999999999,\"x\":9007199254740993}",
   bigobj_hash: "8a09e2d0782c39dd1522f8a83c5338d2960d1b9710ec5c18e66d6cc20354de20",
-  pow_address: "mldsa4496381e3725f85cfe0ab8de17623957b4565ca9b04dbb32",
-  pow_nonce: 60876,
-  pow_target_str: "1766847064778384329583297500742918515827483896875618958121606201292619776",
-  pow_hash_int_str: "479210438811666333841655298381181555121843668852037799455165937879820557",
   fixed_priv: "4d3c2b1a4d3c2b1a4d3c2b1a4d3c2b1a4d3c2b1a4d3c2b1a4d3c2b1a4d3c2b1a", // 32-byte ML-DSA-44 seed
   // Tx vectors carry NO signature (ML-DSA is hedged); only txid/canonical are comparable.
   // REGENERATE via tools/gen_selftest_vectors.py after ANY field/format/tag/chain_id change.
-  register_tx: {"sender": "mldsa441e9f9f319a9ee0f98b3147a67dca40e7296d5e847b69d6", "amount": 0, "timestamp": 1700000000, "data": "", "nonce": "fixednonc", "public_key": "1e9f9f319a9ee0f98b3147a67dca40e7296d5e847b34ad683692f39264379f38", "max_block": 12345, "chain_id": "alphanet-7", "fee": 0, "recipient": "register", "pow_nonce": 2108331, "txid": "aeebd09bf694e154b24e7cdc7b813640cf57ae12c62da6c83882b4f8daad0730"},
-  register_canonical: "{\"amount\":0,\"chain_id\":\"alphanet-7\",\"data\":\"\",\"fee\":0,\"max_block\":12345,\"nonce\":\"fixednonc\",\"pow_nonce\":2108331,\"public_key\":\"1e9f9f319a9ee0f98b3147a67dca40e7296d5e847b34ad683692f39264379f38\",\"recipient\":\"register\",\"sender\":\"mldsa441e9f9f319a9ee0f98b3147a67dca40e7296d5e847b69d6\",\"timestamp\":1700000000}",
-  heartbeat_tx: {"sender": "mldsa441e9f9f319a9ee0f98b3147a67dca40e7296d5e847b69d6", "amount": 0, "timestamp": 1700000000, "data": "", "nonce": "fixednonc", "public_key": "1e9f9f319a9ee0f98b3147a67dca40e7296d5e847b34ad683692f39264379f38", "max_block": 12345, "chain_id": "alphanet-7", "fee": 0, "recipient": "heartbeat", "epoch": 205, "txid": "d57992ea881d5d5748578e709b34bd2fda355b44b55e05f209528d7e9c6f2cc8"},
-  heartbeat_canonical: "{\"amount\":0,\"chain_id\":\"alphanet-7\",\"data\":\"\",\"epoch\":205,\"fee\":0,\"max_block\":12345,\"nonce\":\"fixednonc\",\"public_key\":\"1e9f9f319a9ee0f98b3147a67dca40e7296d5e847b34ad683692f39264379f38\",\"recipient\":\"heartbeat\",\"sender\":\"mldsa441e9f9f319a9ee0f98b3147a67dca40e7296d5e847b69d6\",\"timestamp\":1700000000}",
-  transfer_tx: {"sender": "mldsa441e9f9f319a9ee0f98b3147a67dca40e7296d5e847b69d6", "amount": 123456, "timestamp": 1700000000, "data": "hello world", "nonce": "fixednonc", "public_key": "1e9f9f319a9ee0f98b3147a67dca40e7296d5e847b34ad683692f39264379f38", "max_block": 12345, "chain_id": "alphanet-7", "fee": 1000, "recipient": "mldsa446a7a7a6d26040d8d53ce66343a47347c9b79e814c6f301", "txid": "9c68398f51d18f51ed7b4e52fede0de19bd4b492c234d6a8be2e3cadc659fc05"},
-  transfer_canonical: "{\"amount\":123456,\"chain_id\":\"alphanet-7\",\"data\":\"hello world\",\"fee\":1000,\"max_block\":12345,\"nonce\":\"fixednonc\",\"public_key\":\"1e9f9f319a9ee0f98b3147a67dca40e7296d5e847b34ad683692f39264379f38\",\"recipient\":\"mldsa446a7a7a6d26040d8d53ce66343a47347c9b79e814c6f301\",\"sender\":\"mldsa441e9f9f319a9ee0f98b3147a67dca40e7296d5e847b69d6\",\"timestamp\":1700000000}",
+  register_tx: {"sender": "f2565151bc281b6c03b5de04be1396f44333e033b4c07935bd", "amount": 0, "timestamp": 1700000000, "data": "", "nonce": "fixednonc", "public_key": "1e9f9f319a9ee0f98b3147a67dca40e7296d5e847b34ad683692f39264379f38", "max_block": 12345, "chain_id": "betanet-9", "fee": 0, "recipient": "register", "txid": "a91135068ba8940ce1e57ad34d485de16704622f9cd1c3ba89e7e1de76f4342a"},
+  register_canonical: "{\"amount\":0,\"chain_id\":\"betanet-9\",\"data\":\"\",\"fee\":0,\"max_block\":12345,\"nonce\":\"fixednonc\",\"public_key\":\"1e9f9f319a9ee0f98b3147a67dca40e7296d5e847b34ad683692f39264379f38\",\"recipient\":\"register\",\"sender\":\"f2565151bc281b6c03b5de04be1396f44333e033b4c07935bd\",\"timestamp\":1700000000}",
+  heartbeat_tx: {"sender": "f2565151bc281b6c03b5de04be1396f44333e033b4c07935bd", "amount": 0, "timestamp": 1700000000, "data": "", "nonce": "fixednonc", "public_key": "1e9f9f319a9ee0f98b3147a67dca40e7296d5e847b34ad683692f39264379f38", "max_block": 12345, "chain_id": "betanet-9", "fee": 0, "recipient": "heartbeat", "epoch": 205, "txid": "71f6a274c3b728940c4c3cd46a20626e5ee5394d7489a8b9160bdb6271d7b870"},
+  heartbeat_canonical: "{\"amount\":0,\"chain_id\":\"betanet-9\",\"data\":\"\",\"epoch\":205,\"fee\":0,\"max_block\":12345,\"nonce\":\"fixednonc\",\"public_key\":\"1e9f9f319a9ee0f98b3147a67dca40e7296d5e847b34ad683692f39264379f38\",\"recipient\":\"heartbeat\",\"sender\":\"f2565151bc281b6c03b5de04be1396f44333e033b4c07935bd\",\"timestamp\":1700000000}",
+  transfer_tx: {"sender": "f2565151bc281b6c03b5de04be1396f44333e033b4c07935bd", "amount": 123456, "timestamp": 1700000000, "data": "hello world", "nonce": "fixednonc", "public_key": "1e9f9f319a9ee0f98b3147a67dca40e7296d5e847b34ad683692f39264379f38", "max_block": 12345, "chain_id": "betanet-9", "fee": 1000, "recipient": "6a7a7a6d26040d8d53ce66343a47347c9b79e814c6c2ad7b3e", "txid": "99ef7e971b40d28739b5f78d7ddf9f4f791ee7f51522c49279bc558fd38b5a16"},
+  transfer_canonical: "{\"amount\":123456,\"chain_id\":\"betanet-9\",\"data\":\"hello world\",\"fee\":1000,\"max_block\":12345,\"nonce\":\"fixednonc\",\"public_key\":\"1e9f9f319a9ee0f98b3147a67dca40e7296d5e847b34ad683692f39264379f38\",\"recipient\":\"6a7a7a6d26040d8d53ce66343a47347c9b79e814c6c2ad7b3e\",\"sender\":\"f2565151bc281b6c03b5de04be1396f44333e033b4c07935bd\",\"timestamp\":1700000000}",
 };
 
 function bodyOf(tx) {
@@ -2634,11 +5927,6 @@ function runSelfTest() {
   const bigobj = { amount: 99999999999999999999n, x: 9007199254740993n };
   add("canonical(BigInt > 2^53)", canonicalize(bigobj), VEC.bigobj_canonical);
   add("blake2b_hash(BigInt obj)", blake2bHash(bigobj), VEC.bigobj_hash);
-
-  // registration PoW
-  add("registration PoW target", powTarget().toString(), VEC.pow_target_str);
-  add("registration PoW hash(int)", powHashInt(VEC.pow_address, VEC.pow_nonce).toString(), VEC.pow_hash_int_str);
-  add("registration PoW valid", String(powValid(VEC.pow_address, VEC.pow_nonce)), "true");
 
   // key derivation — ML-DSA-44 keygen is deterministic from the 32-byte seed.
   const kpA = keypairFromPriv(VEC.fixed_priv);
@@ -2679,7 +5967,9 @@ function runSelfTest() {
   add("register tx carries public_key (establishes it on-chain)", String(hasPub(buildRegisterTx(w, 12345, 2108331, 1700000000))), "true");
   add("transfer OMITS public_key when sender established", String(hasPub(buildTransferTx(w, VEC.transfer_tx.recipient, 123456n, 1000, 12345, "", 1700000000, false))), "false");
   add("transfer CARRIES public_key when not established", String(hasPub(buildTransferTx(w, VEC.transfer_tx.recipient, 123456n, 1000, 12345, "", 1700000000, true))), "true");
-  add("pubkeyEstablished(registered acc)", String(pubkeyEstablished({ registered: 1 })), "true");
+  // registered=1 WITHOUT a stored pubkey is NOT established (genesis-seeded identities carry
+  // registered=1 with no on-chain key — omitting it got every first tx rejected, 2026-08-23):
+  add("pubkeyEstablished(registered, no stored pubkey)", String(pubkeyEstablished({ registered: 1 })), "false");
   add("pubkeyEstablished(acc with stored pubkey)", String(pubkeyEstablished({ public_key: "ab" })), "true");
   add("pubkeyEstablished(fresh/absent acc)", String(pubkeyEstablished(null) || pubkeyEstablished({ registered: 0 })), "false");
 
@@ -2721,19 +6011,42 @@ function renderSelfTest(cases) {
  * Full wallet: download key, send, bond/unbond, receive QR, transaction history
  * -------------------------------------------------------------------------------------------- */
 
-/* Download the key as a JSON file via a Blob + a temporary <a download> (explicit user request). */
-function downloadKeyFile() {
+/* Download the key as a JSON file via a Blob + a temporary <a download> (explicit user request).
+ *
+ * THE FILE MUST CARRY THE RECOVERY PHRASE. It shipped with the raw seed only, which is technically
+ * sufficient — the 32-byte seed IS the identity and import accepts 64-hex — but it is not what users are
+ * told to keep. Every "back up your wallet" instruction, the save screen and the reveal panel all present
+ * the 24 words as THE backup, so a file called `nado-key-….json` that silently omits them reads as a
+ * complete backup while missing the thing the user believes they saved. The two are the same secret in two
+ * encodings; a backup should contain the one a human can actually transcribe and re-enter.
+ *
+ * async because seedToMnemonic() is: the phrase is DERIVED from the seed, never stored, so there is nothing
+ * to look up synchronously. If derivation ever fails the file is still written with the seed — a backup
+ * missing the phrase beats no backup at all — and the note says so rather than pretending it is complete. */
+async function downloadKeyFile() {
   // Fall back to pendingWallet: on the "⚠ Save your private key" screen the freshly-generated key is
   // held in pendingWallet and is NOT yet state.wallet (that happens only on "Continue → store"). Without
   // this, a brand-new user who clicks Download on that very screen got a confusing "No wallet loaded."
   // HD SAFETY: export the MASTER key (recovers every derived account), not the active child.
   const w = (masterSeedOf() ? keypairFromPriv(masterSeedOf()) : null) || state.wallet || pendingWallet;
   if (!w) { uiAlert(i18("wallet.needFirst", "Create or import a wallet first — then you can download its key file.")); return; }
+  // Derive the 24-word phrase from the SAME master seed the file exports, so the two can never disagree.
+  let mnemonic = null;
+  try { mnemonic = await seedToMnemonic(hexToBytes(w.privateKey)); } catch (e) { mnemonic = null; }
   const keyfile = {
     private_key: w.privateKey,            // the 32-byte ML-DSA-44 SEED (hex) — this IS the secret
+    mnemonic,                             // the SAME secret as 24 words — what users are told to keep
     public_key: w.publicKey,
     address: w.address,
-    note: "NADO ML-DSA-44 key — keep secret, no recovery",
+    // the derived accounts and the scheme of each that does not sign with ML-DSA-44 (LS_HD_ALGS): the phrase alone
+    // re-derives every key, but only this map knows which scheme an index was added with
+    hd_accounts: hdCount(),
+    hd_algs: hdAlgs(),
+    note: mnemonic
+      ? "NADO ML-DSA-44 key — keep secret, no recovery. `mnemonic` and `private_key` are the SAME secret "
+        + "in two encodings; either one alone restores this wallet and every account derived from it."
+      : "NADO ML-DSA-44 key — keep secret, no recovery. The recovery phrase could not be derived in this "
+        + "browser, so this file has the raw seed ONLY; `private_key` still restores the wallet in full.",
   };
   const blob = new Blob([JSON.stringify(keyfile, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
@@ -2755,6 +6068,9 @@ async function importEncryptedBlob(blob) {
   try {
     const seed = await decryptSeed(blob, pw);
     const w = keypairFromPriv(seed);
+    // REPLACE GUARD (every import path): the wallet already on this device may hold coins — it is not overwritten
+    // until confirmReplaceWallet() has had its backup taken (funded) or one confirm (empty).
+    if (!(await clearToReplaceWith(w))) return;
     localStorage.setItem(LS_WALLET, JSON.stringify(blob));   // keep it encrypted at rest here too
     state.wallet = w; state.locked = false;
     show("importBox", false); show("onboard", false); show("unlockCard", false);
@@ -2781,6 +6097,104 @@ function downloadEncryptedWallet() {
   log("ok", i18("sec.dlEncOk", "Encrypted backup downloaded — it needs your password to restore."));
 }
 
+/* IMPORTING OVER A WALLET THAT ALREADY EXISTS (2026-10-08). The wallet creates one for every newcomer, so a person who
+ * owns a wallet arrives holding a second one, and Import used to be reachable only after Forget wallet. Import is now
+ * offered from the first-run note and Settings while the current wallet stays put; it is replaced only at the moment
+ * the new key is actually in hand, and only past this guard:
+ *   - EMPTY (every account of this seed — Main and each derived one — is unknown to the chain): one confirm.
+ *   - ANYTHING ELSE — a balance, a stake, a registration, any history, or a relay that could not answer — the owner
+ *     downloads this wallet's key file first (the existing downloadKeyFile, master seed + phrase) and then confirms,
+ *     ticking that the backup is saved. "Could not check" is treated as funded: a silent replace of a wallet holding
+ *     real coins is the one outcome this must never produce.
+ * The keys never leave this browser: the only network reads are public /get_account lookups by ADDRESS. */
+async function walletReplaceRisk() {
+  const master = masterSeedOf();
+  if (!master) return "empty";
+  let risk = "empty";
+  try {
+    for (let i = 0; i <= hdCount() && risk !== "funded"; i++) {
+      const addr = accountKeypair(master, i).address;
+      const r = await rpcJSON("/get_account?address=" + encodeURIComponent(addr));
+      // The relay answers HTTP 404 {"address": "Not found"} for an address no block has ever touched — a 404, so r.ok
+      // is FALSE for the empty case (measured against the live relay 2026-10-08; reading `ok` as "exists" made every
+      // never-used wallet look funded). A 200 record, even one with a zero balance, is history (a registration, a
+      // spent balance, a stake) and needs the backup. Any other answer is "could not check", never "empty".
+      const d = r && r.data;
+      if (d && typeof d === "object" && d.address === "Not found") continue;
+      if (r && r.ok && d && typeof d === "object" && d.address) { risk = "funded"; break; }
+      risk = "unknown";
+    }
+    return risk;
+  } catch (e) { return "unknown"; }
+}
+async function confirmReplaceWallet(next) {
+  const cur = state.wallet;
+  if (!cur) return true;
+  const master = masterSeedOf();
+  const curAddr = master ? accountKeypair(master, 0).address : cur.address;
+  const risk = await walletReplaceRisk();
+  const vars = { a: curAddr, b: next.address };
+  if (risk === "empty") {
+    return !!(await uiConfirm({
+      title: i18("import.replaceTitle", "Replace this wallet?"),
+      body: i18("import.replaceEmptyBody", "The wallet on this device ({a}) is empty and has never been used. {b} will take its place.", vars),
+      confirmText: i18("import.replaceGo", "Replace wallet"),
+    }));
+  }
+  // STEP 1 — the backup, through the SAME export the wallet already offers. Cancel here replaces nothing.
+  const wantBackup = await uiConfirm({
+    title: i18("import.backupFirstTitle", "Back up this wallet first"),
+    body: risk === "unknown"
+      ? i18("import.backupUnknownBody", "The balance of {a} could not be checked right now, so treat it as holding coins. Download its key file before replacing it — it is the only way back to this wallet.", vars)
+      : i18("import.backupFundedBody", "{a} holds coins or has history on the chain. Download its key file before replacing it — it is the only way back to this wallet.", vars),
+    confirmText: i18("import.backupDl", "Download key file"),
+  });
+  if (!wantBackup) return false;
+  await downloadKeyFile();
+  markBackupSeen();
+  // STEP 2 — an explicit confirm that names both addresses and requires the backup to be acknowledged.
+  const ok = await uiConfirm({
+    title: i18("import.replaceTitle", "Replace this wallet?"),
+    body: i18("import.replaceFundedBody", "{b} becomes the wallet on this device and {a} is removed from it. Its coins stay on the chain, and only its key file opens them again.", vars),
+    checkbox: { label: i18("import.replaceAck", "The key file of {a} is saved somewhere safe", vars) },
+    confirmText: i18("import.replaceGo", "Replace wallet"), danger: true,
+  });
+  if (!ok) return false;
+  if (!modalCheckValue()) {
+    uiAlert(i18("import.replaceNeedAck", "Nothing was replaced. Tick the box once the key file is saved."));
+    return false;
+  }
+  return true;
+}
+// The gate every import path passes before it overwrites the stored wallet. Re-importing the wallet already here is not
+// a replacement. On a real replacement the old wallet's collecting loop stops first, exactly as Forget wallet stops it,
+// so nothing keeps renewing a lease for an address this device no longer holds.
+async function clearToReplaceWith(next) {
+  if (!state.wallet) return true;
+  const master = masterSeedOf();
+  if (master && next && accountKeypair(master, 0).address === next.address) return true;
+  if (!(await confirmReplaceWallet(next))) {
+    log("info", i18("log.importCancelled", "Import cancelled — this wallet was kept."));
+    return false;
+  }
+  stopMining();
+  return true;
+}
+// Open the import fields WITHOUT forgetting the current wallet: the one #importBox (paste + key file) moves into
+// Settings, so btnImport / importKeyFile and their encrypted-file handling stay a single code path.
+function openImportExisting() {
+  showTab("settings");
+  const box = $("importBox"), mount = $("importMountSettings");
+  if (box && mount && box.parentNode !== mount) mount.appendChild(box);
+  show("importBox", true);
+  // AFTER the tab switch has painted (showTab resets the scroll): scrolling in the same tick left the person at the
+  // bottom of Settings with the fields off-screen (headless walk at 412 px, 2026-10-08).
+  setTimeout(() => {
+    if (box && box.scrollIntoView) box.scrollIntoView({ block: "center" });
+    const k = $("importKey"); if (k && k.focus) k.focus({ preventScroll: true });
+  }, 120);
+}
+
 /* Import a wallet from a key FILE (the mirror of downloadKeyFile): reads the JSON produced by
  * downloadKeyFile and adopts the wallet from its private_key. Also tolerates a plain-hex-only file. */
 function importKeyFile(file) {
@@ -2791,14 +6205,29 @@ function importKeyFile(file) {
     let obj = null;
     try { obj = JSON.parse(text); } catch (e) { obj = null; }
     if (obj && obj.enc) { importEncryptedBlob(obj); return; }   // an encrypted backup -> ask for the password
-    try {
-      const priv = (obj && (obj.private_key || obj.privateKey || obj.private || obj.seed)) || (obj ? null : text);
-      if (!priv) throw new Error(i18("import.noKey", "no private key found in the file"));
-      adoptWallet(keypairFromPriv(String(priv).trim()), { needsSavePrompt: false });
-      log("info", i18("log.keyImported", "Imported key from file."));
-    } catch (e) {
-      uiAlert(i18("import.fileFailed", "Import from file failed:") + " " + e.message);
-    }
+    (async () => {
+      try {
+        let priv = (obj && (obj.private_key || obj.privateKey || obj.private || obj.seed)) || (obj ? null : text);
+        // ACCEPT A PHRASE TOO. The exported keyfile now carries `mnemonic` alongside the seed, and the two
+        // are the same secret — so a file that has only the phrase (hand-trimmed, or written by a future
+        // export that drops the raw seed) must still import rather than reporting "no private key found".
+        if (!priv && obj && obj.mnemonic && looksLikeMnemonic(String(obj.mnemonic))) {
+          priv = bytesToHex(await mnemonicToSeed(String(obj.mnemonic).trim()));
+        }
+        if (!priv) throw new Error(i18("import.noKey", "no private key found in the file"));
+        const kp = keypairFromPriv(String(priv).trim());
+        if (!(await clearToReplaceWith(kp))) return;      // REPLACE GUARD — see confirmReplaceWallet
+        // a key file written with derived accounts brings them back, each with the scheme it was added with
+        if (obj && Number.isInteger(obj.hd_accounts) && obj.hd_accounts > hdCount()) localStorage.setItem(LS_HD_COUNT, String(obj.hd_accounts));
+        if (obj && obj.hd_algs && typeof obj.hd_algs === "object")
+          for (const [i, a] of Object.entries(obj.hd_algs)) if (/^[1-9][0-9]*$/.test(i) && SIG_NAMES[a]) setHdAlg(Number(i), a);
+        adoptWallet(kp, { needsSavePrompt: false });
+        show("importBox", false);
+        log("info", i18("log.keyImported", "Imported key from file."));
+      } catch (e) {
+        uiAlert(i18("import.fileFailed", "Import from file failed:") + " " + e.message);
+      }
+    })();
   };
   reader.onerror = () => uiAlert(i18("import.readErr", "Could not read the file."));
   reader.readAsText(file);
@@ -2807,16 +6236,22 @@ function importKeyFile(file) {
 /* The network fee is a tiny fixed protocol minimum (destroyed, not paid out). We hide the raw-unit
  * complexity entirely: the user never types a fee — we apply the relay's recommended fee (floored at
  * MIN_TX_FEE) automatically and just DISPLAY it in NADO. Returns the fee in RAW units. */
+const MAX_QUOTED_FEE = 100 * MIN_TX_FEE;
 async function getRecommendedFee() {
   try {
     const r = await rpcJSON("/get_recommended_fee");
     const f = r.ok && r.data ? Number(r.data.fee) : NaN;
-    return Math.max(Number.isFinite(f) ? Math.floor(f) : 0, MIN_TX_FEE);
+    // A CEILING TOO (audit 2026-09-25): the quote is the tip block's mean fee, so one tx paying a huge fee — or a
+    // hostile failover relay — could make every confirm propose burning it. Fees are destroyed, not refunded.
+    return Math.min(Math.max(Number.isFinite(f) ? Math.floor(f) : 0, MIN_TX_FEE), MAX_QUOTED_FEE);
   } catch (e) { return MIN_TX_FEE; }
 }
+// The fee the ACTIVE account's next paying tx will carry: the network fee lifted to its signature scheme's floor (an
+// SLH-DSA account pays 3 x MIN_TX_FEE). finalizeTransaction lifts it too; reading it here keeps the balance check, the
+// confirm dialog and the "Network fee" label true of the transaction actually signed (CLAUDE.md rule 6).
 async function currentFeeRaw() {
   if (state.recommendedFee == null) state.recommendedFee = await getRecommendedFee();
-  return state.recommendedFee;
+  return schemeFee(schemeOf(state.wallet), state.recommendedFee);
 }
 // Fill the read-only "Network fee: X NADO" labels on the Send + Stake tabs (no raw units shown).
 async function updateFeeInfo() {
@@ -2837,7 +6272,7 @@ async function nextTargetBlock() {
   // quickly. (Flexibly-landing txs use nextFlexTarget for a wide expiry window instead.)
   const latest = await getLatestBlock();
   if (!latest || typeof latest.block_number !== "number") throw new RelayUnreachable("relay /get_latest_block unavailable");
-  state.latest = latest.block_number;
+  state.latest = latest.block_number; state.latestAt = Date.now();
   return latest.block_number + 8;
 }
 
@@ -2847,7 +6282,7 @@ async function nextFlexTarget() {
   // does not expire (and re-gossip-flood "Target block too low") before a producer includes it.
   const latest = await getLatestBlock();
   if (!latest || typeof latest.block_number !== "number") throw new RelayUnreachable("relay /get_latest_block unavailable");
-  state.latest = latest.block_number;
+  state.latest = latest.block_number; state.latestAt = Date.now();
   return latest.block_number + TX_TARGET_MARGIN;
 }
 
@@ -2882,17 +6317,18 @@ async function sendAllToAmount() {
 }
 
 async function doSend() {
+  if (!netAdopted) await refreshNetIdentity();   // never sign with an unconfirmed chain_id
   // lowercase: alias names are all-lowercase on-chain (and THIS string becomes the signed tx
-  // recipient), while a valid mldsa44… address is lowercase hex anyway — so "Alice" sends to "alice".
+  // recipient), while a valid address is lowercase hex anyway — so "Alice" sends to "alice".
   const recipient = $("sendTo").value.trim().toLowerCase();
   let resolvedOwner = null;
-  if (!validateAddress(recipient)) {
+  if (!validatePayee(recipient) && !isSendableReserved(recipient)) {
     if (looksLikeAlias(recipient)) {
       setMsg("sendMsg", `Resolving alias "${recipient}"…`, null);
       resolvedOwner = await resolveAlias(recipient);
       if (!resolvedOwner) { setMsg("sendMsg", `Alias "${recipient}" is not registered.`, "err"); return; }
     } else {
-      setMsg("sendMsg", i18("msg.badRecipient", "Invalid recipient — a 49-char mldsa44… address or a registered alias name."), "err"); return;
+      setMsg("sendMsg", i18("msg.badRecipient", "Invalid recipient — a 46-char address, a registered alias, or a reserved name (faucet, bridge)."), "err"); return;
     }
   }
   let rawAmount;
@@ -2926,7 +6362,7 @@ async function doSend() {
     // min_block (tip + TX_INCLUSION_DELAY): the transfer gossips to EVERY producer before any may
     // include it, so all nodes build the identical block — no fork/reorg lottery on a fresh tx.
     const tx = buildTransferTx(state.wallet, recipient, rawAmount, fee, targetBlock, "", nowSeconds(),
-      !pubkeyEstablished(acc), state.latest + TX_INCLUSION_DELAY);
+      !pubkeyEstablished(acc), guardFrom(state.latest));
     if (await submitAndReport(tx, "Transfer", "sendMsg")) { addrBookAdd(resolvedOwner || recipient, looksLikeAlias(recipient) ? recipient : ""); $("sendAmount").value = ""; show("payBanner", false); }
   } catch (e) { setMsg("sendMsg", i18("msg.sendFailed", "Send failed:") + " " + e.message, "err"); }
   finally { btn.disabled = false; }
@@ -2949,7 +6385,7 @@ async function doAliasOp(op) {
       if (!owner) { setMsg("aliasMsg", i18("alias.xferAliasMissing", "That target alias isn't registered."), "err"); return; }
       to = owner;
     }
-    if (!validateAddress(to)) { setMsg("aliasMsg", i18("alias.xferTarget", "Transfer target must be a valid mldsa44… address or a registered alias."), "err"); return; }
+    if (!validateAddress(to)) { setMsg("aliasMsg", i18("alias.xferTarget", "Transfer target must be a valid address or a registered alias."), "err"); return; }
   }
   const fee = op === "register" ? ALIAS_REGISTRATION_FEE : await currentFeeRaw();
   const acc = await getAccount(state.wallet.address);
@@ -3048,7 +6484,7 @@ async function renderAssets() {
   $("assetIssuedList").innerHTML = _myIssued.length ? _myIssued.map((a) =>
     '<div style="margin:.35rem 0"><b>' + escapeHtml(a.sym) + '</b> <span class="dim">' + escapeHtml(a.name) + '</span>' + assetUriLink(a.uri)
     + ' <span class="faint">· ' + i18("assets.supplyIs", "supply") + " "
-    + escapeHtml(assetToDisplay(a.supply, a.dec)) + ' · ' + a.holders + " " + i18("assets.holders", "holders")
+    + escapeHtml(assetToDisplay(a.supply, a.dec)) + ' · ' + (Number(a.holders) || 0) + " " + i18("assets.holders", "holders")
     + ' · ' + (a.mintable ? i18("assets.isMintable", "mintable") : i18("assets.isFixed", "fixed supply"))
     + '</span></div>').join("")
     : '<span class="faint">' + i18("assets.noneIssued", "You have not issued an asset.") + '</span>';
@@ -3085,7 +6521,7 @@ async function assetBlob(payload, label, msgId, rows) {
   const latest = await getLatestBlock();
   if (!latest) { setMsg(msgId, i18("rollup.relayDown", "Relay unavailable."), "err"); return false; }
   const tx = buildBlobTx(state.wallet, payload, latest.block_number + 8, fee, nowSeconds(),
-    latest.block_number + TX_INCLUSION_DELAY);
+    guardFrom(latest.block_number));
   const ok = await submitAndReport(tx, label, msgId);
   if (ok) setTimeout(() => renderAssets().catch(() => {}), 1500);
   return ok;
@@ -3299,7 +6735,9 @@ function assetsWire() {
  * see an asset's supply or mintable flag, so a declared floor is only trustworthy when the registry says
  * the asset is fixed-supply AND its live supply still equals the vault's outstanding (renderVaults).
  * ------------------------------------------------------------------------------------------------- */
-const RESERVE_CID = "243abeed686b04e4d75aecee9f2d9813";   // execnode/games/reserve.py, nonce a5 (deterministic)
+const RESERVE_CID = "0ce22fd93ec4c803bd38cecf799a5aed";   // execnode/games/reserve.py — the cid the exec node HOLDS
+                                                        // (2026-09-23: the previous constant named a contract that no
+                                                        // longer existed on the exec node, so the reserve page could not work)
 const VAULT_UNIT = 100000000n;                            // reserve.UNIT — raw per stored reserve unit
 const VAULT_MIN_NOTICE = 14400;                           // reserve.MIN_NOTICE — 1 day at 6s blocks
 const VAULT_BOUND = 1n << 31n;                            // reserve.BOUND — both reserve(UNITs) and outstanding < this
@@ -3324,7 +6762,7 @@ async function renderVaults() {
     $("vaultList").textContent = i18("assets.execDown", "Execution node unreachable.");
     return;
   }
-  // decode_view returns an asset id (`ast`) as a raw field element — a JSON number past 2^53, so JS has
+  // decode_view returns an asset id (`ast`) as a raw 256-bit word — a JSON number past 2^53, so JS has
   // already rounded it by the time we see it (the registry, by contrast, sends `id` as an exact STRING).
   // Match on the lossy double on BOTH sides — Number(exact-string) === the-rounded-number for the same
   // integer — then take the EXACT id back from the matched asset, because `redeem` must escrow against the
@@ -3426,7 +6864,7 @@ async function vaultCall(method, args, opts, label, msgId, rows) {
   if (opts && opts.value != null) payload.value = opts.value;
   if (opts && opts.asset != null) payload.asset = opts.asset;
   const tx = buildBlobTx(state.wallet, payload, latest.block_number + 8, fee, nowSeconds(),
-    latest.block_number + TX_INCLUSION_DELAY);
+    guardFrom(latest.block_number));
   const ok = await submitAndReport(tx, label, msgId);
   if (ok) setTimeout(() => renderAssets().catch(() => {}), 1800);   // renderAssets() also refreshes vaults
   return ok;
@@ -3581,21 +7019,24 @@ async function doBond(kind) {
   finally { btn.disabled = false; }
 }
 
+// Read-only summaries: two decimals, not the ten of the raw unit (a line read "room 99046.1618097931 NADO" on
+// 2026-09-08). Inputs the user edits keep rawToNado's exact value.
+function nadoShort(raw) { const t = rawToNado(BigInt(raw || 0)); const i = t.indexOf("."); return i < 0 ? t : t.slice(0, i + 3).replace(/\.?0+$/, ""); }
 /* AUTO-BOND: compound a configured % of newly-mined spendable earnings straight into bonded stake.
  * Mirrors the node's core_loop.maybe_auto_bond EXACTLY: throttled to one bond per epoch, accrues
- * below the AUTO_BOND_MIN_RAW dust floor instead of emitting fee-dominated dust txs, and STOPS once
- * bonded >= BOND_CAP (extra bond buys no selection weight). `acc` is the just-fetched /get_account.
+ * below the AUTO_BOND_MIN_RAW dust floor instead of emitting fee-dominated dust txs. No upper stop:
+ * bonded weight is linear in stake. `acc` is the just-fetched /get_account.
  * Called from the mining poll loop while mining + registered. Best-effort; never throws to the loop. */
 function setAutoBondPct(pct) {
   pct = Math.max(0, Math.min(100, Math.floor(Number(pct) || 0)));
   state.autoBondPct = pct;
   // Always persist — INCLUDING 0 — so an explicit "off" is remembered and does NOT fall back to the
-  // AUTO_BOND_DEFAULT_PCT (80%) default on the next load (which only applies when nothing was ever set).
+  // AUTO_BOND_DEFAULT_PCT default on the next load (which only applies when nothing was ever set).
   try { localStorage.setItem(LS_AUTOBOND, String(pct)); } catch (e) {}
   const note = $("autoBondNote");
   if (note) note.textContent = pct
-    ? `${i18("autobond.onA", "On — saving")} ${pct}% ${i18("autobond.onB", "of new mining rewards each epoch.")}`
-    : i18("autobond.off", "Off — mining rewards stay in your spendable balance.");
+    ? `${i18("autobond.onA", "On — saving")} ${pct}% ${i18("autobond.onB", "of what you earn each epoch — block rewards and the presence dividend.")}`
+    : i18("autobond.off", "Off — collecting rewards stay in your spendable balance.");
   // keep BOTH controls (Stake tab + mining card) in sync, without clobbering the one being typed into
   for (const id of ["autoBondPct", "autoBondPctMine"]) {
     const el = $(id);
@@ -3619,21 +7060,38 @@ async function maybeAutoBond(acc, ms) {
   // and the node rejects the overlap as "overspending balance" — exactly what happens when a phone locks
   // and then resumes several epochs later. Times out after 3 epochs so a dropped bond never wedges it.
   if (state.autoBondPending) {
-    if (bonded >= state.autoBondPending.target || (epoch - state.autoBondPending.epoch) > 3) {
+    const landed = bonded >= state.autoBondPending.target;
+    if (landed || (epoch - state.autoBondPending.epoch) > 3) {
+      // The baseline was advanced optimistically at submit time, so a bond that LANDED needs no
+      // reconciliation. One that timed out never happened: give its slice of the mining gain back, so
+      // those earnings are retried instead of being written off. (This used to snap the baseline to
+      // `balance` in both cases — which, now that the baseline counts MINED coins, would have written a
+      // balance figure into a produced-denominated counter and broken the accounting outright.)
+      if (!landed) {
+        if (state.autoBondPending.consumed) state.autoBondBaseline -= state.autoBondPending.consumed;
+        if (state.autoBondPending.fromDiv) state.autoBondDividend += state.autoBondPending.fromDiv;   // give the dividend slice back too
+      }
       state.autoBondPending = null;
-      state.autoBondBaseline = balance;                 // reconcile to on-chain reality after it lands
     } else {
       return;
     }
   }
-  if (state.autoBondBaseline == null) { state.autoBondBaseline = balance; return; }  // only future earnings
-  if (bonded >= BOND_CAP) { state.autoBondBaseline = balance; return; }              // already at the cap
-  const gain = balance - state.autoBondBaseline;
-  if (gain <= 0n) { state.autoBondBaseline = balance; return; }                      // balance fell — rebaseline
+  // EARNINGS ARE MINED COINS, NOT INCOMING COINS. This baselined on BALANCE, so every credit the wallet
+  // received counted as "new mining rewards" and got swept into savings behind a 24h timelock: a transfer
+  // from a friend, a faucet payout, a bridge deposit, and — worst — a matured `withdraw`, which put the
+  // coins the user had just deliberately taken OUT of savings straight back in. `produced` is the chain's
+  // counter of what this address actually MINED, so it moves only on a won slot. Same fix as the node's
+  // core_loop.maybe_auto_bond, which this mirrors.
+  const mined = BigInt(acc.produced ?? 0);
+  if (state.autoBondBaseline == null) { state.autoBondBaseline = mined; return; }    // only future mining
+  let minedGain = mined - state.autoBondBaseline;
+  if (minedGain < 0n) { state.autoBondBaseline = mined; minedGain = 0n; }            // a reorg took some back
+  // EARNINGS = MINED + DIVIDEND CLAIMED. Two counters because they are denominated differently: the mined
+  // side is a delta of the chain's own `produced`, the dividend side a tally of claims we submitted.
+  const gain = minedGain + state.autoBondDividend;
+  if (gain <= 0n) return;                                                            // nothing earned since
 
   let toBond = (gain * BigInt(pct)) / 100n;
-  const headroom = BOND_CAP - bonded;
-  if (toBond > headroom) toBond = headroom;
   const fee = MIN_TX_FEE;
   if (toBond < AUTO_BOND_MIN_RAW || balance < toBond + BigInt(fee)) return;          // accrue (no rebaseline)
 
@@ -3644,15 +7102,29 @@ async function maybeAutoBond(acc, ms) {
     const res = await submitTransaction(tx);
     if (res.data && res.data.result) {
       state.lastAutoBondEpoch = epoch;
-      state.autoBondPending = { target: bonded + toBond, epoch };  // wait for THIS to land before the next
-      state.autoBondBaseline = balance - toBond - BigInt(fee);   // optimistic; reconciled once it confirms
-      log("ok", i18("log.autoBonded", "Auto-bonded {a} NADO ({p}% of {g} new rewards) → bonded lane.", {a: rawToNado(toBond), p: pct, g: rawToNado(gain)}));
+      // Consume only the slice of the MINED gain this bond covers — the whole gain when nothing clamped,
+      // less when the cap cut it down, so the remainder stays claimable on a later pass. Moves forward
+      // over mined coins only; a received or withdrawn credit can never enter the baseline.
+      const covered = (toBond * 100n) / BigInt(pct);
+      const consumed = gain < covered ? gain : covered;
+      // SPEND THE DIVIDEND TALLY FIRST, the mined baseline with what is left: the baseline may only ever
+      // move forward over coins `produced` actually counted, so a dividend must never enter it.
+      const fromDiv = consumed < state.autoBondDividend ? consumed : state.autoBondDividend;
+      state.autoBondDividend -= fromDiv;
+      // wait for THIS to land before the next, and remember what it consumed so a timeout can undo it
+      state.autoBondPending = { target: bonded + toBond, epoch, consumed: consumed - fromDiv, fromDiv };
+      state.autoBondBaseline += (consumed - fromDiv);
+      log("ok", i18("log.autoBonded", "Auto-bonded {a} NADO ({p}% of {g} newly collected) → bonded lane.", {a: rawToNado(toBond), p: pct, g: rawToNado(gain)}));
       refreshDashboard().catch(() => {});
     } else {
       const m = res.data && (res.data.message || JSON.stringify(res.data));
       log("err", i18("log.autoBondRejected", "Auto-bond rejected: {m}", {m}));
     }
-  } catch (e) { log("err", i18("log.autoBondError", "Auto-bond error: {m}", {m: e.message})); }
+  } catch (e) {
+    // a relay bounce mid-tick is not an auto-bond failure: the next tick retries (2026-09-07 "failed to fetch")
+    if (isTransient(e)) { setConn(false); return; }
+    log("err", i18("log.autoBondError", "Auto-bond error: {m}", {m: e.message}));
+  }
 }
 
 /* ----------------------------------------------------------------------------------------------
@@ -3671,11 +7143,25 @@ function saveRandao(m) { try { localStorage.setItem(randaoKey(), JSON.stringify(
 // The epoch secret is DERIVED from the wallet key (like ETH validators' deterministic randao_reveal):
 // every device holding this wallet computes the SAME secret, so multi-device mining can never
 // split-brain an epoch. Only the key holder can compute it; the commit binds it two epochs ahead.
-function randaoSecretFor(epoch) { return blake2bHash([DOMAIN_RANDAO_SECRET, masterSeedOf() || state.wallet.privateKey, Number(epoch)]); }
+// A SECRET NEVER REPEATS ACROSS A REROLL (audit 2026-09-24, lower; confirmed 2026-10-18). Epoch numbers restart at every
+// reroll, so H(domain, seed, epoch) gave the new chain's epoch E the very secret this validator REVEALED for epoch E on
+// the old one: public, so its commitment's opening was known in advance. From generation 29 the chain's id is part of
+// the secret. Generation 28 keeps the form it started with (switching mid-generation would break a commitment already
+// made with it: a missed reveal), and a reroll restarts the epochs, so no commitment straddles the change.
+function randaoSecretFor(epoch) {
+  const seed = masterSeedOf() || state.wallet.privateKey;
+  return Number(P.CHAIN_GENERATION || 0) >= 29
+    ? blake2bHash([DOMAIN_RANDAO_SECRET, seed, CHAIN_ID, Number(epoch)])
+    : blake2bHash([DOMAIN_RANDAO_SECRET, seed, Number(epoch)]);
+}
 
 let _randaoBusy = false;
 const _randaoDead = new Set();     // epochs with a DETERMINISTIC reveal rejection — same inputs give the same
                                    // answer, so a resubmit can never succeed; never send one twice
+// The three rejections that can never change for a given (sender, epoch). Anchored to the node's own
+// assertion text in ops/transaction_ops._validate_reveal_fields — if those strings move, this must too,
+// and the cost of missing one is a duty tx that retries forever and takes the attest + commit down with it.
+const DEAD_REVEAL_RE = /no matching commit for this reveal|does not open the commitment|already revealed for the epoch/i;
 const _dutyDone = {};              // epoch X -> true once our duty tx for X was accepted (no re-submit)
 
 // MERGED EPOCH DUTY (doc/consensus-aggregation.md): the node no longer accepts standalone
@@ -3685,15 +7171,41 @@ const _dutyDone = {};              // epoch X -> true once our duty tx for X was
 // broadcasting anything (a non-member never sends a rejected tx), then (2) submit one duty tx with
 // whatever sections are due. Mirrors the node's maybe_epoch_duty; secrets are deterministic from the
 // wallet key, so no cross-window storage is needed.
+/* The landing window for an epoch duty — the node's rule, line for line (core_loop.py, epoch duty):
+ *   min_block = latest + TX_INCLUSION_DELAY          the propagation guard; no producer can build it earlier
+ *   max_block = end of epoch X, capped to the reveal window while a reveal is still possible and open
+ * Every duty timing rule binds to max_block (attest epoch, commit epoch, reveal window — block_ops.py), so
+ * any landing inside the window keeps identical semantics. Pure, so tests/test_duty_window.mjs can lift it. */
+function dutyWindow(latest, X, revealPossible) {
+  const minBlock = latest + TX_INCLUSION_DELAY;
+  const epochHi = (X + 1) * EPOCH_LENGTH - 1;
+  const revealHi = (X + 1) * EPOCH_LENGTH - FINALITY_DEPTH - 1;
+  let hi = epochHi;
+  if (revealPossible && revealHi > latest) hi = Math.min(epochHi, revealHi);
+  return { minBlock, tb: hi, revealHi };
+}
+
+/* A seatless REVEAL-ONLY duty (protocol.py "RANDAO DUTY CONSISTENCY"): a wallet without a seat in epoch X still reveals the
+ * secret it committed for X+1 — committed from epoch X-1, so only when it was seated in X-1 — as long as the landing
+ * window lies inside the reveal window. The node accepts it (REVEAL_SEATLESS_HEIGHT, gen 28's gate, inlined in G9);
+ * a refusal ends the epoch's attempt. Pure, so tests/test_duty_seatless_reveal.mjs can lift it. Returns the duty data
+ * (reveal section ONLY: an unseated attest or commit is refused) or null. */
+function seatlessRevealData(X, seatedPrev, revealPossible, win, secretFor) {
+  if (!seatedPrev || !revealPossible) return null;
+  if (win.minBlock > win.tb || win.tb > win.revealHi) return null;
+  return { reveal: { target_epoch: X + 1, secret: secretFor(X + 1) } };
+}
+
 async function maybeRandao() {
   if (_randaoBusy || !state.wallet || state.locked || state.latest == null) return;
   _randaoBusy = true;
   try {
     const acc = await getAccount(state.wallet.address);
     if (!acc || BigInt(acc.bonded ?? 0) < B_MIN_RAW) return;   // duties apply to bonded validators only
-    const latest = state.latest;
+    const latest = Math.max(state.latest, relayTipEstimate());   // the network's tip, not one lagging relay's (see guardFrom)
     const X = Math.floor(latest / EPOCH_LENGTH);
     for (const k of Object.keys(_dutyDone)) { if (Number(k) < X) delete _dutyDone[k]; }
+    for (const e of _randaoDead) { if (e < X) _randaoDead.delete(e); }   // its reveal window is long shut
     if (_dutyDone[X]) return;                                   // already accepted this epoch
 
     // COMMITTEE GATE: only seat-holders may post a duty tx — check before broadcasting so a
@@ -3703,7 +7215,32 @@ async function maybeRandao() {
       const r = await fetch(relayBase() + "/duty_committee?epoch=" + X + "&address=" + encodeURIComponent(state.wallet.address), { cache: "no-store" });
       inCommittee = !!(await r.json()).in_committee;
     } catch (e) { return; }                                    // relay hiccup — try next poll
-    if (!inCommittee) return;                                   // not our epoch to post; wait for a seat
+    if (!inCommittee) {
+      // NO SEAT THIS EPOCH: still reveal the secret committed while seated (seatlessRevealData). One attempt per
+      // epoch: accepted, refused (a max_block of 0 still needs the seat) or dead, the epoch is done.
+      let seatedPrev = false;
+      try {
+        const r0 = await fetch(relayBase() + "/duty_committee?epoch=" + (X - 1) + "&address=" + encodeURIComponent(state.wallet.address), { cache: "no-store" });
+        seatedPrev = !!(await r0.json()).in_committee;
+      } catch (e) { return; }
+      const revealPossible0 = !_randaoDead.has(X + 1);
+      const data0 = seatlessRevealData(X, seatedPrev, revealPossible0, dutyWindow(latest, X, revealPossible0), randaoSecretFor);
+      if (!data0) return;                                       // nothing of ours to reveal this epoch
+      await refreshNetIdentity();
+      const w0 = dutyWindow(latest, X, true);
+      const tx0 = buildTransferTx(state.wallet, "duty", 0n, 0, w0.tb, data0, nowSeconds(), !pubkeyEstablished(acc), w0.minBlock);
+      const res0 = await submitTransaction(tx0);
+      const msg0 = String(res0.data && (res0.data.message || ""));
+      if (res0.data && res0.data.result) {
+        _dutyDone[X] = true;
+        log("ok", i18("log.dutyRevealOnly", "RANDAO reveal submitted for epoch {e} (no committee seat this epoch) ✓", {e: X + 1}));
+      } else if (DEAD_REVEAL_RE.test(msg0)) {
+        _randaoDead.add(X + 1); _dutyDone[X] = true;
+      } else if (/already|no seat/i.test(msg0)) {
+        _dutyDone[X] = true;
+      }
+      return;
+    }
 
     // Bind the duty tx to the relay's CURRENT chain_id AND finality_depth before computing the reveal
     // window / signing — a reroll or a finality-depth change mid-session would otherwise sign against
@@ -3711,28 +7248,62 @@ async function maybeRandao() {
     await refreshNetIdentity();
 
     // reveal window bounds the whole tx's landing block (the tightest of the three sections).
-    const revealHi = (X + 1) * EPOCH_LENGTH - FINALITY_DEPTH - 1;
-    const tb = Math.min(latest + 5, (X + 1) * EPOCH_LENGTH - 1);
-    if (tb <= latest) return;                                   // epoch tail — resume next epoch
+    // THE DUTY LANDS IN A WINDOW, NOT ON A CLIFF (2026-09-22). This built an exact-landing duty at
+    // latest + 5 — the LEGACY form, ~34 s of headroom at best and less behind Cloudflare — while the node
+    // has posted windowed duties since 2026-08-19. Measured on the relay over 24 h: every duty involved in
+    // a same-height split was this form, from browser-wallet validators, and 22 of the 23 the relay held
+    // and a peer lacked were LOST (never landed), because the fleet built the block before the duty had
+    // gossiped and an exact-landing tx that misses its block is dead. Same window as the node
+    // (core_loop.py, epoch duty): min_block is the propagation guard, max_block carries every deadline.
+    const revealPossible = !_randaoDead.has(X + 1);
+    const { minBlock, tb, revealHi } = dutyWindow(latest, X, revealPossible);
+    if (minBlock > tb) return;                                  // epoch tail — resume next epoch
 
     const data = {};
     // FFG attest (epoch X's checkpoint = first block of X)
     if (X >= 1) {
       try {
-        const b = await (await fetch(relayBase() + "/get_block_number?number=" + (X * EPOCH_LENGTH), { cache: "no-store" })).json();
+        const b = await (await fetch(relayBase() + "/get_block?number=" + (X * EPOCH_LENGTH), { cache: "no-store" })).json();
         if (b && b.block_hash) data.attest = { target_epoch: X, target_hash: b.block_hash };
       } catch (e) { /* skip attest this pass */ }
     }
     // RANDAO commit for X+2 (deterministic secret from the key)
     data.commit = { target_epoch: X + 2, commitment: blake2bHash([DOMAIN_RANDAO_COMMIT, randaoSecretFor(X + 2)]) };
     // RANDAO reveal for X+1 (its E-1 finalized window), if the landing block is inside it
-    if (tb <= revealHi && !_randaoDead.has(X + 1)) {
+    if (tb <= revealHi && revealPossible) {
       data.reveal = { target_epoch: X + 1, secret: randaoSecretFor(X + 1) };
     }
 
-    const tx = buildTransferTx(state.wallet, "duty", 0n, 0, tb, data, nowSeconds(), !pubkeyEstablished(acc));
-    const res = await submitTransaction(tx);
-    const msg = String(res.data && (res.data.message || ""));
+    let tx = buildTransferTx(state.wallet, "duty", 0n, 0, tb, data, nowSeconds(), !pubkeyEstablished(acc), minBlock);
+    let res = await submitTransaction(tx);
+    let msg = String(res.data && (res.data.message || ""));
+
+    // A DEAD REVEAL MUST NOT TAKE THE REST OF THE DUTY WITH IT. The three sections ride in ONE tx, so a
+    // reveal the chain can never accept fails the WHOLE thing — and the attest and the next commit, both
+    // perfectly valid, are lost with it. That is not cosmetic: the validator silently stops attesting for
+    // FFG and stops committing for future epochs, for as long as it keeps retrying.
+    //
+    // And it retries forever. These rejections do not match the "nothing left to post" pattern below, so
+    // _dutyDone[X] is never set and every poll pass resubmits the identical doomed tx. Observed live:
+    // "Epoch duty rejected: Could not merge remote transaction: No matching commit for this reveal",
+    // once a minute, after a node restart cost the wallet its commit for that epoch.
+    //
+    // These are PERMANENT, which is why _randaoDead exists ("a resubmit can never succeed") — and nothing
+    // ever added to it. A commit for epoch E has to be posted in epoch E-2, while the reveal lands in
+    // E-1's finalized window, so by the time a reveal is rejected for a missing commit that window shut an
+    // epoch ago and commit_get(sender, E) stays empty for good. Same for a secret that does not open the
+    // commitment, or one already revealed: identical inputs, identical answer, every time.
+    if (!(res.data && res.data.result) && data.reveal && DEAD_REVEAL_RE.test(msg)) {
+      _randaoDead.add(X + 1);
+      delete data.reveal;                                       // never send this one again
+      log("info", i18("log.dutyRevealDead",
+        "Reveal for epoch {e} cannot be accepted ({m}) — dropping it and posting the rest of the duty.",
+        {e: X + 1, m: msg.replace(/^Could not merge remote transaction:\s*/i, "").slice(0, 70)}));
+      tx = buildTransferTx(state.wallet, "duty", 0n, 0, tb, data, nowSeconds(), !pubkeyEstablished(acc), minBlock);   // same window
+      res = await submitTransaction(tx);
+      msg = String(res.data && (res.data.message || ""));
+    }
+
     if (res.data && res.data.result) {
       _dutyDone[X] = true;
       log("ok", i18("log.dutyOk", "Epoch duty submitted for epoch {e} — bonded lane eligible ✓", {e: X}));
@@ -3743,6 +7314,200 @@ async function maybeRandao() {
     }
   } catch (e) { /* best-effort; never break the poll loop */ }
   finally { _randaoBusy = false; }
+}
+
+/* ----------------------------------------------------------------------------------------------
+ * TPM CHALLENGER DUTY (doc/tpm-attestation-without-a-ca.md) — the wallet twin of the node's maybe_tpm_challenge
+ * (loops/core_loop.py). A machine proves it holds a vendor-certified TPM by opening credentials that DRAWN
+ * challengers seal to its endorsement key; forging one needs every drawn challenger to collude. A bonded wallet
+ * can be drawn, and a drawn challenger that never answers kills the enrolment: the stranger's chip did nothing
+ * wrong and has to start over. So a bonded wallet answers, automatically, like its epoch duty.
+ *
+ * The relay names the work (GET /tpm_duty?address=): per enrolment one action, "challenge" or "reveal".
+ *   challenge  fresh 32-byte secret + seed, PERSISTED HERE FIRST, then tpm_challenge {id, blob, enc}
+ *   reveal     tpm_reveal {id, secret, seed} with the stored pair — only when the relay says "reveal", which it
+ *              does only once the client's tpm_commit is ON CHAIN (consensus also refuses an early reveal, but a
+ *              reveal broadcast before the commit lands hands the client the secret off the mempool)
+ * INVARIANTS (tests/test_wallet_tpm_challenger_duty.mjs pins each one):
+ *   - the secret is written to localStorage, and read back, BEFORE the challenge is broadcast; a challenger
+ *     that publishes a blob and then loses (secret, seed) can never reveal, and nothing else can;
+ *   - an existing secret for an id is NEVER replaced: the blob on chain may already be sealed under it;
+ *   - one message per enrolment per pass, and never a second while one is in flight for that id (the node's
+ *     _tpm_tx_pending: a duplicate fails inside later block candidates);
+ *   - a refusal that can never change (DEAD_TPM_RE) is not resent.
+ * -------------------------------------------------------------------------------------------- */
+const TPM_SECRET_KEEP_BLOCKS = 720;   // an UNREVEALED secret outlives any enrolment it could open: the longest window is
+                                      // the draw wait (<= 2 epochs = 120) + DEVICE_ATTEST_EK_ENROL_SHORT (180) = 300 blocks
+// Refusals that are the same on every retry, anchored to the node's own assertion text (ops/tpm_enrol.apply_challenge /
+// apply_reveal, ops/transaction_ops). If those strings move, this must too — the test reads both files.
+const DEAD_TPM_RE = /no longer accepting challenges|not a drawn challenger|already challenged this enrolment|already revealed|nothing to reveal for this enrolment|do not reproduce the published challenge|enrolment has expired/i;
+// Per chain AND per account: a reroll's enrolment ids are a different chain's, and two accounts on one browser are
+// two challengers. Not lsChainGet — that DELETES a mismatching chain's entry, and a stale CHAIN_ID read before the
+// relay answered must never be able to erase a secret an enrolment is waiting on.
+function tpmSecretsKey(addr) { return "nado_tpm_chal_v1:" + CHAIN_ID + ":" + addr; }
+function tpmSecretsLoad(addr) {
+  try {
+    const m = JSON.parse(localStorage.getItem(tpmSecretsKey(addr)) || "{}");
+    return (m && typeof m === "object" && !Array.isArray(m)) ? m : {};
+  } catch (e) { return {}; }
+}
+// EVERY WRITE IS A READ-MODIFY-WRITE OF WHAT IS STORED NOW, never a pass-start snapshot written back: two tabs of one
+// wallet both run this duty, and a snapshot written over the other tab's fresh secret is a published blob nobody can
+// reveal. `fn` mutates the current map and returns what the caller wants back. Returns null unless the write is READ
+// BACK identical: a quota error, a private window or blocked site data must stop the challenge, not surface at the reveal.
+function tpmSecretsUpdate(addr, fn) {
+  try {
+    const k = tpmSecretsKey(addr), m = tpmSecretsLoad(addr);
+    const out = fn(m);
+    const v = JSON.stringify(m);
+    localStorage.setItem(k, v);
+    return localStorage.getItem(k) === v ? (out === undefined ? true : out) : null;
+  } catch (e) { return null; }
+}
+function tpmDutyOk(d) {
+  return d && typeof d.id === "string" && /^[0-9a-f]{32}$/.test(d.id)
+    && (d.action === "challenge" || d.action === "reveal")
+    && Number.isInteger(d.min_block) && Number.isInteger(d.max_block)
+    && (d.action !== "challenge" || (typeof d.ekpub === "string" && /^([0-9a-fA-F]{2})+$/.test(d.ekpub)
+        && typeof d.name === "string" && /^([0-9a-fA-F]{2})+$/.test(d.name)));
+}
+let _tpmBusy = false;
+const _tpmNoted = new Set();          // "<id>:<what>" — say each problem once, not once per poll
+
+async function maybeTpmChallenge() {
+  if (_tpmBusy || !state.wallet || state.locked || state.latest == null || !netAdopted) return;
+  _tpmBusy = true;
+  try {
+    const addr = state.wallet.address;
+    // ONE TAB AT A TIME: two tabs of one wallet would otherwise both see "challenge" and both broadcast. Where the Web
+    // Locks API exists (every secure context) a tab that finds the lock held skips this pass; elsewhere the fresh
+    // per-id reads and merge-writes below keep the secret safe, and a duplicate is refused by consensus.
+    const locks = globalThis.navigator && navigator.locks;
+    if (locks && typeof locks.request === "function") {
+      await locks.request("nado_tpm_duty:" + addr, { ifAvailable: true }, (lock) => (lock ? tpmChallengePass(addr) : null));
+    } else {
+      await tpmChallengePass(addr);
+    }
+  } catch (e) { /* best-effort; never break the poll loop */ }
+  finally { _tpmBusy = false; }
+}
+
+async function tpmChallengePass(addr) {
+  const acc = await getAccount(addr);
+  if (!acc || BigInt(acc.bonded ?? 0) < B_MIN_RAW) return;            // only a bonded account can be drawn
+  let resp = null;
+  try {                                                                // ONE /tpm_duty fetch per pass
+    const r = await fetch(relayBase() + "/tpm_duty?address=" + encodeURIComponent(addr), { cache: "no-store" });
+    if (!r.ok) return;                                                 // a relay without the endpoint: nothing to do
+    resp = await r.json();
+  } catch (e) { return; }                                              // relay hiccup — next poll
+  const tip = Number(resp && resp.tip);
+  const duties = resp && Array.isArray(resp.duties) ? resp.duties : null;
+  if (!Number.isInteger(tip) || !duties) return;
+  if (duties.length) {
+    // Bind to the relay's CURRENT chain before reading the chain-scoped store or signing (see refreshNetIdentity).
+    await refreshNetIdentity();
+    if (!state.wallet || state.wallet.address !== addr || state.locked) return;   // switched account / locked meanwhile
+  }
+  const handled = new Set();
+  const expOf = {};                                                    // id -> the enrolment's expiry (d.expires_at)
+  try {
+    for (const d of duties) {
+      if (!tpmDutyOk(d) || handled.has(d.id)) continue;
+      handled.add(d.id);                                               // ONE MESSAGE PER ENROLMENT PER PASS
+      if (Number.isInteger(d.expires_at)) expOf[d.id] = d.expires_at;
+      let ent = tpmSecretsLoad(addr)[d.id];                            // FRESH: another tab may have written since
+      if (ent && ent.dead === d.action) continue;                      // refused for good; never resend
+      if (ent && ent.pend && ent.pend.action === d.action && tip <= ent.pend.max) continue;   // IN FLIGHT for this id
+      if (d.min_block > d.max_block || d.max_block <= tip) continue;   // cannot land any more
+      let data;
+      if (d.action === "challenge") {
+        if (!ent || !ent.secret || !ent.seed) {
+          // NEVER REPLACE AN EXISTING SECRET: if an earlier challenge already landed under it, a new one would leave
+          // the published blob unrevealable. Generate only when none is stored, and STORE BEFORE BROADCASTING — the
+          // claim keeps whatever secret is there by the time it writes, so a racing tab's secret wins, not ours.
+          const fresh = { secret: tpmToHex(crypto.getRandomValues(new Uint8Array(32))),
+                          seed: tpmToHex(crypto.getRandomValues(new Uint8Array(32))), at: tip, seen: tip };
+          ent = tpmSecretsUpdate(addr, (m) => {
+            if (!(m[d.id] && m[d.id].secret && m[d.id].seed)) m[d.id] = fresh;
+            return m[d.id];
+          });
+          if (!ent) {
+            if (!_tpmNoted.has("store")) { _tpmNoted.add("store");
+              log("err", i18("log.tpmStoreFail", "This browser cannot store the TPM challenge secret (site data blocked or storage full) — not challenging, so no enrolment is left waiting on a secret that was never kept.")); }
+            return;
+          }
+        }
+        let cred;
+        try {
+          cred = tpmMakeCredential(tpmHex(d.ekpub), tpmHex(d.name), tpmHex(ent.secret), tpmHex(ent.seed));
+        } catch (e) {
+          if (!_tpmNoted.has(d.id + ":key")) { _tpmNoted.add(d.id + ":key");
+            log("warn", i18("log.tpmBadKey", "TPM enrolment {id}…: its endorsement key cannot be used ({m}) — skipping it.", { id: d.id.slice(0, 12), m: String(e.message || e).slice(0, 60) })); }
+          continue;
+        }
+        data = { id: d.id, blob: tpmToHex(cred.blob), enc: tpmToHex(cred.enc) };
+      } else {
+        // REVEAL ONLY ON THE RELAY'S "reveal": it says so only once the client's commitment is on chain.
+        // ONLY THE SECRET THAT REPRODUCES OUR PUBLISHED CHALLENGE. With this wallet open on two devices both challenge,
+        // one is refused as a duplicate, and its stored secret is NOT the one on chain: revealing it is refused, and
+        // here it must not even be tried — the other device holds the right one (the relay sends our blob as d.blob).
+        let mine = !!(ent && ent.secret && ent.seed);
+        if (mine && d.blob) {
+          try { mine = tpmToHex(tpmCredentialBlob(tpmHex(d.name), tpmHex(ent.secret), tpmHex(ent.seed))) === String(d.blob).toLowerCase(); }
+          catch (e) { mine = false; }
+        }
+        if (!mine) {
+          if (!_tpmNoted.has(d.id + ":nosecret")) { _tpmNoted.add(d.id + ":nosecret");
+            log("warn", i18("log.tpmNoSecret", "Cannot reveal for TPM enrolment {id}…: this browser does not hold its challenge secret (it was challenged from another device, or site data was cleared).", { id: d.id.slice(0, 12) })); }
+          continue;
+        }
+        data = { id: d.id, secret: ent.secret, seed: ent.seed };
+      }
+      if (!state.wallet || state.wallet.address !== addr || state.locked) return;   // never sign one account's duty as another
+      const tx = buildTransferTx(state.wallet, "tpm_" + d.action, 0n, 0, d.max_block, data, nowSeconds(),
+                                 !pubkeyEstablished(acc), d.min_block);
+      let res;
+      try { res = await submitTransaction(tx); }
+      catch (e) { if (isTransient(e)) { setConn(false); return; } throw e; }
+      const msg = String((res && res.data && res.data.message) || "");
+      if (res && res.data && res.data.result) {
+        // IN FLIGHT, PERSISTED AT ONCE (not at the end of the pass, which an early return would skip): the next pass,
+        // a reload or another tab must all see it, or each mints a duplicate with a new nonce.
+        tpmSecretsUpdate(addr, (m) => {
+          if (!m[d.id]) return;
+          m[d.id].pend = { action: d.action, txid: tx.txid, max: d.max_block };
+          if (d.action === "reveal") m[d.id].revealed = tip;
+        });
+        log("ok", d.action === "challenge"
+          ? i18("log.tpmChallenge", "Challenging a TPM enrolment you were drawn for ({id}…).", { id: d.id.slice(0, 12) })
+          : i18("log.tpmRevealed", "Revealed your TPM challenge for enrolment {id}… — its proof can now complete.", { id: d.id.slice(0, 12) }));
+      } else {
+        if (DEAD_TPM_RE.test(msg)) tpmSecretsUpdate(addr, (m) => { if (m[d.id]) m[d.id].dead = d.action; });
+        const note = d.id + ":" + d.action + ":" + msg;
+        if (msg && !_tpmNoted.has(note)) { _tpmNoted.add(note);
+          log("err", i18("log.tpmRefused", "TPM challenger message refused: {m}", { m: msg.replace(/^Could not merge remote transaction:\s*/i, "").slice(0, 120) })); }
+      }
+    }
+  } finally {
+    // PRUNE: a secret goes once its id is no longer returned AND it is spent (its reveal was accepted and that tx's
+    // window has closed) — or, never revealed, once it has gone unseen longer than any enrolment can live. A gap
+    // between our challenge and the client's commit returns nothing for the id, which is why "not returned" alone
+    // is never enough. Runs on the CURRENT store (merge-write), and only when there is something stored.
+    if (Object.keys(tpmSecretsLoad(addr)).length) {
+      tpmSecretsUpdate(addr, (m) => {
+        for (const id of Object.keys(m)) {
+          const ent = m[id] || {};
+          if (handled.has(id)) { ent.seen = tip; if (expOf[id] != null) ent.exp = expOf[id]; continue; }
+          const spent = ent.revealed != null && !(ent.pend && tip <= Number(ent.pend.max));
+          const lastSeen = Number(ent.seen ?? ent.at ?? tip);
+          // the enrolment's own expiry when the relay told us (d.expires_at): past it nothing can land for this id
+          const expired = ent.exp != null && tip > Number(ent.exp);
+          if (spent || expired || tip - lastSeen > TPM_SECRET_KEEP_BLOCKS) delete m[id];
+        }
+      });
+    }
+  }
 }
 
 /* ---- Payment-request deep links: QR / shareable URL that prefills a Send on scan ---- */
@@ -3878,6 +7643,32 @@ function _openModal(spec) {
 let _modalCheckEl = null;
 function modalCheckValue() { return !!(_modalCheckEl && _modalCheckEl.checked); }
 function uiConfirm(spec) { return _openModal(Object.assign({}, spec, { kind: "confirm" })); }
+// One choice from a short list (spec.choices = [{value, label, note}]): resolves the chosen value, or null on Cancel.
+// Built on the confirm modal — the list is radio rows in its body slot, the first one preselected (the default).
+async function uiChoose(spec) {
+  const list = document.createElement("div");
+  list.className = "modal-choices";
+  list.style.cssText = "display:flex;flex-direction:column;gap:8px;margin:10px 0 0";
+  const name = "choice" + Date.now();
+  (spec.choices || []).forEach((c, i) => {
+    const row = document.createElement("label");
+    row.style.cssText = "display:flex;gap:10px;align-items:flex-start;cursor:pointer;font-size:13px";
+    const r = document.createElement("input");
+    r.type = "radio"; r.name = name; r.value = c.value; r.checked = i === 0;
+    const t = document.createElement("span");
+    const b = document.createElement("b"); b.textContent = c.label;
+    t.appendChild(b);
+    if (c.note) { const n = document.createElement("div"); n.className = "small faint"; n.textContent = c.note; t.appendChild(n); }
+    row.appendChild(r); row.appendChild(t); list.appendChild(row);
+  });
+  const done = _openModal(Object.assign({}, spec, { kind: "confirm", choices: undefined }));
+  const rows = _modalEl && _modalEl.querySelector(".modal-rows");
+  if (rows) { rows.innerHTML = ""; rows.appendChild(list); rows.classList.remove("hidden"); }
+  const ok = await done;
+  if (!ok) return null;
+  const sel = list.querySelector("input:checked");
+  return sel ? sel.value : null;
+}
 function uiAlert(body, title) { return _openModal({ kind: "alert", title: title || i18("dlg.notice", "Notice"), body: body, confirmText: i18("dlg.ok", "OK") }); }
 function uiPrompt(spec) { return _openModal(Object.assign({}, spec, { kind: "prompt" })); }
 
@@ -3911,7 +7702,7 @@ async function shareZpayLink() {
 
 // Share the MINER itself (the site URL) — the growth loop: whoever opens it can mine + share it again.
 async function shareMiner() {
-  sdkShare(shareUrl(), i18("share.msg", "Mine NADO in your browser — no install, no signup. Open and go:"), $("btnShareMiner"));
+  sdkShare(shareUrl(), i18("share.msg", "Collect NADO in your browser — no install, no signup. Open and go:"), $("btnShareMiner"));
 }
 
 /* Receive: amount-aware QR + shareable payment link (degrades to the link text if QR is unavailable). */
@@ -3954,7 +7745,8 @@ function parsePayHash() {
   return { to: (params.get("to") || "").trim(), amount: (params.get("amount") || "").trim() };
 }
 
-// A #pay link's recipient can be transparent (mldsa44…) or shielded (zaddr…) — same link format, routed by prefix.
+// A #pay link's recipient can be transparent (46-hex) or shielded (zaddr…) — routed by shape, since only
+// the shielded form carries a prefix now.
 function _isZAddr(a) { try { parseShieldAddr(a); return true; } catch (e) { return false; } }
 
 // A #pay link with a zaddr… recipient prefills the SHIELDED send (same review-first rule as a normal Send).
@@ -4075,9 +7867,447 @@ function resumePendingClaim() {
   if (req.code && req.code.startsWith("zbill")) applyClaimRequest(req);
 }
 
+/* ==== FUNDED INVITE LINKS + REFERRALS (protocol.py "FUNDED INVITE LINKS" and "REFERRALS", from block 1) ====
+ *
+ * The referrer escrows NADO under a THROWAWAY ML-DSA-44 key generated here from a fresh random 32-byte seed for that
+ * one link — never derived from, or related to, the wallet's own key (CLAUDE.md rule 8). The seed travels in the
+ * link's #fragment, which a browser never sends to a server. The newcomer's wallet keeps it until it has registered a
+ * device, then signs (chain, invite id, ITS OWN ADDRESS) with the link key in a fee-exempt invite_claim. The first
+ * registration also names the referrer (register data {"referrer"}), which is what earns the referrer a slice of the
+ * newcomer's dividend for the referral window.
+ *
+ * The functions inviteKeyOf / inviteIdOf / inviteClaimSig are what tests/test_invite_link_js_matches_python.py runs
+ * against ops/transaction_ops.invite_id_of / invite_claim_message, and the flow below is what
+ * tests/test_wallet_invite_flow.mjs drives with stubs — both LIFT this block from the file, so keep it contiguous
+ * between the two marker lines. */
+const LS_PENDING_INVITE = "nado_pending_invite";   // localStorage: an invite link opened here, kept until it is claimed
+// INVITE_MIN_TIMELOCK / INVITE_MAX_TIMELOCK are imported from /protocol.js at the top of this file.
+const INVITE_BLOCKS_PER_DAY = 86400 / P.BLOCK_TIME;   // protocol.BLOCK_TIME (6 s) -> 14,400 blocks a day
+const INVITE_DEFAULT_DAYS = 7;
+const INVITE_LAND_AHEAD = 8;                       // exact-landing reserved txs land at tip + 8 (as htlc_lock does)
+// A link opened within a minute of being made can be read before its lock has landed: /invite answers null then. Only
+// a null that persists this long means the link is not (or no longer) on this chain.
+const INVITE_NULL_GRACE = 120;
+// Claim refusals that no retry can fix (ops/transaction_ops.validate_invite). Everything else — "only a registered
+// device identity can claim" while a registration is still landing, a relay blip, a target-block race — is retried.
+const DEAD_INVITE_RE = /no OPEN invite|invite has expired|cannot claim their own|key does not match the invite|does not name this claimant|bad invite id/i;
+
+function inviteSeedOk(s) { return typeof s === "string" && /^[0-9a-f]{64}$/.test(s); }
+const _inviteKeyMemo = new Map();
+function inviteKeyOf(seedHex) {                    // the link's ML-DSA-44 public key (hex, 2624 chars)
+  let k = _inviteKeyMemo.get(seedHex);
+  if (!k) { k = bytesToHex(ml_dsa44.keygen(hexToBytes(seedHex)).publicKey); _inviteKeyMemo.set(seedHex, k); }
+  return k;
+}
+// == transaction_ops.invite_id_of: blake2b(["invite-id-v1", CHAIN_ID, key_hex]). Chain-scoped, so read CHAIN_ID only
+// once the relay's chain is adopted (netAdopted).
+function inviteIdOf(keyHex) { return blake2bHash(["invite-id-v1", CHAIN_ID, keyHex]); }
+// == transaction_ops.invite_claim_message: the link key signs bytes(blake2b(["invite-claim-v1", CHAIN_ID, id,
+// claimant])). Naming the claimant is the point — a claim copied out of the mempool cannot be re-pointed.
+function inviteClaimSig(seedHex, id, claimant) {
+  return mldsaSignHex(seedHex, hexToBytes(blake2bHash(["invite-claim-v1", CHAIN_ID, id, claimant]))).signature;
+}
+function inviteLink(seedHex) { return `${location.origin}${location.pathname}#invite=${seedHex}`; }
+function parseInviteHash() {
+  const m = /^#invite=([0-9a-fA-F]{64})$/.exec(location.hash || "");
+  return m ? m[1].toLowerCase() : null;
+}
+
+function pendingInviteLoad() {
+  try { const p = JSON.parse(localStorage.getItem(LS_PENDING_INVITE) || "null"); return p && inviteSeedOk(p.seed) ? p : null; }
+  catch (e) { return null; }
+}
+function pendingInviteSave(p) {
+  try { if (p) localStorage.setItem(LS_PENDING_INVITE, JSON.stringify(p)); else localStorage.removeItem(LS_PENDING_INVITE); }
+  catch (e) {}
+}
+
+// THE REGISTER'S `data` (buildRegisterTx). A pending invite whose sender the chain has confirmed names that sender as
+// the referrer — never this wallet itself (consensus refuses a self-referral, and that would cost the user their
+// registration). Consensus writes the link only on the identity's FIRST attested registration and ignores it on a
+// renewal, so sending it while an invite is pending is always safe; with no pending invite, data stays "".
+function registerData(address) {
+  const p = pendingInviteLoad();
+  const ref = p && typeof p.sender === "string" ? p.sender : "";
+  return (ref && ref !== address && validateAddress(ref)) ? { referrer: ref } : "";
+}
+
+// What the chain says about the pending invite, as one word. Pure: tests pin it.
+function inviteVerdict(inv, tip, me, p) {
+  if (!inv) return (p && p.nullSince != null && tip - p.nullSince > INVITE_NULL_GRACE) ? "gone" : "wait";
+  if (inv.status === "claimed") return (me && inv.claimant === me) ? "mine" : "taken";
+  if (inv.status === "refunded") return "refunded";
+  if (inv.status !== "open") return "gone";
+  if (tip >= Number(inv.expiry)) return "expired";
+  if (me && inv.sender === me) return "own";
+  return "open";
+}
+
+// Re-read the pending invite from the chain, keep or drop it, and repaint the banner. Returns the pending record
+// (null once dropped). A relay that cannot answer changes nothing — the chain overrules stored state, not a blip.
+async function inviteRefreshPending() {
+  let p = pendingInviteLoad();
+  if (!p || !netAdopted) { renderInviteBanner(p); return p; }
+  const id = inviteIdOf(inviteKeyOf(p.seed));
+  let d = null;
+  try {
+    const r = await fetch(relayBase() + "/invite?id=" + encodeURIComponent(id), { cache: "no-store" });
+    if (r.ok) d = await r.json();
+  } catch (e) { d = null; }
+  const tip = d ? Number(d.tip) : NaN;
+  if (!d || !Number.isInteger(tip) || d.id !== id) { renderInviteBanner(p); return p; }
+  const inv = d.invite && typeof d.invite === "object" ? d.invite : null;
+  const me = state.wallet ? state.wallet.address : null;
+  p = pendingInviteLoad();                       // FRESH: another tab may have cleared or replaced it meanwhile
+  if (!p || inviteIdOf(inviteKeyOf(p.seed)) !== id) { renderInviteBanner(p); return p; }
+  const v = inviteVerdict(inv, tip, me, p);
+  const amt = inv ? rawToNado(bnum(inv.amount)) : "";
+  if (v === "wait" || v === "open") {
+    if (inv) Object.assign(p, { id, sender: String(inv.sender || ""), amount: String(bnum(inv.amount)), expiry: num(inv.expiry), status: "open", nullSince: null, tip });
+    else Object.assign(p, { id, nullSince: p.nullSince != null ? p.nullSince : tip, tip });
+    pendingInviteSave(p);
+    renderInviteBanner(p);
+    return p;
+  }
+  pendingInviteSave(null);
+  if (v === "mine") {
+    log("ok", i18("invite.received", "Your invite gift of {a} NADO has arrived ✓", { a: amt }));
+    toast(i18("invite.received", "Your invite gift of {a} NADO has arrived ✓", { a: amt }), "ok", 7000);
+  } else {
+    const why = v === "taken" ? i18("invite.taken", "This invite link was already claimed by someone else.")
+      : v === "refunded" ? i18("invite.refunded", "This invite was taken back by the person who sent it.")
+      : v === "expired" ? i18("invite.expired", "This invite link has expired.")
+      : v === "own" ? i18("invite.own", "This is your own invite link — send it to a friend instead.")
+      : i18("invite.gone", "This invite link is not valid on this network.");
+    log("err", why);
+    toast(why, "err", 8000);
+  }
+  renderInviteBanner(null);
+  return null;
+}
+
+// #invite=<seed> — the funded-invite twin of #claim. Stored in localStorage (not sessionStorage): it must survive
+// wallet creation, a device registration that can take a while, and reloads, until the gift has landed.
+function consumeInviteRequest() {
+  const seed = parseInviteHash();
+  if (!seed) return false;
+  try { history.replaceState(null, "", location.pathname); } catch (e) {}   // the seed leaves the address bar
+  const prev = pendingInviteLoad();
+  if (!prev || prev.seed !== seed) pendingInviteSave({ seed, at: Date.now() });
+  log("info", i18("invite.opened", "Invite link opened — checking what is waiting for you…"));
+  inviteRefreshPending().catch(() => {});
+  return true;
+}
+
+function inviteReadyToClaim(acc) {
+  return !!(acc && acc.registered === 1) && !!(state.lastMs && state.lastMs.registered_present === true);
+}
+
+let _inviteClaimBusy = false;
+const _inviteNoted = new Set();                    // say each refusal once, not once per poll
+// AUTO-CLAIM (pollOnce). Receiving moves nothing out of this wallet, so there is no confirm — but it is logged. Sent
+// only once this identity is a registered, present device identity (consensus refuses anyone else), one at a time,
+// and never again while the last one's landing block is still ahead (exact landing: it lands at max_block or never).
+async function maybeInviteClaim() {
+  if (_inviteClaimBusy || !netAdopted || !pendingInviteLoad()) return;
+  _inviteClaimBusy = true;
+  try {
+    let p = await inviteRefreshPending();            // the banner follows the chain even while the wallet is locked
+    if (!p || p.status !== "open" || !p.id || !state.wallet || state.locked || state.latest == null) return;
+    const me = state.wallet.address;
+    if (!me) return;
+    const acc = await getAccount(me);
+    if (!inviteReadyToClaim(acc)) return;
+    const tip = Math.max(Number(state.latest) || 0, Number(p.tip) || 0);
+    if (p.pend && p.pend.addr === me && tip <= Number(p.pend.max)) return;          // IN FLIGHT: wait for it
+    const key = inviteKeyOf(p.seed);
+    const id = inviteIdOf(key);
+    if (id !== p.id) return;                                                        // chain changed under us
+    const target = tip + INVITE_LAND_AHEAD;
+    const tx = buildTransferTx(state.wallet, "invite_claim", 0n, 0, target, { id, key, sig: inviteClaimSig(p.seed, id, me) },
+                               nowSeconds(), !pubkeyEstablished(acc));
+    let res;
+    try { res = await submitTransaction(tx); }
+    catch (e) { if (isTransient(e)) return; throw e; }
+    const msg = String((res && res.data && res.data.message) || "");
+    if (res && res.data && res.data.result) {
+      p = pendingInviteLoad();
+      if (p) { p.pend = { txid: tx.txid, max: target, addr: me }; pendingInviteSave(p); }
+      log("ok", i18("invite.claiming", "Receiving your invite gift — the claim is on its way into a block."));
+      renderInviteBanner(p);
+      return;
+    }
+    if (DEAD_INVITE_RE.test(msg)) {
+      // THE CHAIN DECIDES, NOT THE REFUSAL: "no OPEN invite" is also what a second tab hears after the first tab's
+      // claim landed. Re-read it; only an invite that is still not ours is dropped.
+      const still = await inviteRefreshPending();
+      if (still) {
+        pendingInviteSave(null);
+        renderInviteBanner(null);
+        log("err", i18("invite.claimDead", "This invite cannot be claimed: {m}", { m: msg.replace(/^Could not merge remote transaction:\s*/i, "").slice(0, 120) }));
+      }
+      return;
+    }
+    if (msg && !_inviteNoted.has(msg)) {
+      _inviteNoted.add(msg);
+      log("warn", i18("invite.claimRetry", "Invite claim not accepted yet ({m}) — retrying.", { m: msg.replace(/^Could not merge remote transaction:\s*/i, "").slice(0, 120) }));
+    }
+  } catch (e) { /* best-effort; never break the poll loop */ }
+  finally { _inviteClaimBusy = false; }
+}
+
+// ---- the newcomer's banner -------------------------------------------------------------------------------------
+function renderInviteBanner(p) {
+  const el = $("inviteBanner");
+  if (!el) return;
+  if (p === undefined) p = pendingInviteLoad();
+  if (!p) { el.classList.add("hidden"); el.innerHTML = ""; return; }
+  const who = p.sender ? (_abAlias[p.sender] || _abShort(p.sender)) : "";
+  let head, next = "", btn = "";
+  if (!p.sender) {
+    head = i18("invite.checking", "You opened an invite link. Checking it — the gift may still be confirming on the network.");
+  } else {
+    head = i18("invite.head", "{who} invited you and left you {a} NADO.", { who, a: rawToNado(bnum(p.amount)) });
+    const ready = !!(state.lastMs && state.lastMs.registered_present === true);
+    if (!state.wallet) next = i18("invite.nextUnlock", "Unlock your wallet, then register this device to receive it.");
+    else if (ready || p.pend) next = i18("invite.nextClaiming", "Receiving it now — it arrives in your balance within a minute or two.");
+    else {
+      next = i18("invite.nextRegister", "Register this device to receive it — it arrives right after.");
+      if (!state.mining) btn = `<button type="button" class="primary" id="btnInviteRegister">${escapeHtml(i18("invite.registerBtn", "Register this device"))}</button>`;
+    }
+    const left = Number(p.expiry) - Number(state.latest || p.tip || 0);
+    if (left > 0) next += " " + i18("invite.expiresIn", "Expires in {t}.", { t: blocksToEta(left) });
+  }
+  el.innerHTML = `<span>🎁 ${escapeHtml(head)}${next ? " " + escapeHtml(next) : ""}</span>${btn}`;
+  el.classList.remove("hidden");
+  const b = $("btnInviteRegister");
+  if (b) b.onclick = () => { showTab("wallet"); if (!state.mining && $("btnMine")) $("btnMine").click(); };
+  if (p.sender && !(p.sender in _abAlias)) abResolveAliases([p.sender]).then(() => renderInviteBanner()).catch(() => {});
+}
+
+// ---- the referrer's side: create, list, reclaim ----------------------------------------------------------------
+function inviteSeedsKey(addr) { return "nado_invite_seeds:" + CHAIN_ID + ":" + addr; }
+function inviteSeedsLoad(addr) { try { return JSON.parse(localStorage.getItem(inviteSeedsKey(addr)) || "{}") || {}; } catch (e) { return {}; } }
+function inviteSeedsSave(addr, m) { try { localStorage.setItem(inviteSeedsKey(addr), JSON.stringify(m)); return true; } catch (e) { return false; } }
+
+// What the card shows. Pure: tests pin it. Invite creation is OFFERED only once the chain accepts invites
+// (tip >= active_from: 1 since REFERRAL_HEIGHT was inlined in G9) — never something the chain refuses — and the list only when
+// there is something in it.
+function inviteUiState(ref, invites) {
+  const from = ref ? Number(ref.active_from) : NaN, tip = ref ? Number(ref.tip) : NaN;
+  const canCreate = Number.isFinite(from) && Number.isFinite(tip) && tip >= from;
+  const nInv = invites && typeof invites === "object" ? Object.keys(invites).length : 0;
+  const hasRef = !!(ref && (ref.referrer || (Array.isArray(ref.referred) && ref.referred.length)));
+  return { canCreate, showList: nInv > 0 || hasRef, showCard: canCreate || nInv > 0 || hasRef };
+}
+// Why a referred identity is or is not earning its referrer a slice right now. Pure: tests pin it.
+function referralStatus(r, selfPresent) {
+  if (!r || !r.in_window) return "window";
+  if (!r.present) return "absent";
+  if (!selfPresent) return "selfAbsent";
+  return "earning";
+}
+
+let _invRef = null, _invList = null, _invAddr = null, _invTickAt = 0, _invTickBusy = false;
+function _applyInviteVisibility() {
+  const card = $("inviteCard");
+  if (!card) return;
+  const ui = inviteUiState(_invAddr === (state.wallet && state.wallet.address) ? _invRef : null, _invList);
+  card.classList.toggle("hidden", !ui.showCard || (state.activeTab || "wallet") !== "wallet");
+}
+// Reads /referrals (rate-limited 30/min per IP; it reads the open registry) and, once invites exist on this chain,
+// /invites — only while the Wallet tab is on screen, at most once a minute, or at once when forced (after creating or
+// reclaiming). Nobody sees the card on another tab or in a background tab, so the relay is not asked for it.
+async function inviteTick(force) {
+  if (!state.wallet || _invTickBusy) return;
+  if (!force && ((state.activeTab || "wallet") !== "wallet" || document.visibilityState === "hidden")) return;
+  if (!force && Date.now() - _invTickAt < 60000) return;
+  _invTickBusy = true; _invTickAt = Date.now();
+  try {
+    const me = state.wallet.address;
+    let ref = null;
+    try { const r = await fetch(relayBase() + "/referrals?address=" + encodeURIComponent(me), { cache: "no-store" }); if (r.ok) ref = await r.json(); }
+    catch (e) { ref = null; }
+    if (!state.wallet || state.wallet.address !== me) return;
+    if (ref && typeof ref === "object" && !ref.error) {
+      if (_invAddr !== me) _invList = null;
+      _invRef = ref; _invAddr = me;
+    } else if (_invAddr !== me) return;                    // nothing known for this account yet: stay hidden
+    const ui = inviteUiState(_invRef, null);
+    const seeds = inviteSeedsLoad(me);
+    if (ui.canCreate || Object.keys(seeds).length) {
+      try {
+        const r = await fetch(relayBase() + "/invites?address=" + encodeURIComponent(me), { cache: "no-store" });
+        if (r.ok) {
+          const d = await r.json();
+          if (state.wallet && state.wallet.address === me && d && d.invites && typeof d.invites === "object") {
+            _invList = d.invites;
+            // A seed is kept only while its link can still be used: drop it once the invite is settled, or when its
+            // lock never landed (absent a day after it was made).
+            let changed = false;
+            for (const id of Object.keys(seeds)) {
+              const inv = _invList[id];
+              if ((inv && inv.status !== "open") || (!inv && Date.now() - Number(seeds[id].at || 0) > 86400000)) { delete seeds[id]; changed = true; }
+            }
+            if (changed) inviteSeedsSave(me, seeds);
+          }
+        }
+      } catch (e) { /* keep the last list */ }
+    }
+    renderInviteCard();
+  } finally { _invTickBusy = false; }
+}
+
+function renderInviteCard() {
+  if (!$("inviteCard") || !state.wallet) return;
+  const me = state.wallet.address;
+  const ref = _invAddr === me ? _invRef : null;
+  const ui = inviteUiState(ref, _invList);
+  _applyInviteVisibility();
+  show("inviteCreate", ui.canCreate);
+  const share = ref && Array.isArray(ref.share) && ref.share.length === 2 ? ref.share : [1, 10];
+  const p = Math.round(100 * Number(share[0]) / Number(share[1])) || 10;
+  const days = Math.round(Number((ref && ref.window_epochs) || 7200) * EPOCH_LENGTH / INVITE_BLOCKS_PER_DAY) || 30;
+  if ($("inviteDeal")) $("inviteDeal").textContent = i18("invite.deal", "You earn {p} % of each friend's dividend for {d} days while you are both present; they keep {q} % and get your gift.", { p, q: 100 - p, d: days });
+  renderInviteExpiry();
+  const wrap = $("inviteListWrap");
+  if (wrap) wrap.classList.toggle("hidden", !ui.showList);
+  const box = $("inviteList");
+  if (!box || !ui.showList) return;
+  const tip = Number((ref && ref.tip) || state.latest || 0);
+  const seeds = inviteSeedsLoad(me);
+  let html = "";
+  // REFERRALS: who referred me, and whom I referred — with why each one is (not) earning right now.
+  if (ref && ref.referrer && ref.referrer.address) {
+    html += `<div class="small mt">${escapeHtml(i18("invite.invitedBy", "You were invited by"))} ${exLink("a", ref.referrer.address, exShort(ref.referrer.address, 6))}</div>`;
+  }
+  const referred = ref && Array.isArray(ref.referred) ? ref.referred : [];
+  if (referred.length) {
+    html += `<div class="small mt"><b>${escapeHtml(i18("invite.referred", "Friends you referred"))}</b></div>`;
+    for (const r of referred) {
+      const st = referralStatus(r, !!ref.self_present);
+      const label = st === "earning" ? i18("invite.stEarning", "earning now")
+        : st === "window" ? i18("invite.stWindow", "the {d}-day window is over", { d: days })
+        : st === "absent" ? i18("invite.stAbsent", "not present right now — you earn while they are")
+        : i18("invite.stSelfAbsent", "you are not present — you earn only while you are");
+      html += `<div class="ex-row"><div class="inv-who">${exLink("a", String(r.address || ""), exShort(String(r.address || ""), 6))}</div>`
+        + `<div class="small ${st === "earning" ? "msg-ok" : "faint"}">${escapeHtml(label)}</div></div>`;
+    }
+  }
+  const ids = _invList ? Object.keys(_invList) : [];
+  ids.sort((a, b) => num(_invList[b].expiry) - num(_invList[a].expiry));
+  let reclaimable = false;
+  if (ids.length) html += `<div class="small mt"><b>${escapeHtml(i18("invite.yourLinks", "Your invite links"))}</b></div>`;
+  for (const id of ids) {
+    const inv = _invList[id] || {};
+    const amt = rawToNado(bnum(inv.amount)) + " NADO";
+    let status, action = "";
+    if (inv.status === "open" && tip < num(inv.expiry)) {
+      status = i18("invite.stOpen", "waiting to be claimed · expires in {t}", { t: blocksToEta(num(inv.expiry) - tip) });
+      if (seeds[id] && inviteSeedOk(seeds[id].seed)) action = `<button type="button" class="copy" data-invcopy="${exEsc(id)}">${escapeHtml(i18("invite.copyLink", "Copy link"))}</button>`;
+    } else if (inv.status === "open") {
+      status = i18("invite.stExpired", "expired — you can take it back");
+      action = `<button type="button" class="ghost" data-invrefund="${exEsc(id)}">${escapeHtml(i18("invite.reclaim", "Reclaim"))}</button>`;
+      reclaimable = true;
+    } else if (inv.status === "claimed") {
+      status = i18("invite.stClaimed", "claimed by {who}", { who: exShort(String(inv.claimant || ""), 6) });
+    } else {
+      status = i18("invite.stRefunded", "taken back");
+    }
+    html += `<div class="ex-row"><div><div class="mono small">${escapeHtml(amt)}</div><div class="faint small">${escapeHtml(status)}</div></div><div>${action}</div></div>`;
+  }
+  html += `<div id="inviteListMsg" class="small mt faint"></div>`;
+  box.innerHTML = html;
+  if (reclaimable && wrap && !wrap.open) wrap.open = true;     // something to do: do not hide it behind a disclosure
+  if ($("inviteListCount")) $("inviteListCount").textContent = (ids.length + referred.length) ? "(" + (ids.length + referred.length) + ")" : "";
+  box.querySelectorAll("[data-invcopy]").forEach((b) => {
+    b.onclick = async () => {
+      const s = inviteSeedsLoad(me)[b.dataset.invcopy];
+      if (!s) return;
+      const ok = await copyToClipboard(inviteLink(s.seed));
+      b.textContent = ok ? i18("copy.copied", "Copied ✓") : i18("copy.select", "select & copy");
+      setTimeout(() => (b.textContent = i18("invite.copyLink", "Copy link")), 1400);
+    };
+  });
+  box.querySelectorAll("[data-invrefund]").forEach((b) => { b.onclick = () => inviteRefund(b.dataset.invrefund).catch(() => {}); });
+}
+
+function inviteDaysValue() {
+  return Math.min(30, Math.max(1, parseInt(($("inviteDays") && $("inviteDays").value) || INVITE_DEFAULT_DAYS, 10) || INVITE_DEFAULT_DAYS));
+}
+function renderInviteExpiry() {
+  if ($("inviteExpirySum")) $("inviteExpirySum").textContent = i18("invite.expirySum", "Expires after {n} days", { n: inviteDaysValue() });
+}
+
+async function createInvite() {
+  if (!state.wallet || state.locked) return;
+  const msgId = "inviteMsg";
+  let amt;
+  try { amt = nadoToRaw($("inviteAmount").value || "0"); } catch (e) { setMsg(msgId, i18("invite.badAmount", "Enter how much NADO to give."), "err"); return; }
+  if (amt <= 0n) { setMsg(msgId, i18("invite.badAmount", "Enter how much NADO to give."), "err"); return; }
+  const days = inviteDaysValue();
+  const blocks = Math.min(INVITE_MAX_TIMELOCK, Math.max(INVITE_MIN_TIMELOCK, days * INVITE_BLOCKS_PER_DAY));
+  const me = state.wallet.address;
+  const acc = await getAccount(me);
+  if (!acc) { setMsg(msgId, i18("rollup.relayDown", "Relay unavailable."), "err"); return; }
+  const fee = await currentFeeRaw();
+  if (amt + BigInt(fee) > bnum(acc.balance)) { setMsg(msgId, i18("invite.noFunds", "Not enough NADO for the gift plus the network fee."), "err"); return; }
+  const label = i18("invite.dlgTitle", "Create an invite link");
+  if (!await uiConfirm({ title: label, rows: [
+      { k: i18("invite.gift", "Gift"), v: rawToNado(amt) + " NADO" },
+      { k: i18("dlg.fee", "Network fee"), v: rawToNado(fee) + " NADO" },
+      { k: i18("invite.expiry", "You can take it back after"), v: blocksToEta(blocks) }],
+      note: i18("invite.dlgNote", "Whoever opens the link and registers a device receives the gift. Send it to one person.") })) {
+    setMsg(msgId, i18("msg.cancelled", "Cancelled."), null); return;
+  }
+  const latest = await getLatestBlock();
+  if (!latest) { setMsg(msgId, i18("rollup.relayDown", "Relay unavailable."), "err"); return; }
+  await refreshNetIdentity();                                   // the id is chain-scoped: sign for the relay's chain
+  if (!state.wallet || state.wallet.address !== me) return;
+  const target = latest.block_number + INVITE_LAND_AHEAD;
+  const expiry = target + blocks;
+  const seed = bytesToHex(crypto.getRandomValues(new Uint8Array(32)));   // a THROWAWAY key for this one link
+  const key = inviteKeyOf(seed), id = inviteIdOf(key);
+  // STORE THE SEED BEFORE BROADCASTING: a lock whose link was never kept can only be reclaimed after expiry.
+  const seeds = inviteSeedsLoad(me);
+  seeds[id] = { seed, amount: amt.toString(), expiry, at: Date.now() };
+  if (!inviteSeedsSave(me, seeds)) { setMsg(msgId, i18("invite.storeFail", "This browser cannot store the invite link (site data blocked) — nothing was sent."), "err"); return; }
+  const tx = buildTransferTx(state.wallet, "invite_lock", amt, fee, target, { key, expiry }, nowSeconds(), !pubkeyEstablished(acc));
+  const ok = await submitAndReport(tx, label, msgId);
+  if (!ok) { const s = inviteSeedsLoad(me); delete s[id]; inviteSeedsSave(me, s); return; }
+  $("inviteAmount").value = "";
+  if ($("inviteLinkText")) $("inviteLinkText").textContent = inviteLink(seed);
+  show("inviteLinkBox", true);
+  setTimeout(() => inviteTick(true).catch(() => {}), 60000);   // the lock lands at tip + 8: list it once it has
+}
+
+async function shareInviteLink() {
+  const url = ($("inviteLinkText") && $("inviteLinkText").textContent) || "";
+  if (!url) return;
+  sdkShare(url, i18("invite.shareMsg", "I left you some NADO — open this link to get it:"), $("btnInviteShare"), "NADO invite");
+}
+
+async function inviteRefund(id) {
+  if (!state.wallet || state.locked || !_invList || !_invList[id]) return;
+  const inv = _invList[id], me = state.wallet.address;
+  const label = i18("invite.reclaimTitle", "Take back an unclaimed invite");
+  if (!await uiConfirm({ title: label, rows: [
+      { k: i18("invite.back", "Returns to you"), v: rawToNado(bnum(inv.amount)) + " NADO" },
+      { k: i18("dlg.fee", "Network fee"), v: "0 NADO" }],
+      note: i18("invite.reclaimNote", "The link stops working once this lands.") })) {
+    setMsg("inviteListMsg", i18("msg.cancelled", "Cancelled."), null); return;
+  }
+  const latest = await getLatestBlock();
+  if (!latest) { setMsg("inviteListMsg", i18("rollup.relayDown", "Relay unavailable."), "err"); return; }
+  const acc = await getAccount(me);
+  const tx = buildTransferTx(state.wallet, "invite_refund", 0n, 0, latest.block_number + INVITE_LAND_AHEAD, { id }, nowSeconds(), !pubkeyEstablished(acc));
+  if (await submitAndReport(tx, label, "inviteListMsg")) setTimeout(() => inviteTick(true).catch(() => {}), 60000);
+}
+/* ==== end FUNDED INVITE LINKS + REFERRALS ==== */
+
 /* Transaction history: classify each tx relative to the wallet and show a signed amount. */
 const HIST_ICON = { send: "↑", receive: "↓", bond: "🔒", unbond: "🔓", register: "✦", heartbeat: "♥",
-  dividend: "💰", bridge: "🌉", swap: "🔀", blob: "▧", protocol: "•" };
+  dividend: "💰", bridge: "🌉", swap: "🔀", blob: "▧", protocol: "•", invite: "🎁" };
 function histClassify(tx, addr) {
   // `amt` (raw) overrides tx.amount for reserved txs whose value is carried in `data`, not the amount field —
   // notably the presence DIVIDEND collection (dividend_withdraw), which otherwise shows as "0 NADO".
@@ -4094,6 +8324,10 @@ function histClassify(tx, addr) {
   if (r === "htlc_lock") return { type: "swap", sign: -1, cp: i18("hist.cpSwapLock", "→ atomic-swap lock") };
   if (r === "htlc_claim") return { type: "swap", sign: 0, cp: i18("hist.cpSwapClaim", "atomic-swap claim") };
   if (r === "htlc_refund") return { type: "swap", sign: 0, cp: i18("hist.cpSwapRefund", "atomic-swap refund") };
+  // FUNDED INVITES: the lock moves the gift into escrow; a claim / refund carries no amount of its own (the escrow pays)
+  if (r === "invite_lock") return { type: "invite", sign: -1, cp: i18("hist.cpInviteLock", "→ invite link") };
+  if (r === "invite_claim") return { type: "invite", sign: 0, cp: i18("hist.cpInviteClaim", "invite gift received") };
+  if (r === "invite_refund") return { type: "invite", sign: 0, cp: i18("hist.cpInviteRefund", "invite taken back") };
   if (r === "blob") return { type: "blob", sign: 0, cp: (d.op === "collect_dividend") ? i18("hist.cpDivCollect", "dividend collect (requested)") : i18("hist.cpBlob", "data blob") };
   if (["attest", "commit", "reveal", "settle", "slash", "alias"].includes(r)) return { type: "protocol", sign: 0, cp: i18("hist.cp." + r, r) };
   if (tx.sender === addr) return { type: "send", sign: -1, cp: i18("hist.to", "to"), cpAddr: r };
@@ -4153,7 +8387,8 @@ async function loadHistory() {
 // badge instead of a dead account link — block rows, tx views and mempool rows all go through this.
 const EX_RESERVED = new Set(["bond", "unbond", "withdraw", "register", "heartbeat", "slash", "attest", "commit",
   "reveal", "duty", "alias", "blob", "settle", "bridge", "bridge_withdraw", "dividend", "dividend_withdraw",
-  "htlc", "htlc_lock", "htlc_claim", "htlc_refund", "shield", "unshield", "treasury", "treasury_vote",
+  "htlc", "htlc_lock", "htlc_claim", "htlc_refund", "invite", "invite_lock", "invite_claim", "invite_refund",
+  "shield", "unshield", "treasury", "treasury_vote",
   "treasury_execute", "msgkey", "xmsg", "faucet"]);
 async function exGetJSON(path) {
   const r = await fetch(relayBase() + path, { cache: "no-store" });
@@ -4207,13 +8442,13 @@ async function exLoadOverview() {
       ["OPEN lane", `${num(ms.open_registry_size)} miners · ${num(ms.k_open)}/${num(ms.epoch_length)} slots`],
       ["BONDED lane", `${num(ms.bonded_registry_size)} miners · ${num(ms.total_bonded_shares)} shares`],
     ]);
-  } catch { $("exMining").innerHTML = `<div class="faint small">${i18("ex.miningUnavail", "mining status unavailable")}</div>`; }
+  } catch { $("exMining").innerHTML = `<div class="faint small">${i18("ex.miningUnavail", "collecting status unavailable")}</div>`; }
 }
 async function exLoadRecent() {
   try {
     const tip = await exGetJSON("/get_latest_block");
     const nums = []; for (let n = tip.block_number, lo = Math.max(0, n - 11); n >= lo; n--) nums.push(n);
-    const blocks = await Promise.all(nums.map((n) => exGetJSON("/get_block_number?number=" + n).catch(() => null)));
+    const blocks = await Promise.all(nums.map((n) => exGetJSON("/get_block?number=" + n).catch(() => null)));
     $("exRecent").innerHTML = blocks.filter(Boolean).map(exBlockRow).join("") || `<div class="faint small">${i18("ex.noBlocks", "no blocks")}</div>`;
   } catch { $("exRecent").innerHTML = `<div class="faint small">${i18("ex.unavail", "unavailable")}</div>`; }
 }
@@ -4288,14 +8523,52 @@ function exRenderBlock(b) {
     ["Transactions", String(txs.length)],
   ])}${txs.length ? `<div class="ex-rows mt">${txs.map(exTxRow).join("")}</div>` : `<div class="faint small mt">${i18("ex.noTxs", "no transactions")}</div>`}`;
 }
+// Which mining lane(s) this account is in. Both can be true — a bond ADDS the savings lane, it does not
+// remove you from the open one (the same rule the lane legend applies to the miner's own address).
+function exLanes(a) {
+  const open = !!a.registered, saved = BigInt(a.bonded ?? 0) >= B_MIN_RAW;
+  if (open && saved) return i18("ex.regBoth", "yes — OPEN + SAVINGS lane");
+  if (saved) return i18("ex.regBonded", "savings lane only (bonded, not registered)");
+  if (open) return i18("ex.regYes", "yes (OPEN-lane collector)");
+  return i18("badge.no", "no");
+}
+// Reserved names whose coins are HELD SOMEWHERE ELSE: {name: [holder, exec-ledger key]}. The explorer
+// resolves these to the account that actually holds the value plus the exec-side ledger entry that says
+// how much of it is theirs, instead of reporting a missing row.
+const EX_ESCROWED = { faucet: ["bridge", "faucet"] };
+
+async function exRenderEscrowed(name) {
+  const [holder, ledgerKey] = EX_ESCROWED[name];
+  let vault = null, mine = null;
+  try { vault = await exGetJSON("/get_account?address=" + encodeURIComponent(holder)); } catch (e) {}
+  try {
+    const b = await (await fetch(execBase() + "/exec/bridge?provisional=1", { cache: "no-store" })).json();
+    const v = b && b.balances && b.balances[ledgerKey];
+    if (v != null) mine = String(v);
+  } catch (e) { /* exec node optional — the L1 half still explains it */ }
+  return `<h2>${exEsc(name)}</h2>${exKV([
+    ["Balance", mine != null ? exNado(mine)
+      : `<span class="faint">${i18("ex.escrowUnknown", "unavailable (no exec node reachable)")}</span>`],
+    ["Held in", exLink("a", holder, holder)],
+  ])}<div class="faint small mt">${i18("ex.escrowNote",
+    "\u0022{n}\u0022 is a reserved name, not a wallet: coins sent to it are escrowed in {h}, which is where " +
+    "they are redeemed from. The balance above is its share of that escrow.", { n: name, h: holder })}</div>`;
+}
+
 function exRenderAccount(a) {
   return `<h2>${i18("ex.account","Account")}</h2>${exKV([
     ["Address", `<span class="mono">${exEsc(a.address)}</span>`],
     ["Balance", exNado(a.balance)],
     ["Bonded", exNado(a.bonded)],
     ["Produced", exNado(a.produced)],
-    ["Registered", a.registered ? i18("ex.regYes", "yes (OPEN-lane miner)") : i18("badge.no", "no")],
-    ["Fidelity", num(a.fidelity) + " / 1000"],
+    // LANES ARE NOT EXCLUSIVE. `registered` is open-lane presence; `bonded >= B_MIN` is savings-lane
+    // weight; an account can hold both at once (this node does). The old label read the `registered`
+    // flag alone and announced "yes (OPEN-lane miner)" at an address that was also the largest bonded
+    // producer on the chain — it hid the lane that was earning nearly all of the rewards.
+    ["Registered", exLanes(a)],
+    // FIDELITY_CAP is 30, not 1000 — the ramp saturates at 30 continuous recerts, so "1 / 1000" told
+    // a fully-ramped miner it was at 3% of the bonus it had actually maxed out.
+    ["Fidelity", num(a.fidelity) + " / " + FIDELITY_CAP + (Number(a.fidelity) >= FIDELITY_CAP ? " (max)" : "")],
   ])}<div class="row mt"><button class="accent" id="exLoadTxs">${i18("ex.showTxs", "Show transactions")}</button></div><div id="exAcctTxs" class="ex-rows mt"></div>`;
 }
 function exRenderTx(t) {
@@ -4314,6 +8587,12 @@ function exShowResult(html) { const r = $("exResult"); r.innerHTML = html; r.cla
 async function exOpen(kind, val) {
   try {
     if (kind === "a") {
+      // ESCROWED RESERVED NAMES need explaining, not a 404. `faucet` holds no balance of its own — a
+      // donation to it is redirected into BRIDGE_ESCROW, because that is where a prize winner redeems it
+      // (ops/account_ops.py: escrow must match the redemption path). So the account row genuinely does
+      // not exist, and searching it returned "Not found on this node… the node may have pruned it" — two
+      // wrong things at once: nothing was pruned, and the coins are there. Show where they actually live.
+      if (EX_ESCROWED[val]) { exShowResult(await exRenderEscrowed(val)); return; }
       exShowResult(exRenderAccount(await exGetJSON("/get_account?address=" + encodeURIComponent(val))));
       const btn = $("exLoadTxs"); if (btn) btn.onclick = async () => {
         const box = $("exAcctTxs"); box.innerHTML = `<div class="faint small">${i18("ex.loading", "loading…")}</div>`;
@@ -4327,7 +8606,7 @@ async function exOpen(kind, val) {
       };
     } else if (kind === "b") {
       let b = null;
-      if (/^\d+$/.test(val)) b = await exGetJSON("/get_block_number?number=" + val);
+      if (/^\d+$/.test(val)) b = await exGetJSON("/get_block?number=" + val);
       else { try { b = await exGetJSON("/get_block?hash=" + encodeURIComponent(val)); } catch { b = null; }
         if (!b || !b.block_hash) { try { const t = await exGetJSON("/get_transaction?txid=" + encodeURIComponent(val)); if (t) { exShowResult(exRenderTx(t)); return; } } catch {} } }
       if (!b || b === false || !b.block_hash) throw new Error("not found");
@@ -4357,7 +8636,7 @@ async function exSearch() {
     if (owner) return exOpen("a", owner);
     $("exSearchErr").textContent = `Alias "${q}" is not registered.`; $("exSearchErr").classList.remove("hidden"); return;
   }
-  $("exSearchErr").textContent = i18("ex.searchErr", "Unrecognized — an mldsa44… address, an alias, a block number, or a 64-hex hash/txid.");
+  $("exSearchErr").textContent = i18("ex.searchErr", "Unrecognized — an address, an alias, a block number, or a 64-hex hash/txid.");
   $("exSearchErr").classList.remove("hidden");
 }
 
@@ -4623,10 +8902,18 @@ function _uptime(sec) {
   const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600), m = Math.floor((sec % 3600) / 60);
   return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`;
 }
-/** an IPv4 shortened for a narrow table: keep the two octets that actually distinguish peers (full IP on hover) */
+/** an IP shortened for a narrow table: keep the tail that actually distinguishes peers (full IP on hover).
+ * IPv4 -> last two octets; IPv6 -> last two groups (2001:b07:…:fea2:7bae was rendered FULL, blowing the
+ * node-table layout — reported 2026-08-23). */
 function _shortIp(ip) {
-  const m = String(ip).match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
-  return m ? "\u2026" + m[3] + "." + m[4] : String(ip);
+  const v = String(ip);
+  const m = v.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (m) return "\u2026" + m[3] + "." + m[4];
+  if (v.includes(":")) {
+    const g = v.split(":").filter(Boolean);
+    if (g.length >= 2) return "\u2026" + g[g.length - 2] + ":" + g[g.length - 1];
+  }
+  return v;
 }
 
 /**
@@ -4653,8 +8940,9 @@ function _nodeType(st) {
   const snap = st && st.snapshot_height ? ' <span class="mono faint" title="' +
     i18("stats.ndSnapTip", "bootstrapped from a snapshot — no block bodies from before it") + '">snap</span>' : "";
   if (t === "rolling") {
-    const n = st.history_retention ? " " + (st.history_retention >= 1000
-      ? Math.round(st.history_retention / 1000) + "k" : st.history_retention) : "";
+    // Number(): a peer-supplied string here went into innerHTML verbatim (review 2026-09-25) — only digits render
+    const ret = Number(st.history_retention);
+    const n = Number.isFinite(ret) && ret > 0 ? " " + (ret >= 1000 ? Math.round(ret / 1000) + "k" : Math.round(ret)) : "";
     return '<span title="' + i18("stats.ndRollingTip", "prunes block bodies past its retention window") + '">'
       + i18("stats.ndRolling", "rolling") + n + "</span>" + snap;
   }
@@ -4688,7 +8976,12 @@ async function renderNodes() {
   const rows = [];
   if (self) rows.push(["★ this relay", self, true]);
   for (const [ip, st] of Object.entries(pool)) if (st && typeof st === "object") rows.push([ip, st, false]);
-  if (!rows.length) { box.innerHTML = "<span class='faint small'>" + i18("stats.nodata", "no data yet") + "</span>"; if (sub) sub.textContent = ""; return; }
+  if (!rows.length) {
+    // a transient fetch failure (relay busy) must not wipe a table that was fine 15 s ago — keep the last
+    // rows and say they are stale; "no data yet" is only for a panel that never had any
+    if (box.querySelector("table")) { if (sub) sub.textContent = i18("stats.stale", "refresh failed — showing the last snapshot"); return; }
+    box.innerHTML = "<span class='faint small'>" + i18("stats.nodata", "no data yet") + "</span>"; if (sub) sub.textContent = ""; return;
+  }
   // sort: self first, then by weight desc
   rows.sort((a, b) => (b[2] - a[2]) || ((b[1].latest_block_weight || 0) - (a[1].latest_block_weight || 0)));
   const th = (t) => `<th style="text-align:left;padding:4px 5px;color:var(--dim,#7c8b9a);font-weight:600;font-size:10.5px;white-space:nowrap">${t}</th>`;
@@ -4709,6 +9002,84 @@ async function renderNodes() {
   // — which is exactly when you need to see them, and they are already coloured red in that case.
   const showOdd = !!self && rows.some(([, st]) => st.protocol !== self.protocol || (st.chain_id || "?") !== self.chain_id);
   let onLatest = 0;
+  // BRANCH IDENTIFICATION (2026-08-21). Height alone hid a split: 7 nodes at 13208 and 3 at 13206 read
+  // as "propagation lag" while both sides were frozen for 73 min on different chains. The tip hash IS
+  // the branch. Majority tip = the hash most nodes advertise (ties → heavier). Verdict per node:
+  //   ● same hash as the majority                 → on the majority branch
+  //   ✕ same height, different hash               → a FORK, no ambiguity
+  //   ▲ lower height                              → behind by k (lag OR an unresolved split — the
+  //                                                  subline's distinct-tip list tells them apart)
+  //   ◆ higher height                             → ahead of the majority by k
+  const tips = {};
+  for (const [, st] of rows) {
+    const h = st.latest_block_hash; if (!h) continue;
+    const t = tips[h] || (tips[h] = { n: 0, height: st.latest_block_height, weight: st.latest_block_weight || 0 });
+    t.n++;
+  }
+  const tipList = Object.entries(tips).sort((a, b) => (b[1].n - a[1].n) || (b[1].weight - a[1].weight));
+  const majHash = tipList.length ? tipList[0][0] : null;
+  const majHeight = majHash ? tips[majHash].height : null;
+  // CONVERGENT OR FORKED — RESOLVED, not guessed. Two tips at different heights say nothing by hash
+  // alone: 13331/f5d6 under 13332/06b5 is either the parent (catching up) or another branch. So ask
+  // the relay for ITS hash at each distinct tip height (/get_block?number=&hash_only=1 — an index read):
+  //   same hash  → that tip is a PREFIX of the relay's chain → converging
+  //   different  → a different block at the same height      → FORKED
+  //   above the relay's tip → cannot be verified from here   → "ahead of relay"
+  // The reference is the relay the wallet is talking to, and the subline says so.
+  const relayH = self && self.latest_block_height != null ? self.latest_block_height : null;
+  const relayHash = self && self.latest_block_hash;
+  const verdictByTip = {};
+  await Promise.all(tipList.map(async ([h, t]) => {
+    if (h === relayHash) { verdictByTip[h] = "same"; return; }
+    if (relayH == null || t.height == null) { verdictByTip[h] = "unknown"; return; }
+    if (t.height > relayH) { verdictByTip[h] = "ahead"; return; }
+    try {
+      const r = await (await fetch(relayBase() + `/get_block?number=${t.height}&hash_only=1`, { cache: "no-store" })).json();
+      const ours = r && (r.block_hash || (r.data && r.data.block_hash));
+      verdictByTip[h] = !ours ? "unknown" : ours === h ? "prefix" : "fork";
+    } catch { verdictByTip[h] = "unknown"; }
+  }));
+  const branchOf = (st) => {
+    const h = escapeHtml(String(st.latest_block_hash || ""));   // peer-supplied: escaped before any markup (2026-09-25)
+    if (!h) return [`<span class="faint">?</span>`, ""];
+    const d = (st.latest_block_height != null && relayH != null) ? st.latest_block_height - relayH : 0;
+    const v = verdictByTip[h];
+    const g = (sym, col, word, extra) =>
+      [`<span title="${word} · ${h}" style="color:${col}">${sym}</span><span class="mono" title="${h}">${h.slice(0, 4)}</span>${extra || ""}`,
+       v === "fork" ? `color:${_CRED}` : ""];
+    if (v === "same")   return g("●", _CGRN, i18("stats.brSame", "same tip as this relay"));
+    if (v === "prefix") return g("●", _CGRN, i18("stats.brConv", "converging — a prefix of this relay's chain"), `<span class="faint">${d}</span>`);
+    if (v === "fork")   return g("✕", _CRED, i18("stats.brFork", "FORKED — a different block at this height"), `<b>!</b>`);
+    if (v === "ahead")  return g("◆", "var(--acc,#3aa0ff)", i18("stats.brAhead", "ahead of this relay — not verifiable yet"), `<span class="faint">+${d}</span>`);
+    return g("?", "inherit", "unknown");
+  };
+  const forked = rows.filter(([, st]) => verdictByTip[st.latest_block_hash] === "fork").length;
+  // CHECKPOINT = a hash at a height every node shares (the snapshot checkpoint), so it identifies a fork
+  // that predates the tip even when heights differ. Majority per checkpoint height; a minority hash at
+  // the SAME checkpoint height is a fork older than that checkpoint — unambiguous, shown red.
+  const ckp = {};
+  for (const [, st] of rows) {
+    if (st.snapshot_hash == null || st.snapshot_height == null) continue;
+    const k = st.snapshot_height + "/" + st.snapshot_hash;
+    ckp[k] = (ckp[k] || 0) + 1;
+  }
+  const ckpMajByHeight = {};
+  for (const [k, n] of Object.entries(ckp)) {
+    const [h, hash] = k.split("/");
+    if (!ckpMajByHeight[h] || ckpMajByHeight[h].n < n) ckpMajByHeight[h] = { hash, n };
+  }
+  const checkpointOf = (st) => {
+    if (st.snapshot_hash == null || st.snapshot_height == null) return [`<span class="faint">?</span>`, ""];
+    const maj = ckpMajByHeight[st.snapshot_height];
+    const bad = maj && maj.hash !== st.snapshot_hash;
+    const _sh = escapeHtml(String(st.snapshot_hash)), _sn = Number(st.snapshot_height) || 0;   // peer-supplied (2026-09-25)
+    return [`<span class="mono" title="${_sh}">${_sn}/${_sh.slice(0, 6)}</span>`
+            + (bad ? ` <span style="color:${_CRED}">✕ fork</span>` : ""), bad ? `color:${_CRED}` : ""];
+  };
+  const ckpForked = rows.filter(([, st]) => checkpointOf(st)[1]).length;
+  const showWeight = new Set(rows.map(([, st]) => st.latest_block_weight)).size > 1;
+  const showCkp = Object.keys(ckp).length > 1;   // a column only when it carries information; else the subline states it
+  const ckpUniform = Object.keys(ckp).length === 1 ? Object.keys(ckp)[0] : null;
   // PHONE LAYOUT: eight nowrap columns cannot fit ~360px, and the two ways a table can respond to that are
   // both bad — a horizontal scrollbar (stats hidden off-screen behind a swipe) or letting it overflow the
   // card. So below NARROW_PX the same data is rendered as one stacked block per node instead: identity +
@@ -4741,11 +9112,14 @@ async function renderNodes() {
       ? `<span title="${i18("stats.ndFinalized", "finalized")}: ${st.finalized_height != null ? st.finalized_height : "?"}">${st.latest_block_height}</span>`
       : "?";
     const weight = `${st.latest_block_weight != null ? (st.latest_block_weight / 1e6).toFixed(2) + "M" : "?"}`;
+    const [branch, branchStyle] = branchOf(st);
     const who = _ccFlag(label) + `<span class="mono" title="${label}">`
       + (isSelf ? `<b>${_shortIp(label)}</b>` : _shortIp(label)) + "</span>";
-    const oddCells = showOdd
-      ? [[`p${st.protocol != null ? st.protocol : "?"}`, protoBad ? `color:${_CRED}` : ""],
-         [chain, chainBad ? `color:${_CRED}` : `color:${_CGRN}`]] : [];
+    const [ckpCell, ckpStyle] = checkpointOf(st);
+    const oddCells = [];
+    if (showOdd) oddCells.push([`p${st.protocol != null ? st.protocol : "?"}`, protoBad ? `color:${_CRED}` : ""],
+                               [chain, chainBad ? `color:${_CRED}` : `color:${_CGRN}`]);
+    if (showCkp) oddCells.push([ckpCell, ckpStyle]);
     if (narrow) {
       // stat chips carry their own label, because without a header row "15988 · 5.41M · 2h" is unreadable
       const chip = (k, v, extra) => `<span style="white-space:nowrap;${extra || ""}"><span class="faint">${k}</span> ${v}</span>`;
@@ -4758,6 +9132,7 @@ async function renderNodes() {
         + chip(i18("stats.ndVersion", "Version"), ver + (upd ? ` <span style="color:${_CGOLD}">⬆</span>` : ""))
         + oddCells.map(([t, ex]) => chip("", t, ex)).join("")
         + chip(i18("stats.ndHeight", "Height"), height)
+        + chip(i18("stats.ndBranch", "Branch"), branch, branchStyle)
         + chip(i18("stats.ndWeight", "Weight"), weight)
         + chip(i18("stats.ndUptime", "Uptime"), _uptime(st.reported_uptime))
         + "</div></div>";
@@ -4768,7 +9143,8 @@ async function renderNodes() {
       + td(_nodeType(st))
       + oddCells.map(([t, ex]) => td(t, ex)).join("")
       + td(height)
-      + td(weight)
+      + td(branch, branchStyle)
+      + (showWeight ? td(weight) : "")
       + td(_uptime(st.reported_uptime))
       + td(act)
       + "</tr>";
@@ -4777,8 +9153,8 @@ async function renderNodes() {
     : `<table style="width:100%;border-collapse:collapse;table-layout:auto">   <!-- no min-width: the table FITS the card; columns that carry no information are dropped instead -->
     <thead><tr style="border-bottom:1px solid var(--line,#1c2530)">
       ${th(i18("stats.ndNode", "Node"))}${th(i18("stats.ndVersion", "Version"))}${th(i18("stats.ndType", "Type"))}
-      ${showOdd ? th(i18("stats.ndProto", "Proto")) + th(i18("stats.ndChain", "Chain")) : ""}
-      ${th(i18("stats.ndHeight", "Height"))}${th(i18("stats.ndWeight", "Weight"))}${th(i18("stats.ndUptime", "Uptime"))}${th("")}
+      ${showOdd ? th(i18("stats.ndProto", "Proto")) + th(i18("stats.ndChain", "Chain")) : ""}${showCkp ? th(i18("stats.ndCheckpoint", "Checkpoint")) : ""}
+      ${th(i18("stats.ndHeight", "Height"))}${th(i18("stats.ndBranch", "Branch"))}${showWeight ? th(i18("stats.ndWeight", "Weight")) : ""}${th(i18("stats.ndUptime", "Uptime"))}${th("")}
     </tr></thead><tbody>${body}</tbody></table>`;
   box.querySelectorAll(".node-upd").forEach((b) => b.onclick = async () => {
     const ip = b.dataset.upd ? decodeURIComponent(b.dataset.upd) : "";
@@ -4794,8 +9170,24 @@ async function renderNodes() {
       setTimeout(() => renderNodes().catch(() => {}), 4000);   // reflect the new state shortly after
     } catch (e) { b.disabled = false; b.textContent = "↻"; b.title = i18("stats.ndFailed", "failed — retry"); }
   });
-  if (sub) sub.textContent = i18("stats.nodesSub", "{n} nodes seen · {u} on the latest code · newest main {m}",
-    { n: rows.length, u: onLatest, m: latestMain ? String(latestMain).slice(0, 8) : "—" });
+  if (sub) {
+    const vName = { same: i18("stats.brSame", "same"), prefix: i18("stats.brConv", "converging"), fork: i18("stats.brFork", "FORKED"),
+                    ahead: i18("stats.brAhead", "ahead of relay"), unknown: "?" };
+    const tipsTxt = tipList.length > 1
+      ? " · " + tipList.length + " " + i18("stats.ndTips", "distinct tips vs this relay's chain") + ": "
+        + tipList.map(([h, t]) => `${t.height}/${h.slice(0, 6)} ×${t.n} ${vName[verdictByTip[h]] || "?"}`).join(", ")
+        + (forked ? " · " + i18("stats.ndForked", "{f} node(s) FORKED", { f: forked })
+           : tipList.some(([h]) => verdictByTip[h] === "ahead" || verdictByTip[h] === "unknown")
+             ? " · " + i18("stats.ndNoFork", "no fork among verifiable tips")
+             : " · " + i18("stats.ndConv", "all convergent"))
+        + (ckpForked ? " · " + i18("stats.ndCkpForked", "{f} on a different checkpoint hash", { f: ckpForked }) : "")
+      : " · " + i18("stats.ndOneTip", "all on one tip");
+    const idTxt = (!showOdd && self && self.chain_id ? " · " + self.chain_id : "")
+      + (ckpUniform ? " · " + i18("stats.ndCkpAll", "checkpoint") + " " + ckpUniform.split("/")[0] + "/" + ckpUniform.split("/")[1].slice(0, 6) + " ×" + rows.length : "");
+    sub.textContent = i18("stats.nodesSub", "{n} nodes seen · {u} on the latest code · newest main {m}",
+      { n: rows.length, u: onLatest, m: latestMain ? String(latestMain).slice(0, 8) : "—" }) + idTxt + tipsTxt;
+    sub.style.color = (forked || ckpForked) ? _CRED : "";   // propagation shows several tips 1 block apart; only a same-height hash conflict is alarming
+  }
 }
 
 // zkVM EXEC-LAYER (L2) vitals on the Stats tab: how far the exec cursor trails the L1 tip, contract count,
@@ -4872,7 +9264,7 @@ async function renderRollbacks() {
 // CONSENSUS-HEALTH panel: state-root REJECTS (blocks refused because our as-of-parent L1 root diverged
 // from the producer — the fatal-divergence signal) + EMERGENCY-mode ENTRIES (falling out of consensus into
 // a rollback/resync burst), per day. Both ride /rollback_stats (node-local). A healthy fleet trends flat at
-// zero; a sustained rejects spike is the fingerprint of a state fork (the alphanet-8 wedge). Days predating
+// zero; a sustained rejects spike is the fingerprint of a state fork (the betanet-8 wedge). Days predating
 // this telemetry arrive null ("not measured"), drawn empty — never a fake zero.
 async function renderDivergence(rb) {
   // `rb` is renderRollbacks' already-fetched /rollback_stats payload — both panels read the SAME endpoint,
@@ -4960,7 +9352,9 @@ async function renderDailyStats() {
 
 async function renderStats() {
   if (!state.wallet) return;
-  const head = $("statsHeadline"); if (head) head.innerHTML = "";
+  // The headline is built OFF-DOM and swapped in once complete: clearing it up front left the network-stats
+  // row blank for the whole fetch (~1-2 s) on every 15 s live refresh — rows "disappearing and reappearing".
+  const head = $("statsHeadline"); const headFrag = head ? document.createDocumentFragment() : null;
   renderGeoMap().catch(() => {});   // independent of the block charts — paint it in parallel
   renderNodes().catch(() => {});    // the network-nodes table (status_pool)
   // one /rollback_stats fetch feeds BOTH panels (reorgs + consensus health)
@@ -4972,7 +9366,7 @@ async function renderStats() {
   const N = 16, nums = [];
   for (let i = Math.max(1, (tip || 0) - N + 1); i <= (tip || 0); i++) nums.push(i);
   const blocks = (await Promise.all(nums.map((n) =>
-    fetch(relayBase() + "/get_block_number?number=" + n, { cache: "no-store" }).then((r) => (r.ok ? r.json() : null)).catch(() => null)
+    fetch(relayBase() + "/get_block?number=" + n, { cache: "no-store" }).then((r) => (r.ok ? r.json() : null)).catch(() => null)
   ))).filter((b) => b && typeof b.block_number === "number");
   blocks.sort((a, b) => a.block_number - b.block_number);
   const times = [], tlabels = [];
@@ -5002,6 +9396,25 @@ async function renderStats() {
   let ms = state.lastMs;
   try { ms = await getMiningStatus(state.wallet.address); } catch {}
   if (ms) laneBar("chartLanes", ms.open_registry_size || 0, ms.bonded_registry_size || 0);
+  // DEVICES — what the collectors run on (operator 2026-09-13). Live bindings only in the donut: a device
+  // whose lease ran out or whose account left the registry is not "representation", it is history — the
+  // caption carries the all-time count so both are visible. Classes are the handles consensus binds on.
+  try {
+    const dv = await (await fetch(relayBase() + "/device_stats", { cache: "no-store" })).json();
+    const LABEL = { "android-key": ["dev.cls.android", "Android phone"], ek: ["dev.cls.ek", "TPM chip"],
+                    tpm: ["dev.cls.tpm", "Windows Hello"], webauthn: ["dev.cls.webauthn", "Security key"],
+                    ledger: ["dev.cls.ledger", "Ledger"], trezor: ["dev.cls.trezor", "Trezor"] };
+    const COLOR = [_CACC, _CGRN, _CGOLD, _CPUR, "#5865F2", "#e0a458"];
+    const classes = Object.entries((dv && dv.classes) || {}).sort((a, b) => b[1].live - a[1].live);
+    const slices = classes.map(([cls, v], i) => {
+      const l = LABEL[cls] || ["dev.cls.unknown", cls];
+      return { label: i18(l[0], l[1]), value: v.live, color: COLOR[i % COLOR.length] };
+    });
+    pieChart("chartDevices", slices);
+    const sub = $("devicesSub");
+    if (sub) sub.textContent = i18("stats.devicesSub", "{n} live devices vouching for collectors · {t} bound on chain in total",
+      { n: (dv && dv.live_total) || 0, t: (dv && dv.bound_total) || 0 });
+  } catch (e) { pieChart("chartDevices", []); }
 
   // REWARD DISTRIBUTION by pipeline (structural consensus split): open lane is ~20% of blocks (treasury 10 /
   // tip 20 / dividend 70), bonded ~80% (producer 70 / dividend 20 / treasury 10) -> effective network split.
@@ -5028,9 +9441,9 @@ async function renderStats() {
       { label: i18("stats.supShield", "Shielded"), value: shd, color: _CPUR },
     ], { fmt: fmtN });
   } catch {}
-  const addStat = (label, val, tipText) => { if (!head) return; const d = document.createElement("div"); d.className = "stat"; d.innerHTML = `<div class="label"></div><div class="value sm"></div>`; d.children[0].textContent = label; d.children[1].textContent = val; if (tipText) d.title = tipText; head.appendChild(d); };
+  const addStat = (label, val, tipText) => { if (!head) return; const d = document.createElement("div"); d.className = "stat"; d.innerHTML = `<div class="label"></div><div class="value sm"></div>`; d.children[0].textContent = label; d.children[1].textContent = val; if (tipText) d.title = tipText; headFrag.appendChild(d); };
   addStat(i18("stats.tip", "Height"), tip != null ? tip : "—");
-  if (ms) { addStat(i18("stats.present", "Present miners"), ms.open_registry_size ?? "—"); addStat(i18("stats.bondedMiners", "Savings miners"), ms.bonded_registry_size ?? "—"); }
+  if (ms) { addStat(i18("stats.present", "Present collectors"), ms.open_registry_size ?? "—"); addStat(i18("stats.bondedMiners", "Savings collectors"), ms.bonded_registry_size ?? "—"); }
   try { const pool = await (await fetch(relayBase() + "/get_account?address=dividend", { cache: "no-store" })).json(); addStat(i18("stats.pool", "Dividend pool"), rawToNado(BigInt(pool.balance || 0)) + " NADO"); } catch {}
   // LIVE consensus gauges (/daily_stats .now — relay-local): null until the quorum forms
   try {
@@ -5043,6 +9456,7 @@ async function renderStats() {
     addStat(i18("stats.txVol", "Tx volatility"), pct(now.volatility),
             i18("stats.txVolTip", "share of peers whose mempool disagrees with the majority right now (100% − tx-pool agreement)"));
   } catch {}
+  if (head) head.replaceChildren(headFrag);   // one swap: the old values stay on screen until the new ones exist
 }
 
 /* ============================ SWAP TAB — HTLC cross-chain atomic swaps ============================ */
@@ -5056,7 +9470,7 @@ async function swapLock() {
   const amtRaw = nadoToRaw($("swapAmount").value || "0");
   const blocks = Math.max(10, parseInt($("swapTimelock").value || "120", 10) || 120);
   let hashlock = $("swapHashlock").value.trim().toLowerCase(), preimageHex = null;
-  if (!ADDR_RE_I.test(claimant)) { log("err", i18("swap.badClaimant", "Enter a valid mldsa44… claimant address.")); return; }
+  if (!ADDR_RE_I.test(claimant)) { log("err", i18("swap.badClaimant", "Enter a valid claimant address.")); return; }
   if (amtRaw <= 0n) { log("err", i18("swap.badAmount", "Enter an amount to lock.")); return; }
   try {
     if (!hashlock) { const pre = crypto.getRandomValues(new Uint8Array(32)); preimageHex = _hex(pre); hashlock = await _sha256hex(pre); }
@@ -5174,13 +9588,16 @@ async function renderSettlement() {
   try { bonded = acct && acct.bonded ? BigInt(acct.bonded) : 0n; } catch (e) { bonded = 0n; }
   let role, note = "";
   if (bonded > 0n && execn && execn.settle_enabled) {
-    role = "Settling — attesting every " + (execn.settle_every || "?") + " blocks";
+    role = i18("rollup.roleSettling", "Settling — attesting every {n} blocks", { n: execn.settle_every || "?" });
   } else if (bonded > 0n) {
-    role = "Bonded, not settling";
-    note = "Your stake is bonded, but this node isn't posting settlement attestations. Set NADO_EXEC_SETTLE=1 on your exec node to help settle the L2.";
+    // Every exec node settles (execnode.SETTLE is unconditional since its opt-in environment flag was deleted), so the only
+    // way here is an exec node that did not answer. Never tell the user to set a variable nothing reads:
+    // tests/test_the_wallet_names_no_setting_nothing_reads.py.
+    role = i18("rollup.roleBonded", "Bonded — settlement status unavailable");
+    note = i18("rollup.noteBonded", "Your stake is bonded. The exec node behind this relay is not answering, so whether it settles can't be shown here.");
   } else {
-    role = "Observer";
-    note = "Bond stake (Stake tab) to become a validator that attests the L2 state root to L1.";
+    role = i18("rollup.roleObserver", "Observer");
+    note = i18("rollup.noteObserver", "Bond stake (Stake tab) to become a validator that attests the L2 state root to L1.");
   }
   setT("settleRole", role);
   setT("settleNote", note);
@@ -5194,6 +9611,7 @@ function showTab(name) {
   document.querySelectorAll("#tabbar .tab").forEach((b) => b.classList.toggle("active", b.dataset.tabbtn === name));
   document.querySelectorAll("[data-tab]").forEach((el) => el.classList.toggle("hidden", el.dataset.tab !== name));
   _applyMineVisibility();   // the mining card also depends on whether there is anything to show
+  _applyInviteVisibility(); // so does the invite card (hidden until the chain accepts invites, or you have some)
   if (name !== "send") show("payBanner", false); // the pay-request banner belongs to the Send tab only
   if (name === "receive") renderReceiveQR();
   else if (name === "aliases") loadMyAliases();
@@ -5203,6 +9621,7 @@ function showTab(name) {
   else if (name === "rich") loadRichList().catch(() => {});
   else if (name === "stats") renderStats().catch(() => {});
   else if (name === "swap") renderSwaps().catch(() => {});
+  else if (name === "wallet") inviteTick().catch(() => {});
   else if (name === "shield") renderShield().catch(() => {});
   else if (name === "settlement") renderSettlement().catch(() => {});
   else if (name === "rollup") renderRollup().catch(() => {});
@@ -5211,7 +9630,7 @@ function showTab(name) {
   else if (name === "quorum") renderQuorum().catch(() => {});
   else if (name === "multisig") renderMsig().catch(() => {});
   else if (name === "messages") msgOpen().catch(() => {});
-  else if (name === "settings") renderSecurity();
+  else if (name === "settings") { renderSecurity(); show("selftestCard", false); }   // the self-test appears when asked for, not on every visit
 }
 
 /* ----------------------------------------------------------------------------------------------
@@ -5267,8 +9686,26 @@ async function rollupLoadExamples() {
 }
 
 // pending deploys tracked locally (per ns) so the pickers show them BEFORE they land at finality
-function rollupPendLoad() { try { return JSON.parse(localStorage.getItem("nado_rollup_pending") || "{}"); } catch { return {}; } }
-function rollupPendSave(p) { try { localStorage.setItem("nado_rollup_pending", JSON.stringify(p)); } catch (e) {} }
+// CHAIN-SCOPED local caches. A genesis reroll replaces the chain but localStorage survives it, so the
+// rollup call history and the pending-call set kept showing entries from a chain that no longer exists —
+// calls against contracts whose cids are gone, and "confirming…" pendings that can never confirm because
+// the block they targeted was never on THIS chain. Both are stamped with the live CHAIN_ID (which
+// refreshNetIdentity adopts from the relay) and dropped when it changes. Settings (autosign, PoSW rate)
+// are deliberately NOT scoped — a preference is not chain state.
+function lsChainGet(key, fallback) {
+  try {
+    const raw = JSON.parse(localStorage.getItem(key) || "null");
+    if (raw && typeof raw === "object" && raw.chain === CHAIN_ID) return raw.v;
+    if (raw !== null) localStorage.removeItem(key);     // another chain (or a pre-stamp cache): drop it once
+  } catch (e) {}
+  return fallback;
+}
+function lsChainSet(key, v) {
+  try { localStorage.setItem(key, JSON.stringify({ chain: CHAIN_ID, v })); } catch (e) {}
+}
+
+function rollupPendLoad() { return lsChainGet("nado_rollup_pending", {}) || {}; }
+function rollupPendSave(p) { lsChainSet("nado_rollup_pending", p); }
 function rollupAddPending(ns, cid, methods, abi) {
   const p = rollupPendLoad(); (p[ns] = p[ns] || {})[cid] = { methods, abi: abi || {}, ts: Date.now() }; rollupPendSave(p);
 }
@@ -5425,7 +9862,7 @@ async function rollupDeploy() {
   const abi = ($("rollupCode").value === _rollupLoadedCode) ? _rollupLoadedAbi : {};
   if (abi && Object.keys(abi).length) payload.abi = abi;
   const tx = buildBlobTx(state.wallet, payload, latest.block_number + 8, MIN_TX_FEE, nowSeconds(),
-    latest.block_number + TX_INCLUSION_DELAY);   // propagation delay (anti-reorg)
+    guardFrom(latest.block_number));   // propagation delay (anti-reorg)
   const res = await submitTransaction(tx);
   if (res.data && res.data.result) {
     rollupAddPending(ns, cid, Object.keys(code), payload.abi);
@@ -5445,12 +9882,16 @@ async function rollupCall() {
   const payload = { op: "call", contract: p.cid, method: p.method, args: p.args };
   const ns = rollupNs(); if (ns !== "default") payload.ns = ns;
   const tx = buildBlobTx(state.wallet, payload, latest.block_number + 8, MIN_TX_FEE, nowSeconds(),
-    latest.block_number + TX_INCLUSION_DELAY);   // propagation delay (anti-reorg)
+    guardFrom(latest.block_number));   // propagation delay (anti-reorg)
   const res = await submitTransaction(tx);
   const ok = !!(res.data && res.data.result);
   const status = ok ? i18("rollup.histSent", "sent (applies at finality)") : i18("rollup.rejected", "Rejected: ") + ((res.data && res.data.message) || "");
   $("rollupCallMsg").textContent = ok ? i18("rollup.callSent", "Call submitted — state updates after finality.") : status;
-  rollupHistLog(ns, { cid: p.cid, method: p.method, args: p.args, ok, status, ts: Date.now() });
+  // STAMP THE BLOCK, not just the clock. A contract call is ordered by BLOCK, and a wall-clock time is
+  // the one thing that cannot be compared against chain state later; `blk` is the tip this call was
+  // submitted against, so the entry can be lined up with the explorer and with when it actually applied.
+  rollupHistLog(ns, { cid: p.cid, method: p.method, args: p.args, ok, status,
+                      ts: Date.now(), blk: latest.block_number });
 }
 
 async function rollupView() {
@@ -5460,26 +9901,40 @@ async function rollupView() {
   try {
     const u = execBase() + "/exec/view?ns=" + encodeURIComponent(ns) + "&cid=" + encodeURIComponent(p.cid)
       + "&method=" + encodeURIComponent(p.method) + "&args=" + encodeURIComponent(JSON.stringify(p.args));
-    const j = await (await fetch(u, { cache: "no-store" })).json();
+    const res = await fetch(u, { cache: "no-store" });
+    // a busy exec node answers 429 (execnode.h_view slots full): say so, never show it as a null result
+    if (res.status === 429) { out.textContent = i18("err.relayHttp", "The relay is unreachable right now (HTTP {s}). Please try again in a moment.", { s: "429" }); return; }
+    const j = await res.json();
     out.textContent = i18("rollup.result", "Result: ") + JSON.stringify(j.result);
-    rollupHistLog(ns, { cid: p.cid, method: p.method, args: p.args, ok: true, status: "→ " + JSON.stringify(j.result), ts: Date.now() });
+    rollupHistLog(ns, { cid: p.cid, method: p.method, args: p.args, ok: true,
+                        status: "→ " + JSON.stringify(j.result), ts: Date.now(), blk: state.latest });
   } catch (e) { out.textContent = i18("rollup.execDown", "Execution node unreachable."); }
 }
 
 // per-namespace local call history (last 30) shown in the tab — immediate feedback for what you called
 function rollupHistLog(ns, entry) {
-  let all = {}; try { all = JSON.parse(localStorage.getItem("nado_rollup_hist") || "{}"); } catch (e) {}
+  const all = lsChainGet("nado_rollup_hist", {}) || {};
   const arr = all[ns] || []; arr.unshift(entry); all[ns] = arr.slice(0, 30);
-  try { localStorage.setItem("nado_rollup_hist", JSON.stringify(all)); } catch (e) {}
+  lsChainSet("nado_rollup_hist", all);
   rollupRenderHistory();
 }
 function rollupRenderHistory() {
   const el = $("rollupHistory"); if (!el) return;
-  let arr = []; try { arr = (JSON.parse(localStorage.getItem("nado_rollup_hist") || "{}"))[rollupNs()] || []; } catch (e) {}
+  const arr = (lsChainGet("nado_rollup_hist", {}) || {})[rollupNs()] || [];
   if (!arr.length) { el.innerHTML = '<span class="faint">' + escapeHtml(i18("rollup.noHistory", "No calls yet.")) + '</span>'; return; }
+  // A bare toLocaleTimeString() ("8:23:41") is not a timestamp: no date, so anything older than today is
+  // ambiguous, and no block, so it cannot be lined up with the chain at all. Show the local date+time AND
+  // the block the call was submitted against. Older entries predate `blk` and simply omit it.
+  const stamp = (e) => {
+    const d = new Date(e.ts);
+    const p2 = (n) => String(n).padStart(2, "0");
+    const when = isFinite(d) ? `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())} `
+                             + `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}` : "";
+    return when + (e.blk != null ? "  ·  #" + e.blk : "");
+  };
   el.innerHTML = arr.map((e) => '<div class="rollup-hist"><span class="mono">' + escapeHtml((e.cid || "").slice(0, 10)) + '….' + escapeHtml(e.method)
     + '(' + escapeHtml(JSON.stringify(e.args)) + ')</span> <span class="' + (e.ok ? "faint" : "err") + '">' + escapeHtml(e.status) + '</span> '
-    + '<span class="faint">' + escapeHtml(new Date(e.ts).toLocaleTimeString()) + '</span></div>').join("");
+    + '<span class="faint mono">' + escapeHtml(stamp(e)) + '</span></div>').join("");
 }
 
 /* ----------------------------------------------------------------------------------------------
@@ -5561,7 +10016,7 @@ function msigReadDescriptor() {
   if (members.length < 2 || members.length > MSIG_MAX_MEMBERS)
     throw new Error(i18("msig.badCount", "Enter 2–16 distinct member addresses."));
   for (const m of members)
-    if (!validateAddress(m)) throw new Error(i18("msig.badMember", "Not a valid mldsa44… address: {a}", { a: m }));
+    if (!validateAddress(m)) throw new Error(i18("msig.badMember", "Not a valid address: {a}", { a: m }));
   const threshold = parseInt(($("msigThreshold").value || "").trim(), 10);
   if (!(threshold >= 1 && threshold <= members.length))
     throw new Error(i18("msig.badThreshold", "Signatures required must be between 1 and the number of members."));
@@ -5585,20 +10040,36 @@ function msigCheckProposal(tx) {
   return tx;
 }
 
+// the member address an entry signs as: its key under its own scheme (ops/multisig_ops.verify_multisig_origin)
+// (an entry that names its `member` signs for that member — a protected member's rotated key, MSIG_MEMBER_AUTH_HEIGHT)
+function msigEntryAddress(e) { return e.member || makeAddress(String(e.public_key || ""), ADDR_PREFIX, e.alg || undefined); }
+function msigMemberAuthLive() {
+  const h = Number(P.MSIG_MEMBER_AUTH_HEIGHT);
+  return Number.isFinite(h) && state.latest != null && state.latest >= h;
+}
+
 /* Add THIS wallet's signature entry (if it is a member and hasn't signed). Returns true if added. */
 function msigTrySignLocal(tx) {
   const w = state.wallet;
   if (!w || !tx.multisig.members.includes(w.address)) return false;
-  if (tx.signature.some((e) => e && makeAddress(String(e.public_key || "")) === w.address)) return false;
-  const { publicKey, secretKey } = ml_dsa44.keygen(hexToBytes(w.privateKey));
-  const m = hexToBytes(tx.txid);
-  let sig = null;   // hedged signing can rarely produce a non-verifying sig — verify + retry (see finalizeTransaction)
-  for (let k = 0; k < 8; k++) {
-    const s = ml_dsa44.sign(secretKey, m);
-    if (ml_dsa44.verify(publicKey, m, s)) { sig = bytesToHex(s); break; }
+  // a member of another scheme signs in it from SIG_SCHEME_KEYS_HEIGHT (its entry names its `alg`); before, ML-DSA-44 only
+  if (schemeOf(w) !== SIG_ML44 && !schemeKeysLive()) return false;
+  if (tx.signature.some((e) => e && msigEntryAddress(e) === w.address)) return false;
+  // A PROTECTED MEMBER signs with its current key (state.wallet is its signer child after authSync), whose address is
+  // not the member's: from MSIG_MEMBER_AUTH_HEIGHT the entry names the member, and the chain checks the key against the
+  // member's auth config. Before it the chain accepts only the key that derives the member address, so the wallet signs
+  // with the account's base key (it signed with the rotated key before 2026-11-04 — an entry no node accepted).
+  let kp = w;
+  const derives = makeAddress(w.publicKey, ADDR_PREFIX, w.alg && w.alg !== SIG_ML44 ? w.alg : undefined) === w.address;
+  if (!derives && !msigMemberAuthLive()) {
+    const master = masterSeedOf();
+    if (!master) return false;
+    kp = accountKeypair(master, state.activeIdx || 0);
+    if (kp.address !== w.address) return false;        // no base key of this seed derives the member: nothing to sign with
   }
-  if (!sig) throw new Error("could not produce a verifying signature — please retry");
-  tx.signature.push({ public_key: bytesToHex(publicKey), signature: sig });
+  const entry = schemeSignEntry(kp, hexToBytes(tx.txid));
+  if (kp === w && !derives) entry.member = w.address;
+  tx.signature.push(entry);
   return true;
 }
 
@@ -5636,13 +10107,24 @@ async function msigPropose() {
         const owner = await resolveAlias(recipient);
         if (!owner) { setMsg("msigProposeMsg", i18("msig.aliasMissing", "That alias isn't registered."), "err"); return; }
       } else {
-        setMsg("msigProposeMsg", i18("msg.badRecipient", "Invalid recipient — a 49-char mldsa44… address or a registered alias name."), "err"); return;
+        setMsg("msigProposeMsg", i18("msg.badRecipient", "Invalid recipient — a 46-char address, a registered alias, or a reserved name (faucet, bridge)."), "err"); return;
       }
     }
     let rawAmount;
     try { rawAmount = nadoToRaw($("msigAmount").value); } catch (e) { setMsg("msigProposeMsg", i18("msg.badAmount", "Invalid amount."), "err"); return; }
     if (rawAmount <= 0n) { setMsg("msigProposeMsg", i18("msg.amountPos", "Amount must be greater than zero."), "err"); return; }
-    const fee = MIN_TX_FEE * d.members.length;   // consensus floor is MIN_TX_FEE per signature ENTRY — cover all members signing
+    // consensus floor is MIN_TX_FEE per signature ENTRY at its scheme's multiple — cover every member signing. A member's
+    // scheme shows in the key it published (every scheme's key has its own length); one that never sent counts at the
+    // largest multiple once members of every scheme may sign (SIG_SCHEME_KEYS_HEIGHT), else ML-DSA-44's.
+    const sizes = P.SIG_SCHEME_SIZES || {};
+    const maxUnits = schemeKeysLive() ? Math.max(1, ...(P.SIG_SCHEMES_OFFERED || []).map((a) => (sizes[a] || [0, 0, 1])[2])) : 1;
+    let units = 0;
+    for (const m of d.members) {
+      let pk = ""; try { pk = String(((await getAccount(m)) || {}).public_key || ""); } catch (e) {}
+      const a = pk && Object.keys(sizes).find((x) => sizes[x][0] === pk.length);
+      units += a ? sizes[a][2] : maxUnits;
+    }
+    const fee = MIN_TX_FEE * units;
     const acc = await getAccount(sender);
     const balance = BigInt((acc && acc.balance) || 0);
     if (rawAmount + BigInt(fee) > balance) {
@@ -5652,7 +10134,7 @@ async function msigPropose() {
     const body = {
       sender, recipient, amount: rawAmount, timestamp: nowSeconds(), data: "",
       nonce: randNonce(), max_block: latest.block_number + MSIG_TARGET_HEADROOM,
-      min_block: latest.block_number + TX_INCLUSION_DELAY,   // propagation delay (anti-reorg); trivially past by signing time
+      min_block: guardFrom(latest.block_number),   // propagation delay (anti-reorg); trivially past by signing time
       chain_id: CHAIN_ID, multisig: { threshold: d.threshold, members: d.members }, fee,
     };
     const tx = { ...body, txid: createTxid(body), signature: [] };
@@ -5668,19 +10150,22 @@ function msigRefreshStatus() {
   const box = $("msigStatus");
   let tx = null;
   try { tx = msigBlobTx(); }
-  catch (e) { box.innerHTML = '<span class="warn">' + e.message + "</span>"; return; }
+  catch (e) { box.innerHTML = '<span class="warn">' + escapeHtml(String(e.message)) + "</span>"; return; }
   if (!tx) { box.textContent = ""; return; }
   const d = tx.multisig;
+  // EVERY FIELD OF A PASTED PROPOSAL IS ATTACKER-CHOSEN (review 2026-09-25): a "co-signer" can craft recipient,
+  // max_block and threshold, and this ran on paste. Escape strings and coerce numbers before any markup.
+  const _e = (v) => escapeHtml(String(v));
   const mine = state.wallet && d.members.includes(state.wallet.address);
-  const signed = tx.signature.map((e) => makeAddress(String(e.public_key || "")));
+  const signed = tx.signature.map(msigEntryAddress);
   const iSigned = state.wallet && signed.includes(state.wallet.address);
   const ready = signed.length >= d.threshold;
   const rows = [
-    i18("msig.stFrom", "From {a}", { a: tx.sender.slice(0, 12) + "…" }),
-    i18("msig.stTo", "to {a}", { a: tx.recipient }),
-    rawToNado(BigInt(tx.amount)) + " NADO",
-    i18("msig.stSigs", "signatures {have}/{need}", { have: signed.length, need: d.threshold }),
-    i18("msig.stExpiry", "valid until block {b}", { b: tx.max_block }),
+    i18("msig.stFrom", "From {a}", { a: _e(String(tx.sender).slice(0, 12)) + "…" }),
+    i18("msig.stTo", "to {a}", { a: _e(tx.recipient) }),
+    _e(rawToNado(BigInt(tx.amount))) + " NADO",
+    i18("msig.stSigs", "signatures {have}/{need}", { have: signed.length, need: Number(d.threshold) || 0 }),
+    i18("msig.stExpiry", "valid until block {b}", { b: Number(tx.max_block) || 0 }),
   ];
   let verdict;
   if (ready) verdict = '<span class="ok">' + i18("msig.stReady", "Ready to submit ✓") + "</span>";
@@ -5694,6 +10179,20 @@ async function msigSign() {
   try {
     const tx = msigBlobTx();
     if (!tx) { setMsg("msigMsg", i18("msig.pasteFirst", "Paste a proposal first."), "err"); return; }
+    // A SIGNATURE IS CONSENT, so it gets the same confirm a submit does (audit 2026-09-25): the proposer chose the
+    // fee — which is burned — and any data, and co-signers used to add their signature without seeing either.
+    const d = tx.multisig;
+    const ok = await uiConfirm({
+      title: i18("msig.signTitle", "Sign this multisig transfer"),
+      rows: [
+        { k: i18("dlg.amount", "Amount"), v: rawToNado(BigInt(tx.amount)) + " NADO" },
+        { k: i18("dlg.to", "To"), v: String(tx.recipient) },
+        { k: i18("dlg.fee", "Network fee"), v: rawToNado(BigInt(tx.fee)) + " NADO" },
+        { k: i18("msig.dlgSigs", "Signatures"), v: tx.signature.length + " / " + d.threshold },
+      ].concat(tx.data ? [{ k: i18("dapp.args", "Arguments"), v: (typeof tx.data === "string" ? tx.data : JSON.stringify(tx.data)).slice(0, 200) }] : []),
+      confirmText: i18("msig.sign", "Sign"),
+    });
+    if (!ok) { setMsg("msigMsg", i18("msg.cancelled", "Cancelled."), null); return; }
     const added = msigTrySignLocal(tx);
     $("msigBlob").value = canonicalize(tx);
     msigRefreshStatus();
@@ -5757,6 +10256,18 @@ async function loadMessaging() {
 function _msgKey(suffix) { return "nado_msg_v1_" + (state.wallet ? state.wallet.address : "_") + "_" + suffix; }
 function msgHistLoad() { try { return JSON.parse(localStorage.getItem(_msgKey("hist")) || "{}"); } catch { return {}; } }
 function msgHistSave(h) { try { localStorage.setItem(_msgKey("hist"), JSON.stringify(h)); } catch (e) {} }
+// Ratchet sessions (doc/messaging.md §3.2): root/chain keys + ratchet keypairs per peer. Same at-rest model as the
+// history (browser localStorage, this device only) — wiping it strands live sessions until the peer re-initialises.
+function msgSessLoad() { try { const s = JSON.parse(localStorage.getItem(_msgKey("sess")) || "null"); return (s && s.v === 2 && s.peers) ? s : MSG.sessionsNew(); } catch { return MSG.sessionsNew(); } }
+function msgSessSave(st) { try { localStorage.setItem(_msgKey("sess"), JSON.stringify(st)); } catch (e) {} }
+// Seal through the ratchet, persisting the advanced session state BEFORE the network round-trip (a message key
+// must never be reusable after the envelope exists, whether or not the POST succeeds).
+function msgSeal(m, id, peerAddr, kemPub, payload, ts) {
+  const st = msgSessLoad();
+  const env = m.ratchetSeal(id, state.wallet.address, st, peerAddr, kemPub, payload, ts);
+  msgSessSave(st);
+  return env;
+}
 function msgCursor() { return parseInt(localStorage.getItem(_msgKey("cursor")) || "0", 10) || 0; }
 function msgSetCursor(n) { try { localStorage.setItem(_msgKey("cursor"), String(n)); } catch (e) {} }
 function _nowSec() { return Math.floor(Date.now() / 1000); }
@@ -5764,6 +10275,8 @@ function _lastTs(conv) { return conv.messages.length ? conv.messages[conv.messag
 
 function msgIdentity() {
   if (!MSG || !state.wallet || !state.wallet.privateKey) return null;
+  // the messaging key binds to the account through an ML-DSA-44 signature (msgkey, nado.py key_authorized)
+  if (schemeOf(state.wallet) !== SIG_ML44) return null;
   if (!state._msgId || state._msgId.addr !== state.wallet.address) {
     state._msgId = { addr: state.wallet.address, id: MSG.identity(state.wallet.privateKey) };  // per-account
   }
@@ -5791,9 +10304,20 @@ async function msgPublishPrekey() {
   try {
     const acc = await getAccount(state.wallet.address);
     if (acc && acc.kem_pub === id.kemPub) { state._msgPublished = state.wallet.address; return; }  // already bound
+    // A brand-new wallet has no account on chain yet, and the relay refuses its tx ("Empty account"). Wait for the
+    // first coins instead of submitting a tx that cannot land; the next call retries.
+    if (!acc) return;
     const targetBlock = await nextTargetBlock();
-    await submitTransaction(buildMsgkeyTx(state.wallet, id.kemPub, targetBlock, nowSeconds()));
-    state._msgPublished = state.wallet.address;   // one publish per session; confirms on-chain within a block
+    // Only the FIRST messaging key is free; replacing a bound one pays the minimum fee (the node's SPAM_HARDEN_HEIGHT
+    // rule: a free, repeatable msgkey was free spam). A chain still before that rule refuses a fee on msgkey, so a
+    // refusal naming the fee is retried once at 0.
+    let out = await submitTransaction(buildMsgkeyTx(state.wallet, id.kemPub, targetBlock, nowSeconds(),
+                                                    acc.kem_pub ? MIN_TX_FEE : 0));
+    if (acc.kem_pub && out && out.data && !out.data.result && /fee must be 0/.test(String(out.data.message || "")))
+      out = await submitTransaction(buildMsgkeyTx(state.wallet, id.kemPub, targetBlock, nowSeconds(), 0));
+    // Only an ACCEPTED submit counts: a refusal returns result:false without throwing, and marking it published
+    // left a newly funded wallet unreachable by DM for the rest of the session.
+    if (out && out.data && out.data.result) state._msgPublished = state.wallet.address;
   } catch (e) {}
 }
 
@@ -5812,6 +10336,7 @@ async function msgOpen() {
 }
 
 async function msgSend() {
+  if (ml44Only(state.wallet, i18("sig.whatMsg", "Messaging"))) return;
   const m = await loadMessaging(); if (!m) return;
   const toRaw = ($("msgTo").value || "").trim().toLowerCase();
   const body = ($("msgBody").value || "").trim();
@@ -5833,8 +10358,7 @@ async function msgSend() {
   }
   let res, mid;
   try {
-    const env = m.makeEnvelope(id, state.wallet.address, kemPub,
-      { type: "msg", from: state.wallet.address, alias: myPrimaryAlias(), body, ts }, ts);
+    const env = msgSeal(m, id, addr, kemPub, { type: "msg", from: state.wallet.address, alias: myPrimaryAlias(), body, ts }, ts);
     mid = m.messageId(env);
     res = await (await fetch(relayBase() + "/message", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(env) })).json();
   } catch (e) { res = { result: false, reason: e && e.message || i18("msg.sendFail", "send failed") }; }
@@ -5847,7 +10371,7 @@ async function msgSendAck(m, id, toAddr, ackId) {
   const kemPub = await msgFetchKemPub(toAddr);
   if (!kemPub) return;
   const ts = _nowSec();
-  const env = m.makeEnvelope(id, state.wallet.address, kemPub, { type: "ack", from: state.wallet.address, ackId, ts }, ts);
+  let env; try { env = msgSeal(m, id, toAddr, kemPub, { type: "ack", from: state.wallet.address, ackId, ts }, ts); } catch (e) { return; }
   try { await fetch(relayBase() + "/message", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(env) }); } catch (e) {}
 }
 
@@ -5864,11 +10388,35 @@ async function msgPoll() {
     let env;
     try { env = (await (await fetch(relayBase() + "/message?id=" + t.id, { cache: "no-store" })).json()).message; } catch { continue; }
     if (!env) continue;
-    const pt = m.tryOpen(id, env);
+    let pt = null;
+    if (env.v === 2) {                                            // ratchet: open against our sessions (commits state on success)
+      const st = msgSessLoad();
+      const r = m.ratchetOpen(id, st, env, _nowSec());
+      if (r) { msgSessSave(st); pt = r.pt; }
+    } else pt = m.tryOpen(id, env);                               // v1 legacy (pre-ratchet wallets)
     if (!pt) continue;                                            // not ours (or not decryptable)
     if (pt.type === "ack") {
       for (const c of Object.values(hist)) for (const msg of c.messages)
         if (msg.dir === "out" && msg.id === pt.ackId && msg.status !== "delivered") { msg.status = "delivered"; changed = true; }
+    } else if (pt.type === "zbill" && typeof pt.code === "string" && pt.code.startsWith("zbill")) {
+      // A shielded banknote delivered over the message channel. Banking it is LOCAL — it moves no funds
+      // out and it only works if the note was committed to OUR shieldOwner — so it may auto-run, on the
+      // same reasoning applyClaimRequest already uses for a #claim deep link. It still lands in the
+      // conversation as a normal message so the transfer is visible rather than silent.
+      const from = pt.from || env.sender;
+      const conv = (hist[from] = hist[from] || { alias: pt.alias || null, messages: [] });
+      if (pt.alias && !conv.alias) conv.alias = pt.alias;
+      if (!conv.messages.some(x => x.id === t.id)) {
+        const viewing = state.activeTab === "messages" && state.msgActivePeer === from;
+        conv.messages.push({ id: t.id, dir: "in", ts: pt.ts || env.ts, status: "received", read: viewing,
+          body: pt.body || (i18("shield.dmBody", "A private NADO banknote — open to claim:") + " " + claimLink(pt.code)) });
+        changed = true;
+        msgSendAck(m, id, from, t.id).catch(() => {});
+        if (state.wallet && !state.locked && $("zrecvCode")) {
+          $("zrecvCode").value = pt.code;
+          doReceiveShielded().catch(() => {});   // already-held / not-yet-settled both report themselves
+        }
+      }
     } else {
       const from = pt.from || env.sender;
       const conv = (hist[from] = hist[from] || { alias: pt.alias || null, messages: [] });
@@ -5991,7 +10539,7 @@ async function submitTreasurySpend(kind, recipient, amountRaw, memo, nonce, expi
     data,
     nonce: randNonce(), public_key: state.wallet.publicKey,
     max_block: latest.block_number + 8, chain_id: CHAIN_ID };
-  return submitTransaction(finalizeTransaction(draft, state.wallet.privateKey, MIN_TX_FEE));
+  return submitTransaction(finalizeTransaction(draft, state.wallet, MIN_TX_FEE));
 }
 async function proposeSpend() {
   const msg = $("qPropMsg");
@@ -6003,7 +10551,7 @@ async function proposeSpend() {
       if (!owner) throw new Error(i18("quorum.aliasErr", "Alias not found."));
       to = owner;
     }
-    if (to !== "faucet" && !(to.startsWith(ADDR_PREFIX) && to.length === ADDR_LEN)) throw new Error(i18("quorum.badAddr", "Enter a valid mldsa44… address, a registered alias, or 'faucet'."));
+    if (to !== "faucet" && (to.length !== ADDR_LEN || !ADDR_RE.test(to))) throw new Error(i18("quorum.badAddr", "Enter a valid NADO address, a registered alias, or 'faucet'."));
     const amtRaw = nadoToRaw($("qPropAmount").value || "");
     if (!(amtRaw > 0n)) throw new Error(i18("quorum.badAmount", "Enter a positive amount."));
     const memo = ($("qPropMemo").value || "").slice(0, 256);
@@ -6038,9 +10586,14 @@ async function renderQuorum() {
   const box = $("qProposals");
   if (!box) return;
   if ($("qPropBtn")) $("qPropBtn").onclick = proposeSpend;
+  wireAutoVoteToggle();
   if ($("qPropMine")) $("qPropMine").onclick = () => { if (state.wallet) $("qPropRecipient").value = state.wallet.address; };
   let d;
-  try { d = await (await fetch(relayBase() + "/treasury_status", { cache: "no-store" })).json(); }
+  // Ask for OUR vote state alongside the tally. Without it a client cannot tell "nobody voted" from "I
+  // already voted", which the auto-voter below needs as ground truth — localStorage is per-browser, so a
+  // second device or a cleared cache would re-submit a fee-bearing vote on every refresh.
+  const _me = (state.wallet && state.wallet.address) ? "?address=" + encodeURIComponent(state.wallet.address) : "";
+  try { d = await (await fetch(relayBase() + "/treasury_status" + _me, { cache: "no-store" })).json(); }
   catch (e) { box.textContent = i18("quorum.loadErr", "Could not load treasury status."); return; }
   if ($("qTreasury")) $("qTreasury").textContent = rawToNado(BigInt(d.treasury || 0)) + " NADO";
   if ($("qMaxSpend")) $("qMaxSpend").textContent = rawToNado(BigInt(d.max_spend || 0)) + " NADO";
@@ -6077,7 +10630,7 @@ async function renderQuorum() {
         <span style="display:flex;gap:8px;align-items:center">${pid16 ? `<a class="prop-link mono small" href="/quorum#prop=${pid16}" title="${escapeHtml(i18("quorum.linkTip", "Copy a shareable link to this proposal"))}">#${pid16.slice(0, 8)}</a>` : ""}<span class="badge ${p.status === "open" ? "idle" : "ok"}">${i18(stKey, stEn)}</span></span></div>
       <div class="small faint">→ ${exReservedOrAddr(p.recipient || "")}${p.memo ? " · " + escapeHtml(p.memo) : ""}</div>
       <div class="progress mt"><span style="display:block;height:100%;width:${pct}%;background:var(--accent)"></span></div>
-      <div class="small faint">${i18("quorum.tally", "{pct}% of stake · needs 2/3 · {v} voter(s)", { pct, v: p.voters || 0 })}${p.within_cap ? "" : " · " + i18("quorum.overCap", "over cap")}</div>
+      <div class="small faint">${i18("quorum.tally", "{pct}% of stake · needs 2/3 · {v} voter(s)", { pct, v: Number(p.voters) || 0 })}${p.within_cap ? "" : " · " + i18("quorum.overCap", "over cap")}</div>
       ${canVote ? `<button class="accent mt small qvote" data-i="${i}" style="width:100%">${i18("quorum.voteYes", "Vote yes")}</button>` : ""}
       ${canVote ? `<button class="ghost mt small qoppose" data-i="${i}" style="width:100%">${i18("quorum.oppose", "Oppose / withdraw vote")}</button>` : ""}
       ${canExec ? `<button class="primary mt small qexec" data-i="${i}" style="width:100%">${i18("quorum.execute", "Execute payout")}</button>` : ""}</div>`;
@@ -6089,33 +10642,278 @@ async function renderQuorum() {
   box.querySelectorAll(".qvote").forEach(b => b.onclick = () => _qAct("treasury_vote", props[+b.dataset.i], "yes", b));
   box.querySelectorAll(".qoppose").forEach(b => b.onclick = () => _qAct("treasury_vote", props[+b.dataset.i], "no", b));
   box.querySelectorAll(".qexec").forEach(b => b.onclick = () => _qAct("treasury_execute", props[+b.dataset.i], undefined, b));
+  autoVoteYes(props, canPropose).catch(() => {});
+}
+
+/* AUTO-VOTE YES (opt-in, off by default).
+ *
+ * Votes yes on every OPEN proposal this wallet has not already voted on, while the wallet is open. This
+ * approves real treasury money on spends the user has never read, so it is deliberately narrow:
+ *
+ *   • VOTES ONLY. It never executes a payout — that stays a manual button, because executing is what
+ *     actually MOVES the money and is irreversible.
+ *   • NEEDS `voted` FROM THE NODE. If the relay is too old to return the flag, the auto-voter stays off
+ *     rather than guessing: a re-vote overwrites harmlessly but costs a fee every refresh, and
+ *     renderQuorum re-runs on a timer. Silently burning fees in a loop is the worst failure here.
+ *   • ONE AT A TIME, and never re-entrant — renderQuorum is called from several timers.
+ *   • REMEMBERS WHAT IT SUBMITTED this session, because a vote takes a few blocks to confirm and the next
+ *     refresh would otherwise see voted=false and submit again.
+ */
+const _autoVoted = new Set();          // pids submitted this session (confirmation lags by a few blocks)
+let _autoVoting = false;
+// SHIPPED DEFAULT: auto-approve treasury spends paying this address. ON by default, and deliberately
+// RESTRICTED to this one recipient rather than "approve everything" — a default that approved any proposal
+// would hand a yes vote to whoever proposed first.
+// The user can clear the list (auto-approve every recipient), edit it, or switch the whole thing off; the
+// Quorum tab states plainly that it is on, what it votes for, and that each vote costs a fee. It is a
+// visible default, not a silent one — a wallet must never spend someone's fees or cast their governance
+// vote in a way they cannot see.
+// "faucet" ships alongside it: a treasury spend to the faucet refills the public prize bank that pays
+// new miners, so it is the one recipient whose proposals are self-evidently in every holder's interest —
+// and it is a RESERVED name, not an address anyone can claim, so it cannot be squatted or redirected.
+// (The chain already treats it as the single reserved recipient a treasury spend may pay; account_ops
+// routes it through BRIDGE_ESCROW so the coins have a real exit path.)
+const AUTO_VOTE_DEFAULT_ALLOW = ["b7a08de8351e3af97f6f2bbcb19f2a8c722abad81c3460caf9", "faucet"];
+// KEY IS VERSIONED, and that is not cosmetic. The first cut of this box wired `ta.onchange = ta.onblur`,
+// and BLUR FIRES WITHOUT AN EDIT — so merely opening the Quorum tab and clicking away wrote "" to storage.
+// Since "" legitimately means "the user cleared the list, approve any recipient", every wallet that had
+// seen that build was indistinguishable from a deliberate clear, and the shipped default could never apply
+// to it. Bumping the key retires those accidental writes exactly once; a real choice made under _v2 sticks.
+// KEY STAYS AT v2 — deliberately. Bumping it would push the new shipped default to wallets already in
+// the wild, but at the cost of WIPING every list a user had customised, and a customised allow-list is a
+// governance preference, not chain state: it must survive. The upgrade below reaches the same wallets
+// without destroying anything.
+const AUTO_VOTE_ALLOW_KEY = "nado_auto_vote_allow_v2";
+// The previous shipped default. A stored list EXACTLY equal to it was never actually customised — it is
+// the default that got written to storage (an edit, or the accidental blur write described above) — so it
+// may safely follow the default forward. Any other list is the user's own and is returned untouched.
+// ONE LIST PER EARLIER SHIPPED DEFAULT. The gen-28 reroll moved the operator's address to format 2, so the gen-27 default
+// (old address + "faucet") is itself now a never-customised default that must follow forward — an old 46-char address
+// matches no proposal on a format-2 chain, and the list would silently approve only "faucet".
+const AUTO_VOTE_PREV_DEFAULTS = [["27f2870bb2969a4d2b9d4eea303bedea996b9ccc93479f"],
+                                 ["27f2870bb2969a4d2b9d4eea303bedea996b9ccc93479f", "faucet"]];
+function autoVoteEnabled() {
+  try { return (localStorage.getItem("nado_auto_vote_yes") || "1") === "1"; } catch (e) { return true; }
+}
+function autoVoteAllow() {
+  try {
+    const raw = localStorage.getItem(AUTO_VOTE_ALLOW_KEY);
+    if (raw === null) return AUTO_VOTE_DEFAULT_ALLOW.slice();   // untouched -> the shipped default
+    const list = raw.split(/[\s,]+/).filter(Boolean);           // "" means the user CLEARED it: any recipient
+    // NON-DESTRUCTIVE UPGRADE: a stored list identical to the PREVIOUS shipped default was never a real
+    // choice, so it follows the default forward and picks up "faucet". A list the user actually edited —
+    // including one they cleared, and including one they deliberately removed faucet from — is returned
+    // exactly as stored. Settings are preserved; only the un-customised default moves.
+    if (AUTO_VOTE_PREV_DEFAULTS.some(prev => list.length === prev.length && list.every((x, i) => x === prev[i])))
+      return AUTO_VOTE_DEFAULT_ALLOW.slice();
+    return list;
+  } catch (e) { return AUTO_VOTE_DEFAULT_ALLOW.slice(); }
+}
+
+/* WHICH proposals to auto-vote — pure, so the fee-safety rules are testable without a DOM or a chain.
+ * Returns {pick:[...], reason} where reason is "" when pick is authoritative. Every rule here exists to
+ * stop the wallet spending fees in a loop, which is the only way this feature can quietly hurt someone. */
+function autoVotePicks(props, canPropose, submitted, allow) {
+  if (!canPropose) return { pick: [], reason: "ineligible" };
+  const open = (props || []).filter(p => p && p.status === "open");
+  // A node that does not report `voted` cannot tell us what we already did. Voting anyway re-submits a
+  // fee-bearing vote on EVERY refresh (a re-vote overwrites, so it is silent), and renderQuorum runs on a
+  // timer — so refuse rather than guess.
+  if (open.some(p => typeof p.voted !== "boolean")) return { pick: [], reason: "no_voted_flag" };
+  // WHITELIST: when set, only proposals paying one of these recipients are auto-approved; everything else
+  // waits for a human. Empty means "any recipient", which is the plain form of the feature. `voted` is
+  // "has cast a vote, yes OR no", so a deliberate no is never flipped to yes.
+  const wl = (allow || []).map(a => String(a).trim().toLowerCase()).filter(Boolean);
+  const ok = (p) => !wl.length || wl.indexOf(String(p.recipient || "").toLowerCase()) !== -1;
+  return { pick: open.filter(p => !p.voted && !submitted.has(p.pid) && ok(p)), reason: "" };
+}
+
+async function autoVoteYes(props, canPropose) {
+  const note = $("qAutoYesMsg");
+  if (!autoVoteEnabled() || _autoVoting || !state.wallet) return;
+  const { pick: todo, reason } = autoVotePicks(props, canPropose, _autoVoted, autoVoteAllow());
+  if (reason === "no_voted_flag") {
+    if (note) note.innerHTML = '<span class="warn">' + i18("quorum.autoYesNoFlag",
+      "Auto-vote is idle: this node doesn't report whether you've already voted, and voting blindly would resubmit a fee every refresh.") + "</span>";
+    return;
+  }
+  if (reason) return;
+  if (!todo.length) { if (note) note.textContent = ""; return; }
+  _autoVoting = true;
+  try {
+    for (const p of todo) {
+      _autoVoted.add(p.pid);           // mark BEFORE awaiting: a concurrent render must not queue it twice
+      if (note) note.textContent = i18("quorum.autoYesSending", "Auto-voting yes on {n} proposal(s)…", { n: todo.length });
+      try {
+        const res = await submitTreasurySpend("treasury_vote", p.recipient, p.amount, p.memo, p.nonce, p.expiry, "yes");
+        if (!res.ok) {
+          _autoVoted.delete(p.pid);    // a rejection is not a vote — let a later pass retry
+          if (note) note.innerHTML = '<span class="warn">' + escapeHtml((res.data && res.data.message) || i18("quorum.rejected", "Rejected")) + "</span>";
+          break;                       // stop the batch: the next one almost certainly fails the same way
+        }
+      } catch (e) {
+        _autoVoted.delete(p.pid);
+        if (note) note.innerHTML = '<span class="warn">' + escapeHtml(String(e.message || e)) + "</span>";
+        break;
+      }
+    }
+    if (note && !note.querySelector(".warn")) {
+      note.textContent = i18("quorum.autoYesDone", "Auto-voted yes ✓ — votes count in a few blocks.");
+      [6000, 15000, 30000].forEach(t => setTimeout(() => renderQuorum().catch(() => {}), t));
+    }
+  } finally { _autoVoting = false; }
+}
+function wireAutoVoteToggle() {
+  const el = $("qAutoYes");
+  if (!el) return;
+  el.checked = autoVoteEnabled();      // ON by default, scoped to AUTO_VOTE_DEFAULT_ALLOW
+  const row = $("qAutoYesRow"), ta = $("qAutoYesAllow");
+  const show = () => { if (row) row.classList.toggle("hidden", !el.checked); };
+  if (ta && !ta._wired) {
+    ta._wired = true;
+    ta.value = autoVoteAllow().join("\n");
+    // `change` ONLY — never `blur`. A textarea's change event fires on blur *if the value was edited*;
+    // blur fires regardless, which is how an untouched box silently persisted "" and looked like a
+    // deliberate "approve any recipient".
+    ta.onchange = () => {
+      try { localStorage.setItem(AUTO_VOTE_ALLOW_KEY, (ta.value || "").trim()); } catch (e) {}
+      renderQuorum().catch(() => {});
+    };
+  }
+  show();
+  el.onchange = () => {
+    try { localStorage.setItem("nado_auto_vote_yes", el.checked ? "1" : "0"); } catch (e) {}
+    show();
+    if (el.checked) renderQuorum().catch(() => {});
+    else { const n = $("qAutoYesMsg"); if (n) n.textContent = ""; }
+  };
 }
 
 /* ----------------------------------------------------------------------------------------------
- * Shielded pool (doc/privacy.md) — deposit/withdraw against the exec-layer zk-STARK pool. Notes are
- * private, so the wallet keeps its OWN notes locally (localStorage per address); the pool never reveals
- * which note is whose. Transparent phase today: the witness is the proof; the STARK slots in later.
+ * Shielded pool (doc/privacy.md, doc/stwo-migration.md §5.1) — deposit/withdraw against the exec layer's Stwo pool.
+ * Notes are private, so the wallet keeps its OWN notes locally (localStorage per address); the pool never reveals
+ * which note is whose.
  * -------------------------------------------------------------------------------------------- */
-let _shInit = false;
-function ensureShielded() { if (!_shInit) { alghash.initAlghash(blake2bHash); _shInit = true; } }
+// ONE POOL (G6, doc/stwo-migration.md §9.5). The legacy, field and wide pools are closed and were measured EMPTY on the
+// live chain (2026-10-25: 0 commitments, pool_value 0), their deposits refused by L1 and their spends by the exec layer
+// from block 1 (gen 28's PRIVACY_PAUSE / WIDE_DEPOSIT_CLOSE / STWO_POOL gates, inlined), and a reroll refuses to carry a
+// note in any of them. So the wallet builds Stwo notes and proofs only: no alghash2, no joinsplit2/3, no proof_rules.
+// INVARIANT: never reintroduce a fallback to another pool — a deposit escrowed under another pool's owner lands in the
+// Stwo pool where no key can ever spend it.
+let _shieldTip = 0;
+function ensureShielded() {}                      // kept for its callers: the Stwo module loads in refreshShieldRules
+/* THE GATE: the Stwo pool is live from block 1 (gen 28's STWO_POOL_HEIGHT, 1 from gen 29, inlined in G9 — no longer in
+ * /protocol.js). Judged at tip + 1, because a note or proof built now lands in a later block; BigInt() keeps the old
+ * verdict on a tip that is not a number (it throws, and refreshShieldRules keeps what it knew). INVARIANT: the same
+ * height the node uses (ExecState.rules_stwo_pool, execnode._stwo_pool_next). */
+let _stwoGate = false, _stwo = null;
+function stwoGateLive(tip) {
+  return BigInt(tip) + 1n >= 1n;
+}
+async function _refreshStwo(tip) {
+  _stwoGate = stwoGateLive(tip);
+  if (_stwoGate && !_stwo) { try { _stwo = await import("./stark/stwo_js.js"); } catch (e) { _stwo = null; } }
+}
+// resolved once per action (awaited by every shielded entry point) and read synchronously after that, because the
+// owner/address helpers are called from synchronous render paths
+async function refreshShieldRules() {
+  try {
+    const st = await (await fetch(relayBase() + "/status", { cache: "no-store" })).json();
+    _shieldTip = Number(st.latest_block_height || 0);
+    await _refreshStwo(_shieldTip);
+  } catch (e) { /* relay unreachable: keep what we knew; shieldPaused stops an action that cannot be built */ }
+  return shieldStwo();
+}
+function shieldStwo() { return _stwoGate && !!_stwo; }
+// THE GATE IS LIVE BUT THE MODULE DID NOT LOAD: every shielded action stops (shieldPaused) and the page says why.
+function stwoMissing() { return _stwoGate && !_stwo; }
+// Every shielded entry point that builds a transaction calls this right after refreshShieldRules().
+function shieldPaused() {
+  if (staleChain) { log("err", staleChainMsg(staleChain)); return true; }   // a stale tab proves and relays nothing (PAGE_CHAIN)
+  if (stwoMissing()) { log("err", i18("shield.stwoLoadFail", "Private banknotes could not load on this page. Check your connection and reload.")); return true; }
+  if (shieldStwo()) return false;
+  log("err", i18("shield.paused", "Private banknotes are paused for a security upgrade. Your public balance is not affected."));
+  return true;
+}
+// owner ids and commitments as the wire carries them: 64-hex digests (static/stark/stwo_js.js), passed through
+function ownerStr(o) { return String(o); }
+function ownerParse(str) { return String(str).toLowerCase(); }
+function cmStr(cm) { return String(cm); }
+function noteCommit(value, owner, rho) { return _stwo.commit(BigInt(value), owner, BigInt(rho)); }
 function shieldStoreKey() { return "nado.shieldf." + (state.wallet ? state.wallet.address : "none"); }
-function loadNotes() { try { return JSON.parse(localStorage.getItem(shieldStoreKey()) || "[]"); } catch (e) { return []; } }
-function saveNotes(notes) { try { localStorage.setItem(shieldStoreKey(), JSON.stringify(notes)); } catch (e) {} }
-function _randField() {   // a random Goldilocks field element (note randomness rho)
+// ONLY STWO NOTES ARE THIS WALLET'S BALANCE. A Stwo note carries an explicit pool tag (saveNotes stamps it): its cm is
+// 64 hex like a wide note's, so without the tag a wide note would count. A wide or legacy note left in a browser's
+// storage is never shown, summed or deleted (both pools were empty on chain when the wallet dropped them, so any such
+// entry is one that never landed or was already spent) — saveNotes keeps it on disk untouched.
+function _notePool(n) { return n && n.pool === "stwo" ? "stwo" : "other"; }
+function loadNotes() {
+  let all; try { all = JSON.parse(localStorage.getItem(shieldStoreKey()) || "[]"); } catch (e) { return []; }
+  return all.filter((n) => _notePool(n) === "stwo");
+}
+// keep every other entry on disk untouched: saveNotes only ever receives the Stwo list
+function saveNotes(notes) {
+  try {
+    let all = []; try { all = JSON.parse(localStorage.getItem(shieldStoreKey()) || "[]"); } catch (e) {}
+    for (const n of notes) n.pool = "stwo";
+    localStorage.setItem(shieldStoreKey(), JSON.stringify(all.filter((n) => _notePool(n) !== "stwo").concat(notes)));
+  } catch (e) {}
+}
+// a note's randomness rho: a u64, exactly the range L1 admission (transaction_ops.field_shield_check) and the circuit
+// (execnode/shielded_stwo.py: lo(rho), hi(rho)) take
+function _randField() {
   const b = crypto.getRandomValues(new Uint8Array(8)); let x = 0n;
   for (const by of b) x = (x << 8n) | BigInt(by);
-  return (x % alghash.P).toString();
+  return x.toString();
 }
-// STABLE per-wallet shielded spend key, derived from the seed -> recoverable from the recovery phrase, and
-// reusable as a receive address (the on-chain commitments hide it, like a reusable Zcash address).
-function shieldNsk() { ensureShielded(); return BigInt("0x" + blake2bHash([DOMAIN_SHIELD_NSK, state.wallet.privateKey])) % alghash.P; }
-function shieldOwner() { return alghash.ownerOf(shieldNsk()); }
-function shieldAddr() { return "zaddr" + shieldOwner().toString(36); }
+// THE STWO SPEND KEY (doc/stwo-migration.md §5.1): a 256-bit blake2b digest under ITS OWN domain (DOMAIN_SHIELD_NSK_STWO),
+// taken whole as the circuit's eight u32 words — recoverable from the same recovery phrase, and independent of the
+// retired pools' keys (DOMAIN_SHIELD_NSK, _WIDE). INVARIANT: never derive it from another pool's domain; one pool's leak
+// must not open another's notes (review 2026-10-11). The Stwo owner is BLAKE2s(21, nsk) (static/stark/stwo_js.js
+// ownerOf), a one-way image, and a Stwo proof is zero-knowledge.
+function shieldNskStwo() { return blake2bHash([DOMAIN_SHIELD_NSK_STWO, state.wallet.privateKey]); }
+// A FRESH OWNER PER DEPOSIT (ZK review 2026-10-11, tests/test_a_stwo_deposit_does_not_publish_the_owner_behind_the_wallets_zaddr.mjs).
+// A deposit publishes its note's owner in the clear, next to the account that signs it. Under the one stable owner (the
+// zaddr) that tied the zaddr — and every deposit, and every note ever paid to it — to the account. A deposit with
+// randomness rho is owned by ownerOf(nsk_dep), nsk_dep = static/stark/stwo_js.js depositNsk(shieldNskStwo(), rho): one-way,
+// so deposits share nothing an observer can compare, and the recovery phrase re-derives every nsk_dep from the rho its
+// deposit transaction published (stwoRecoverDeposits). The note is marked `dep` and spent with nsk_dep (noteNskWire).
+// KEYED ON RHO, NOT ON A COUNTER (review 2026-10-12, tests/test_every_stwo_deposit_is_restorable_from_the_recovery_phrase.mjs):
+// a per-device deposit index was re-used by a second device of the same wallet (one published owner for two deposits),
+// and refused sends burned indices past the restore's gap. rho is fresh per deposit and already public, so there is no
+// state to keep or share.
+// INVARIANT: doShield never publishes shieldOwner(), and never derives a deposit's key from device state.
+function stwoDepositNsk(rho) { return _stwo.depositNsk(shieldNskStwo(), BigInt(rho)); }
+// the spend key of THIS note: a deposit note is spent with its own nsk_dep; every other note (received payments,
+// change) with the wallet's stable key, which its owner (the zaddr) is the image of
+function noteNskWire(n) {
+  if (n && n.dep) return stwoDepositNsk(n.rho);
+  return shieldNskWire();
+}
+// ONE NULLIFIER, ONE NOTE (review 2026-10-11, "faerie gold"): the Stwo circuit leaves an output's rho free and
+// nf = H(nsk, rho) does not depend on the note's position, so a sender can pay two notes to one owner with the SAME rho
+// and the owner can only ever spend one of them. Received notes are counted by NULLIFIER: a note whose nullifier this
+// wallet already holds (spent or not) is refused, so a payment is credited once and the receiver is told why.
+// INVARIANT: every receive path goes through doReceiveShielded, which asks this before banking a note.
+function shieldDuplicateNote(notes, rho, nskStwo, nullifierOf) {
+  const nf = nullifierOf(nskStwo, BigInt(rho));
+  // a deposit note (n.dep) is spent with its own nsk_dep, so its nullifier is not nf(nskStwo, rho): compare only stable-key notes
+  return notes.some((n) => n.rho !== undefined && !n.dep && nullifierOf(nskStwo, BigInt(n.rho)) === nf);
+}
+// the spend key in the form the prover takes (wit.nsk): 64-hex
+function shieldNskWire() { return shieldNskStwo(); }
+function shieldOwner() { return _stwo.ownerOf(shieldNskStwo()); }
+// a zaddr is the owner digest in base36, marked "zaddr_". The mark is what lets parseShieldAddr refuse an address of
+// a retired pool (unmarked "zaddr" + base36): a note sent to it could never be spent.
+const ZADDR_STWO = "zaddr_";
+function shieldAddr() { return ZADDR_STWO + BigInt("0x" + shieldOwner()).toString(36); }
 function _b36(s) { let x = 0n; for (const c of s.toLowerCase()) { const d = "0123456789abcdefghijklmnopqrstuvwxyz".indexOf(c); if (d < 0) throw new Error("bad shielded address"); x = x * 36n + BigInt(d); } return x; }
 function parseShieldAddr(a) {
   a = String(a || "").trim();
   if (!a.startsWith("zaddr")) throw new Error("not a zaddr… shielded address");
-  return _b36(a.slice(5));   // -> the recipient's owner id (a field element)
+  if (!a.startsWith(ZADDR_STWO)) throw new Error(i18("shield.zaddrPrevPool", "that zaddr… is from the previous pool"));
+  const d = _b36(a.slice(ZADDR_STWO.length));
+  if (d >= (1n << 256n)) throw new Error("bad shielded address");
+  return d.toString(16).padStart(64, "0");   // -> the recipient's Stwo owner digest (64-hex)
 }
 
 // Shielded receive: amount-aware payment-link QR + link text (mirrors renderReceiveQR; the raw zaddr…
@@ -6123,6 +10921,7 @@ function parseShieldAddr(a) {
 function renderZaddrQR() {
   if (!state.wallet) return;
   ensureShielded();
+  if (stwoMissing()) { if ($("zaddr")) $("zaddr").textContent = "—"; return; }   // never show the frozen pool's address
   const za = shieldAddr();
   if ($("zaddr")) $("zaddr").textContent = za;
   const link = payLink(za, currentZrecvAmount());
@@ -6130,17 +10929,213 @@ function renderZaddrQR() {
   _drawQR($("zaddrQR"), $("zaddrQRNote"), link, 260);
 }
 
+// A SPEND IS CONFIRMED BY THE CHAIN, NOT BY THE RELAY TAKING THE BLOB (zk audit 2026-09-26, browser F1). L1 admits a
+// shielded blob without checking its proof; the exec node judges it later and may refuse it (a stale proof, two tabs
+// spending one note). The note used to be marked spent — and its change credited — the moment the blob reached the
+// mempool, so a refused proof hid the note for good. Now a spend remembers its output commitments: once one appears in
+// the tree the spend is confirmed; if none has appeared, its nullifier is unspent and the anchor window has passed
+// (STWO_SPEND_LAND_GRACE_MS), the note is restored and the phantom change dropped. The tree and the spent set are read
+// whole and searched here (as the claim path does), so the relay learns nothing.
+function _markSpendPending(note, pr) {
+  note.spentAt = Date.now();
+  note.spentOuts = [pr && pr.cm_out1, pr && pr.cm_out2].filter(Boolean).map(String);
+}
+const STWO_SPEND_LAND_GRACE_MS = 3 * 3600 * 1000;   // past the anchor window (1024 blocks ~ 1.9 h at 6.8 s), with margin
+async function reconcileSpentNotes() {
+  const notes = loadNotes();
+  const open = notes.filter((n) => n.spent && Array.isArray(n.spentOuts) && n.spentOuts.length);
+  if (!open.length || !shieldStwo()) return 0;           // no Stwo module: no nullifier to judge by, so never restore
+  let leaves;
+  try { leaves = new Set(((await execJSON("/exec/field_leaves")).leaves || []).map(String)); } catch (e) { return 0; }
+  // A RELAYED SPEND CAN LAND LATE (review 2026-10-12): its anchor is accepted for ANCHOR_BLOCKS (~2 h), so a relay (or a
+  // stalled exec node) can land it long after a 20-minute grace (the retired pools' rule). Restoring the input then
+  // deleted the change note for good. An input is restored only when its nullifier is NOT spent and the anchor window
+  // has passed; a spent one keeps its outputs.
+  let spentNf;
+  try { spentNf = new Set(((await execJSON("/exec/stwo_nullifiers")).nullifiers || []).map(String)); } catch (e) { return 0; }
+  let changed = false, restored = 0;
+  for (const n of open) {
+    if (n.spentOuts.some((c) => leaves.has(String(c)))) { delete n.spentOuts; delete n.spentAt; changed = true; continue; }
+    let nf = null;
+    try { nf = _stwo.nullifier(noteNskWire(n), BigInt(n.rho)); } catch (e) { continue; }     // cannot tell: never restore
+    if (spentNf.has(nf)) { delete n.spentOuts; delete n.spentAt; changed = true; continue; }    // it landed: keep the change
+    if (Date.now() - Number(n.spentAt || 0) < STWO_SPEND_LAND_GRACE_MS) continue;
+    const outs = new Set(n.spentOuts.map(String));
+    for (let i = notes.length - 1; i >= 0; i--) if (notes[i] !== n && outs.has(String(notes[i].cm))) notes.splice(i, 1);
+    n.spent = false; delete n.spentOuts; delete n.spentAt; changed = true; restored++;
+  }
+  if (changed) saveNotes(notes);
+  if (restored) log("info", i18("shield.restored", "{n} banknote(s) whose spend never landed on chain are back in your balance.", { n: String(restored) }));
+  return restored;
+}
+
+// RESTORING DEPOSIT NOTES (fresh owner per deposit, stwoDepositNsk). A deposit note is not re-derivable from the zaddr,
+// so a wallet restored on a new device finds its deposits the way it made them: for EVERY one of its own Stwo shield
+// transactions (public: amount, owner, rho) it derives nsk_dep from its key and that rho, and keeps the deposit when
+// ownerOf(nsk_dep) is the owner the transaction published — one note per transaction (never a map keyed by owner), no
+// index, no gap, no counter. A note carried across a reroll has no transaction on the new chain, so the carried public
+// records (/exec/stwo_carried_deposits, execnode/exec_genesis.py) are read the same way. Spent ones are marked by testing
+// their nullifiers against the pool's whole spent set locally (/exec/stwo_nullifiers), so no node learns which notes
+// are this wallet's.
+// NEVER "ONCE" (review 2026-10-12): a deposit whose leaf the exec node has not applied yet (exec trails L1 by the
+// finality depth) used to be skipped and the scan then marked done for good. Now the restore runs on every render and
+// remembers what is SETTLED — each deposit banked or found not to be this wallet's (stwoRestoreKey) — and a block cursor
+// behind which every deposit is settled, so a later render costs one short page of transactions. INVARIANT: the cursor
+// only advances when no deposit of this wallet is still waiting for its leaf.
+const STWO_RESTORE_MARGIN = 64;      // blocks the cursor stays behind the tip: deeper than finality (45), for reorgs
+function stwoRestoreKey() { return "nado.stwoRestore." + (state.wallet ? state.wallet.address : "none"); }
+function _stwoRestoreLoad() {
+  try {
+    const j = JSON.parse(localStorage.getItem(stwoRestoreKey()) || "null");
+    if (j && Array.isArray(j.done)) return { done: new Set(j.done.map(String)), from: Math.max(0, Number(j.from) || 0) };
+  } catch (e) { /* unreadable: start over, the scan is idempotent */ }
+  return { done: new Set(), from: 0 };
+}
+function _stwoRestoreSave(r) {
+  try { localStorage.setItem(stwoRestoreKey(), JSON.stringify({ done: [...r.done], from: r.from })); } catch (e) {}
+}
+// the public records of this account's deposit notes a reroll carried; null when the exec node cannot say (try later)
+async function stwoCarriedDeposits(addr) {
+  try {
+    const j = await execJSON("/exec/stwo_carried_deposits?addr=" + encodeURIComponent(addr));
+    return Array.isArray(j && j.deposits) ? j.deposits : [];
+  } catch (e) { return null; }
+}
+// EVERY transaction of the account, exact. Two traps the first restore fell into (review 2026-10-12):
+// - the endpoint returns at most ~1000 transactions per call (transaction_ops.get_transactions_of_account), so an active
+//   account's later deposits were never read: page by min_block = the last block seen, deduped by txid;
+// - JSON.parse turns an amount above 2^53 raw (~900,719 NADO) into a rounded double, the recomputed commitment then
+//   matches no leaf and the deposit is silently not restored: every "amount" integer is quoted before parsing, so it
+//   reaches BigInt as its exact digits. Returns null on a relay failure (the caller retries on a later render).
+async function stwoOwnTransactions(addr, fromBlock = 0) {
+  const out = [], seen = new Set();
+  let minBlock = Math.max(0, Math.floor(Number(fromBlock) || 0));
+  for (let page = 0; page < 200; page++) {
+    let text, status;
+    try {
+      const res = await fetchWithTimeout(relayBase() + "/get_transactions_of_account?address=" + encodeURIComponent(addr)
+                                         + "&min_block=" + minBlock, { method: "GET", cache: "no-store" }, 20000);
+      status = res.status; text = await res.text();
+    } catch (e) { return null; }
+    if (status === 404) break;
+    if (status !== 200) return null;
+    let d;
+    try { d = JSON.parse(text.replace(/("amount"\s*:\s*)(-?\d+)(?=\s*[,\x7d\x5d])/g, '$1"$2"')); } catch (e) { return null; }
+    const txs = (d && Array.isArray(d.transactions)) ? d.transactions : [];
+    let fresh = 0;
+    for (const t of txs) {
+      if (!t) continue;
+      const key = typeof t.txid === "string" && t.txid ? t.txid : JSON.stringify(t);   // never drop a txid-less entry as a repeat
+      if (seen.has(key)) continue;
+      seen.add(key); out.push(t); fresh++;
+    }
+    // `more` + `last_block` (transaction_ops.get_transactions_of_account): the page stopped inside last_block, so the
+    // next one starts AT it (deduped above). A node without paging sends neither and this reads one page, as before.
+    if (!d.more || !fresh || !Number.isFinite(Number(d.last_block))) break;
+    minBlock = Number(d.last_block);
+  }
+  return out;
+}
+async function stwoRecoverDeposits() {
+  if (!state.wallet || !shieldStwo()) return 0;
+  const addr = state.wallet.address, nsk = shieldNskStwo(), rs = _stwoRestoreLoad();
+  let tip = null;
+  try { const l = await getLatestBlock(); if (l && Number.isFinite(Number(l.block_number))) tip = Number(l.block_number); } catch (e) {}
+  const txs = await stwoOwnTransactions(addr, rs.from);
+  if (txs === null) return 0;                                // try again on a later render
+  // SHADOW ACCOUNTS RETURN COINS BY DEPOSITING FROM THEMSELVES (doReturnShadow), so their deposits are this wallet's
+  // too: scan the private games' shadow addresses on every render, and every official game's on a first restore
+  // (a new device does not know yet which games were played privately)
+  const senders = new Set([addr]);
+  for (const o of (rs.from ? shadowOrigins() : shadowCandidateOrigins())) {
+    const kp = shadowKeypair(o);
+    if (!kp) continue;
+    senders.add(kp.address);
+    const more = await stwoOwnTransactions(kp.address, rs.from);
+    if (more === null) return 0;                             // all or nothing: a partial scan must not advance the cursor
+    txs.push(...more);
+  }
+  const carried = await stwoCarriedDeposits(addr);
+  const cands = [];
+  for (const t of txs) {
+    if (!t || t.recipient !== "shield" || !senders.has(t.sender) || !t.data || t.data.pool !== "stwo" || typeof t.data.owner !== "string") continue;
+    cands.push({ key: "tx:" + (typeof t.txid === "string" && t.txid ? t.txid : JSON.stringify(t)), amount: t.amount, owner: t.data.owner, rho: t.data.rho });
+  }
+  for (const r of carried || []) {
+    if (r && typeof r.owner === "string") cands.push({ key: "carried:" + r.owner + ":" + r.rho, amount: r.amount, owner: r.owner, rho: r.rho });
+  }
+  const notes = loadNotes(), mine = [];
+  let changed = false;
+  for (const c of cands) {
+    if (rs.done.has(c.key)) continue;
+    let amount, rho, nskDep;
+    try { amount = BigInt(c.amount); rho = BigInt(c.rho); nskDep = _stwo.depositNsk(nsk, rho); }
+    catch (e) { rs.done.add(c.key); changed = true; continue; }          // not a u64 rho / amount: no note of ours
+    const owner = _stwo.ownerOf(nskDep);
+    if (owner !== String(c.owner).toLowerCase()) { rs.done.add(c.key); changed = true; continue; }   // not this wallet's
+    // the commitment is recomputed from the public amount, owner and rho — never taken from the tx's data.cm
+    const cm = _stwo.commit(amount, owner, rho);
+    if (notes.some((n) => n.cm === cm)) { rs.done.add(c.key); changed = true; continue; }        // already in the wallet
+    mine.push({ c, amount, rho, nskDep, cm });
+  }
+  let added = 0, waiting = 0;
+  if (mine.length) {
+    let leaves, spent;
+    try {
+      // the spent set FIRST, then the tree: a note whose leaf is read after its nullifier is never banked as unspent
+      // when a spend of it applied between the two reads
+      spent = new Set(((await execJSON("/exec/stwo_nullifiers")).nullifiers || []).map(String));
+      leaves = new Set(((await execJSON("/exec/field_leaves")).leaves || []).map(String));
+    } catch (e) { return 0; }
+    for (const m of mine) {
+      if (!leaves.has(m.cm)) { waiting++; continue; }         // not applied yet: banked on a later render
+      notes.push({ value: m.amount.toString(), rho: m.rho.toString(), cm: m.cm, dep: true, ts: Date.now(),
+                   spent: spent.has(_stwo.nullifier(m.nskDep, m.rho)) });
+      rs.done.add(m.c.key); changed = true; added++;
+    }
+    if (added) saveNotes(notes);
+  }
+  // every deposit at or below tip - margin is settled now: the next render pages from there (never past a waiting one)
+  if (!waiting && tip !== null && tip - STWO_RESTORE_MARGIN > rs.from) { rs.from = tip - STWO_RESTORE_MARGIN; changed = true; }
+  if (changed) _stwoRestoreSave(rs);
+  if (added) log("ok", i18("shield.recovered", "{n} private banknote(s) from your earlier deposits were restored.", { n: String(added) }));
+  return added;
+}
+
+// THE OPEN TAB FOLLOWS THE POOL. A deposit or a received note lands only when the exec node applies a FINALIZED block
+// (~45 blocks, ~5 min), long after the one re-render a deposit schedules — so the pool line and the banknote list sat
+// stale until a reload (found by the gen-29 rehearsal's two-user walk, 2026-10-26). While the tab is open and visible,
+// shieldTick reads only the pool summary and re-renders when it moved; a full re-render every tick would re-run the
+// withdrawal sweep (claimUnshields) each time. tests/test_the_shield_tab_follows_the_pool_while_open.mjs.
+let _shieldPoolSeen = null, _shieldTickBusy = false;
+async function shieldTick() {
+  if (_shieldTickBusy || state.activeTab !== "shield" || !state.wallet || document.visibilityState !== "visible") return;
+  _shieldTickBusy = true;
+  try {
+    const p = await execJSON("/exec/field_shielded");
+    if (p && p.notes + ":" + p.root !== _shieldPoolSeen) await renderShield();
+  } catch (e) { /* the next tick retries */ } finally { _shieldTickBusy = false; }
+}
+
 async function renderShield() {
   if (!state.wallet) return;
-  ensureShielded();
+  ensureShielded(); await refreshShieldRules();
+  await reconcileSpentNotes().catch(() => 0);
+  await stwoRecoverDeposits().catch(() => 0);
+  shadowClaimAll().catch(() => {});   // shadow accounts claim their own settled exits (fee-exempt)
+  renderShadowCard().catch(() => {});
   renderZaddrQR();   // your reusable shielded receive address as a payment-link QR
   const notes = loadNotes();
   const bal = notes.filter((n) => !n.spent).reduce((s, n) => s + BigInt(n.value), 0n);
   $("shieldBal").textContent = rawToNado(bal) + " NADO";
   try {
-    const p = await (await fetch(execBase() + "/exec/field_shielded", { cache: "no-store" })).json();
+    const p = await execJSON("/exec/field_shielded");
+    _shieldPoolSeen = p.notes + ":" + p.root;   // what shieldTick compares against
     $("shieldPool").textContent = i18("shield.poolInfo", "{n} banknotes · root {r}", { n: p.notes, r: (p.root || "").slice(0, 10) + "…" });
   } catch (e) { $("shieldPool").textContent = "—"; }
+  // PRIVACY PAUSE: say so where the pool is described, AFTER the pool line so it is not overwritten.
+  if (stwoMissing()) $("shieldPool").textContent = i18("shield.stwoLoadFail", "Private banknotes could not load on this page. Check your connection and reload.");
+  else if (!shieldStwo()) $("shieldPool").textContent = i18("shield.paused", "Private banknotes are paused for a security upgrade. Your public balance is not affected.");
   claimUnshields(true).catch(() => {});    // seamless: sweep any settled withdrawals into the balance automatically
   const box = $("shieldNotes"); box.innerHTML = "";
   const mine = notes.filter((n) => !n.spent);
@@ -6155,66 +11150,337 @@ async function renderShield() {
 
 async function doShield() {
   if (!state.wallet) return;
-  ensureShielded();
+  ensureShielded(); await refreshShieldRules(); if (shieldPaused()) return;
   const rawAmount = nadoToRaw($("shieldAmount").value || "0");
   if (rawAmount <= 0n) { log("err", i18("shield.badAmount", "Enter an amount to shield.")); return; }
+  if (await shieldDeposit(rawAmount, state.wallet)) { $("shieldAmount").value = ""; setTimeout(() => renderShield().catch(() => {}), 1500); }
+}
+// ONE DEPOSIT, signed by `signer` (the active account, or a shadow account returning its coins to the pool), the note
+// owned by THIS wallet's private keys (a fresh owner from its rho) and banked in this wallet's notes. true on success.
+async function shieldDeposit(rawAmount, signer) {
+  // THE POOL IS CHECKED HERE, for every caller (doShield, and doReturnShadow which skips doShield): a deposit built with
+  // no Stwo module loaded, or below the gate, has no pool to go to
+  if (!shieldStwo()) { shieldPaused(); return false; }
   const rho = _randField();
-  const owner = shieldOwner();                               // this wallet's stable shielded owner
-  const cm = alghash.commit(rawAmount, owner, BigInt(rho));  // field-native note commitment
+  // a fresh owner per deposit, from its own rho (stwoDepositNsk) — never the stable owner the zaddr encodes
+  const owner = _stwo.ownerOf(stwoDepositNsk(rho));
+  const cm = noteCommit(rawAmount, owner, BigInt(rho));
   try {
     const latest = await getLatestBlock(); const target = latest.block_number + 8;
     // C-2: send (owner, rho) so the exec node BINDS the note value to the escrowed amount by recomputing
     // commit(amount, owner, rho) itself. `cm` is kept for local reference only; the node does not trust it.
-    const data = { field: true, owner: owner.toString(), rho: rho.toString(), cm: cm.toString() };
-    const tx = buildTransferTx(state.wallet, "shield", rawAmount, MIN_TX_FEE, target, data, nowSeconds());
+    const data = { field: true, owner: ownerStr(owner), rho: rho.toString(), cm: cmStr(cm) };
+    // A STWO DEPOSIT SAYS SO: a wide owner and a Stwo owner are both 64-hex, so L1 cannot tell a deposit from a page that
+    // predates the pool (it would land in the Stwo pool under an owner no key spends). L1 refuses an untagged deposit
+    // from the gate (tests/test_a_stwo_deposit_must_name_its_pool.py).
+    data.pool = "stwo";
+    const tx = buildTransferTx(signer, "shield", rawAmount, MIN_TX_FEE, target, data, nowSeconds());
     const res = await submitTransaction(tx);
     if (res.data && res.data.result) {
       const notes = loadNotes();
-      notes.push({ value: rawAmount.toString(), rho, cm: cm.toString(), spent: false, ts: Date.now() });
+      notes.push({ value: rawAmount.toString(), rho, cm: cmStr(cm), spent: false, ts: Date.now(), dep: true });
       saveNotes(notes);
       log("ok", i18("shield.done", "Shielded {a} NADO ✓ (the banknote appears once the exec node applies it)", { a: rawToNado(rawAmount) }));
-      $("shieldAmount").value = "";
-      setTimeout(() => renderShield().catch(() => {}), 1500);
-    } else log("err", i18("shield.rej", "Shield rejected: {m}", { m: (res.data && res.data.message) || "" }));
+      return true;
+    }
+    log("err", i18("shield.rej", "Shield rejected: {m}", { m: (res.data && res.data.message) || "" }));
   } catch (e) { log("err", i18("shield.err", "Shielded-pool error: {m}", { m: e.message })); }
+  return false;
+}
+
+// ---- SHADOW ACCOUNTS: fund, collect, return (see shadowKeypair) ----------------------------------------------------
+// whether a relay may be paid by a spend's fee in the block a spend lands in: from block 1 (gen 28's STWO_FEE_TO_HEIGHT,
+// 1 from gen 29, inlined in G9; the node's ExecState.rules_stwo_fee_to)
+function stwoFeeToLive() { return BigInt(_shieldTip || 0) + 1n >= 1n; }
+// the node config a spend is proven at: the one of the block it lands in — CFG_128 (56 queries) from block 1, CFG_340
+// only at height 0 (gen 28's STWO_JS_128_HEIGHT, 1 from gen 29, inlined in G9; stwo_js_native.config_id_at). The node
+// picks it from the height and refuses a proof at the other, so the wallet must match;
+// tests/test_a_stwo_spend_proves_at_the_config_of_the_height_it_lands_at.mjs.
+// From protocol STWO_JS_GRIND_HEIGHT the config grinds before the LogUp elements and the composition coefficient too
+// (CFG_128G). INVARIANT: execnode/stwo_js_native.config_id_at is the same function of the landing height.
+function stwoCfgId() {
+  const h = BigInt(_shieldTip || 0) + 1n;
+  return h >= BigInt(P.STWO_JS_GRIND_HEIGHT) ? _stwo.CFG_128G : h >= 1n ? _stwo.CFG_128 : _stwo.CFG_340;
+}
+// FUND a game's shadow account from this wallet's private balance: one relayed spend per banknote, each paying the
+// relay by its fee (fee_to) and sending the rest of the amount to the shadow address. Nothing is signed by this
+// account or by the shadow account; the shadow account then claims its exits itself (shadowClaimAll).
+async function doFundShadow(origin, rawAmount) {
+  if (!state.wallet) return false;
+  ensureShielded(); await refreshShieldRules(); if (shieldPaused()) return false;
+  if (!shieldStwo() || !stwoFeeToLive()) { log("err", i18("shadow.notYet", "Private accounts open once the network accepts relay-paid withdrawals. Try again later.")); return false; }
+  const kp = shadowKeypair(origin);
+  if (!kp || rawAmount <= 0n) return false;
+  const relays = await stwoRelays();
+  if (!relays.length) { log("err", i18("shield.relayNone", "No relay node can publish a private payment right now. Nothing was sent — try again in a minute.")); return false; }
+  const fee = BigInt(relays[0].fee);
+  let picks = selectNotesFor(rawAmount);
+  for (let i = 0; picks && i < 8; i++) {
+    const again = selectNotesFor(rawAmount + fee * BigInt(picks.length));
+    if (!again || again.length === picks.length) { picks = again; break; }
+    picks = again;
+  }
+  if (!picks) { log("err", insufficientMsg(rawAmount + fee)); return false; }
+  const ok = await uiConfirm({
+    title: i18("shadow.fundTitle", "Fund a private account"),
+    rows: [
+      { k: i18("dlg.amount", "Amount"), v: rawToNado(rawAmount) + " NADO" },
+      { k: i18("shadow.game", "App"), v: origin.replace(/^https:\/\//, "") },
+      { k: i18("shield.relayFee", "Relay fee"), v: rawToNado(fee * BigInt(picks.length)) + " NADO" },
+    ],
+    body: i18("shadow.fundBody", "The app sees a separate account that nothing on chain ties to this wallet. Its activity and balance are public; who it belongs to is not. Only its NADO returns to your private balance: sell tokens and close loans first."),
+    confirmText: i18("shadow.fundOk", "Fund privately") });
+  if (!ok) { log("info", i18("msg.cancelled", "Cancelled.")); return false; }
+  let done = 0n;
+  const owner = shieldOwner();
+  for (const pk of picks) {
+    const notes = loadNotes();
+    const note = notes.find((n) => n.cm === pk.cm && !n.spent);
+    if (!note) continue;
+    const room = BigInt(note.value) - fee;
+    if (room <= 0n) continue;
+    const take = room < rawAmount - done ? room : rawAmount - done;
+    const change = BigInt(note.value) - take - fee;
+    const r1 = _randField(), r2 = _randField();
+    const wit = { cm: note.cm, nsk: noteNskWire(note), value_in: note.value, rho_in: note.rho,
+      v1: change.toString(), o1: ownerStr(owner), r1, v2: "0", o2: ownerStr(owner), r2,
+      public_value: (-take).toString(), fee: fee.toString(), withdraw_addr: kp.address, fee_to_relays: relays };
+    const pr = await proveTransfer2(wit);
+    if (pr.error || !pr.ok) {
+      log("err", i18("shield.proveErr", "Proof failed: {m}", { m: pr.error || pr.applied || "" }));
+      return done > 0n;
+    }
+    note.spent = true;
+    _markSpendPending(note, pr);
+    if (change > 0n) notes.push({ value: change.toString(), rho: r1, cm: pr.cm_out1, spent: false, ts: Date.now() });
+    saveNotes(notes);
+    done += take;
+    if (done >= rawAmount) break;
+  }
+  log("ok", i18("shadow.funded", "{a} NADO is on its way to your private account for {g}. It arrives once the network settles (a few minutes).",
+    { a: rawToNado(done), g: origin.replace(/^https:\/\//, "") }));
+  return done > 0n;
+}
+// COLLECT: every shadow account claims its own settled exits (fee-exempt, self-signed), so funded coins become its
+// spendable balance without the user doing anything
+// THE CARD: a game picker + amount + Fund (turns private play on for that game), and one row per private game with
+// its shadow balance, Return (to the private balance) and Stop (that game signs with the active account again)
+async function renderShadowCard() {
+  const card = $("shadowCard");
+  if (!card) return;
+  const live = shieldStwo() && stwoFeeToLive();
+  card.classList.toggle("hidden", !live || !state.wallet);
+  if (!live || !state.wallet) return;
+  const sel = $("shadowGame");
+  if (sel && !sel.dataset.wired) {
+    sel.dataset.wired = "1";
+    for (const o of EXEC_SIGN_ALLOW) { const op = document.createElement("option"); op.value = o; op.textContent = o.replace(/^https:\/\//, ""); sel.appendChild(op); }
+    $("btnShadowFund").onclick = async () => {
+      const o = sel.value, amt = nadoToRaw($("shadowAmount").value || "0");
+      if (!o || amt <= 0n) { log("err", i18("shield.badAmount", "Enter an amount to shield.")); return; }
+      const b = $("btnShadowFund"); b.disabled = true;
+      try { if (await doFundShadow(o, amt)) { setShadowOn(o, true); $("shadowAmount").value = ""; renderShadowCard().catch(() => {}); } }
+      finally { b.disabled = false; }
+    };
+  }
+  const list = $("shadowList");
+  if (!list) return;
+  list.textContent = "";
+  for (const o of shadowOrigins()) {
+    const kp = shadowKeypair(o);
+    if (!kp) continue;
+    let bal = "…";
+    try { const a = await rpcJSON("/get_account?address=" + encodeURIComponent(kp.address)); bal = rawToNado(BigInt(String((a.data && a.data.balance) || 0).split(".")[0])); } catch (e) {}
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px";
+    const name = document.createElement("span"); name.className = "small"; name.style.flex = "1";
+    name.textContent = i18("shadow.row", "{g}: {b} NADO", { g: o.replace(/^https:\/\//, ""), b: bal });
+    const ret = document.createElement("button"); ret.className = "ghost small"; ret.textContent = i18("shadow.returnOk", "Return");
+    ret.onclick = async () => { if (await doReturnShadow(o)) setTimeout(() => renderShield().catch(() => {}), 1500); };
+    const stop = document.createElement("button"); stop.className = "ghost small"; stop.textContent = i18("shadow.stop", "Stop");
+    stop.onclick = async () => {
+      const ok = await uiConfirm({ title: i18("shadow.stopTitle", "Stop using it privately?"),
+        body: i18("shadow.stopBody", "{g} will see your wallet's own account again. Return the private account's balance first if you want it back in your private balance.", { g: o.replace(/^https:\/\//, "") }),
+        confirmText: i18("shadow.stop", "Stop") });
+      if (ok) { setShadowOn(o, false); renderShadowCard().catch(() => {}); }
+    };
+    row.append(name, ret, stop);
+    list.appendChild(row);
+  }
+}
+async function shadowClaimAll() {
+  for (const o of shadowOrigins()) { const kp = shadowKeypair(o); if (kp) await claimUnshields(true, kp).catch(() => {}); }
+}
+// RETURN a shadow account's balance to this wallet's private balance: a deposit signed by the shadow account, its
+// note owned by this wallet (a fresh owner). The deposit is public (shadow -> pool); nothing links it to this wallet.
+async function doReturnShadow(origin) {
+  const kp = shadowKeypair(origin);
+  if (!kp) return false;
+  let bal = 0n;
+  try { const a = await rpcJSON("/get_account?address=" + encodeURIComponent(kp.address)); bal = BigInt(String((a.data && a.data.balance) || 0).split(".")[0]); } catch (e) {}
+  const amount = bal - BigInt(MIN_TX_FEE);
+  if (amount <= 0n) { log("info", i18("shadow.empty", "That private account holds nothing to return.")); return false; }
+  const ok = await uiConfirm({ title: i18("shadow.returnTitle", "Return to private balance"),
+    rows: [{ k: i18("dlg.amount", "Amount"), v: rawToNado(amount) + " NADO" }, { k: i18("shadow.game", "App"), v: origin.replace(/^https:\/\//, "") }],
+    confirmText: i18("shadow.returnOk", "Return") });
+  if (!ok) return false;
+  return shieldDeposit(amount, kp);
+}
+
+/* ---- AUTOMATIC NOTE MANAGEMENT ---------------------------------------------------------------------
+ *
+ * "No single banknote covers that amount yet (splitting across banknotes isn't supported here)."
+ *
+ * That message described a real limit, not a missing feature: joinsplit2.prove_transfer takes ONE input
+ * note (one value_in/rho_in, one nullifier) and produces TWO outputs. The circuit can SPLIT a note and can
+ * never MERGE two — so there is no "consolidate first" move available, and a wallet that has accumulated
+ * change notes gets permanently stuck below its own balance. Receiving three payments of 4 leaves you
+ * unable to spend 5 despite holding 12.
+ *
+ * The way out with a 1-in circuit is to spend SEVERAL notes in sequence, one proof each. That is what these
+ * helpers pick, and it is why the loops below are written to survive a failure partway: each proof is
+ * independent and already applied, so aborting after two of three leaves the wallet CONSISTENT (spent notes
+ * marked, change banked) and the transfer merely PARTIAL. Silently reporting success for a partial payment
+ * would be the real bug, so both callers report what actually went through.
+ *
+ * LARGEST FIRST. Each proof is ~15 s of on-device work, so the goal is the fewest notes that cover the
+ * amount, not the tidiest change. It also leaves small notes behind rather than shredding a large one into
+ * more dust.
+ */
+function spendableNotes() {
+  return loadNotes().filter((n) => !n.spent && BigInt(n.value) > 0n);
+}
+
+function totalSpendable() {
+  return spendableNotes().reduce((a, n) => a + BigInt(n.value), 0n);
+}
+
+function selectNotesFor(rawAmount) {
+  // Returns the chosen notes (largest first) or null when the WHOLE balance cannot cover it.
+  const av = spendableNotes().sort((a, b) => {
+    const x = BigInt(a.value), y = BigInt(b.value);
+    return y > x ? 1 : y < x ? -1 : 0;
+  });
+  const picks = [];
+  let acc = 0n;
+  for (const n of av) {
+    if (acc >= rawAmount) break;
+    picks.push(n);
+    acc += BigInt(n.value);
+  }
+  return acc >= rawAmount ? picks : null;
+}
+
+function insufficientMsg(rawAmount) {
+  const have = totalSpendable(), n = spendableNotes().length;
+  return i18("shield.insufficient",
+             "Not enough shielded balance: you hold {h} NADO across {n} banknote(s), and this needs {a}.",
+             { h: rawToNado(have), n: String(n), a: rawToNado(rawAmount) });
 }
 
 async function doUnshield() {
   if (!state.wallet) return;
-  ensureShielded();
+  ensureShielded(); await refreshShieldRules(); if (shieldPaused()) return;
   const rawAmount = nadoToRaw($("unshieldAmount").value || "0");
   const to = $("unshieldTo").value.trim() || state.wallet.address;
   if (rawAmount <= 0n) { log("err", i18("shield.badAmount", "Enter an amount to unshield.")); return; }
-  if (!ADDR_RE_I.test(to)) { log("err", i18("shield.badAddr", "Enter a valid mldsa44… address.")); return; }
-  const notes = loadNotes();
-  const note = notes.find((n) => !n.spent && BigInt(n.value) >= rawAmount);
-  if (!note) { log("err", i18("shield.noNote", "No single banknote covers that amount yet (splitting across banknotes isn't supported here).")); return; }
+  if (!ADDR_RE_I.test(to)) { log("err", i18("shield.badAddr", "Enter a valid address.")); return; }
+  // WHO PUBLISHES IT. An account that can pay the L1 fee publishes its own withdrawal, as it always did. One that CANNOT
+  // — everything it holds arrived privately, which is exactly a recipient's case — could never withdraw: its blob was
+  // refused for the fee and the page said only "Proof failed:" (the gen-29 rehearsal's two-user walk, 2026-10-26). Such a
+  // withdrawal is published by a relay node instead and pays the relay's fee out of the banknote — the fee_to path a
+  // shadow account is funded by (STWO_FEE_TO_HEIGHT: the proof binds the relay's address as the fee's payee).
+  let relays = null, fee = 0n;
+  const accNow = await getAccount(state.wallet.address).catch(() => null);
+  if (BigInt((accNow && accNow.balance) || 0) < BigInt(MIN_TX_FEE)) {
+    relays = await stwoRelays();
+    if (!relays.length) { log("err", i18("shield.relayNone", "No relay node can publish a private payment right now. Nothing was sent — try again in a minute.")); return; }
+    fee = BigInt(relays[0].fee);
+  }
+  let picks = selectNotesFor(rawAmount);
+  for (let i = 0; relays && picks && i < 8; i++) {        // each banknote spent pays the relay once
+    const again = selectNotesFor(rawAmount + fee * BigInt(picks.length));
+    if (!again || again.length === picks.length) { picks = again; break; }
+    picks = again;
+  }
+  if (!picks) { log("err", insufficientMsg(rawAmount + fee)); return; }
+  if (relays) {
+    const okr = await uiConfirm({ title: i18("shield.unshieldRelayTitle", "Withdraw through a relay"),
+      rows: [{ k: i18("dlg.amount", "Amount"), v: rawToNado(rawAmount) + " NADO" }, { k: i18("dlg.to", "To"), v: to },
+             { k: i18("shield.relayFee", "Relay fee"), v: rawToNado(fee * BigInt(picks.length)) + " NADO" }],
+      body: i18("shield.unshieldRelayBody", "This account has no public NADO to pay the network fee, so a relay node publishes the withdrawal and takes its fee from your private balance."),
+      confirmText: i18("shield.unshield", "Unshield") });
+    if (!okr) { log("info", i18("msg.cancelled", "Cancelled.")); return; }
+  }
+  // A WITHDRAWAL THIS ACCOUNT PUBLISHES names it: to one's own address that reveals nothing new; to SOMEONE ELSE's it
+  // tells everyone this account paid them. Said once per account, before the first such withdrawal (operator decision
+  // 2026-10-11) — a private payment (Send shielded) is the unlinked way. A relayed withdrawal does not name the account.
+  if (!relays && to !== state.wallet.address) {
+    const seen = "nado.stwoPublicPayWarned." + state.wallet.address;
+    let warned = false; try { warned = !!localStorage.getItem(seen); } catch (e) {}
+    if (!warned) {
+      const okw = await uiConfirm({ title: i18("shield.unshieldPublicTitle", "This withdrawal is public"),
+        body: i18("shield.unshieldPublicBody", "Withdrawing to someone else's address is published by your own account, so anyone can see that this payment came from you. To pay privately, use {b} instead.", { b: i18("shield.zsend", "Send shielded") }),
+        confirmText: i18("shield.unshieldPublicOk", "Withdraw anyway") });
+      if (!okw) { log("info", i18("msg.cancelled", "Cancelled.")); return; }
+      try { localStorage.setItem(seen, "1"); } catch (e) {}
+    }
+  }
   const _ub = $("btnUnshield");
   if (_ub) { _ub.disabled = true; _ub.textContent = i18("shield.provingBtn", "🔐 Proving…"); }
+  let done = 0n;
   try {
-    const change = BigInt(note.value) - rawAmount;
-    const r1 = _randField(), r2 = _randField();
     const owner = shieldOwner();                             // change comes back to this wallet
-    $("shieldStatus").innerHTML = '<span class="spin">◐</span> ' + i18("shield.proving", "Generating your zero-knowledge proof… (~15s, one-time per withdrawal)");
-    // withdrawal = a 2-output join-split with a public exit: out1 = change (back to me), out2 = empty note,
-    // public_value = -amount (the coins leaving the pool). Uses the SAME on-device prover as a shielded send.
-    const wit = {
-      cm: note.cm, nsk: shieldNsk().toString(), value_in: note.value, rho_in: note.rho,
-      v1: change.toString(), o1: owner.toString(), r1,
-      v2: "0", o2: owner.toString(), r2,
-      public_value: (-rawAmount).toString(), fee: "0", withdraw_addr: to,
-    };
-    const pr = await proveTransfer2(wit);
-    if (pr.error || !pr.ok) {
-      log("err", i18("shield.proveErr", "Proof failed: {m}", { m: pr.error || pr.applied || "" }));
-      $("shieldStatus").textContent = ""; return;
+    for (let i = 0; i < picks.length; i++) {
+      // Re-read on every pass: each proof mutates storage (spent flag + change note), and holding one
+      // stale array across a multi-minute loop is how a change note gets dropped.
+      const notes = loadNotes();
+      const note = notes.find((n) => n.cm === picks[i].cm && !n.spent);
+      if (!note) continue;                                   // already spent by a concurrent tab
+      const room = BigInt(note.value) - fee;                 // a relayed withdrawal pays the relay out of this note
+      if (room <= 0n) continue;
+      const take = room < (rawAmount - done) ? room : (rawAmount - done);
+      const change = BigInt(note.value) - take - fee;
+      const r1 = _randField(), r2 = _randField();
+      $("shieldStatus").innerHTML = '<span class="spin">◐</span> ' + (picks.length > 1
+        ? i18("shield.provingN", "Generating proof {i} of {n}… (~15s each — this amount spans several banknotes)",
+              { i: String(i + 1), n: String(picks.length) })
+        : i18("shield.proving", "Generating your zero-knowledge proof… (~15s, one-time per withdrawal)"));
+      // withdrawal = a 2-output join-split with a public exit: out1 = change (back to me), out2 = empty note,
+      // public_value = -amount (the coins leaving the pool). Uses the SAME on-device prover as a shielded send.
+      const wit = {
+        cm: note.cm, nsk: noteNskWire(note), value_in: note.value, rho_in: note.rho,
+        v1: change.toString(), o1: ownerStr(owner), r1,
+        v2: "0", o2: ownerStr(owner), r2,
+        public_value: (-take).toString(), fee: fee.toString(), withdraw_addr: to,
+        ...(relays ? { fee_to_relays: relays } : {}),
+      };
+      const pr = await proveTransfer2(wit);
+      if (pr.error || !pr.ok) {
+        // STOP, and say how far we got. Everything proved so far is already applied and irreversible;
+        // continuing would risk compounding the failure, and claiming success would be a lie.
+        log("err", done > 0n
+          ? i18("shield.partial", "Withdrew {d} of {a} NADO, then a proof failed: {m}. The rest is still " +
+                                  "in the pool — retry for the remainder.",
+                { d: rawToNado(done), a: rawToNado(rawAmount), m: pr.error || pr.applied || "" })
+          : i18("shield.proveErr", "Proof failed: {m}", { m: pr.error || pr.applied || "" }));
+        $("shieldStatus").textContent = "";
+        return;
+      }
+      // The proof (on-device or delegated) was applied; the withdrawal settles on L1 via the bonded-quorum root.
+      // Nothing else to submit — just track the change note + auto-claim.
+      note.spent = true;
+      _markSpendPending(note, pr);        // confirmed by its outputs landing, or restored (reconcileSpentNotes)
+      if (change > 0n) notes.push({ value: change.toString(), rho: r1, cm: pr.cm_out1, spent: false, ts: Date.now() });
+      saveNotes(notes);
+      done += take;
+      if (done >= rawAmount) break;
     }
-    // The proof (on-device or delegated) was applied; the withdrawal settles on L1 via the bonded-quorum root.
-    // Nothing else to submit — just track the change note + auto-claim.
-    note.spent = true;
-    if (change > 0n) notes.push({ value: change.toString(), rho: r1, cm: pr.cm_out1, spent: false, ts: Date.now() });
-    saveNotes(notes);
-    log("ok", i18("shield.unshieldSent", "Unshield proved ✓ — {a} NADO will arrive once the exec root settles.", { a: rawToNado(rawAmount) }));
+    log("ok", picks.length > 1
+      ? i18("shield.unshieldSentN", "Unshield proved ✓ — {a} NADO across {n} banknotes will arrive once " +
+                                    "the exec root settles.", { a: rawToNado(done), n: String(picks.length) })
+      : i18("shield.unshieldSent", "Unshield proved ✓ — {a} NADO will arrive once the exec root settles.",
+            { a: rawToNado(done) }));
     $("shieldStatus").textContent = i18("shield.pending", "Pending: {a} NADO → {t} (settling…).", { a: rawToNado(rawAmount), t: to.slice(0, 12) + "…" });
     $("unshieldAmount").value = "";
     setTimeout(() => { renderShield().catch(() => {}); claimUnshields().catch(() => {}); }, 2000);
@@ -6226,72 +11492,128 @@ async function doUnshield() {
 // removed. All shielded sends/withdrawals go through proveTransfer2, which fails closed when on-device is on.)
 function _b36enc(x) { x = BigInt(x); if (x === 0n) return "0"; const D = "0123456789abcdefghijklmnopqrstuvwxyz"; let s = ""; while (x > 0n) { s = D[Number(x % 36n)] + s; x /= 36n; } return s; }
 
-// ON-DEVICE 2-output prover: build the Merkle path from the pool + prove entirely in the browser, so the node
-// never sees the witness. Returns the same shape as the delegated /exec/prove_transfer2. (~20-30s at depth 12.)
-let _starkInit = false;
-async function ensureFastStarkHash() {
-  // route the prover's Merkle/transcript hashing through the WASM BLAKE2b (~50x faster; identical output).
-  if (_starkInit) return;
-  try {
-    const h = await initBlake2bWasm();
-    initStarkHashing((data, size = 32) => (size === 32 ? bytesToHex(h(canonicalBytes(data))) : blake2bHash(data, size)));
-    setMerkleWasm(await initMerkleWasm());   // whole-tree Merkle in wasm
-  } catch (e) {
-    initStarkHashing(blake2bHash);   // wasm unavailable -> pure-JS fallback
-  }
-  try { setFieldWasm(await initGoldilocksWasm()); } catch (e) { /* NTT stays pure-JS BigInt */ }
-  _starkInit = true;
-}
-// DA-only submission (alphanet — no legacy single-operator path): publish the ~1-4MB proof to the DA layer
+// DA-only submission (betanet — no legacy single-operator path): publish the ~1-4MB proof to the DA layer
 // (too big for a 16KB blob), then submit an L1 blob carrying ONLY the proof's commitment. Every exec node
 // resolves the proof by that commitment from DA and applies it in L1 ORDER — so the shielded pool is
 // reconstructible by the whole bonded quorum. Throws (no fallback) if DA publish or the relay is unavailable.
 async function _daSubmitFieldTransfer(bundle, execBase) {
-  const pr = await fetch(execBase + "/da/publish", {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(bundle) });
-  if (!pr.ok) throw new Error("DA publish failed (HTTP " + pr.status + ")");
-  const commitment = (await pr.json()).commitment;
+  // Same treatment as the reads: a 200 carrying an HTML error page would otherwise reach .json() and
+  // surface as "Unexpected token '<'" through the generic shielded-pool catch.
+  const commitment = (await execJSON("/da/publish", { base: execBase, method: "POST",
+                                                      body: JSON.stringify(bundle) })).commitment;
   if (!commitment) throw new Error("DA publish returned no commitment");
   if (!state.wallet) throw new Error("no wallet loaded");
   const latest = await getLatestBlock();
   if (!latest) throw new Error("relay unavailable");
   const tx = buildBlobTx(state.wallet, { op: "field_transfer", proof_da: commitment },
     latest.block_number + 8, MIN_TX_FEE, nowSeconds(),
-    latest.block_number + TX_INCLUSION_DELAY);   // propagation delay (anti-reorg)
+    guardFrom(latest.block_number));   // propagation delay (anti-reorg)
   const res = await submitTransaction(tx);
-  return { ok: !!(res.data && res.data.result), da: true, commitment, txid: tx.txid,
-           message: res.data && res.data.message };
+  const ok = !!(res.data && res.data.result);
+  // A REFUSAL SAYS WHY: callers read `error` — this returned only `message`, so a refused withdrawal showed the user
+  // "Proof failed:" and nothing else (the gen-29 rehearsal's walk: an account with no public NADO for the fee)
+  return { ok, da: true, commitment, txid: tx.txid, message: res.data && res.data.message,
+           error: ok ? undefined : ((res.data && res.data.message) || i18("shield.publishRefused", "the network refused the withdrawal")) };
 }
 
+// ON-DEVICE prover: the Merkle path is built here from the pool's leaves and the proof made in the browser (the Stwo
+// WASM, in a Worker), so the node never sees the witness. The leaves and the pool tag come from one exec-node answer.
 async function _onDeviceProve2(wit, execBase) {
-  await ensureFastStarkHash();
-  ensureShielded();
-  const leaves = (await (await fetch(execBase + "/exec/field_leaves", { cache: "no-store" })).json()).leaves || [];
-  const cm = BigInt(wit.cm);
-  const idx = leaves.findIndex((l) => BigInt(l) === cm);
-  if (idx < 0) throw new Error("note not in the pool yet");
-  const { sibs, dirs } = treePath(leaves, idx);
-  const J = sjoinsplit2;
-  const bt = J.buildTrace(BigInt(wit.nsk), BigInt(wit.value_in), BigInt(wit.rho_in), sibs, dirs,
-    BigInt(wit.v1), BigInt(wit.o1), BigInt(wit.r1), BigInt(wit.v2), BigInt(wit.o2), BigInt(wit.r2));
-  const total = J.bounds(bt.D)[2];
-  const consPub = sfield.sub(BigInt(wit.fee), BigInt(wit.public_value));
-  const bnd = [[0, J.S0, alghash.DOM_OWNER], [0, J.S1, alghash.ivVal()], [0, J.AB, alghash.DOM_OWNER], [0, J.CONS, consPub],
-    [total, J.ROOTREG, bt.root], [total, J.NFREG, bt.nf], [total, J.CMOUT1, bt.cm1], [total, J.S0, bt.cm2]];
-  // sstark.NUM_QUERIES is the protocol FRI query count (execnode/stark/fri.py NUM_QUERIES). The node's
-  // verifier REQUIRES exactly this many + the grinding PoW (C-1), so an on-device proof must produce them or
-  // it is rejected. The last arg binds the unshield withdraw_addr into the proof (H-4) so the exit can't be
-  // redirected; null for a transfer.
-  const proof = sstark.prove(bt.tr, J.transitions(), bnd, J.periodic(bt.T, bt.D), J.MAX_DEGREE, sstark.NUM_QUERIES, wit.withdraw_addr || null);
-  proof.D = bt.D;
-  const ser = (x) => typeof x === "bigint" ? x.toString() : Array.isArray(x) ? x.map(ser) : (x && typeof x === "object" ? Object.fromEntries(Object.entries(x).map(([k, v]) => [k, ser(v)])) : x);
-  const bundle = { stark: { joinsplit2: { proof: ser(proof), root: bt.root.toString(), nf: bt.nf.toString(),
-    cm_out1: bt.cm1.toString(), cm_out2: bt.cm2.toString(), public_value: wit.public_value, fee: wit.fee } } };
-  if (wit.withdraw_addr) bundle.withdraw_addr = wit.withdraw_addr;
-  // DA-backed path (falls back to legacy POST-apply on nodes without /da/publish)
-  const res = await _daSubmitFieldTransfer(bundle, execBase);
-  return { ok: res.ok, applied: res.applied, da: res.da, commitment: res.commitment,
-           cm_out1: bt.cm1.toString(), cm_out2: bt.cm2.toString() };
+  await refreshShieldRules();
+  if (!shieldStwo()) throw new Error(stwoMissing()
+    ? i18("shield.stwoLoadFail", "Private banknotes could not load on this page. Check your connection and reload.")
+    : i18("shield.paused", "Private banknotes are paused for a security upgrade. Your public balance is not affected."));
+  const lv = await execJSON("/exec/field_leaves", { base: execBase });
+  if (lv.pool !== "stwo") throw new Error(i18("shield.poolDisagree", "the exec node and the relay disagree on which pool is live — retry in a moment"));
+  return _onDeviceProveStwo(wit, execBase, lv.leaves || []);
+}
+/* PRIVATE STWO SPENDS ARE PUBLISHED BY A RELAY NODE, NEVER BY THIS ACCOUNT (ZK review 2026-10-11, operator decision
+ * "nodes relay spends"; ops/stwo_relay.py). The proof hides the spent note and its owner; a `field_transfer` blob signed
+ * by this account would put the account's name on it, and every nullifier with it. So a private payment is proved with
+ * unshield = the relay's fee and withdraw_addr = the relay node's address (the proof binds both), and POSTed to that
+ * node's /stwo/relay, which checks it and publishes it under ITS OWN key. If a relay fails, the next one from the relay
+ * pool is tried (a fresh proof: each binds its own relay's address). INVARIANT: a private spend that no relay takes is
+ * an ERROR shown to the user — it never falls back to _daSubmitFieldTransfer with this account. Only a withdrawal (an
+ * unshield to a public address, which is public anyway) is still published by the account itself. */
+const STWO_RELAY_TRIES = 3;
+async function stwoRelayInfo(url) {
+  const res = await fetchWithTimeout(url + "/stwo/relay_info", { method: "GET", cache: "no-store" }, 6000);
+  if (!res.ok) return null;
+  const j = await res.json();
+  if (!j || j.available !== true || typeof j.address !== "string" || !ADDR_RE_I.test(j.address)) return null;
+  if (!/^[0-9]+$/.test(String(j.fee))) return null;
+  return { url, address: j.address, fee: BigInt(j.fee) };
+}
+// the relays to try, in order: the one this wallet talks to, home, then the relay pool — all answering available,
+// all asking the SAME fee as the first (the fee the user confirms; a proof's change depends on it)
+async function stwoRelays() {
+  // OTHER RELAYS FIRST (review 2026-10-12): relayBase() is the node this wallet reads its ACCOUNT through, so relaying the
+  // spend there lets one node join the spend to the account by IP and timing. It is tried last, as the fallback.
+  const urls = [], mine = relayBase();
+  for (const u of [...((relayPool.list || []).map((c) => c.url)), homeRelay(), mine]) if (u && !urls.includes(u)) urls.push(u);
+  if (urls.length > 1 && urls[0] === mine) urls.push(urls.shift());
+  const out = [];
+  for (const u of urls) {
+    try { const i = await stwoRelayInfo(u); if (i && (!out.length || i.fee === out[0].fee)) out.push(i); } catch (e) { /* next */ }
+    if (out.length >= STWO_RELAY_TRIES) break;
+  }
+  return out;
+}
+async function _stwoRelayPost(url, bundle) {
+  const res = await fetchWithTimeout(url + "/stwo/relay", { method: "POST", cache: "no-store",
+    headers: { "Content-Type": "application/json" }, body: JSON.stringify({ bundle }) }, 180000);
+  let j = null; try { j = await res.json(); } catch (e) { /* not JSON */ }
+  return { ok: !!(res.ok && j && j.ok), status: res.status, txid: j && j.txid, commitment: j && j.commitment,
+           reason: (j && j.reason) || ("HTTP " + res.status) };
+}
+// STWO on-device prover (STWO_POOL_HEIGHT): the Merkle path is built here over the pool's leaves, the proof is made by
+// the Stwo WASM in a Worker (static/stark/stwo_js.js proveSpend — never on the main thread), checked against this page's
+// own note algebra, and published: a PRIVATE spend (wit.relays) through a relay node, a withdrawal (wit.withdraw_addr,
+// public_value < 0) through the DA path under this account. The proof binds the destination (aux) and the public
+// unshield + fee. Same shape of result.
+async function _onDeviceProveStwo(wit, execBase, leaves) {
+  const pos = leaves.findIndex((l) => String(l) === String(wit.cm));
+  if (pos < 0) throw new Error(i18("shield.stwoNotInPool", "that banknote is not in the pool yet: try again in a minute"));
+  const pv = BigInt(wit.public_value);                 // the wallet's sign: negative = coins leaving the pool
+  const spend = (unshield, dest, feeTo) => _stwo.proveSpend({ nsk: wit.nsk, vIn: wit.value_in, rho: wit.rho_in, v1: wit.v1,
+    o1: wit.o1, r1: wit.r1, v2: wit.v2, o2: wit.o2, r2: wit.r2, unshield: unshield.toString(), fee: wit.fee, dest, feeTo,
+    cfg: stwoCfgId() }, leaves, pos);
+  if (pv < 0n && wit.fee_to_relays) {
+    // A WITHDRAWAL A RELAY PUBLISHES (STWO_FEE_TO_HEIGHT; shadow accounts): the relay is paid by the spend's fee
+    // (fee_to = the relay), the payout goes to withdraw_addr, and neither this account nor the payee signs anything.
+    // The fee is the relay's, already in wit.fee (the outputs were balanced against it).
+    const relays = wit.fee_to_relays.filter((rl) => rl && String(rl.fee) === String(wit.fee));
+    if (!relays.length) return { ok: false, error: i18("shield.relayNeeded", "A private payment is published only by a relay node, never from your own account, and no relay was available. Nothing was sent.") };
+    let last = "";
+    for (const rl of relays) {
+      const r = await spend(-pv, wit.withdraw_addr, rl.address);
+      let res;
+      try { res = await _stwoRelayPost(rl.url, r.bundle); } catch (e) { res = { ok: false, status: 0, reason: e.message }; }
+      if (res.ok) return { ok: true, relayed: rl.url, txid: res.txid, commitment: res.commitment, cm_out1: r.cm1, cm_out2: r.cm2 };
+      last = res.reason;
+      if (res.status === 400 || res.status === 409) break;
+    }
+    return { ok: false, error: i18("shield.relayAllFailed", "No relay node could publish this private payment ({m}). Nothing was sent from your account — try again in a minute.", { m: last }) };
+  }
+  if (pv >= 0n) {
+    // A PRIVATE SPEND: a relay node publishes it (see above). Never this account.
+    const relays = (wit.relays || []).filter((rl) => rl && rl.fee === wit.relayFee);
+    if (!relays.length) return { ok: false, error: i18("shield.relayNeeded", "A private payment is published only by a relay node, never from your own account, and no relay was available. Nothing was sent.") };
+    let last = "";
+    for (const rl of relays) {
+      const r = await spend(rl.fee, rl.address);
+      let res;
+      try { res = await _stwoRelayPost(rl.url, r.bundle); } catch (e) { res = { ok: false, status: 0, reason: e.message }; }
+      if (res.ok) return { ok: true, relayed: rl.url, txid: res.txid, commitment: res.commitment, cm_out1: r.cm1, cm_out2: r.cm2 };
+      last = res.reason;
+      // the spend itself was refused (spent, stale, malformed): another relay would refuse it too
+      if (res.status === 400 || res.status === 409) break;
+    }
+    return { ok: false, error: i18("shield.relayAllFailed", "No relay node could publish this private payment ({m}). Nothing was sent from your account — try again in a minute.", { m: last }) };
+  }
+  const r = await spend(-pv, wit.withdraw_addr || "");
+  const res = await _daSubmitFieldTransfer(r.bundle, execBase);
+  return { ok: res.ok, applied: res.applied, da: res.da, commitment: res.commitment, cm_out1: r.cm1, cm_out2: r.cm2 };
 }
 if (typeof window !== "undefined") window.nadoProve2 = _onDeviceProve2;
 
@@ -6307,93 +11629,301 @@ async function proveTransfer2(wit) {   // 2-output proof (send + change) — ALW
 // SHIELDED TRANSFER — a private note→note payment INSIDE the pool (public_value=0, no on-chain amount). Sends
 // any amount and keeps the change (1-in/2-out); the recipient reconstructs their note from a claim code.
 async function doSendShielded() {
-  if (!state.wallet) return; ensureShielded();
+  if (!netAdopted) await refreshNetIdentity();   // never sign with an unconfirmed chain_id
+  if (!state.wallet) return; ensureShielded(); await refreshShieldRules(); if (shieldPaused()) return;
   let recipientOwner;
   try { recipientOwner = parseShieldAddr($("zsendTo").value); }
   catch (e) { log("err", i18("shield.badZaddr", "Enter a valid zaddr… shielded address.")); return; }
   const rawAmount = nadoToRaw($("zsendAmount").value || "0");
   if (rawAmount <= 0n) { log("err", i18("shield.badAmount", "Enter an amount to send.")); return; }
-  const notes = loadNotes();
-  const note = notes.find((n) => !n.spent && BigInt(n.value) >= rawAmount);
-  if (!note) { log("err", i18("shield.noNote", "No single shielded banknote covers {a} NADO — shield more first.", { a: rawToNado(rawAmount) })); return; }
+  // STWO: a relay node publishes the payment (stwoRelays / _onDeviceProveStwo) and is paid its fee once per banknote
+  // spent, out of the banknote — so the notes must cover the amount PLUS one fee each, and the user confirms the fee.
+  const relays = await stwoRelays();
+  if (!relays.length) { log("err", i18("shield.relayNone", "No relay node can publish a private payment right now. Nothing was sent — try again in a minute.")); return; }
+  const relayFee = relays[0].fee;
+  let picks = selectNotesFor(rawAmount);
+  for (let i = 0; picks && i < 8; i++) {
+    const need = rawAmount + relayFee * BigInt(picks.length), again = selectNotesFor(need);
+    if (!again || again.length === picks.length) { picks = again; break; }
+    picks = again;
+  }
+  if (!picks) { log("err", insufficientMsg(rawAmount + relayFee)); return; }
+  const okc = await uiConfirm({
+    title: i18("shield.zsendTitle", "Send privately"),
+    rows: [
+      { k: i18("dlg.amount", "Amount"), v: rawToNado(rawAmount) + " NADO" },
+      { k: i18("dlg.to", "To"), v: String($("zsendTo").value || "").trim().slice(0, 18) + "…" },
+      { k: i18("shield.relayFee", "Relay fee"), v: rawToNado(relayFee * BigInt(picks.length)) + " NADO" },
+      { k: i18("shield.relayBy", "Published by"), v: relayHost(relays[0].url) },
+    ],
+    note: i18("shield.zsendNote", "A relay node publishes this payment under its own account, so it is not linked to yours. Its fee comes out of your private balance."),
+  });
+  if (!okc) { log("info", i18("msg.cancelled", "Cancelled.")); return; }
   const _sb = $("btnZsend"); if (_sb) { _sb.disabled = true; _sb.textContent = i18("shield.provingBtn", "🔐 Proving…"); }
   try {
-    const change = BigInt(note.value) - rawAmount;
-    const r1 = _randField(), r2 = _randField();          // recipient-note rho, change-note rho
-    $("shieldStatus").innerHTML = '<span class="spin">◐</span> ' + i18("shield.proving", "Generating your zero-knowledge proof…");
-    const wit = {
-      cm: note.cm, nsk: shieldNsk().toString(), value_in: note.value, rho_in: note.rho,
-      v1: rawAmount.toString(), o1: recipientOwner.toString(), r1,
-      v2: change.toString(), o2: shieldOwner().toString(), r2,
-      public_value: "0", fee: "0",
-    };
-    const pr = await proveTransfer2(wit);
-    if (pr.error || !pr.ok) { log("err", i18("shield.proveErr", "Proof failed: {m}", { m: pr.error || pr.applied || "" })); $("shieldStatus").textContent = ""; return; }
-    note.spent = true;
-    if (change > 0n) notes.push({ value: change.toString(), rho: r2, cm: pr.cm_out2, spent: false, ts: Date.now() });
-    saveNotes(notes);
-    // the recipient reconstructs their note from (amount, r1) + THEIR key -> a claim code to deliver to them
-    const code = "zbill" + _b36enc(rawAmount) + "." + _b36enc(r1);
-    $("zsendCode").textContent = code;
-    if ($("zsendLink")) $("zsendLink").textContent = claimLink(code);
+    // ONE CLAIM CODE PER NOTE SPENT. The circuit is 1-in/2-out, so an amount spanning several banknotes
+    // becomes several transfers, and the recipient banks one code for each. doReceiveShielded is already
+    // idempotent per commitment, so re-claiming a code they already hold is harmless.
+    const codes = [];
+    let done = 0n;
+    for (let i = 0; i < picks.length; i++) {
+      const notes = loadNotes();                          // re-read: each pass mutates stored notes
+      const note = notes.find((n) => n.cm === picks[i].cm && !n.spent);
+      if (!note) continue;
+      const avail = BigInt(note.value) - relayFee;         // what this banknote can pay once the relay's fee is out
+      if (avail <= 0n) continue;
+      const take = avail < (rawAmount - done) ? avail : (rawAmount - done);
+      const change = avail - take;
+      const r1 = _randField(), r2 = _randField();          // recipient-note rho, change-note rho
+      $("shieldStatus").innerHTML = '<span class="spin">◐</span> ' + (picks.length > 1
+        ? i18("shield.provingN", "Generating proof {i} of {n}… (~15s each — this amount spans several banknotes)",
+              { i: String(i + 1), n: String(picks.length) })
+        : i18("shield.proving", "Generating your zero-knowledge proof…"));
+      const wit = {
+        cm: note.cm, nsk: noteNskWire(note), value_in: note.value, rho_in: note.rho,
+        v1: take.toString(), o1: ownerStr(recipientOwner), r1,
+        v2: change.toString(), o2: ownerStr(shieldOwner()), r2,
+        public_value: "0", fee: "0",
+        relays, relayFee,                                  // published by one of these relays, never this account
+      };
+      const pr = await proveTransfer2(wit);
+      if (pr.error || !pr.ok) {
+        // Everything proved so far is applied and irreversible. Hand over the codes already earned rather
+        // than dropping them on the floor, and say plainly that the transfer is short.
+        if (codes.length) {
+          $("zsendCode").textContent = codes.join(" ");
+          show("zsendCodeBox", true);
+        }
+        log("err", codes.length
+          ? i18("shield.partialSend", "Sent {d} of {a} NADO, then a proof failed: {m}. The claim code(s) " +
+                                      "below are valid — deliver them and retry the remainder.",
+                { d: rawToNado(done), a: rawToNado(rawAmount), m: pr.error || pr.applied || "" })
+          : i18("shield.proveErr", "Proof failed: {m}", { m: pr.error || pr.applied || "" }));
+        $("shieldStatus").textContent = "";
+        return;
+      }
+      note.spent = true;
+      _markSpendPending(note, pr);        // confirmed by its outputs landing, or restored (reconcileSpentNotes)
+      if (change > 0n) notes.push({ value: change.toString(), rho: r2, cm: pr.cm_out2, spent: false, ts: Date.now() });
+      saveNotes(notes);
+      // the recipient reconstructs their note from (amount, r1) + THEIR key -> a claim code to deliver to them
+      codes.push("zbill" + _b36enc(take) + "." + _b36enc(r1));
+      done += take;
+      if (done >= rawAmount) break;
+    }
+    const code = codes[0];
+    $("zsendCode").textContent = codes.join(" ");
+    // A QR and a single link can only carry ONE banknote. With several, showing the first would look like
+    // the whole payment and quietly short-change the recipient, so list every link and drop the QR.
+    if ($("zsendLink")) $("zsendLink").textContent = codes.map(claimLink).join("\n");
     show("zsendCodeBox", true);
-    _drawQR($("zsendCodeQR"), null, claimLink(code), 260);  // scanning opens the wallet and banks the banknote
+    // Deliver over NADO instead of copy-pasting. A zaddr we have sent to before already knows its contact,
+    // so that case needs no typing at all; a first-time zaddr just gets the field focused, never auto-sent
+    // to a guess. The mapping is sender-local (see LS_ZADDR_CONTACTS) and never leaves this device.
+    state._lastZaddrSent = String($("zsendTo").value || "").trim();
+    const _known = zaddrContactGet(state._lastZaddrSent);
+    if ($("zsendDeliverTo")) $("zsendDeliverTo").value = _known || "";
+    if ($("zsendDeliverHint")) $("zsendDeliverHint").textContent = "";
+    if (_known) doDeliverZbill().catch(() => {});
+    if (codes.length === 1) _drawQR($("zsendCodeQR"), null, claimLink(code), 260);  // scanning banks the banknote
+    else if ($("zsendCodeQR")) { const _c = $("zsendCodeQR").getContext("2d"); if (_c) _c.clearRect(0, 0, $("zsendCodeQR").width, $("zsendCodeQR").height); }
     $("shieldStatus").textContent = "";
-    log("ok", i18("shield.sent", "Sent {a} NADO privately ✓ — give the recipient the claim link below.", { a: rawToNado(rawAmount) }));
+    log("ok", codes.length > 1
+      ? i18("shield.sentN", "Sent {a} NADO privately across {n} banknotes ✓ — the recipient needs ALL {n} " +
+                            "claim codes below.", { a: rawToNado(done), n: String(codes.length) })
+      : i18("shield.sent", "Sent {a} NADO privately ✓ — give the recipient the claim link below.",
+            { a: rawToNado(done) }));
     setTimeout(() => renderShield().catch(() => {}), 1500);
   } catch (e) { log("err", i18("shield.err", "Shielded-pool error: {m}", { m: e.message })); $("shieldStatus").textContent = ""; }
   finally { if (_sb) { _sb.disabled = false; _sb.textContent = i18("shield.zsend", "Send shielded"); } }
 }
 
+/* ---- DELIVERING A CLAIM CODE WITHOUT COPY-PASTE ---------------------------------------------------
+ *
+ * "copypasting claims is a bit clunky, could it not be automated?" — it can, over NADO's own encrypted
+ * messaging, which already exists end to end (msgkey binds an ML-KEM pubkey to an account on-chain,
+ * makeEnvelope seals to it, msgPoll trial-decrypts every envelope in the gossiped pool).
+ *
+ * WHY DELIVERY IS ADDRESSED BY ACCOUNT AND NOT BY zaddr. The obvious move is to make `zaddr`
+ * self-addressing so the claim code can be sent to it directly. It is the wrong move: shieldOwner() is
+ * BLAKE2s(nsk) (stwo_js ownerOf) — a ONE-WAY hash, not a KEM public key — so nothing can be sealed to it,
+ * and the two ways to fix that both undo the point of a shielded address. Embedding the transparent
+ * address publishes the link between the two identities to everyone the zaddr is ever given to;
+ * registering shieldOwner -> kem_pub on-chain publishes the same link, permanently, in consensus state.
+ * Embedding the kem_pub itself is merely impractical (ML-KEM-768 is 1184 bytes, ~1830 base36 chars).
+ *
+ * NOR MAY THE CODE GO OUT IN THE CLEAR. It is not bearer — doReceiveShielded rebuilds
+ * commit(value, THEIR shieldOwner, rho), so only the intended recipient can bank it, and the HTML says as
+ * much. But broadcasting (value, rho) tagged by owner would publicly assert "this zaddr received X NADO",
+ * which is exactly what the on-chain commitment hides. Safe from theft is not the same as private.
+ *
+ * So: seal it to the recipient's ACCOUNT, and keep the zaddr -> contact mapping in the SENDER'S OWN
+ * storage, never on-chain and never inside the address. Repeat sends to a known zaddr then deliver with
+ * no typing at all, which is the actual complaint, and nothing about the shielded address changes.
+ */
+const LS_ZADDR_CONTACTS = "nado_zaddr_contacts_v1";   // sender-local only: { "<zaddr>": "<addr-or-@alias>" }
+
+function zaddrContacts() { try { return JSON.parse(localStorage.getItem(LS_ZADDR_CONTACTS) || "{}") || {}; } catch { return {}; } }
+function zaddrContactGet(za) { return zaddrContacts()[String(za || "").trim()] || ""; }
+function zaddrContactSet(za, who) {
+  za = String(za || "").trim(); who = String(who || "").trim();
+  if (!za || !who) return;
+  const m = zaddrContacts(); m[za] = who;
+  try { localStorage.setItem(LS_ZADDR_CONTACTS, JSON.stringify(m)); } catch {}
+}
+
+// Seal a claim code to a recipient's account and drop it in the message pool. Returns a status string.
+async function deliverZbill(code, toRaw, zaddrUsed) {
+  const m = await loadMessaging();
+  if (!m) return i18("shield.deliverNoCrypto", "Messaging bundle unavailable — reload the page.");
+  const id = msgIdentity();
+  if (!id) return i18("shield.deliverNoId", "Unlock your wallet to send encrypted messages.");
+  let addr = String(toRaw || "").trim().toLowerCase();
+  if (!addr) return "";
+  if (!ADDR_RE_LOOSE.test(addr) && !MSIG_RE_I.test(addr)) {
+    const owner = await resolveAlias(addr.replace(/^@/, ""));
+    if (!owner) return i18("msg.noAlias", "No such alias:") + " " + toRaw;
+    addr = owner;
+  }
+  const kemPub = await msgFetchKemPub(addr);
+  if (!kemPub) return i18("msg.noKeyYet", "no messaging key on-chain yet — they need to open NADO once to publish it");
+  const ts = _nowSec();
+  // `body` carries the claim link so a wallet that does NOT understand type "zbill" still shows something
+  // openable, rather than an empty chat bubble. Older wallets fall through to the plain-message branch.
+  let env;
+  try {
+    env = msgSeal(m, id, addr, kemPub,
+      { type: "zbill", from: state.wallet.address, alias: myPrimaryAlias(), code, ts,
+        body: i18("shield.dmBody", "A private NADO banknote — open to claim:") + " " + claimLink(code) }, ts);
+  } catch (e) { return (e && e.message) || i18("msg.sendFail", "send failed"); }
+  const res = await (await fetch(relayBase() + "/message", { method: "POST",
+    headers: { "Content-Type": "application/json" }, body: JSON.stringify(env) })).json();
+  if (!res || !res.result) return (res && res.reason) || i18("msg.sendFail", "send failed");
+  zaddrContactSet(zaddrUsed, toRaw);
+  return "";
+}
+
+async function doDeliverZbill() {
+  // zsendCode may hold SEVERAL codes (an amount spanning several banknotes is several transfers, one code
+  // each). Delivering only the first would hand over part of the payment and look like all of it.
+  const codes = ($("zsendCode") && $("zsendCode").textContent || "").trim().split(/\s+/).filter(Boolean);
+  const to = ($("zsendDeliverTo") && $("zsendDeliverTo").value || "").trim();
+  const hint = $("zsendDeliverHint");
+  if (!codes.length) return;
+  if (!to) { if (hint) hint.textContent = i18("shield.deliverNeedTo", "Enter the recipient's address or @alias."); return; }
+  const btn = $("btnZdeliver");
+  if (btn) btn.disabled = true;
+  if (hint) hint.textContent = i18("shield.delivering", "Sending…");
+  try {
+    let err = "";
+    let sent = 0;
+    for (const c of codes) {
+      err = await deliverZbill(c, to, state._lastZaddrSent);
+      if (err) break;
+      sent++;
+    }
+    if (hint) hint.textContent = err
+      ? (i18("shield.deliverFail", "Not delivered:") + " " + err
+         + (sent ? ` (${sent}/${codes.length} sent)` : ""))
+      : (codes.length > 1
+         ? i18("shield.deliveredN", "Delivered all {n} ✓ — their wallet banks them automatically.",
+               { n: String(codes.length) })
+         : i18("shield.delivered", "Delivered ✓ — their wallet banks it automatically."));
+  } catch (e) {
+    if (hint) hint.textContent = i18("shield.deliverFail", "Not delivered:") + " " + (e && e.message || e);
+  } finally { if (btn) btn.disabled = false; }
+}
+
 async function doReceiveShielded() {
-  if (!state.wallet) return; ensureShielded();
+  if (!state.wallet) return; ensureShielded(); await refreshShieldRules(); if (shieldPaused()) return;
   const code = String($("zrecvCode").value || "").trim();
   if (!code.startsWith("zbill") || code.indexOf(".") < 0) { log("err", i18("shield.badCode", "Paste a zbill… claim code.")); return; }
   try {
     const [vB, rB] = code.slice(5).split(".");
     const value = _b36(vB), rho = _b36(rB);
-    const cm = alghash.commit(value, shieldOwner(), rho);      // reconstruct the note with YOUR key
-    const info = await (await fetch(execBase() + "/exec/field_shielded?cm=" + cm.toString(), { cache: "no-store" })).json();
+    const cm = noteCommit(value, shieldOwner(), rho);           // reconstruct the note with YOUR key
+    // LOOK IT UP LOCALLY, NOT BY ASKING (review 2026-09-24): querying field_shielded by cm told the relay exactly which
+    // note this wallet was claiming, linking the requester to the note. Fetch every leaf (the spend path already does)
+    // and search here, so the relay learns nothing but "this wallet read the pool".
+    const lv = await execJSON("/exec/field_leaves");
+    const _mine = cmStr(cm);
+    const _pos = (lv.leaves || []).findIndex((l) => String(l) === _mine);
+    const info = { pos: _pos < 0 ? null : _pos };
     if (info.pos === null || info.pos === undefined) { log("err", i18("shield.noteNotFound", "That banknote isn't in the pool yet — ask the sender to confirm it settled, then retry.")); return; }
     const notes = loadNotes();
-    if (notes.some((n) => n.cm === cm.toString())) { log("info", i18("shield.already", "You already have that banknote.")); return; }
-    notes.push({ value: value.toString(), rho: rho.toString(), cm: cm.toString(), spent: false, ts: Date.now() });
+    if (notes.some((n) => n.cm === cmStr(cm))) { log("info", i18("shield.already", "You already have that banknote.")); return; }
+    if (shieldDuplicateNote(notes, rho, shieldNskStwo(), _stwo.nullifier)) {
+      log("err", i18("shield.stwoSameNf", "This banknote shares its spending tag with one you already hold, so only one of them could ever be spent. It was not added — ask the sender for a new one."));
+      return;
+    }
+    notes.push({ value: value.toString(), rho: rho.toString(), cm: cmStr(cm), spent: false, ts: Date.now() });
     saveNotes(notes);
     $("zrecvCode").value = "";
     log("ok", i18("shield.received", "Received {a} NADO privately ✓", { a: rawToNado(BigInt(value)) }));
     renderShield().catch(() => {});
-  } catch (e) { log("err", i18("shield.badCode", "Invalid claim code: {m}", { m: e.message })); }
+  } catch (e) { log("err", i18("shield.badCodeReason", "Invalid claim code: {m}", { m: e.message })); }
 }
 
-async function claimUnshields(silent) {
-  if (!state.wallet) return;
+async function claimUnshields(silent, kp) {
+  // kp: the account whose exits to claim (a shadow account's own, shadowClaimAll); default the active account. A claim
+  // is self-claimed (L1 requires data.addr == sender), so it is signed by that account and never names another
+  const w = kp || state.wallet;
+  if (!w) return;
   try {
-    const r = await (await fetch(execBase() + "/exec/unshields?addr=" + encodeURIComponent(state.wallet.address), { cache: "no-store" })).json();
-    const pending = r.unshields || [];
+    const r = await execJSON("/exec/unshields?addr=" + encodeURIComponent(w.address));
+    // only exits L1 has NOT released (nado.py /unshield_claimed): the exec node lists every exit it ever recorded, so
+    // claiming from that list alone re-sent a refused claim for each past exit on every render and then said "still
+    // settling" (loopback walk 2026-10-12). A relay without the endpoint answers nothing and the list is used as before.
+    let pending = r.unshields || [];
+    if (pending.length) {
+      try {
+        const q = pending.slice(0, 500).map((u) => String(u.nonce)).join(",");
+        const c = await (await fetch(relayBase() + "/unshield_claimed?addr=" + encodeURIComponent(w.address)
+                                     + "&nonces=" + encodeURIComponent(q), { cache: "no-store" })).json();
+        if (c && Array.isArray(c.claimed)) { const done = new Set(c.claimed.map(String)); pending = pending.filter((u) => !done.has(String(u.nonce))); }
+      } catch (e) { /* an older relay: claim from the whole list, as before */ }
+    }
     if (!pending.length) { if (!silent) $("shieldStatus").textContent = i18("shield.noClaims", "No pending withdrawals for this address."); return; }
-    let claimed = 0;
+    let claimed = 0, refusal = "";
+    // Prove against the SETTLED root (root=) — L1 verifies unshield exits against it, and the exec
+    // node's live root has usually moved past it (see claimPendingDividends). Older exec nodes ignore
+    // the param; the claim then only lands when the live root happens to be the settled one (old behavior).
+    let settledRoot = null;
+    try { const st = await (await fetch(relayBase() + "/get_settled", { cache: "no-store" })).json(); settledRoot = st && st.state_root; } catch (e) {}
     for (const u of pending) {
-      const pr = await (await fetch(execBase() + "/exec/unshield_proof?nonce=" + encodeURIComponent(u.nonce), { cache: "no-store" })).json();
+      const pr = await execJSON("/exec/unshield_proof?nonce=" + encodeURIComponent(u.nonce) + (settledRoot ? "&root=" + encodeURIComponent(settledRoot) : ""));
       if (pr.error || !pr.proof) continue;
       const latest = await getLatestBlock(); const target = latest.block_number + 8;
       const data = { addr: pr.addr, amount: pr.amount, nonce: pr.nonce, proof: pr.proof };
-      const tx = buildTransferTx(state.wallet, "unshield", 0n, 0n, target, data, nowSeconds());
+      const tx = buildTransferTx(w, "unshield", 0n, 0n, target, data, nowSeconds());
       const res = await submitTransaction(tx);
       if (res.data && res.data.result) claimed++;
+      else refusal = (res.data && res.data.message) || refusal;
     }
     if (claimed) $("shieldStatus").textContent = i18("shield.claimed", "Received {n} withdrawal(s) ✓ — coins are in your balance.", { n: claimed });
+    // A REFUSED CLAIM SAYS SO: "still settling" was shown for a claim the network had refused ("Empty account", gen-29
+    // rehearsal walk) — a statement about the chain that was false, and a wait that would never end
+    else if (refusal && !silent) $("shieldStatus").textContent = i18("shield.claimRefused", "The network refused the withdrawal claim: {m}", { m: refusal });
     else if (!silent) $("shieldStatus").textContent = i18("shield.notSettled", "Still settling on L1 — it'll arrive automatically in a few minutes.");
-    setTimeout(() => { refreshBalance().catch(() => {}); renderShield().catch(() => {}); }, 1800);
+    setTimeout(() => { refreshDashboard().catch(() => {}); renderShield().catch(() => {}); }, 1800);
   } catch (e) { log("err", i18("shield.err", "Shielded-pool error: {m}", { m: e.message })); }
 }
 
-/* Pre-wallet view: no tabs; show onboarding + the Settings card (so the relay can be configured). */
+/* Pre-wallet view: no tabs, ONE decision. Settings (relay URL etc.) stay behind an "Advanced" disclosure
+ * on the onboarding card — a first-time visitor should not meet dApp trust switches before they have a key. */
 function enterOnboarding() {
+  show("booting", false);
   show("tabbar", false);
   document.querySelectorAll("[data-tab]").forEach((el) => show(el.id, false));
-  show("settingsCard", true);
+  show("settingsCard", false);
+  show("logCard", false);
   show("savePrompt", false);
+  // The import fields may have been moved into Settings by openImportExisting(); onboarding's Import key needs them back.
+  { const box = $("importBox"), ob = $("onboard"); if (box && ob && box.parentNode !== ob) ob.appendChild(box); }
   show("onboard", true);
+  const adv = $("onboardAdvanced");
+  if (adv && !adv.dataset.wired) { adv.dataset.wired = "1"; adv.onclick = (e) => { e.preventDefault();
+    const on = $("settingsCard").classList.contains("hidden"); show("settingsCard", on); adv.textContent = (on ? "Hide advanced settings" : "Advanced settings") + " ›"; }; }
 }
 
 /* ----------------------------------------------------------------------------------------------
@@ -6410,32 +11940,113 @@ function wireEvents() {
       const raw = $("importKey").value.trim();
       // accept EITHER a 64-hex seed OR a 24-word recovery phrase
       const priv = looksLikeMnemonic(raw) ? _hex(await mnemonicToSeed(raw)) : raw;
-      adoptWallet(keypairFromPriv(priv), { needsSavePrompt: false });
+      const kp = keypairFromPriv(priv);
+      if (!(await clearToReplaceWith(kp))) return;      // REPLACE GUARD — never overwrite a wallet without its backup
+      adoptWallet(kp, { needsSavePrompt: false });
+      $("importKey").value = "";                        // the pasted secret must not linger in a Settings field
+      show("importBox", false);
     } catch (e) { uiAlert(i18("import.pasteFailed", "Import failed:") + " " + e.message); }
   };
+  if ($("btnImportExisting")) $("btnImportExisting").onclick = () => openImportExisting();
   // ONBOARDING PULSE HANDOFF: the save screen guides the eye through its steps — the Download button
   // pulses first (static pulse-ready class in the HTML); downloading hands the pulse to the ack toggle;
   // acking hands it to Continue (whose own pulse-ready arms via :not(:disabled) the moment it enables).
   $("ackSave").onchange = (e) => {
     $("btnConfirmSave").disabled = !e.target.checked;
-    const track = document.querySelector("#savePrompt .tgl-track");
-    if (track) track.classList.toggle("pulse-ready", !e.target.checked && !$("btnDlKeySave").classList.contains("pulse-ready"));
+    $("ackSave").classList.toggle("pulse-ready",
+      !e.target.checked && !$("btnDlKeySave").classList.contains("pulse-ready"));
   };
   $("btnConfirmSave").onclick = () => {
     state.wallet = pendingWallet; pendingWallet = null;
     persistWallet(state.wallet);
     showWalletUI();
+    walletAdopted();
     log("info", i18("log.walletCreated", "New wallet created & stored: {a}", {a: state.wallet.address}));
     refreshDashboard().catch(() => {});
+    // SETUP STEP: prove the device right away (one tap), so the mining page can say what this phone is
+    // before the first registration instead of failing it later.
+    setTimeout(() => { if (window.verifyDevicePreview) window.verifyDevicePreview().catch(() => {}); }, 600);
   };
 
+  // DEVICE ATTESTATION preview (doc/device-attestation.md): ask the platform authenticator for a
+  // hardware-attested credential over a fresh challenge and let the relay parse it. Runs from Settings, from
+  // the wallet-setup step, and its result is shown on the mining page (renderDeviceStatus).
+  const _devBtn = $("btnDeviceVerify");
+  window.verifyDevicePreview = async () => {
+    const st = $("deviceStatus");
+    const say = (t, cls) => { if (st) { st.textContent = t; st.className = "small mt " + (cls || ""); } };
+    if (!window.PublicKeyCredential || !navigator.credentials || !navigator.credentials.create) {
+      const stU = { ok: false, reason: "unsupported" };
+      say(i18("device.unsupported", "This browser cannot attest a device (no WebAuthn platform authenticator).") + "\n" + deviceHint(stU), "err");
+      setDeviceStatus(stU); return;
+    }
+    if (_devBtn) _devBtn.disabled = true;
+    try {
+      const chal = new Uint8Array(32); crypto.getRandomValues(chal);
+      const uid = new Uint8Array(16); crypto.getRandomValues(uid);
+      const cred = await createAttestedCredential({
+        challenge: chal, rp: { name: "NADO", id: location.hostname },
+        user: { id: uid, name: (state.wallet && state.wallet.address) || "nado", displayName: "NADO identity" },
+        pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -257 }],
+        attestation: "direct", timeout: 60000 });
+      const b64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
+      const body = { att: b64(cred.response.attestationObject), cdj: b64(cred.response.clientDataJSON), cid: b64(cred.rawId) };
+      const r = await fetch(relayBase() + "/device_attest_probe", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      const d = await r.json();
+      if (!d.ok) { say(i18("device.probeFailed", "The relay could not parse the attestation: {e}", { e: d.error || r.status }), "err"); return; }
+      const s = d.summary || {}; const ad = s.auth_data || {};
+      const good = s.format_accepted && s.root_pinned !== false;   // None = root not in x5c (tpm/trezor/ledger): the kernel decides
+      const stObj = { ok: good, fmt: s.fmt, aaguid: ad.aaguid || "", format_accepted: !!s.format_accepted, root_pinned: !!s.root_pinned, reason: good ? "ok" : (s.root_pinned ? "format" : "root") };
+      const hint = deviceHint(stObj);
+      say((good ? i18("device.ok", "Real device attested") : i18("device.weak", "Attestation present but not a pinned vendor root"))
+          + ` · fmt=${s.fmt} · chain=${s.x5c_count} · aaguid=${(ad.aaguid || "").slice(0, 8)} · root ${s.root_pinned ? "pinned" : "unknown"}` + (hint ? "\n" + hint : ""), good ? "ok" : "warn");
+      log(good ? "ok" : "warn", `Device attestation: fmt=${s.fmt}, ${s.x5c_count} certs, root ${s.root_pinned ? "pinned vendor root" : "not pinned"}` + (hint ? " — " + hint : ""));
+      setDeviceStatus(stObj);
+    } catch (e) {
+      say(i18("device.failed", "Attestation failed: {e}", { e: (e && e.message) || String(e) }), "err");
+      setDeviceStatus({ ok: false, reason: (e && e.message) || String(e) });
+    } finally { if (_devBtn) _devBtn.disabled = false; }
+  };
+  if (_devBtn) _devBtn.onclick = window.verifyDevicePreview;
+
   $("btnMine").onclick = () => {
-    if (state.starting) return;            // a start/registration is in flight → ignore extra clicks
+    if (state.starting && $("btnMine").disabled) return;   // in flight (disabled spinner) → ignore; an ENABLED button always acts
     if (state.mining) { stopMining(); return; }  // active mining → Stop (never re-triggers registration)
+    // ONE BUTTON (operator, 2026-09-08: "start mining and register this device should be handled automatically as
+    // needed in ONE BUTTON"): the press arms the one device prompt; the loop spends it only if a lease is needed.
+    state.tapArmed = true;
     startMining();
   };
   $("btnCancelPow").onclick = () => { stopMining(); };  // escape hatch while the main button is disabled
+  // HARDWARE WALLETS: the connect must run inside the click (WebHID/WebUSB need a user gesture); the attestation
+  // itself happens later in attestDevice() over the kept handle. Choosing one arms the tap like Start does.
+  const hwPick = async (kind) => {
+    try {
+      const hw = await import("./hwattest.js");   // never a literal version: the server stamps it (ops/static_versions.py)
+      state.hwDevice = await hw.connect(kind);
+      state.attestVia = kind;
+      try { localStorage.setItem("nado_attest_via", kind); } catch (e) {}
+      log("ok", i18("hw.connected", "{n} connected — it will vouch for this identity at registration.", { n: state.hwDevice.name }));
+      state.tapArmed = true;                     // the hardware button IS the register click (no gesture needed later)
+      if (!state.mining) startMining();
+    } catch (e) { log("err", i18("hw.failed", "{n}: {e}", { n: kind, e: (e && e.message) || String(e) })); }
+  };
+  // REGISTER: the one click that opens the device prompt (Windows Hello / Android). Start alone never does.
+  if ($("btnHwLedger")) $("btnHwLedger").onclick = () => hwPick("ledger");
+  if ($("btnHwTrezor")) $("btnHwTrezor").onclick = () => hwPick("trezor");
+  if ($("btnHwRemote")) $("btnHwRemote").onclick = () => {
+    state.hwDevice = null; state.attestVia = "remote"; state.tapArmed = false;
+    try { localStorage.setItem("nado_attest_via", "remote"); } catch (e) {}
+    log("info", i18("remote.on", "This wallet will be vouched for by another device. On that device open Collecting → \"Attest another wallet or node\" and paste: {a}", { a: state.wallet ? state.wallet.address : "" }));
+    if (!state.mining) startMining();
+  };
+  try { if (localStorage.getItem("nado_attest_via") === "remote") state.attestVia = "remote"; } catch (e) {}
+  if ($("btnHwNone")) $("btnHwNone").onclick = () => { state.hwDevice = null; state.attestVia = "platform"; state.tapArmed = false; try { localStorage.removeItem("nado_attest_via"); } catch (e) {} log("info", i18("hw.useThis", "This device's own hardware will attest again.")); };
   if ($("btnAliasReg")) $("btnAliasReg").onclick = () => doAliasOp("register");
+  if ($("inviteDays")) $("inviteDays").oninput = () => renderInviteExpiry();
+  if ($("btnInviteCreate")) $("btnInviteCreate").onclick = () => createInvite().catch((e) => setMsg("inviteMsg", e.message, "err"));
+  // Share only where the platform has a share sheet; Copy (data-copy) is always beside it.
+  if ($("btnInviteShare")) { $("btnInviteShare").classList.toggle("hidden", !navigator.share); $("btnInviteShare").onclick = () => shareInviteLink(); }
   if ($("btnAliasUnreg")) $("btnAliasUnreg").onclick = () => doAliasOp("unregister");
   if ($("btnAliasXfer")) $("btnAliasXfer").onclick = () => doAliasOp("transfer");
   if ($("exGo")) $("exGo").onclick = () => exSearch();
@@ -6450,6 +12061,7 @@ function wireEvents() {
     window._statsTickBusy = true;
     Promise.resolve(renderStats()).catch(() => {}).finally(() => { window._statsTickBusy = false; });
   }, 15000);   // blocks land every ~6s; 15s keeps the panel current without hammering the relay
+  if (!window._shieldTimer) window._shieldTimer = setInterval(() => { shieldTick(); }, 15000);   // no-op unless Shield is open + visible
   document.addEventListener("click", (e) => {           // delegated explorer links (module-safe)
     const a = e.target.closest && e.target.closest("a.ex-link[data-exk]");
     if (a) {
@@ -6483,13 +12095,12 @@ function wireEvents() {
   });
 
   // --- full-wallet wiring ---
-  $("btnDlKey").onclick = downloadKeyFile;
+  $("btnDlKey").onclick = () => { markBackupSeen(); downloadKeyFile().catch(() => {}); };
   $("btnDlKeySave").onclick = () => {
-    downloadKeyFile();
+    downloadKeyFile().catch(() => {});
     // key saved -> hand the onboarding pulse from Download to the "I have saved it" toggle
     $("btnDlKeySave").classList.remove("pulse-ready");
-    const track = document.querySelector("#savePrompt .tgl-track");
-    if (track && !$("ackSave").checked) track.classList.add("pulse-ready");
+    if (!$("ackSave").checked) $("ackSave").classList.add("pulse-ready");
   };
   if ($("btnSwapLock")) $("btnSwapLock").onclick = () => swapLock();
   if ($("btnSwapClaim")) $("btnSwapClaim").onclick = () => swapClaim();
@@ -6501,8 +12112,15 @@ function wireEvents() {
   if ($("btnZaddrShare")) $("btnZaddrShare").onclick = () => shareZpayLink();
   if ($("zrecvAmount")) $("zrecvAmount").oninput = () => renderZaddrQR();   // live-update the shielded QR + payment link
   if ($("btnZcodeShare")) $("btnZcodeShare").onclick = () => shareZcodeLink();
-  $("btnDlKeySettings").onclick = downloadKeyFile;
+  if ($("btnZdeliver")) $("btnZdeliver").onclick = () => doDeliverZbill().catch(() => {});
+  if ($("zsendDeliverTo")) $("zsendDeliverTo").onkeydown = (e) => {
+    if (e.key === "Enter") { e.preventDefault(); doDeliverZbill().catch(() => {}); }
+  };
+  $("btnDlKeySettings").onclick = () => downloadKeyFile().catch(() => {});
   if ($("btnCollectDiv")) $("btnCollectDiv").onclick = () => collectDividend();
+  if ($("btnRenewLease")) $("btnRenewLease").onclick = () => renewLeaseManually();
+  wireAuthButtons();
+  if ($("btnExecCashOut")) $("btnExecCashOut").onclick = () => cashOutExec();
   if ($("btnMsigDerive")) $("btnMsigDerive").onclick = () => msigDerive();
   if ($("btnMsigPropose")) $("btnMsigPropose").onclick = () => msigPropose();
   if ($("btnMsigSign")) $("btnMsigSign").onclick = () => msigSign();
@@ -6583,13 +12201,22 @@ function wireEvents() {
   $("btnSharePay").onclick = () => sharePayLink();
   if ($("btnShareMiner")) $("btnShareMiner").onclick = () => shareMiner();
 
-  $("btnSaveRelay").onclick = () => {
-    const v = $("relayUrl").value.trim();
-    state.relay = v || null;
-    if (v) localStorage.setItem(LS_RELAY, v); else localStorage.removeItem(LS_RELAY);
-    log("info", i18("log.relaySet", "Relay set to {u}", {u: relayBase()}));
-    pollOnce().catch(() => {});
-  };
+  $("btnSaveRelay").onclick = () => applyRelay($("relayUrl").value.trim());
+  if ($("relaySel")) $("relaySel").onchange = () => { applyRelay($("relaySel").value); if ($("relayUrl")) $("relayUrl").value = $("relaySel").value; };
+  if ($("relayAuto")) {
+    $("relayAuto").checked = relayAutoAllowed();
+    $("relayAuto").onchange = () => {
+      try { localStorage.setItem(LS_RELAY_AUTO, $("relayAuto").checked ? "1" : "0"); } catch (e) {}
+      if (!$("relayAuto").checked && relayPool.auto) adoptRelay(null, null);   // back home now; no more silent moves
+      log("info", $("relayAuto").checked ? i18("log.relayAutoOn", "Automatic relay failover is on (a failover relay must match your home relay's finalized chain).")
+                                         : i18("log.relayAutoOff", "Automatic relay failover is off — this wallet talks only to its home relay."));
+    };
+  }
+  renderRelaySelect();
+  // measure the relays when the user is about to choose (focus / tap on the dropdown), at most once a minute
+  if ($("relaySel")) $("relaySel").addEventListener("focus", () => {
+    if (!relayPool.probedAt || Date.now() - relayPool.probedAt > 60000) { relayPool.probedAt = Date.now(); probeRelayList().catch(() => {}); }
+  });
 
   $("btnSelfTest").onclick = () => { try { runSelfTest(); show("selftestCard", true); } catch (e) { log("err", "Self-test error: " + e.message); } };
 
@@ -6626,7 +12253,9 @@ function wireEvents() {
     state.relay = v || null;
     if (v) localStorage.setItem(LS_RELAY, v); else localStorage.removeItem(LS_RELAY);
     if ($("relayUrl")) $("relayUrl").value = v;              // keep the Settings-tab field in sync
+    relayPool.auto = null; relayPool.fails = 0; renderRelayTag();
     log("info", i18("log.relaySet", "Relay set to {u}", { u: relayBase() }));
+    netAdopted = false; refreshNetIdentity().catch(() => {});
     refreshUnlockLease();                                    // retry the "still mining" banner with the new relay
   });
   _btn("btnUnlockRemove", async () => {
@@ -6669,6 +12298,9 @@ function wireEvents() {
  * Boot
  * -------------------------------------------------------------------------------------------- */
 async function boot() {
+  // THEME FIRST, before any paint: applying it later means a flash of the default accent on every load.
+  try { applyTheme(localStorage.getItem(LS_THEME) || "teal"); } catch (e) {}
+  renderThemePicker();
   bgExecTriageEarly();   // hidden-iframe sign request we can't autosign silently → bounce to the redirect NOW, before the crypto load
   // relay
   state.relay = localStorage.getItem(LS_RELAY) || null;
@@ -6681,17 +12313,20 @@ async function boot() {
 
   // auto-bond preference (persisted %); reflect it into the Stake-tab control + the status note
   try {
-    // No saved preference at all -> the 80% default (auto-bond on out of the box). A stored value
+    // No saved preference at all -> the protocol default (AUTO_BOND_DEFAULT_PCT; auto-bond on out of the box). A stored value
     // (including "0" for explicit off) is honoured verbatim.
     const raw = localStorage.getItem(LS_AUTOBOND);
     const saved = raw === null ? AUTO_BOND_DEFAULT_PCT : (parseInt(raw, 10) || 0);
     const p = setAutoBondPct(saved);
     if ($("autoBondPct")) $("autoBondPct").value = String(p);
+    // the placeholders in interface.html are only first paint; the default they show is the protocol's
+    for (const id of ["autoBondPct", "autoBondPctMine"]) if ($(id)) $(id).placeholder = String(AUTO_BOND_DEFAULT_PCT);
   } catch (e) {}
 
   try {
     await loadDeps();
   } catch (e) {
+    show("booting", false);
     show("bootError", true);
     $("bootErrorMsg").textContent = "Could not load crypto (local vendor bundle + CDN both failed): " + (e && e.message || e);
     return;
@@ -6704,7 +12339,7 @@ async function boot() {
   // run the self-test automatically on boot (also logs to console)
   let ok = false;
   try { ok = runSelfTest(); } catch (e) { log("err", "Self-test crashed: " + e.message); }
-  log(ok ? "ok" : "err", `Self-test: ${ok ? "all vectors match Python ✓" : "MISMATCH — see Self-test card"}`);
+  if (!ok) log("err", "Self-test: MISMATCH — see Self-test card");   // a passing self-test is not an event worth a log line
 
   // load existing wallet or onboard
   const w = loadWallet();
@@ -6721,10 +12356,26 @@ async function boot() {
     // one-per-(address,epoch) and won't re-register an already-registered (lease-valid) identity. NEVER in the
     // hidden signer service — that would spin up a duplicate miner in an invisible iframe.
     if (!BGSVC && localStorage.getItem(LS_MINING) === "1") {
-      log("info", i18("log.resuming", "Resuming mining after refresh (no re-click needed)…"));
+      log("info", i18("log.resuming", "Resuming collecting after refresh (no re-click needed)…"));
       startMining();
       resumedMining = true;
     }
+  } else if (!BGSVC) {
+    // NO PRIVATE-KEY CEREMONY FOR A NEWCOMER (operator 2026-09-13): "just generate a wallet by default and
+    // show them the landing page with the 'start mining' button". A first visit used to land on a
+    // Generate/Import choice, then a save screen — phrase, raw key, download, an acknowledgement toggle,
+    // Continue — before anything worked. Now the wallet exists the moment the page does, and the first
+    // thing a person sees is Start mining. Everything the old screen offered is still one disclosure
+    // away (Wallet -> Reveal / export), Import is still reachable from Settings and the lock screen, and
+    // the key never leaves this browser — nothing about custody changed, only the order of the doors.
+    // The hidden signer service creates nothing: an iframe must never mint an identity of its own.
+    const fresh = newKeypair();
+    state.wallet = fresh;
+    persistWallet(fresh);
+    try { localStorage.setItem(LS_AUTO_WALLET, "1"); } catch (e) {}
+    showWalletUI();
+    log("info", i18("log.walletAuto", "A new wallet was created for you on this device: {a}", { a: fresh.address }));
+    refreshDashboard().catch(() => {});
   } else {
     enterOnboarding();
   }
@@ -6739,6 +12390,9 @@ async function boot() {
   // and resume after onboarding. Never auto-submits — the user still reviews + confirms.
   try { consumePayRequest(); } catch (e) { log("err", "Pay-link error: " + e.message); }
   try { consumeClaimRequest(); } catch (e) { log("err", "Claim-link error: " + e.message); }
+  try { consumeInviteRequest() || renderInviteBanner(); } catch (e) { log("err", "Invite-link error: " + e.message); }
+  // An invite link opened in a tab that already shows the wallet changes only the #fragment — no reload, no boot.
+  window.addEventListener("hashchange", () => { try { consumeInviteRequest(); } catch (e) {} });
 
   // initial connectivity + dashboard (startMining already kicks a poll when we auto-resumed)
   if (!resumedMining) pollOnce().catch(() => setConn(false));
@@ -6759,14 +12413,16 @@ function installBgSignListener() {
     if (!d || d.nadoExecSignReq !== 1) return;
     const trusted = originAllowed(e.origin) || localStorage.getItem("nado_skip_origin_check") === "1";
     if (!trusted) { try { e.source && e.source.postMessage({ nadoExecSign: 1, needui: 1, reason: "untrusted" }, e.origin); } catch (err) {} return; }
-    pendingExecSign = { payload: d.payload, ret: d.ret || (e.origin + "/"), app: d.app || "a game", bg: true };
+    // The answer goes back to the SENDER, whatever `ret` it names: taking d.ret let an untrusted sender (with "trust
+    // any site" on) name a trusted game and inherit its autosign (audit 2026-09-25).
+    pendingExecSign = { payload: d.payload, ret: e.origin + "/", app: d.app || "a game", bg: true, caller: e.origin };
     resumePendingExecSign();
   });
 }
 
 /* Network tag (header, upper right): which chain this wallet signs for. The relay's /status is the source of
  * truth — the wallet ADOPTS its chain_id at boot, so chain upgrades resolve automatically (no more
- * "alphanet-N ≠ alphanet-M" limbo after a reroll). The fallback literal only covers the pre-fetch window;
+ * "betanet-N ≠ betanet-M" limbo after a reroll). The fallback literal only covers the pre-fetch window;
  * a failed fetch keeps the fallback and the next signed tx surfaces any real problem via the node's own
  * "Wrong or missing chain id" rejection. */
 // Re-adopt the relay's AUTHORITATIVE network identity (chain_id + finality window) from /status.
@@ -6781,8 +12437,12 @@ function installBgSignListener() {
 async function refreshNetIdentity() {
   try {
     const st = (await rpcJSON("/status")).data;
-    if (st && st.chain_id && st.chain_id !== CHAIN_ID) {
-      CHAIN_ID = st.chain_id;                       // adopt the relay's chain — self-resolving upgrades
+    noteRelayExecPort(relayBase(), st);             // where this relay's exec node answers (execBase)
+    if (st && typeof st.chain_id === "string" && st.chain_id) {
+      if (!relayOnPageChain(st.chain_id)) return CHAIN_ID;   // a rerolled chain: this page's rules are not its rules
+      CHAIN_ID = st.chain_id;                       // == PAGE_CHAIN (relayOnPageChain)
+      netAdopted = true;
+      try { localStorage.setItem(LS_CHAIN_ID, CHAIN_ID); } catch (e) {}   // next boot shows THIS, not a literal
       const el = $("netTag"); if (el) el.textContent = CHAIN_ID;
     }
     // ADOPT THE CONSENSUS CONSTANTS TOO. These are hardcoded above with a "MUST match protocol.py"
@@ -6790,6 +12450,9 @@ async function refreshNetIdentity() {
     // reveal window 33 blocks late so a browser-signed reveal was rejected). Taking them from the relay
     // makes the pair self-healing instead of relying on someone remembering to edit two files.
     if (st && Number.isInteger(st.finality_depth) && st.finality_depth > 0) FINALITY_DEPTH = st.finality_depth;
+    if (st && Number.isInteger(st.posw_lease_epochs) && st.posw_lease_epochs > 0) POSW_LEASE_EPOCHS = st.posw_lease_epochs;
+    if (st && st.lease_epochs_by_class && typeof st.lease_epochs_by_class === "object") LEASE_BY_CLASS = st.lease_epochs_by_class;
+    if (st && Number.isInteger(st.fidelity_min_gap_epochs) && st.fidelity_min_gap_epochs > 0) FIDELITY_MIN_GAP_EPOCHS = st.fidelity_min_gap_epochs;
   } catch (e) {}
   return CHAIN_ID;
 }
@@ -6797,10 +12460,47 @@ async function refreshNetIdentity() {
 async function initNetTag() {
   const el = $("netTag");
   if (el) {
-    el.textContent = CHAIN_ID;
+    // Show what this browser has actually seen (the last adopted chain), or nothing at all — never the
+    // compile-time literal, which is exactly the thing that goes stale across rerolls.
+    el.textContent = CHAIN_ID_SAVED ? CHAIN_ID : "…";
     el.title = i18("net.tagTip", "The network this wallet signs for.");
   }
+  renderRelayTag();
+  // Lease truth, in plain words, next to the countdown (Discord 2026-08-31: people saved seed phrases expecting
+  // hundreds of addresses to "mine forever"): the wallet renews ONLY while this tab is open.
+  // One short visible line; the full wording moves into the ⓘ tooltip of the lease label (2026-09-08 UX pass).
+  if ($("leaseWarn")) {
+    $("leaseWarn").textContent = i18("lease.short", "Renews only while this wallet is open and unlocked.");
+    const full = i18("lease.warn",
+      "Collecting stays eligible until the lease expires. Reopen and unlock this wallet before then — it renews only while it is open and unlocked (a phone may suspend a background tab); a saved seed phrase does not renew itself.");
+    const h = document.querySelector('#leaseWrap .hint'); if (h) h.title = (h.title || "") + "\n\n" + full;
+  }
   await refreshNetIdentity();
+  if (!netAdopted) netIdentityRetryLoop();      // detached: boot must not wait on a relay that is down
+  else refreshRelayPool(true).catch(() => {});
+}
+
+// A fresh browser whose first /status lost a race with a busy relay used to keep the fallback for the whole
+// session (only a reload fixed it). Retry with backoff until a relay has actually answered; pollOnce keeps
+// nudging too, so this is belt and braces for the pre-mining boot window. One loop at a time.
+let _netRetryRunning = false;
+async function netIdentityRetryLoop() {
+  if (_netRetryRunning) return;
+  _netRetryRunning = true;
+  try {
+    let delay = 3000;
+    while (!netAdopted) {
+      await new Promise((r) => setTimeout(r, delay));
+      await refreshNetIdentity();
+      delay = Math.min(60000, delay * 2);
+    }
+    refreshRelayPool(true).catch(() => {});
+  } finally { _netRetryRunning = false; }
 }
 
 boot();
+
+
+// Upgrade every <select> once the page exists, and again whenever a render fills one in: the picker is
+// idempotent (it marks what it has done), so this is cheap and keeps dynamically built lists searchable.
+if (typeof document !== "undefined") autoEnhanceSelects();

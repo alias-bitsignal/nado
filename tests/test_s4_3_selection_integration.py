@@ -1,5 +1,6 @@
 import os, sys, tempfile, traceback
 os.environ["HOME"] = tempfile.mkdtemp(prefix="nado_s43_")
+import atexit, shutil; atexit.register(shutil.rmtree, os.environ["HOME"], ignore_errors=True)   # leave no /tmp home behind (9,600 leaked by 2026-09-22)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 for d in ("index", "blocks", "logs", "peers"):
     os.makedirs(os.path.expanduser(f"~/nado/{d}"), exist_ok=True)
@@ -13,12 +14,9 @@ from ops.account_ops import create_account, get_bonded_registry
 from ops.mining_ops import select_producer, compute_beacon, total_shares
 from ops.block_ops import epoch_beacon, get_block_hash_by_number, index_block_number, save_block
 
-fails = 0
-def check(name, fn):
-    """Run fn; print PASS/FAIL and count failures."""
-    global fails
-    try: fn(); print(f"PASS  {name}")
-    except Exception as e: fails += 1; print(f"FAIL  {name}: {e}"); traceback.print_exc()
+import _harness
+_report = _harness.Report()
+check = _report.run
 
 def t1():
     """Prove get_bonded_registry includes only accounts bonded >= B_MIN and total_shares sums their shares."""
@@ -65,5 +63,5 @@ def t3():
     assert winners and winners <= set(reg), winners        # never an ineligible address
 check("select_producer over the registry+beacon is deterministic + only eligible addresses win", t3)
 
-print(f"\n{'ALL S4.3 CHECKS PASSED' if fails==0 else str(fails)+' S4.3 CHECK(S) FAILED'}")
-sys.exit(1 if fails else 0)
+print(f"\n{'ALL S4.3 CHECKS PASSED' if _report.fails==0 else str(_report.fails)+' S4.3 CHECK(S) FAILED'}")
+sys.exit(1 if _report.fails else 0)

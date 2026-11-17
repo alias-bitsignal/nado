@@ -1,10 +1,12 @@
+> **Note (2026-08-25):** the per-identity `BOND_CAP` / `MAX_SHARES` cap referenced below was removed — bonded weight is linear in stake (`bonded // B_MIN`). References to the cap are historical.
+
 # Consensus hardening plan (#15–#18) — locked design + ordered implementation
 
 **Status:** design locked 2026-06-30 (vetted by a 3-architect + synthesis design pass).
 **Implementation progress (steps 1–8 now all landed except the post-launch eclipse ops; testnet-stage alpha):**
 - The **SQLite → LMDB migration (#21)** is **DONE** (`ops/kv_ops.py`); the `get_finalized_height` /
   meta accessors are KV calls.
-- **Step 1 — finality floor (#17): DONE.** `FINALITY_DEPTH=30`, persisted monotonic
+- **Step 1 — finality floor (#17): DONE.** `FINALITY_DEPTH=45`, persisted monotonic
   `finalized_height`, `rollback_one_block` raises `FinalityViolation`.
 - **Step 2 — grind-proof `cumulative_weight` header: DONE** (carried + verified as-of-parent).
 - **Step 3 — objective heaviest-`cumulative_weight` fork-choice: DONE** (peer-IP plurality removed

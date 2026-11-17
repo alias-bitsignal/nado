@@ -7,6 +7,7 @@ verify_block, and rejecting a cross-block second heartbeat (per address,epoch) /
 """
 import os, sys, tempfile, traceback
 os.environ["HOME"] = tempfile.mkdtemp(prefix="nado_uniq_")
+import atexit, shutil; atexit.register(shutil.rmtree, os.environ["HOME"], ignore_errors=True)   # leave no /tmp home behind (9,600 leaked by 2026-09-22)
 os.environ["NADO_TESTNET"] = "1"
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 for d in ("index", "blocks", "logs", "peers"):
@@ -25,14 +26,9 @@ from ops.transaction_ops import (reserved_uniqueness_key, dedupe_reserved, asser
 from signatures import generate_keydict, sign, unhex
 from protocol import CHAIN_ID, EPOCH_LENGTH, B_MIN
 
-fails = 0
-def check(name, fn):
-    """Run fn; print PASS/FAIL and count failures."""
-    global fails
-    try:
-        fn(); print(f"PASS  {name}")
-    except Exception as e:
-        fails += 1; print(f"FAIL  {name}: {e}"); traceback.print_exc()
+import _harness
+_report = _harness.Report()
+check = _report.run
 
 def tx(r, sender="s", **kw):
     """Build a minimal tx dict with recipient r, sender, and extra fields kw."""
@@ -103,5 +99,5 @@ def t4_attest_cross_block():
 check("cross-block: a 2nd attestation for an already-attested epoch is rejected", t4_attest_cross_block)
 
 
-print(f"\n{'ALL IN-BLOCK UNIQUENESS CHECKS PASSED' if not fails else str(fails) + ' FAILURE(S)'}")
-sys.exit(1 if fails else 0)
+print(f"\n{'ALL IN-BLOCK UNIQUENESS CHECKS PASSED' if not _report.fails else str(_report.fails) + ' FAILURE(S)'}")
+sys.exit(1 if _report.fails else 0)

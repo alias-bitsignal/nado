@@ -10,6 +10,7 @@ FFG-lite objective finality unit checks (#6).
 """
 import os, sys, tempfile, traceback
 os.environ["HOME"] = tempfile.mkdtemp(prefix="nado_ffg_")
+import atexit, shutil; atexit.register(shutil.rmtree, os.environ["HOME"], ignore_errors=True)   # leave no /tmp home behind (9,600 leaked by 2026-09-22)
 os.environ["NADO_TESTNET"] = "1"
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 for d in ("index", "blocks", "logs", "peers"):
@@ -29,14 +30,9 @@ from ops.account_ops import get_bonded_registry
 from signatures import generate_keydict, sign, unhex
 from protocol import B_MIN, EPOCH_LENGTH, CHAIN_ID
 
-fails = 0
-def check(name, fn):
-    """Run fn; print PASS/FAIL and count failures."""
-    global fails
-    try:
-        fn(); print(f"PASS  {name}")
-    except Exception as e:
-        fails += 1; print(f"FAIL  {name}: {e}"); traceback.print_exc()
+import _harness
+_report = _harness.Report()
+check = _report.run
 
 # 4 bonded validators, 1 share each (total 4). 2/3 supermajority (strict) => need >= 3 attesters.
 VALS = [generate_keydict() for _ in range(4)]
@@ -92,6 +88,13 @@ def t2_finalize():
     """Prove two consecutive justified epochs (each by its own committee) finalize the earlier one."""
     from ops.block_ops import duty_committee_for_epoch
     reg = get_bonded_registry()
+    # THIS STATE APPLIES NO BLOCKS, so no epoch anchor ever froze a registry snapshot (core_loop writes regsnap:<E+1> at
+    # each anchor but genesis). Epoch 2's committee reads the snapshot (REGISTRY_SNAPSHOT_HEIGHT, 1 from gen 29, inlined
+    # in G9): put the row the anchor block (EPOCH_LENGTH) would have written, as a chain from block 1
+    # does — never fall back to the live registry, which the node itself refuses to do (gen-29 rehearsal).
+    if kv_ops.regsnap_get(2) is None:
+        with kv_ops.write_txn():
+            kv_ops.regsnap_put(2, get_bonded_registry())
     for E, H in ((1, H_E), (2, H_CHILD)):
         for v in duty_committee_for_epoch(E):          # every committee seat attests -> justified
             kv_ops.attestation_put(E, v, H)
@@ -126,5 +129,5 @@ def t3_attest_tx():
 check("attest tx: bonded-only, one-per-epoch (no double-vote), revert-symmetric", t3_attest_tx)
 
 
-print(f"\n{'ALL FFG CHECKS PASSED' if not fails else str(fails) + ' FAILURE(S)'}")
-sys.exit(1 if fails else 0)
+print(f"\n{'ALL FFG CHECKS PASSED' if not _report.fails else str(_report.fails) + ' FAILURE(S)'}")
+sys.exit(1 if _report.fails else 0)

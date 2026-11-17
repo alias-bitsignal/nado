@@ -1,5 +1,7 @@
+import threading
+
 from ops import kv_ops
-from protocol import B_MIN, EPOCH_LENGTH, FIDELITY_GAIN, SLASH_BOND_PENALTY, BOND_UNLOCK_DELAY, BRIDGE_ESCROW, FAUCET_ESCROW, DIVIDEND_POOL, POSW_LEASE_EPOCHS, HTLC_ESCROW, SHIELD_ESCROW
+from protocol import B_MIN, EPOCH_LENGTH, fidelity_step, lease_epochs_for, LEASE_EPOCHS_MAX, SLASH_BOND_PENALTY, BOND_UNLOCK_DELAY, BRIDGE_ESCROW, FAUCET_ESCROW, DIVIDEND_POOL, HTLC_ESCROW, SHIELD_ESCROW
 
 # Account state lives in the schemaless `accounts` sub-DB as a msgpack document keyed by address
 # (see ops/kv_ops.py). Missing fields default to 0 on read, so adding a field (as we did with
@@ -82,7 +84,59 @@ def reflect_transaction(transaction, logger, block_height=None, revert=False):
     # registered flag; `heartbeat` (one per epoch) records presence + bumps fidelity. Neither moves
     # balance or charges a fee (a 0-balance address could not pay one) — validation enforces fee==0.
     if recipient == "register":
-        apply_register(address=sender, epoch=(block_height // EPOCH_LENGTH), logger=logger, revert=revert)
+        # ONE DEVICE, ONE IDENTITY: the register's device certificate is bound to the sender. Derived HERE from the tx
+        # bytes (validation already accepted them), so apply and revert see the same key. The device gates of gen 25
+        # (DEVICE_BIND_HEIGHT, _STRICT_, _PERMANENT_, DEVICE_REBIND_INSTANT_HEIGHT) were all 1 from gen 26 and are
+        # deleted: apply runs only for a block's own transactions and genesis carries none, so block_height >= 1 here
+        # and every one of them held — and so did gen 27's DEVICE_BIND_CANONICAL_HEIGHT (1 from gen 28, deleted after the
+        # betanet-9 reroll). (block_height None raises at apply_register's epoch below, as it always did.)
+        from protocol import DEVICE_BIND_MAX_CERT_SECS, permanent_classes_at
+        device_key, permanent, legacy_key = None, False, None
+        # BINDING MODES (doc/device-attestation.md §"Binding modes"): a register with NO statement is a hardware
+        # identity's statement-free presence renewal (validation admitted it only because devbind[devkey] points back at
+        # the sender) — it writes nothing to devbind. A statement from a permanent class binds for life. Same parse as
+        # validation (strict), at the block's own height.
+        has_device = isinstance(transaction.get("device"), dict)
+        # a SIGNATURE RENEWAL (transaction_ops.is_assert_device) carries no certificate: it binds nothing and stamps
+        # nothing, like a statement-free renewal — the lease grant it writes is by the class already on the account
+        from ops.transaction_ops import is_assert_device as _is_assert
+        if _is_assert(transaction.get("device")):
+            has_device = False
+        elif has_device:
+            from ops.device_attest import device_binding_key
+            # canonical: keyed on the certificate's SIGNED part (protocol.py "ONE DEVICE, ONE IDENTITY — FOR REAL")
+            device_key = device_binding_key(transaction.get("device") or {}, DEVICE_BIND_MAX_CERT_SECS,
+                                            strict=True, canonical=True)   # same parse as validation
+            # THE SAME DEVICE UNDER ITS OLD RAW-BYTES KEY: a device bound on betanet-8 below block 19800 sits in devbind
+            # under sha256(raw certificate), and the reroll carried those rows into betanet-9 verbatim. Its canonical key
+            # is new to the table, so without this lookup the switch would let every such device back one more identity.
+            # apply_register evicts what the legacy row backs. INVARIANT: keep this lookup while any carried raw-bytes
+            # row can exist — deleting it hands each such device a second identity.
+            _lk = device_binding_key(transaction.get("device") or {}, DEVICE_BIND_MAX_CERT_SECS, strict=True)
+            legacy_key = _lk if _lk != device_key else None
+            # permanent_classes_at(height), the same call as validation
+            permanent = device_key.split(":", 1)[0] in permanent_classes_at(block_height)
+        # THE CREDENTIAL, from the tx bytes: the COSE public key inside the statement's authenticator data becomes the
+        # account's `devcred`, which a later signature renewal is verified against. Pure in the bytes every node holds, so
+        # apply stamps the identical value everywhere; None for shapes with no WebAuthn credential.
+        cred_pub = None
+        if device_key and not revert:
+            from ops.device_attest import credential_public_key
+            cred_pub = credential_public_key(transaction.get("device") or {})
+        # REFERRAL LINK (protocol.py "REFERRALS"): judged BEFORE apply_register writes the recert and stamps the device,
+        # because "first" is a statement about the state this tx found. Revert deletes the row only when it was written
+        # by THIS block (the stored height names it), so a rollback is the exact inverse.
+        if revert:
+            _link = kv_ops.referral_get(sender)
+            if _link is not None and _link[1] == int(block_height):
+                kv_ops.referral_del(sender)
+        else:
+            _ref = referral_to_write(transaction, block_height, device_key, legacy_key)
+        apply_register(address=sender, epoch=(block_height // EPOCH_LENGTH), logger=logger, revert=revert,
+                       device_key=device_key, permanent=permanent, cred_pub=cred_pub, legacy_key=legacy_key,
+                       height=block_height)
+        if not revert and _ref:
+            kv_ops.referral_set(sender, _ref, int(block_height))
         return
 
     # --- ON-CHAIN MESSAGING KEY (msgkey): bind/rotate the sender's ML-KEM-768 pubkey onto their account so
@@ -92,6 +146,43 @@ def reflect_transaction(transaction, logger, block_height=None, revert=False):
     if recipient == "msgkey":
         apply_msgkey(address=sender, kem_pub=transaction["kem_pub"], txid=transaction["txid"],
                      logger=logger, revert=revert)
+        if fee:        # a key ROTATION pays MIN_TX_FEE (burned); a first bind carries 0
+            change_balance(address=sender, amount=-fee, logger=logger, revert=revert)
+        return
+
+    # --- CHALLENGER ANNOUNCEMENT (tpm_ready). It used to have no branch here (betanet-8 below block 24000) and fell
+    #     through to the ordinary transfer below, which wrote a zero account for a never-funded sender and a junk row
+    #     named "tpm_ready" — free account creation, which is what made msgkey's "the account must exist" bound void.
+    #     It writes nothing (validation holds its fee at 0 and requires a bonded sender, who already has an account).
+    #     Unconditional: apply runs only for a block's own transactions, so block_height >= 1 here.
+    #     INVARIANT: never let a fee-exempt kind reach the transfer path — it creates accounts for free.
+    if recipient == "tpm_ready":
+        return
+
+    # --- LEGACY CLAIM (gen 28, transaction_ops.validate_transaction): move the old address's whole balance, as stated in the claim and
+    #     checked by validation, to the claimant. Revert moves exactly that amount back (change_balance flips the sign).
+    if recipient == "legacy_claim":
+        amt = int((transaction.get("data") or {}).get("amount") or 0)
+        change_balance(address=str(transaction["data"]["legacy"]), amount=-amt, logger=logger, revert=revert)
+        change_balance(address=sender, amount=amt, logger=logger, revert=revert)
+        return
+
+    # --- VENDOR-ENDORSED TPM ENROLMENT (gen 25's DEVICE_ATTEST_EK_HEIGHT, doc/tpm-attestation-without-a-ca.md):
+    #     the four-message proof that an attestation key lives inside a vendor-certified chip. Fee-exempt, no
+    #     coin movement, one consensus row per enrolment. Revert-symmetric: apply journals the WHOLE previous
+    #     record (or None when it created the row), so a rollback restores the exact prior state — the state
+    #     machine is not invertible step by step, and re-deriving "what it was before" would be a second
+    #     implementation of the rules with its own bugs.
+    if recipient in ("tpm_enrol", "tpm_challenge", "tpm_commit", "tpm_reveal"):
+        apply_tpm_enrol_tx(transaction, block_height, revert=revert)
+        return
+
+    # --- ACCOUNT AUTHENTICATION (doc/key-rotation.md): install / rotate / cancel the sender's auth config.
+    #     Fee-paying (debited + destroyed like every fee), zero amount. Revert-symmetric via auth_revert.
+    if recipient == "auth":
+        from ops.auth_ops import apply_auth_tx
+        change_balance(address=sender, amount=-fee, logger=logger, revert=revert)
+        apply_auth_tx(transaction, block_height, logger, revert=revert)
         return
 
     # --- SLASHING (#15 step 5C): a fee-exempt tx carrying a proven equivocation proof in `data`.
@@ -99,7 +190,7 @@ def reflect_transaction(transaction, logger, block_height=None, revert=False):
     # already slashed at this height, so reflect just extracts (offender, height) and burns the bond.
     if recipient == "slash":
         from ops.transaction_ops import resolve_slash   # lazy: transaction_ops imports account_ops
-        result = resolve_slash(transaction.get("data") or {})   # block-authorship OR FFG-attestation equivocation
+        result = resolve_slash(transaction.get("data") or {}, block_height)   # same judging height as validation
         if result:
             offender, height = result
             apply_slash(address=offender, height=height, logger=logger, revert=revert)
@@ -179,7 +270,23 @@ def reflect_transaction(transaction, logger, block_height=None, revert=False):
         # A settle-with-proof also records the on-chain VALIDITY marker (validation already verified the proof
         # deterministically, so a settle tx that reached apply with a `proof` is proven). settlement_justified
         # then reads this committed marker — the trustless, fork-free replacement for the old node-local cache.
-        proven = "proof" in data
+        # S4: a DA-carried proof (`proof_da`) was fully verified at validation but never recorded the proven marker, so
+        # the settle it justified fell back to the quorum path. `>= 1` is gen 25's REVIEW_R2_HEIGHT from gen 26 (deleted).
+        proven = "proof" in data or (block_height is not None and int(block_height) >= 1 and "proof_da" in data)
+        # INVARIANT (protocol.SETTLE_FIELDS_HEIGHT): from the gate only `stwo` (below) marks a root proven. The retired
+        # names are refused by key at validation from the same height; this keeps apply from honouring them even so.
+        from protocol import SETTLE_FIELDS_HEIGHT
+        # (keyed on the block's own height only: apply and revert of one block see the same height, so the marker
+        # put and the marker deleted stay one decision — an absent height keeps the old reading, as before the gate)
+        if block_height is not None and int(block_height) >= SETTLE_FIELDS_HEIGHT:
+            proven = False
+        # G8: A STWO SETTLEMENT (`stwo`, the DA commitment of an execnode/settle_b2 bundle) is proven the same way —
+        # transaction_ops._stwo_settle_check verified it before it could reach apply, and refuses the field below
+        # protocol.STWO_SETTLE_HEIGHT. INVARIANT: the same field and the same gate as that validation, and revert deletes
+        # exactly the marker apply put (settlement_proof_put / _del are a refcount, so the inverse is exact).
+        if "stwo" in data and block_height is not None:
+            from protocol import STWO_SETTLE_HEIGHT
+            proven = proven or int(block_height) >= STWO_SETTLE_HEIGHT
         if revert:
             kv_ops.settlement_del(ns, cursor, sender, root)
             if proven:
@@ -188,6 +295,8 @@ def reflect_transaction(transaction, logger, block_height=None, revert=False):
             kv_ops.settlement_put(ns, cursor, sender, root)
             if proven:
                 kv_ops.settlement_proof_put(ns, cursor, root)
+        if fee:        # outside the default namespace a settle pays MIN_TX_FEE (burned)
+            change_balance(address=sender, amount=-fee, logger=logger, revert=revert)
         return
 
     # --- BRIDGE DEPOSIT (Phase 2): move amount+fee from sender, LOCK `amount` in the escrow, burn the fee.
@@ -256,6 +365,8 @@ def reflect_transaction(transaction, logger, block_height=None, revert=False):
             kv_ops.xmsg_nullifier_del(from_ns, seq)
         else:
             kv_ops.xmsg_nullifier_put(from_ns, seq)
+        if fee:        # xmsg pays MIN_TX_FEE (burned)
+            change_balance(address=sender, amount=-fee, logger=logger, revert=revert)
         return
 
     # --- SHIELD DEPOSIT (doc/privacy.md): lock `amount` in the shielded-pool escrow, burn the fee. The output
@@ -318,6 +429,36 @@ def reflect_transaction(transaction, logger, block_height=None, revert=False):
         change_balance(address=doc["sender"], amount=amt, logger=logger, revert=revert)
         doc["status"] = "open" if revert else "refunded"
         kv_ops.htlc_put(data["htlc_id"], doc)
+        return
+
+    # --- FUNDED INVITES (protocol.py "FUNDED INVITE LINKS"). Validation checked the gate, the key, the window and,
+    # for a claim, the attested claimant and the link key's signature naming it. The record is a list, mutated in
+    # place and restored exactly on revert (kv_ops.invite_put). ---
+    if recipient == "invite_lock":
+        from protocol import INVITE_ESCROW
+        from ops.transaction_ops import invite_id_of
+        data = transaction.get("data") or {}
+        iid = invite_id_of(data["key"])
+        change_balance(address=sender, amount=-(amount + fee), logger=logger, revert=revert)
+        change_balance(address=INVITE_ESCROW, amount=amount, logger=logger, revert=revert)
+        if revert:
+            kv_ops.invite_del(iid)
+        else:
+            kv_ops.invite_put(iid, [sender, int(amount), int(data["expiry"]), "open", ""])
+        return
+    if recipient in ("invite_claim", "invite_refund"):
+        from protocol import INVITE_ESCROW
+        iid = (transaction.get("data") or {})["id"]
+        rec = kv_ops.invite_get(iid)
+        referrer, amt, expiry = rec[0], int(rec[1]), int(rec[2])
+        payee = sender if recipient == "invite_claim" else referrer
+        change_balance(address=INVITE_ESCROW, amount=-amt, logger=logger, revert=revert)
+        change_balance(address=payee, amount=amt, logger=logger, revert=revert)
+        if revert:
+            kv_ops.invite_put(iid, [referrer, amt, expiry, "open", ""])
+        else:
+            kv_ops.invite_put(iid, [referrer, amt, expiry, "claimed" if recipient == "invite_claim" else "refunded",
+                                    sender if recipient == "invite_claim" else ""])
         return
 
     # --- DIVIDEND COLLECTION (doc/presence-dividend.md): release `amount` from the DIVIDEND_POOL to the proven
@@ -460,6 +601,22 @@ def get_finalized_height() -> int:
     return kv_ops.meta_get_int("finalized_height", 0)
 
 
+def get_hard_finality() -> int:
+    """The UN-CROSSABLE floor (two-floor model, protocol.FINALITY_HARD_BACKSTOP doc): the highest of the
+    FFG-finalized checkpoint (quorum-attested, slashable to revert) and the wide liveness backstop.
+    rollback_one_block refuses to cross THIS, not finalized_height; fork classification and re-anchor
+    candidate floors use it too. Monotonic, meta-persisted, ROOT-EXCLUDED (it is derived through the
+    node-LOCAL corroboration gate, so it must never enter the consensus root). Defaults to 0."""
+    return kv_ops.meta_get_int("hard_finality", 0)
+
+
+def set_hard_finality(height: int):
+    """Persist the hard-finality floor. Strictly monotonic — a quorum-signed checkpoint never un-happens,
+    and unlike finalized_height there is NO recovery exception: a chain view where this floor is wrong
+    is a chain view where >1/3 of bonded seats equivocated, which is slashing's problem, not rollback's."""
+    kv_ops.meta_set_int("hard_finality", int(height))
+
+
 def set_finalized_height(height: int):
     """Persist the finalized-height floor. Callers MUST keep it monotonic (only ever increase it).
 
@@ -520,13 +677,23 @@ def change_bonded(address: str, amount: int, logger, revert=False):
 # poll — the dominant per-block cost at scale). env_path is in the key so tests that switch HOME can
 # never serve another home's registry.
 _bonded_reg_cache = [None]          # [(key, registry)] or [None]
+# THUNDERING-HERD LOCKS (the latest_settled pattern, e2396baf). These caches are keyed on the write
+# generation, which every 6-second block bumps — and /mining_status polls from hundreds of wallets land on
+# HTTP worker threads all at once. Without a lock every worker that misses the fresh key recomputes the
+# registry in PARALLEL, serialising on the GIL against the core thread's block apply: py-spy on
+# 2026-09-01 (515 wallets polling, block applies at 3 s) put 38% of ALL process CPU in parallel copies of
+# the open-registry compute. One compute per generation; the herd reads the result. The in-write-txn
+# bypass stays AHEAD of the lock so the core thread never blocks mid-transaction.
+_bonded_reg_lock = threading.Lock()
+_open_reg_lock = threading.Lock()
 
 
 def _compute_bonded_registry():
-    accts = [(addr, doc) for addr, doc in kv_ops.iter_accounts() if doc.get("bonded", 0) >= B_MIN]
-    since = kv_ops.bond_since_many([a for a, _ in accts])
-    return {addr: {"bonded": doc["bonded"], "fidelity": None, "bond_since": since.get(addr)}
-            for addr, doc in accts}
+    bm = kv_ops.bonded_map(B_MIN)              # {address: bonded}, address order (LMDB key sort)
+    since = kv_ops.bond_since_many(list(bm))
+    # No `pool_to` / `pooled` any more: staking pools never ran from generation 26 on (protocol.py "THE SAVINGS LANE
+    # IS PLAIN STAKE") and nothing reads delegation. Same address set, order and `bonded` as the old pool-aware scan.
+    return {addr: {"bonded": b, "fidelity": None, "bond_since": since.get(addr)} for addr, b in bm.items()}
 
 
 def get_bonded_registry():
@@ -550,10 +717,13 @@ def get_bonded_registry():
     key = (kv_ops.env_path(), kv_ops.write_generation())
     entry = _bonded_reg_cache[0]
     if entry is None or entry[0] != key:
-        # key captured BEFORE the scan: a concurrent commit mid-scan bumps the generation, so a
-        # torn read can be stored only under the OLD key and gets recomputed on the next call.
-        entry = (key, _compute_bonded_registry())
-        _bonded_reg_cache[0] = entry
+        with _bonded_reg_lock:
+            entry = _bonded_reg_cache[0]          # re-check: the herd resolves to ONE compute
+            if entry is None or entry[0] != key:
+                # key captured BEFORE the scan: a concurrent commit mid-scan bumps the generation, so a
+                # torn read can be stored only under the OLD key and gets recomputed on the next call.
+                entry = (key, _compute_bonded_registry())
+                _bonded_reg_cache[0] = entry
     return {addr: dict(info) for addr, info in entry[1].items()}
 
 
@@ -604,51 +774,353 @@ def get_open_registry(current_epoch: int):
     against PARENT state on the production/verification paths (as-of-parent guard, task #17).
     Cached per committed-write generation (bypassed inside a write txn), like get_bonded_registry."""
     def _compute():
+        # ONE txn for every member doc (get_accounts_many) — the same docs get_account returns, without an
+        # env.begin() per address. Iteration order is irrelevant to the result (a dict keyed by address).
         registry = {}
-        for address in kv_ops.recert_addresses_after(current_epoch - POSW_LEASE_EPOCHS):
-            account = kv_ops.get_account(address)
+        # PER-CLASS LEASES (gen 25's LEASE_V2_EPOCH): the candidate set is every address with a recert inside the LONGEST
+        # lease; each is present iff its latest recert's own GRANT still covers this epoch (kv_ops.lease_of — the same
+        # reader dividend_ops.present_at_epoch uses; pre-gate recerts read as POSW_LEASE_EPOCHS, so history is unchanged).
+        members = kv_ops.recert_addresses_after(current_epoch - LEASE_EPOCHS_MAX)
+        for address, account in kv_ops.get_accounts_many(members).items():
             if account and account.get("registered", 0) == 1:
-                registry[address] = {"fidelity": account.get("fidelity", 0)}
+                latest = kv_ops.recert_latest(address)
+                if latest < 0 or current_epoch - latest >= kv_ops.lease_of(address, latest):
+                    continue
+                # EVICTED (DEVICE_REBIND_INSTANT_HEIGHT): the device that vouched for this lease moved on; only a recert
+                # NEWER than the voided one counts (same rule as dividend_ops.present_at_epoch — one truth, two readers)
+                if kv_ops.recert_latest(address) <= kv_ops.devevict_voided(address, current_epoch):
+                    continue
+                # `bonded` rides along: it fed gen 25's open-lane exclusion of stakers (deleted after the betanet-8 reroll,
+                # protocol.py "THE SAVINGS LANE IS PLAIN STAKE"); the entry shape is left as it was. The registry itself
+                # is the ATTESTED set (statement-free renewals, the open draw)
+                registry[address] = {"fidelity": account.get("fidelity", 0), "bonded": int(account.get("bonded", 0) or 0)}
         return registry
     if kv_ops.in_write_txn():
         return _compute()
     key = (kv_ops.env_path(), kv_ops.write_generation(), current_epoch)
     entry = _open_reg_cache[0]
     if entry is None or entry[0] != key:
-        entry = (key, _compute())
-        _open_reg_cache[0] = entry
+        with _open_reg_lock:
+            entry = _open_reg_cache[0]            # re-check: the herd resolves to ONE compute
+            if entry is None or entry[0] != key:
+                entry = (key, _compute())
+                _open_reg_cache[0] = entry
     return {addr: dict(info) for addr, info in entry[1].items()}
 
 
-def apply_register(address: str, epoch: int, logger, revert=False):
+def referral_to_write(transaction: dict, block_height: int, device_key, legacy_key):
+    """The referrer to link for this register, or None — only on the identity's FIRST attested registration
+    (protocol.py "REFERRALS"). First means all of: height at least 1; the tx names a referrer; it carries a real
+    device statement (device_key set — not a signature or statement-free renewal); the sender never recerted; its
+    account carries no device stamp; no link exists yet; and the DEVICE is fresh — bound to no identity under its
+    canonical or its carried raw-bytes key. A device moving to a new address is a move, not a newcomer: counting it
+    would let one phone mint a new "newcomer" (and a new slice for someone) every time it re-registered elsewhere.
+    Read against the state before this tx applies — call it BEFORE apply_register."""
+    from ops.transaction_ops import register_referrer
+    # REFERRAL_HEIGHT (gen 28's gate, 1 from gen 29, inlined in G9): `< 1` kept so a height-0 register writes no link.
+    if int(block_height) < 1 or not device_key:
+        return None
+    ref = register_referrer(transaction)
+    if not ref:
+        return None
+    sender = transaction["sender"]
+    if kv_ops.recert_latest(sender) >= 0 or kv_ops.referral_get(sender) is not None:
+        return None
+    acc = kv_ops.get_account(sender) or {}
+    if isinstance(acc.get("devkey"), str) and acc.get("devkey"):
+        return None
+    if kv_ops.devbind_get(device_key) is not None or (legacy_key and kv_ops.devbind_get(legacy_key) is not None):
+        return None
+    return ref
+
+
+def _evict_voids(evicted: str, epoch: int, height) -> int:
+    """The recert epoch an eviction voids: EVERY recert of the evicted identity up to and including this epoch. Voiding
+    only its latest recert as the parent block left it let a renewal of the evicted identity applied later in the SAME
+    block (renewals bind no device, so they share a block with the move) slip past, keeping it present for a whole lease
+    while another identity held the device.
+    INVARIANT: an identity a device left counts again only with a register in a LATER epoch."""
+    # EVICT_VOIDS_EPOCH_HEIGHT (gen 28's gate, 1 from gen 29, inlined in G9): `>= 1` and the None case kept, so a call
+    # without a block height (height=None, apply_register's default) still voids only the latest recert, as it did.
+    if height is not None and int(height) >= 1:
+        return int(epoch)
+    return kv_ops.recert_latest(evicted)
+
+
+def apply_register(address: str, epoch: int, logger, revert=False, device_key=None, permanent=False, cred_pub=None,
+                   legacy_key=None, height=None):
     """Renewable presence LEASE + continuity FIDELITY. A valid register/recert (its PoSW checked in tx
     validation) records a recert at `epoch`, marks the address registered, and updates fidelity: +GAIN if
     this recert is CONTINUOUS with the previous one (gap <= POSW_LEASE_EPOCHS), else it RESETS to GAIN (a
     lapse loses the streak). fidelity ramps over ~FIDELITY_CAP recerts (≈ days). Revert-symmetric: the
     exact fidelity net is stored (hb_revert store reused) and restored, the recert rows removed, and
-    `registered` cleared only if no recert remains."""
+    `registered` cleared only if no recert remains.
+
+    `device_key`: the register's device certificate is bound to `address` at
+    `epoch` in the consensus devbind table; the value it overwrote is journaled (devbind_revert) and restored on
+    rollback — rollback_one_block must be the EXACT inverse of incorporate_block (the h4260 lesson)."""
     if revert:
         rec = kv_ops.hb_revert_pop(epoch, address)
+        fields = None
         if rec is not None:
-            _prev, net = rec
+            _prev, net, fields = rec
             if not kv_ops.account_adjust(address, "fidelity", -net, floor_zero=True):
                 raise AssertionError(f"Fidelity revert underflow for {address}")
         kv_ops.recert_del(address, epoch)
+        kv_ops.lease_grant_del(address, epoch)                  # the grant this recert wrote (no-op before the gate)
         if kv_ops.recert_latest(address) < 0:
             kv_ops.account_set(address, "registered", 0)
+        # the LEGACY-ROW record (a carried raw-bytes binding, see reflect_transaction's register branch) first: it was
+        # written after the main one
+        lrec = kv_ops.devbind_revert_pop(epoch, address + "|legacy")
+        if lrec is not None:
+            lkey, l_addr, l_epoch, l_mode, _ldk, _lperm, l_evicted, l_prev_evict = lrec
+            if l_addr is not None:
+                kv_ops.devbind_set(lkey, l_addr, l_epoch, l_mode)
+            if l_evicted is not None:
+                kv_ops.devevict_set(l_evicted, l_prev_evict)
+        brec = kv_ops.devbind_revert_pop(epoch, address)
+        if brec is not None:
+            key, prev_addr, prev_epoch, prev_mode, prev_devkey, was_perm, evicted, prev_evict = brec
+            if prev_addr is None:
+                kv_ops.devbind_del(key)
+            else:
+                kv_ops.devbind_set(key, prev_addr, prev_epoch, prev_mode)
+            if was_perm:
+                # the sender's `devkey` field is restored to what it was (or removed) — the exact inverse
+                if prev_devkey is None:
+                    kv_ops.account_del_field(address, "devkey")
+                else:
+                    kv_ops.account_set_field(address, "devkey", prev_devkey)
+            if evicted is not None:
+                kv_ops.devevict_set(evicted, prev_evict)      # the evicted identity's eviction list, exactly as before
+        if fields is not None:
+            # The statement stamped `devkey` (every class) and `devcred`; put back exactly what it overwrote.
+            # The permanent-binding journal above restored `devkey` to the same value — the two records were cut from the
+            # same account state, so this is idempotent, and it is the ONLY restore path for a leased class.
+            for name, prev_val in zip(("devkey", "devcred"), fields):
+                if prev_val is None:
+                    kv_ops.account_del_field(address, name)
+                else:
+                    kv_ops.account_set_field(address, name, prev_val)
     else:
+        acc_before = kv_ops.get_account(address) or {}
+        fields = None
+        if device_key:
+            # BINDING MODES: a permanent-class statement writes the "perm" row (a rebind from another sender supersedes the
+            # old row in this very write — the old identity's statement-free renewals fail from the next block because the
+            # row no longer points back at it) and stamps the sender's account with `devkey`, the reverse index a
+            # statement-free renewal is validated against. The journal carries the previous row AND the previous devkey.
+            prev_bind = kv_ops.devbind_get(device_key)
+            # INSTANT MOVE: the device leaves another identity -> that identity is EVICTED in this block: its current lease
+            # is voided (an eviction row names the recert epoch it voids), so it drops out of the open registry and the
+            # epoch weights at once and comes back only with a NEWER register of its own. (Unconditional: the only caller
+            # passes a block's own height, where gen 25's DEVICE_REBIND_INSTANT_HEIGHT — 1 from gen 26 — always held.)
+            evicted, prev_evict = None, None
+            if prev_bind and prev_bind[0] != address:
+                evicted = prev_bind[0]
+                prev_evict = kv_ops.devevict_get(evicted)
+                kv_ops.devevict_set(evicted, prev_evict + [(epoch, _evict_voids(evicted, epoch, height))])
+            acc0 = kv_ops.get_account(address) or {}
+            prev_devkey = acc0.get("devkey") if isinstance(acc0.get("devkey"), str) else None
+            if permanent:
+                kv_ops.devbind_revert_put(epoch, address, device_key, prev_bind, prev_devkey, perm=True, evicted=evicted, prev_evict=prev_evict)
+                kv_ops.devbind_set(device_key, address, epoch, "perm")
+                kv_ops.account_set_field(address, "devkey", device_key)
+            else:
+                kv_ops.devbind_revert_put(epoch, address, device_key, prev_bind, prev_devkey, perm=False, evicted=evicted, prev_evict=prev_evict)
+                kv_ops.devbind_set(device_key, address, epoch)
+            # THE RAW-BYTES ROW OF THIS SAME DEVICE (carried from betanet-8, where it was written below block 19800;
+            # reflect_transaction passes it whenever it differs from the canonical key). If it backs ANOTHER identity, that identity loses the device exactly as an instant move would: it is
+            # evicted and the legacy row removed, so neither its signature nor its statement-free renewals find a row that
+            # points back at it. Journaled under "<address>|legacy" and restored first on rollback.
+            if legacy_key:
+                lb = kv_ops.devbind_get(legacy_key)
+                if lb and lb[0] != address:
+                    l_ev, l_prev_ev = None, None
+                    if lb[0] != evicted:
+                        l_ev = lb[0]
+                        l_prev_ev = kv_ops.devevict_get(l_ev)
+                        kv_ops.devevict_set(l_ev, l_prev_ev + [(epoch, _evict_voids(l_ev, epoch, height))])
+                    # perm=True keeps the row's MODE in the record whatever it was ("perm" or "lease"): rollback restores
+                    # the row exactly (the short record would restore a permanent binding as a lease)
+                    kv_ops.devbind_revert_put(epoch, address + "|legacy", legacy_key, lb, None, perm=True,
+                                              evicted=l_ev, prev_evict=l_prev_ev)
+                    kv_ops.devbind_del(legacy_key)
+            # STAMP THE HANDLE FOR EVERY CLASS, AND THE CREDENTIAL (every epoch; gen 25's LEASE_V2_EPOCH). `devkey` is the reverse
+            # index — account -> the device that vouches for it — that a statement-free or signature renewal is
+            # validated against, and what lets /get_account name the class; `devcred` is the COSE public key of the
+            # WebAuthn credential the statement created, the key a signature renewal (LEASE_ASSERT_CLASSES) verifies.
+            # The exact previous values go into the recert journal (hb_revert `fields`) so a rollback restores or
+            # deletes both — the earlier attempt at this stamp (DEVICE_BIND_DEVKEY_ALL_EPOCH) forked one node because
+            # its HEIGHT was wrong, not the rule; and it had no restore path for a leased class, which this has.
+            prev_dk = acc_before.get("devkey") if isinstance(acc_before.get("devkey"), str) else None
+            prev_dc = acc_before.get("devcred") if isinstance(acc_before.get("devcred"), str) else None
+            fields = [prev_dk, prev_dc]
+            kv_ops.account_set_field(address, "devkey", device_key)
+            if cred_pub:
+                kv_ops.account_set_field(address, "devcred", str(cred_pub))
+            else:
+                kv_ops.account_del_field(address, "devcred")    # a hardware wallet / chip statement has no WebAuthn credential
         prev = kv_ops.recert_latest(address)                    # previous recert epoch (before this one)
         acc = kv_ops.get_account(address)
         cur_fid = int(acc.get("fidelity", 0)) if acc else 0
-        continuous = prev >= 0 and (epoch - prev) <= POSW_LEASE_EPOCHS
-        decay = 0 if continuous else cur_fid                    # a lapse (or first recert) resets to GAIN
-        net = FIDELITY_GAIN - decay                             # cur_fid+net = cur_fid+GAIN (cont) or GAIN
+        # CONTINUITY IS JUDGED BY THE PREVIOUS RECERT'S OWN GRANT (kv_ops.lease_of): a 7-day lease is continuous across a
+        # 6-day gap, a 36-hour one is not — and a pre-gate recert reads as POSW_LEASE_EPOCHS, exactly the old rule.
+        continuous = prev >= 0 and (epoch - prev) <= kv_ops.lease_of(address, prev)
+        # THE RAMP LIVES IN protocol.fidelity_step — one function for this live apply and for the fraud-proof
+        # replay (dividend_ops.fidelity_at_epoch). They used to be two hand-mirrored copies with a comment
+        # begging them to stay in lockstep; a divergence false-slashes an honest settler. It carries the
+        # anti-farm spacing (a recert closer than FIDELITY_MIN_GAP_EPOCHS renews the lease, earns nothing)
+        # and the softened lapse (halve, not reset).
+        net = fidelity_step(cur_fid, continuous, epoch - prev, epoch) - cur_fid
         kv_ops.recert_put(address, epoch)
+        # THE GRANT (every epoch; gen 25's LEASE_V2_EPOCH was 0 from gen 26): this recert keeps the identity present for
+        # its class's lease. The class is the statement's device when there is one, else the device already stamped on
+        # the account (a statement-free or signature renewal); an identity with neither is on the historical lease until
+        # its next statement.
+        dk_now = device_key or (acc.get("devkey") if acc and isinstance(acc.get("devkey"), str) else None)
+        cls = dk_now.split(":", 1)[0] if dk_now else None
+        kv_ops.lease_grant_put(address, epoch, lease_epochs_for(cls, epoch))
         kv_ops.account_set(address, "registered", 1)
         if not kv_ops.account_adjust(address, "fidelity", net, floor_zero=True):
             raise AssertionError(f"Fidelity underflow for {address}")
-        kv_ops.hb_revert_put(epoch, address, prev, net)         # exact inverse for rollback
+        kv_ops.hb_revert_put(epoch, address, prev, net, fields)   # exact inverse for rollback
     return True
+
+
+def apply_tpm_enrol_tx(transaction, block_height, revert=False):
+    """Apply / revert one of the four enrolment messages (ops/tpm_enrol).
+
+    APPLY RE-RUNS THE STATE MACHINE rather than trusting validation. Validation ran the same transition as a
+    dry run against the record as it stood then; between then and now another transaction in this very block
+    may have changed it (two challengers landing together is the ordinary case). Only the transition applied
+    HERE, against the record as it actually is, decides the state — the same discipline every other
+    order-sensitive apply follows.
+    """
+    from ops import kv_ops, tpm_enrol as _te
+    from protocol import CHAIN_ID
+    recipient, sender = transaction["recipient"], transaction["sender"]
+    data = transaction.get("data") or {}
+    h = int(block_height)
+
+    if recipient == "tpm_enrol":
+        from ops import attest_native
+        chain = [bytes.fromhex(x) for x in data["ek"]]
+        pub = bytes.fromhex(data["pub"])
+        # the SAME check validation ran, grace included (transaction_ops.cert_verdict) — or a record validated there
+        # would fail to apply here
+        from ops.transaction_ops import cert_verdict
+        ek = cert_verdict(lambda t: attest_native.verify_ek(chain, t, height=h), _tpm_anchor_time(h))
+        eid = _te.enrol_id(CHAIN_ID, str(ek["identity"]), _te.aik_name_hex(pub))
+    else:
+        eid = str(data["id"])
+
+    if revert:
+        # The journal holds the record as it stood BEFORE this block (kv_ops.tpm_enrol_revert_put: first write wins),
+        # and rollback reverts a block's messages last-to-first, so the FIRST revert for (h, eid) restores the whole
+        # block's effect on this enrolment and every later one finds the journal gone. "Not found" therefore means
+        # "already undone by a later message of this block" — or a block from before the gate.
+        found, prev = kv_ops.tpm_enrol_revert_pop(h, eid)
+        if not found:
+            return
+        # The chip is read from the record (the row before or after this block — the id binds the chip, so both
+        # name the same one), since the message being reverted first need not be the tpm_enrol itself.
+        cur = kv_ops.tpm_enrol_get(eid)
+        ek_id = str((prev or cur or {}).get("ek") or "") or None
+        if prev is None:
+            kv_ops.tpm_enrol_del(eid)        # the row was CREATED in this block
+        else:
+            kv_ops.tpm_enrol_set(eid, prev)  # e.g. an expired record this block's tpm_enrol superseded
+        if ek_id is None:
+            return
+        # RESTORE THE CHIP'S MARKER FROM ITS JOURNAL, NEVER BY DELETING IT (audit 2026-09-25, HIGH). This used to
+        # set the marker to None whenever the row was created here — the prior value only for a chip's FIRST
+        # enrolment. After an earlier attempt expired, rolling back the second left the chip with no marker where
+        # every node that never applied the block still named the first; superseding an expired record under the
+        # same id left the marker on that id instead of the one it replaced. The marker is in devbind, so in the
+        # L1 root: a state-root split from a one-block reorg. INVARIANT: revert restores what apply journaled
+        # (kv_ops.tpm_enrol_open_revert_put); it never re-derives a prior value.
+        # INVARIANT: the retry count (retry spacing) is restored from its own journal, popped by the first
+        # revert of this block to reach the chip, because apply journaled the value before the block changed it.
+        rfound, rprev, rkey = kv_ops.tpm_retry_revert_pop(h, ek_id)
+        if rfound:
+            kv_ops.tpm_retry_set(rkey, rprev)
+        mfound, mprev = kv_ops.tpm_enrol_open_revert_pop(h, ek_id)
+        if mfound:
+            # popped by the FIRST revert of this block to reach the chip (first-write-wins journal), so it restores
+            # the marker as it stood before the block even when two enrolments of the chip landed in it
+            kv_ops.tpm_enrol_open_set(ek_id, mprev)
+        elif prev is None and kv_ops.tpm_enrol_open_for_ek(ek_id) == eid:
+            # A block applied before the marker journal existed: the old behaviour is the best information there
+            # is. Guarded on the marker still naming THIS enrolment so that, when the journal was already popped by
+            # a later message of the same block, the value it restored is never clobbered.
+            kv_ops.tpm_enrol_open_set(ek_id, None)
+        return
+
+    prev = kv_ops.tpm_enrol_get(eid)
+    kv_ops.tpm_enrol_revert_put(h, eid, prev)
+    if recipient == "tpm_enrol":
+        # COMMIT, THEN DRAW (ops/tpm_enrol, audit 2026-09-27): the record is written with NO challengers — its dice
+        # are two epochs away — and the first tpm_challenge materialises them.
+        # INVARIANT: never draw here; a draw at the enrol is a draw the client could predict.
+        from protocol import DEVICE_ATTEST_EK_CHALLENGERS_V2
+        # TPM POOL v2: the POOL is frozen here (the dice are still two epochs away) and stored in the record with
+        # its k, so the draw reads this snapshot and nothing later can move it; and the misses of the expired
+        # record this one supersedes (same chip, same key, same id) are carried, or a retry would erase them.
+        # TPM_POOL_V2_HEIGHT (gen 28's gate, 1 from gen 29, inlined in G9): unconditional, since a block applying a
+        # tx is never block 0 (genesis carries none). INVARIANT: every record written by apply is a v2 record.
+        # INVARIANT: tpm_pool_v2 is the function validation checked pool_can_seat against; the journal above
+        # holds `prev` whole, so a rollback restores the superseded record and its fields exactly.
+        from ops.transaction_ops import tpm_pool_v2, tpm_carry_misses
+        rec = _te.new_record(str(ek["identity"]), attest_native.ek_public_der(chain[0]),
+                             _te.aik_name_hex(pub), pub, sender, h, [],
+                             pool=sorted(tpm_pool_v2(h).items()), k=DEVICE_ATTEST_EK_CHALLENGERS_V2,
+                             missed=tpm_carry_misses(prev, h))
+    elif recipient == "tpm_challenge":
+        # The journal above holds `prev` as it was — for a delayed record, with its set still empty — so a rollback
+        # of the materialising challenge restores the undrawn record exactly (Rollback must be the exact inverse).
+        # INVARIANT: materialise here AND in validation (transaction_ops), from the same pure function.
+        from ops.transaction_ops import tpm_materialise_draw
+        rec = _te.apply_challenge(tpm_materialise_draw(prev, h), sender, bytes.fromhex(data["blob"]),
+                                  bytes.fromhex(data["enc"]), h)
+    elif recipient == "tpm_commit":
+        rec = _te.apply_commit(prev, sender, str(data["commit"]), h)
+    else:
+        # TPM_ENROL_V3_HEIGHT (gen 28's gate, 1 from gen 29, inlined in G9): a wrong commitment FAILS the record at
+        # every applied block (h >= 1). INVARIANT: validation passes the same flag for every block_height >= 1.
+        rec = _te.apply_reveal(prev, sender, bytes.fromhex(data["secret"]), bytes.fromhex(data["seed"]), h,
+                               fail_on_mismatch=True)
+    kv_ops.tpm_enrol_set(eid, rec)
+    if recipient == "tpm_enrol":
+        # INVARIANT: journal the marker this overwrites BEFORE overwriting it — revert restores exactly that value
+        # (audit 2026-09-25, HIGH: the revert used to delete the marker, splitting the root after a reorg of a
+        # chip's second enrolment). Node-local journal; the devbind write below is unchanged.
+        _ek_id = str(ek["identity"])
+        _old = kv_ops.tpm_enrol_open_for_ek(_ek_id)
+        # RETRY SPACING: a chip enrolling again after its CLIENT failed the last enrolment counts one more failure
+        # (validation already held it to retry_ready_at). The prior count is journaled; revert restores it.
+        # TPM_ENROL_V3_HEIGHT (gen 28's gate, 1 from gen 29, inlined in G9): unconditional, an applied block is h >= 1.
+        if _old:
+            _old_rec = prev if str(_old) == eid else kv_ops.tpm_enrol_get(str(_old))
+            if _te.client_failed(_old_rec, h):
+                # charged to retry_key: (chip, the failed record's opener) — TPM_RETRY_OWNER_HEIGHT, inlined in G9.
+                # The journal names the row it saved, so revert restores that row and never re-derives which one it was.
+                _key = _te.retry_key(_old_rec, h)
+                _n = kv_ops.tpm_retry_get(_key)
+                kv_ops.tpm_retry_revert_put(h, _ek_id, _n, count_key=_key)
+                kv_ops.tpm_retry_set(_key, _n + 1)
+        kv_ops.tpm_enrol_open_revert_put(h, _ek_id, _old)
+        kv_ops.tpm_enrol_open_set(_ek_id, eid)   # this chip's slot is taken until it expires
+
+
+def _tpm_anchor_time(block_height):
+    # INVARIANT: apply re-verifies the endorsement chain, so it must read the SAME clock validation read — delegate to
+    # transaction_ops._anchor_time, never a block_timestamp of its own (protocol.py "CERTIFICATE VALIDITY READS AGREED
+    # TIME": that field differs between honest nodes for one block, and apply here indexes ek["identity"] without
+    # re-checking ek["ok"]).
+    from ops.transaction_ops import _anchor_time
+    return _anchor_time({}, block_height)
 
 
 def apply_msgkey(address, kem_pub, txid, logger, revert=False):
@@ -668,18 +1140,6 @@ def apply_msgkey(address, kem_pub, txid, logger, revert=False):
         prev = acc.get("kem_pub") if acc else None
         kv_ops.msgkey_revert_put(txid, prev)
         kv_ops.account_set_field(address, "kem_pub", kem_pub)
-    return True
-
-
-def change_fidelity(address: str, amount: int, logger, revert=False):
-    """Additive OPEN-lane diligence counter (revert = sign-flip, EXACT). Stored RAW/uncapped;
-    mining_ops.open_shares clamps to FIDELITY_CAP on READ, so the stored value stays a clean
-    reversible counter (no lossy clamp at write time). Floor keeps it non-negative -> a bad revert
-    fails closed instead of going negative."""
-    delta = -amount if revert else amount
-    if not kv_ops.account_adjust(address, "fidelity", delta, floor_zero=True):
-        logger.error(f"Refusing to drive fidelity negative for {address} (amount={amount}, revert={revert})")
-        raise AssertionError(f"Fidelity underflow for {address}")
     return True
 
 

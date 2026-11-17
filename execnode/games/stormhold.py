@@ -23,6 +23,7 @@ both keyed by gameId (frontend reads mv[g*10000+i] / mh[g*10000+i], view stride 
 Methods: open(g)[stake] · join(g)[stake] · move(g,enc,ply) · agree(g,result) · resign(g) · abort(g) · cancel(g).
 """
 from execnode import zkvmasm
+from execnode.games import _lib
 from execnode.games import tictactoe as _t
 from execnode.games import chess as _c
 
@@ -71,7 +72,7 @@ JOIN = f"""
 
 # reveal(g, x): post the pre-committed secret once the game is decided — every client re-derives the whole
 # hidden game and verifies every claim (engine verifyHidden). Requires: both seats filled, caller seated,
-# caller committed (hidden game), and alghash(x) == commit. Storing into R1/R2 by seat; idempotent
+# caller committed (hidden game), and HASH(x) == commit (the VM's BLAKE2s word hash). Storing into R1/R2 by seat; idempotent
 # re-reveals just overwrite with the same value (a DIFFERENT x can't hash to the same commit).
 REVEAL = f"""
     slot r4 {NN} r0
@@ -101,7 +102,7 @@ REVEAL = f"""
     require r6              ; this seat committed (hidden game)
     hash r4 <- r1
     eq r4 r3
-    require r4              ; alghash(x) == commit
+    require r4              ; HASH(x) == commit
     movi r2 {R1H << 32}
     mul r2 r5
     movi r4 {R2H << 32}
@@ -118,8 +119,8 @@ REVEAL = f"""
     lo32 r6                 ; r6 = x & 0xffffffff (canonical low half)
     mov r5 r1
     sub r5 r6               ; r5 = hi·2^32 (an exact multiple)
-    movi r7 18446744065119617026
-    mul r5 r7               ; r5 = hi — the field inverse of 2^32 undoes the exact factor
+    movi r7 4294967296
+    divmod r5 r7            ; r5 = hi (exact: r5 is a multiple of 2^32); DIVMOD writes its 0 remainder to r7, read by nothing after
     sstore r2 r5            ; hi half
     sstore r3 r6            ; lo half
     ret r0
@@ -205,7 +206,7 @@ OPEN = f"""
 """ + _t.SRC["open"]
 
 SRC = {"open": OPEN, "join": JOIN, "move": MOVE, "agree": _c.AGREE, "reveal": REVEAL,
-       "resign": _t.SRC["resign"], "abort": _t.SRC["abort"], "cancel": _t.SRC["cancel"]}
+       "resign": _t.SRC["resign"], "abort": _t.ABORT_REFUND, "cancel": _t.SRC["cancel"]}
 
 ABI = {
     "open": {"args": ["gameId", "cfg", "commit"], "value": True},
@@ -229,4 +230,28 @@ ABI = {
 
 
 def build():
-    return zkvmasm.assemble_contract(SRC)
+    # C2 (security review 2026-09-23): every id-taking method refuses an id >= 2^32 before touching a slot;
+    # see _lib.id_guard. The ABI, the field layout and every honest call are unchanged.
+    ID_GUARDS = {m: ["r0"] for m in ("open", "join", "move", "agree", "reveal", "resign", "abort", "cancel")}
+    return zkvmasm.assemble_contract(_lib.guard_ids(SRC, ID_GUARDS))
+
+
+def carry_in_flight(storage):
+    """Why this contract cannot cross a reroll yet ([] = it can):
+      * an open game (_lib.pvp_games_in_flight) — its move clock is an old-chain height and its shuffles pin old-chain
+        block hashes: the opener's cancel(g) in the lobby; agree / resign, or abort(g) once the move clock lapses
+        (permissionless, refunds both stakes) after the join;
+    A SETTLED game's unrevealed hidden-hands commitment does NOT block (the rule hexholm and scrapline share): reveal()
+    after settlement is a client-side audit and moves no value, and blocking on it would let anyone hold the reroll
+    forever — open a hidden game between two of their own addresses, settle it, never reveal. The commitment carries
+    verbatim; a reveal of it on gen 29 reverts (the new hash cannot match it), and that is all that is lost.
+    Reached through the game index only (slot 0 count, field LIST)."""
+    slots = (storage or {}).get("slots") or {}
+    g = lambda f, k: int(slots.get(str((f << 32) + k), 0))
+    out = []
+    for gid in _lib.pvp_games_in_flight(storage, NN, SD, LIST):
+        if g(NN, gid) == 1:
+            out.append(f"game {gid} awaits a joiner - cancel({gid}) (opener)")
+        else:
+            out.append(f"game {gid} is in play - agree/resign, or abort({gid}) past block {g(DL, gid)} (permissionless)")
+    return out

@@ -175,4 +175,37 @@ ABI = {
 
 
 def build():
-    return zkvmasm.assemble_contract(SRC)
+    # C2 (security review 2026-09-23): every id-taking method refuses an id >= 2^32 before touching a slot;
+    # see _lib.id_guard. The ABI, the field layout and every honest call are unchanged.
+    ID_GUARDS = {m: ["r0"] for m in ("open", "join", "move", "agree", "reveal", "resign", "abort", "cancel")}
+    return zkvmasm.assemble_contract(_lib.guard_ids(SRC, ID_GUARDS))
+
+
+# ---- the gen-29 reroll carry (tools/carry.py, doc/stwo/g5-carry.md) -------------------------------------------------
+# An unsettled game holds stakes against an old-chain move clock (dl) — it blocks the carry. A SETTLED game (sd) is
+# history: the pot is paid, every value-moving method refuses it, and its pinned heights (kh, mh) are only the browser's
+# replay seeds. The stormhold sources this contract reuses also carry hidden-hands commitments (c1/c2, checked by
+# reveal against the VM hash); this page never sets one, and a settled game's unrevealed one does not block, for the
+# reason hexholm.py gives (it moves nothing; gen 29 keeps it verbatim and a reveal of it there reverts).
+def carry_in_flight(storage):
+    """Why this contract cannot cross a reroll yet ([] = it can), per unsettled game in the index, naming the call that
+    ends it on the old chain."""
+    slots = (storage or {}).get("slots") or {}
+    g = lambda f, k: int(slots.get(str((f << 32) + k), 0))
+    out = []
+    for gid in _lib.pvp_games_in_flight(storage, NN, SD, LIST):
+        if g(NN, gid) == 1:
+            out.append(f"game {gid} waits for an opponent - cancel({gid}) by its opener refunds the stake")
+        else:
+            out.append(f"game {gid} is in play (stakes on an old-chain move clock) - agree({gid}, result) by both "
+                       f"players, resign({gid}), or abort({gid}) by anyone once the move clock lapses (refunds both)")
+    return out
+
+
+def carry_rebase(storage, tip):
+    """This contract's storage on a new chain whose block 0 stands where the old chain's `tip` stood: only the daily
+    board's unresolved anchors move (_lib.rebase_daily_anchors); everything else is at rest once carry_in_flight is []."""
+    slots = {str(k): v for k, v in ((storage or {}).get("slots") or {}).items()}
+    out = dict(storage or {})
+    out["slots"] = _lib.rebase_daily_anchors(slots, tip, A_H, A_V, DCNT_SLOT, DLIST)
+    return out

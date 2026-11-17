@@ -9,12 +9,13 @@ nobody can hide ships (the same proof binds the subtree ship-count, and the full
 requires it to reproduce the committed root with exactly 17 ship cells — a scattered/overlapping cheat can
 never claim (and the loser then takes the pot via forfeit()).
 
-Field-native crypto (this port): hashes are alghash field elements, domain-separated by a leading tag —
+In-VM crypto: hashes are the VM's 256-bit BLAKE2s word hash (zkvm2.hash_words), domain-separated by a leading tag —
     salt(seed, c)          = H(1, seed, c)
     leaf(c, isShip, salt)  = H(2, salt, 2c + isShip)
     node(L, R, sum)        = H(3, L, R, sum)        (ordered absorption -> position-binding)
 Leaves sit at bit-reversed positions (pos = bitrev7(cell)) so a proof's sibling SUMS cover scattered cells,
-leaking nothing about ship shapes. The browser mirrors these three lines with the same alghash (alghash.js).
+leaking nothing about ship shapes. The browser mirrors these three lines with the same hash (nadodapp algHashn ->
+blake2s.js hashWords).
 
 This is the ARG-bus showcase: answer(g, isShip, salt, sib0,ss0..sib6,ss6) takes 17 args and
 claim(g, a0,o0..a4,o4, seed) takes 12 — both impossible under the old 8-register ABI.
@@ -30,7 +31,6 @@ Methods: open(g,root)[stake] · join(g,root)[stake] · fire(g,cell) · answer(g,
 """
 from execnode import zkvmasm
 from execnode.games import _lib
-from execnode.stark import alghash, field as F
 
 P1, P2, R1, R2, ST, PT, NN, SD, DL = 1, 2, 3, 4, 5, 6, 7, 8, 9
 PC, PEX, PF, TF, H1, H2, WR, DC, CD = 10, 11, 12, 13, 14, 15, 16, 17, 18
@@ -55,15 +55,15 @@ DAILY_WORDS = 6                                        # ceil(40 shots / 7 per w
 
 # ---- python reference (what the browser + tests mirror) --------------------------------------------
 def salt_at(seed, c):
-    return alghash.hashn([TAG_SALT, seed % F.P, c])
+    return _lib.vm_hash([TAG_SALT, seed % _lib.vm_mod(), c])
 
 
 def leaf_at(c, is_ship, salt):
-    return alghash.hashn([TAG_LEAF, salt % F.P, 2 * c + is_ship])
+    return _lib.vm_hash([TAG_LEAF, salt % _lib.vm_mod(), 2 * c + is_ship])
 
 
 def node_at(l, r, s):
-    return alghash.hashn([TAG_NODE, l % F.P, r % F.P, s])
+    return _lib.vm_hash([TAG_NODE, l % _lib.vm_mod(), r % _lib.vm_mod(), s])
 
 
 def bitrev7(x):
@@ -426,3 +426,37 @@ def build():
     src["answer"] = "\n".join(_answer())
     src["claim"] = "\n".join(_claim())
     return zkvmasm.assemble_contract(src)
+
+
+# ---- the gen-29 reroll carry (tools/carry.py, doc/stwo/g5-carry.md) -------------------------------------------------
+# A board root is a Merkle-sum commitment under the VM hash: answer() re-climbs a revealed cell to it and claim()
+# rebuilds the whole tree to it. The gen-29 hash cannot reproduce a gen-28 root, so every game whose root can still be
+# checked — and whose pot is still escrowed — blocks the carry. A SETTLED game (sd) is history: answer/claim/forfeit
+# refuse it, nothing reads its roots again, and its deadlines (dl, cd) are dead old-chain heights nobody can lose to.
+def carry_in_flight(storage):
+    """Why this contract cannot cross a reroll yet ([] = it can), per unsettled game in the index, naming the move that
+    ends it on the old chain."""
+    slots = (storage or {}).get("slots") or {}
+    g = lambda f, k: int(slots.get(str((f << 32) + k), 0))
+    out = []
+    for gid in _lib.carry_ids(slots, 0, GLIST):
+        if not g(NN, gid) or g(SD, gid):
+            continue
+        if g(NN, gid) == 1:
+            out.append(f"game {gid} waits for an opponent - cancel({gid}) by its opener refunds the stake")
+        elif not g(DC, gid):
+            out.append(f"game {gid} is in play (its board roots are still checked shot by shot) - play it out, "
+                       f"resign({gid}), or timeout({gid}) by the player kept waiting once the move deadline passes")
+        else:
+            out.append(f"game {gid} is decided but unpaid (the winner's fleet is still to be proven against its root) "
+                       f"- claim({gid}, fleet, seed) by the winner, or forfeit({gid}) by the loser after the claim deadline")
+    return out
+
+
+def carry_rebase(storage, tip):
+    """This contract's storage on a new chain whose block 0 stands where the old chain's `tip` stood: only the daily
+    board's unresolved anchors move (_lib.rebase_daily_anchors); everything else is at rest once carry_in_flight is []."""
+    slots = {str(k): v for k, v in ((storage or {}).get("slots") or {}).items()}
+    out = dict(storage or {})
+    out["slots"] = _lib.rebase_daily_anchors(slots, tip, A_H, A_V, DCNT_SLOT, DLIST)
+    return out

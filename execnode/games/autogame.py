@@ -21,9 +21,10 @@ the run concludes at its last resolved step and scores what it had (`mists`).
 
 THIS FILE IS THE DEFINITION OF THE RULES. tests/autogame_model.py imports the constants below rather than
 restating them, so the readable reference model and the authoritative contract cannot drift. The JS engine
-(static/autogame-engine.js) mirrors them and tests/autogame_contract_test.py asserts all three agree.
+(static/autogame-engine.js) mirrors them and tests/test_autogame_contract_matches_the_reference_model.py asserts all three agree.
 
-FIELD-WRAP DISCIPLINE. Goldilocks subtraction wraps, and a wrapped `hp` is a ~2^64 hit-point pool. Every
+WORD-WRAP DISCIPLINE. Subtraction wraps at 2^256 (the gen-29 VM word; Goldilocks's ~2^64 before G3), and a wrapped
+`hp` is a ~2^256 hit-point pool. Every
 subtraction of a player- or roll-controlled quantity goes through `csub` (select(a<b, 0, a-b)), never a bare
 `-`. This is the class of bug that produced the banked-table drain; check it first in any diff.
 """
@@ -91,7 +92,7 @@ NSLOT = 6
 
 # tile classes. THE ORDER IS LOAD-BEARING: the contract derives the class as a sum of threshold
 # comparisons (see TILE_CUTS), which yields exactly this ordering — renumbering is a WORLD CHANGE, done
-# deliberately twice now (both 2026-07-21, alphanet: no compatibility): once for HORDE/AMBUSH/GALE/IDOL,
+# deliberately twice now (both 2026-07-21, betanet: no compatibility): once for HORDE/AMBUSH/GALE/IDOL,
 # and again for the ELEVEN classes that take the road to 25 tile types. The newcomers, by what they ask:
 #
 #   MIMIC    — a fight that is always carrying loot: one body, elite-level, bites twice as hard as its
@@ -129,7 +130,7 @@ NSLOT = 6
 # back by mimics, barrows and the pyre's amplifier.
 TILE_CUTS = (18, 36, 43, 50, 55, 57, 62, 64, 65, 68, 70, 74, 77, 79, 81, 83, 86, 88, 90, 92, 94, 97, 99)
 
-# actions (3 bits each, 16 per leg => 48 bits, safely under Goldilocks P)
+# actions (3 bits each, 16 per leg => 48 bits, far inside the 256-bit word and the 2^62 RANGE window)
 A_DEFAULT, A_STRIKE, A_GUARD, A_DODGE, A_POTION, A_SPRINT, A_REST, A_RIGHT = range(8)
 A_RALLY = A_RIGHT        # action 7 does double duty: right lane at a FORK, Rally anywhere else
 # Guard at 1 stamina was FREE: +1/step regen made "guard every fight, forever" sustainable, and the
@@ -167,7 +168,7 @@ AFFIX_NAMES = ("none", "keen", "heavy", "warding", "swift", "vampiric", "blazing
 # meaningful ONLY in the weapon slot; every other slot rolls kind 0. Each class rewrites the engagement math
 # against a different axis of the road (see _fight): sword neutral, axe the aggressor (+renown/+damage-in),
 # maul the crusher (renown up vs the big ones, down vs a crowd), spear the skirmisher (damage-in down vs a
-# crowd, renown down in a duel). On alphanet this is a clean packing widen — no legacy item to preserve.
+# crowd, renown down in a duel). On betanet this is a clean packing widen — no legacy item to preserve.
 W_SWORD, W_AXE, W_MAUL, W_SPEAR = range(4)
 NWKIND = 4
 WKIND_NAMES = ("sword", "axe", "maul", "spear")
@@ -797,7 +798,12 @@ def _noncombat(m):
     _s(m, S_T5).set(_r(m, RMX).get() + 4 * _s(m, S_T5).get())          # the bloodlust factor, x1..x5
     _s(m, S_T4).set(_s(m, S_T4).get() * _s(m, S_T5).get() // _r(m, RMX).get())
     _s(m, S_T0).set(_s(m, S_ACT).get() == A_STRIKE)
-    _s(m, S_T1).set((_s(m, S_ACT).get() == A_POTION) * (_r(m, RPO).get() > 0))
+    # THE OFFERING IS THE IDOL'S (2026-10-19): this flag spends a flask, so it carries `idol` itself. It used to be
+    # gated only through S_T4 — the XP — which left `potions -= 1` firing on EVERY non-combat tile answered with
+    # Potion: the explicit drink took one and this took a second, where the model and the browser engine took one
+    # (found running the reference test as generation 29; 110 of 119 random runs diverged on the live contract).
+    # INVARIANT: every effect of a tile's block is multiplied by that tile's flag.
+    _s(m, S_T1).set((_s(m, S_ACT).get() == A_POTION) * (_r(m, RPO).get() > 0) * idol)
     _s(m, S_T2).set(_s(m, S_T0).get() + 3 * _s(m, S_T1).get())         # smash x1, offer x3
     _r(m, RXP).set(_r(m, RXP).get() + _s(m, S_T4).get() * _s(m, S_T2).get())
     _r(m, RPO).set(csub(_r(m, RPO).get(), _s(m, S_T1).get()))
@@ -1097,6 +1103,10 @@ def build():
         m.ret(m.const(1))
 
     with c.method("begin") as m:
+        # C2 (security review 2026-09-23): a runId >= 2^32 addresses ANOTHER field's row (slot = field*2^32 +
+        # key, no mask) — begin(run + 20*2^32) read RDN[run] as RA and bricked a live run. Bound it first,
+        # before any guard reads a slot. `<` is an exact LT on the 256-bit word, so any id >= 2^32 fails it.
+        m.require(m.arg(0) < (1 << 32))
         # begin(runId): claim a fresh id, set out, AND ARM. The first terrain height is pinned START_GAP
         # blocks in the FUTURE (so the road you will walk cannot be steered by when you call this), and the
         # dice stay UNSCHEDULED — nothing can resolve until you answer the tiles and commit.
@@ -1138,6 +1148,10 @@ def build():
         m.ret(m.arg(0))
 
     with c.method("plan") as m:
+        # C2 (security review 2026-09-23): a runId >= 2^32 addresses ANOTHER field's row (slot = field*2^32 +
+        # key, no mask) — begin(run + 20*2^32) read RDN[run] as RA and bricked a live run. Bound it first,
+        # before any guard reads a slot. `<` is an exact LT on the 256-bit word, so any id >= 2^32 fails it.
+        m.require(m.arg(0) < (1 << 32))
         # plan(runId, agg, stance, focus, healPct): re-tune the DIALS, nothing else. Optional — begin()
         # ships playable defaults — and there is deliberately no window check: the dials govern legs whose
         # dice do not exist yet, and the POLH fence (tested in advance()) keeps them off any leg whose roll
@@ -1186,6 +1200,10 @@ def build():
         m.ret(m.arg(1))
 
     with c.method("commit") as m:
+        # C2 (security review 2026-09-23): a runId >= 2^32 addresses ANOTHER field's row (slot = field*2^32 +
+        # key, no mask) — begin(run + 20*2^32) read RDN[run] as RA and bricked a live run. Bound it first,
+        # before any guard reads a slot. `<` is an exact LT on the 256-bit word, so any id >= 2^32 fails it.
+        m.require(m.arg(0) < (1 << 32))
         # commit(runId, word): your answer to the SPECIFIC sixteen tiles now in front of you — 3 bits each,
         # step 0 in the low bits. Zero is itself an action (A_DEFAULT: walk in and fight plainly), so an
         # unanswered tile is never a trap, just an unspent choice.
@@ -1217,6 +1235,10 @@ def build():
         m.ret(_r(m, RNH).get())
 
     with c.method("retire") as m:
+        # C2 (security review 2026-09-23): a runId >= 2^32 addresses ANOTHER field's row (slot = field*2^32 +
+        # key, no mask) — begin(run + 20*2^32) read RDN[run] as RA and bricked a live run. Bound it first,
+        # before any guard reads a slot. `<` is an exact LT on the 256-bit word, so any id >= 2^32 fails it.
+        m.require(m.arg(0) < (1 << 32))
         # retire(runId): walk away on your feet. Keeps everything, and earns the road bonus pro-rata on the
         # depth reached — the cash-out side of the push-or-bank decision.
         _own_or_die(m)
@@ -1225,6 +1247,10 @@ def build():
         m.ret(_r(m, RDP).get())
 
     with c.method("advance") as m:
+        # C2 (security review 2026-09-23): a runId >= 2^32 addresses ANOTHER field's row (slot = field*2^32 +
+        # key, no mask) — begin(run + 20*2^32) read RDN[run] as RA and bricked a live run. Bound it first,
+        # before any guard reads a slot. `<` is an exact LT on the 256-bit word, so any id >= 2^32 fails it.
+        m.require(m.arg(0) < (1 << 32))
         # advance(runId): resolve every leg whose rolling hash now exists, up to MAX_LEGS_PER_CALL.
         # PERMISSIONLESS — the outcome is a pure function of two already-final hashes, so who calls it and
         # when cannot change a single step.
@@ -1246,6 +1272,10 @@ def build():
         m.ret(_r(m, RDP).get())
 
     with c.method("march") as m:
+        # C2 (security review 2026-09-23): a runId >= 2^32 addresses ANOTHER field's row (slot = field*2^32 +
+        # key, no mask) — begin(run + 20*2^32) read RDN[run] as RA and bricked a live run. Bound it first,
+        # before any guard reads a slot. `<` is an exact LT on the 256-bit word, so any id >= 2^32 fails it.
+        m.require(m.arg(0) < (1 << 32))
         # march(runId, word, leg): settle-then-answer in ONE transaction — the latency op. The old cadence
         # was two round trips per leg: advance() lands, the client SEES the park, only then can commit()
         # go out ("Queued — sends itself", every leg, forever). This fuses them: resolve whatever legs the
@@ -1351,7 +1381,7 @@ def rules_js():
         "//",
         "// The contract is the authority on every number in this game. The browser cannot import Python, so",
         "// this file is emitted from it rather than transcribed — the engine, the contract and the Python",
-        "// reference model then all trace back to one definition, and tests/autogame_contract_test.py fails",
+        "// reference model then all trace back to one definition, and tests/test_autogame_contract_matches_the_reference_model.py fails",
         "// the moment this file stops matching its source.",
         "",
     ]
@@ -1414,3 +1444,77 @@ if __name__ == "__main__":
         with open(_p, "w") as _f:
             _f.write(rules_js())
         print("wrote", _p)
+
+
+# ── reroll carry (tools/alphanet6_carryforward.carry_policy, doc/stwo-migration.md §6.2) ──────────────────────
+CARRY_PIN_FLOOR = _lib.CARRY_PIN_FLOOR
+_carry_ids = _lib.carry_ids
+
+
+def _run_live(slots, rid):
+    g = lambda f: int(slots.get(str((f << 32) + rid), 0))
+    return g(RAV) != 0 and not g(RDN) and not g(RRT) and not g(RMI)
+
+
+def carry_in_flight(storage, tip=None):
+    """Why this contract cannot cross a reroll yet ([] = it can):
+      * a LIVE run whose dice are scheduled (RNH != 0) — its sixteen committed answers were chosen against old-chain
+        terrain, so it cannot be re-pinned fairly; advance it on the old chain (permissionless) until it parks;
+      * (given the old `tip`) a live run already IN THE MISTS at the tip (tip - lh >= HORIZON): the rules have ended it,
+        and a re-pin would hand it a fresh terrain instead (review 2026-10-11). advance() concludes it, and anyone may
+        call it, so nobody can hold the carry hostage with one."""
+    slots = (storage or {}).get("slots") or {}
+    out = []
+    for rid in _carry_ids(slots, 0, RLIST):
+        if not _run_live(slots, rid):
+            continue
+        if int(slots.get(str((RNH << 32) + rid), 0)):
+            out.append(f"run {rid} has a leg in flight")
+        elif tip is not None:
+            lh = int(slots.get(str((RLH << 32) + rid), 0))
+            if lh and int(tip) - lh >= HORIZON:
+                out.append(f"run {rid} is in the mists - advance({rid}) concludes it (permissionless)")
+    return out
+
+
+def carry_rebase(storage, tip):
+    """This contract's storage on a new chain whose block 0 stands where the old chain's `tip` stood. A parked live run's
+    next terrain (RLH, read as BHASH(lh)) is re-pinned to a new-chain block >= CARRY_PIN_FLOOR, and its dial fences
+    (POLH, POLPH) shift by `tip`, so dials set before the reroll still predate every new leg. An unresolved day anchor
+    (A_V == 0) is re-pinned the same way. Finished runs and resolved days are history and stay as they are.
+
+    DOCUMENTED EXCEPTION (operator decision 2026-10-11; doc/reroll.md "What crosses a reroll"): a terrain ALREADY
+    VISIBLE at the tip (lh <= tip) is re-pinned although its owner may have seen it — a one-time redraw of the sixteen
+    tiles the run has not answered. Every other carry hook refuses to re-roll a visible outcome; this one cannot: a
+    parked run ALWAYS sits on a visible terrain (each leg ends parked on the next) and only its owner can commit, so a
+    blocker would make autogame uncarryable whenever anyone has a run, and a reset loses every run. What stays closed:
+    nothing COMMITTED is re-rolled (a run with dice scheduled blocks the carry) and a run the mists already ended blocks
+    it too (carry_in_flight) — the redraw never rescues a run the rules concluded.
+    INVARIANT: every value written is an INT — exec_root.kv_projection commits only int-valued slots at their slot
+    positions, while the settle proof's sparse_projection int()s every slot (review 2026-10-11). Only (field, id) slots
+    reached through the contract's own indexes are touched (runs: count slot 0 / RLIST; days: DCNT_SLOT / DLIST)."""
+    tip = int(tip)
+    blocked = carry_in_flight(storage, tip)
+    if blocked:
+        # carry_policy never rebases a blocked contract; refusing here keeps a direct caller from rescuing one
+        raise ValueError("autogame carry_rebase: resolve these on the old chain first: " + "; ".join(blocked))
+    slots = {str(k): v for k, v in ((storage or {}).get("slots") or {}).items()}
+
+    def get(f, k):
+        return int(slots.get(str((f << 32) + k), 0))
+
+    def put(f, k, v):
+        key = str((f << 32) + k)
+        if key in slots or v:
+            slots[key] = int(v)
+
+    for rid in _carry_ids(slots, 0, RLIST):
+        if _run_live(slots, rid):
+            put(RLH, rid, max(CARRY_PIN_FLOOR, get(RLH, rid) - tip))
+        for f in (POLH, POLPH):
+            if get(f, rid):
+                put(f, rid, max(0, get(f, rid) - tip))
+    _lib.rebase_daily_anchors(slots, tip, A_H, A_V, DCNT_SLOT, DLIST)
+    out = dict(storage or {})
+    out["slots"] = slots
+    return out

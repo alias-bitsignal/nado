@@ -19,11 +19,11 @@ Related deep-dives: [economics.md](economics.md) (emission + supply accounting),
 | Premine | **None** — `TREASURY_GENESIS = 0`, no pre-funded balances |
 | Launch | Fair: open-lane mining + a base subsidy earn real coins from block 1 |
 | Emission | Elastic per-block reward, **floored** and **capped** (see below) |
-| Per-block reward | **0.1 NADO** (floor) … **0.5 NADO** (cap) |
-| Max supply | **Uncapped** — perpetual tail emission at ≥ the base subsidy |
+| Per-block reward | **≈0.0166 NADO** (floor) … **0.1 NADO** (max) |
+| Max supply | **Uncapped** — perpetual tail emission at ≥ the floor |
 | Reward split | **90 %** block producer · **10 %** treasury |
 | Block lanes | **30 %** open (permissionless) · **70 %** bonded (staked) |
-| Fees | **Destroyed** (not paid to the producer); drive the elastic reward |
+| Fees | **Destroyed** (not paid to the producer); emission does not depend on them |
 | Treasury | Keyless account, fills from the 10 % cut, bonded-quorum governed |
 
 ---
@@ -45,7 +45,7 @@ payload (see `hashing.canonical_bytes`). Reference amounts:
 | `BASE_SUBSIDY` | 1 000 000 000 | 0.1 |
 | `ALIAS_REGISTRATION_FEE` | 10 000 000 | 0.001 |
 | `B_MIN` (one bonded share) | 100 000 000 000 | 10 |
-| `BOND_CAP` (per identity) | 10 000 000 000 000 | 1 000 |
+| ~~`BOND_CAP`~~ (per identity) | removed 2026-08-25 | — |
 
 ## 2. Fair launch — no premine
 
@@ -70,16 +70,16 @@ minted = BASE_SUBSIDY * m(r) // 1        # m(r) in [m_min, 1], r = bonded / tota
 - `BASE_SUBSIDY = 0.1 NADO` — since `m(r) ≤ 1`, this is the **MAX** emission per block.
 - `m(r)` (`bond_elastic_mult_bps`, tuned `M_MIN=0.15, k=4`) shrinks emission as the bonded ratio
   rises, so a more-secured chain mints less — self-throttling "super hard money."
-- Floor `m_min · BASE_SUBSIDY ≈ 0.015 NADO` is the perpetual disinflationary tail.
+- Floor `m_min · BASE_SUBSIDY ≈ 0.0166 NADO` is the perpetual disinflationary tail.
 
 **Supply is uncapped but rate-bounded.** Emission never falls below the floor, so NADO
 has a perpetual (disinflationary-by-ratio) tail rather than a hard cap. As an order of
-magnitude, at a ~6 s block cadence the floor is ~14 400 blocks/day × 0.1 = **~1,440 NADO/day**;
-at the cap, ~7,200 NADO/day. (Block cadence is a network parameter, so treat these as
+magnitude, at a ~6 s block cadence the maximum (r = 0) is ~14 400 blocks/day × 0.1 = **~1,440 NADO/day**;
+at the floor, ~240 NADO/day. (Block cadence is a network parameter, so treat these as
 illustrative — emission is defined **per block**, not per day.)
 
-Fees themselves are **destroyed**, not paid to the producer — so higher usage raises *everyone's*
-reward through the elastic term rather than enriching one miner. See [economics.md](economics.md).
+Fees themselves are **destroyed**, not paid to the producer, and emission does not depend on them —
+usage shrinks supply rather than enriching one miner. See [economics.md](economics.md).
 
 ## 4. The 90 / 10 split
 
@@ -98,7 +98,7 @@ treasury_cut = R − producer_cut                              # 10 %
 Each epoch's `EPOCH_LENGTH = 60` slots are split by a beacon-keyed permutation into:
 
 - an **OPEN lane** — `OPEN_BPS = 3000` (**30 %**, `K_OPEN = 18` slots/epoch): permissionless,
-  zero capital, one renewable registration PoW (a *presence lease*). This is the Sybil-bounded
+  zero capital, one renewable device-attested registration (a *presence lease*). This is the Sybil-bounded
   fair-mining lane.
 - a **BONDED lane** — the remaining **70 %**: selection weight proportional to locked stake.
 
@@ -108,7 +108,7 @@ is redistributed differently per lane to reward *presence* over *capital*:
 | Lane | Producer | Treasury | Dividend pool |
 |---|---|---|---|
 | **Open** block | `OPEN_TIP_BPS = 20 %` | 10 % | **70 %** (the rest) |
-| **Bonded** block | 70 % | 10 % | `BONDED_DIVIDEND_BPS = 20 %` |
+| **Bonded** block | 50 % | 10 % | `BONDED_DIVIDEND_BPS = 40 %` (20 % before betanet-5) |
 
 The **DIVIDEND_POOL** (`"dividend"`, a keyless L1 account) accrues the redistributed share.
 It is paid out off-L1 by the execution node to the **currently-present open miners**, weighted
@@ -122,18 +122,18 @@ Locking stake buys **producer-selection shares** in the bonded lane:
 
 - `B_MIN = 10 NADO` — capital per selection share. Bonded stake is *refundable locked stake*,
   **not** spendable balance.
-- `BOND_CAP = 1 000 NADO` → `MAX_SHARES = 100` — a per-identity variance cap so a whale can't
-  monopolise the bonded lane.
+- No per-identity bond cap (removed 2026-08-25). The former `BOND_CAP = 1 000 NADO` / `MAX_SHARES = 100` was per
+  key, so a second key restored linear weight; it bound only honest single-key miners. Weight is `bonded // B_MIN`.
 - `BOND_RAMP_EPOCHS = 30` — a fresh bond's selection weight ramps linearly 0 → full over ~30
   epochs (stake-weighted bond age), giving the network reaction time against a sudden takeover.
-- `BOND_UNLOCK_DELAY = 1440 blocks` — after an `unbond` request the stake stays locked (and
+- `BOND_UNLOCK_DELAY = 14400 blocks` (~1 day) — after an `unbond` request the stake stays locked (and
   slashable) for this delay before `withdraw` can claim it. This closes the instant-unbond
   slash-escape.
 - **Slashing**: `SLASH_BOND_PENALTY = B_MIN` (one share) is **burned** from an identity proven to
   have equivocated (two conflicting signatures at one height). Burned, not redistributed.
 
 Yield is not a fixed APY — a bonded miner earns the bonded-lane block rewards it is selected to
-produce (70 % of `R` per bonded block it makes), which depends on its share of total bonded
+produce (50 % of `R` per bonded block it makes), which depends on its share of total bonded
 stake and the current reward. Early-network yields are high and fall as more stake bonds; the
 wallet's Savings tab estimates a live figure.
 
@@ -147,7 +147,7 @@ premine). It is spent by **bonded-quorum governance**, not by any individual:
 - `TREASURY_MAX_SPEND_BPS = 2500` — any single proposal may spend **at most 25 %** of the
   *current* treasury balance, bounding blast radius.
 - `TREASURY_VOTE_ACTIVATION_EPOCHS` — a delay before a newly-bonded identity's vote counts
-  (alpha value low; raise to ~240 ≈ 1 day for mainnet).
+  (alpha value low; raise to ~180 for mainnet).
 - **Anti-hoard self-burn**: every `TREASURY_SPEND_PERIOD = 14400` blocks, `TREASURY_BURN_BPS =
   100` (**1 %**) of the balance above `TREASURY_RUNWAY_FLOOR` is burned, so an idle treasury
   can't simply be hoarded. Governance details: [treasury.md](treasury.md).
@@ -164,8 +164,8 @@ reward is transparent rather than a hard-coded skim (treasury.md §3.7).
 
 - A transaction's `fee` is **always debited from the sender**.
 - Fees are **destroyed** (credited to no one), counted into `totals.fees`, subtracted from
-  supply, and committed into each block's `cumulative_fees` — which is exactly what drives the
-  elastic reward (§3). Usage funds emission collectively; it does not tip the producer.
+  supply, and committed into each block's `cumulative_fees`. Emission does not depend on them (§3);
+  usage does not tip the producer.
 - `MIN_TX_FEE = 1000 raw` is a deterministic integer anti-spam floor enforced in consensus.
 - There is **no separate burn recipient** — a tx to `burn` is rejected. "Fee destruction" is the
   only sink.
@@ -200,23 +200,23 @@ part of emission and hold no key:
 | Constant | Value | Meaning |
 |---|---|---|
 | `TREASURY_GENESIS` | 0 | No premine |
-| `BASE_SUBSIDY` | 0.1 NADO | Per-block emission floor |
-| `REWARD_WINDOW` | 100 | Trailing blocks averaged for the elastic reward |
+| `BASE_SUBSIDY` | 0.1 NADO | Per-block emission maximum |
+| `REWARD_WINDOW` | 100 | Prune/rollback safety window (not used for emission) |
 | `TREASURY_BPS` | 1000 (10 %) | Treasury cut of every block reward |
 | `EPOCH_LENGTH` | 60 | Slots per epoch |
 | `OPEN_BPS` | 3000 (30 %) | Open-lane share of slots (Sybil ceiling) |
 | `OPEN_TIP_BPS` | 2000 (20 %) | Open producer's own cut of an open block |
-| `BONDED_DIVIDEND_BPS` | 2000 (20 %) | Bonded block's contribution to the dividend pool |
+| `BONDED_DIVIDEND_BPS` | 4000 (40 %) | Bonded block's contribution to the dividend pool (2000 before betanet-5, gen 23) |
 | `B_MIN` | 10 NADO | Capital per bonded selection share |
-| `BOND_CAP` / `MAX_SHARES` | 100 000 NADO / 100 | Per-identity bond & share cap |
+| ~~`BOND_CAP` / `MAX_SHARES`~~ | removed 2026-08-25 | (was a per-identity bond & share cap) |
 | `BOND_RAMP_EPOCHS` | 30 | Fresh-bond selection-weight ramp |
-| `BOND_UNLOCK_DELAY` | 1440 blocks | Post-unbond lock (slashable) |
-| `SLASH_BOND_PENALTY` | `B_MIN` (1 000 NADO) | Burned per proven equivocation |
+| `BOND_UNLOCK_DELAY` | 14 400 blocks (~1 day) | Post-unbond lock (slashable) |
+| `SLASH_BOND_PENALTY` | `B_MIN` (10 NADO) | Burned per proven equivocation |
 | `TREASURY_MAX_SPEND_BPS` | 2500 (25 %) | Max single proposal vs current balance |
 | `TREASURY_SPEND_PERIOD` | 14 400 blocks | Self-burn cadence (~1 day @6s) |
 | `TREASURY_BURN_BPS` | 100 (1 %) | Self-burn of balance above the floor |
 | `MIN_TX_FEE` | 1 000 raw | Consensus anti-spam fee floor |
 
-> **Status:** testnet alpha (`chain_id = alphanet-6`). Several parameters carry alpha
+> **Status:** betanet, pre-mainnet (the network name is `protocol.CHAIN_ID`). Several parameters carry alpha
 > values flagged for mainnet tuning (e.g. `TREASURY_VOTE_ACTIVATION_EPOCHS`,
 > `TREASURY_RUNWAY_FLOOR`). Always read the current value from `protocol.py`.

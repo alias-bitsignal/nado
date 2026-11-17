@@ -4,12 +4,12 @@ import time
 
 from ops import codec
 import aiohttp
-from .account_ops import get_bonded_registry, get_open_registry, fetch_totals
+from .account_ops import get_bonded_registry, get_open_registry, fetch_totals, get_account
 from config import get_timestamp_seconds, get_config, hostport
 from .data_ops import average, get_home, is_hex_hash
 from hashing import blake2b_hash_link, blake2b_hash
 from signatures import sign as _sign_message, verify as _verify_message, unhex as _unhex
-from .address_ops import proof_sender, make_address
+from .address_ops import make_address
 from . import kv_ops
 from . import segment_store
 from .mining_ops import (select_producer_two_lane, lane_of, epoch_of, compute_beacon,
@@ -17,7 +17,7 @@ from .mining_ops import (select_producer_two_lane, lane_of, epoch_of, compute_be
 from protocol import (CHAIN_ID, REWARD_WINDOW, BASE_SUBSIDY, GENESIS_BEACON, EPOCH_LENGTH,
 
                       B_MIN, TREASURY_GENESIS, BOND_ELASTIC_MULT_BPS, BLOCK_TIMESTAMP_DRIFT)
-from protocol import ADDRESS_PREFIX
+from protocol import CHAIN_GENERATION, GENESIS_TIMESTAMP, DOMAIN_BLOCKSIG
 import zstandard as zstd
 
 # Block bodies are stored as zstd(codec(block)) (#14) — ops/codec.py is a compact portable JSON
@@ -57,14 +57,16 @@ def _unpack_block(raw: bytes):
 # Bounded decompress for the zstd block-sync WIRE payload (get_blocks_after/before). max_output_size caps a
 # decompression bomb from an untrusted peer (a tiny frame that expands to gigabytes); a full sync batch of
 # real data is a few MB (SYNC_BATCH_BYTES bounds the serve side), so 64 MiB is a generous ceiling.
-_ZSTD_WIRE_MAX = 64 << 20
+_ZSTD_WIRE_MAX = max(64 << 20, (__import__("protocol").MAX_INLINE_TX_BYTES * 2) + (64 << 20))
 
 # Block-sync batch bounds, shared by the serve side (nado.py blocks_after/before: hard count cap + byte
 # budget so a fat-block batch stays far under the client's _ZSTD_WIRE_MAX bomb cap) and the pull side
 # (core_loop emergency sync asks for SYNC_BATCH_MAX; an old peer capped at 100 simply returns fewer —
 # the puller never assumes a full batch). Mostly-empty ML-DSA blocks are ~7 KB, so 500 is ~3.5 MB typical.
 SYNC_BATCH_MAX = 500
-SYNC_BATCH_BYTES = 8 << 20
+# RAISED for inline settle proofs: a single block can now carry a ~120 MiB proof, so a batch byte budget of
+# 8 MiB would refuse to serve the very block that matters. See protocol.MAX_INLINE_TX_BYTES.
+SYNC_BATCH_BYTES = max(8 << 20, __import__("protocol").MAX_INLINE_TX_BYTES + (8 << 20))
 
 # Hard cap on the RAW (still-compressed) bytes we will buffer from a peer's block-sync response before
 # decoding. The serve side bounds a batch to SYNC_BATCH_BYTES compressed; 2x that is generous headroom for
@@ -133,7 +135,7 @@ def valid_block_timestamp(new_block):
         return True
 
 
-def _lands_flexibly(transaction):
+def _lands_flexibly(transaction, block_number=None):
     """True if a tx has NO landing-block-dependent protocol timing, so it may be included in ANY block in its
     [min_block, max_block] window (a plain EXPIRY window) instead of one exact height. Value transfers, `blob`
     (exec-layer, applied in L1 order regardless of which block), bridge in/out, and `dividend_withdraw` (a
@@ -143,9 +145,57 @@ def _lands_flexibly(transaction):
     (commit/reveal/attest), release-timed bond/unbond, PoW-anchored register/msgkey, settle, governance —
     keeps EXACT landing so its timing invariants hold. max_block still bounds the tx's life (mempool gate:
     tip < max_block < tip + TX_LANDING_WINDOW), so an unincluded tx still expires and can't be replayed."""
+    # is_address(), NOT startswith(ADDRESS_PREFIX). The prefix is gone at betanet-14, and an empty prefix
+    # makes startswith() true for EVERY string — bond, register, attest and settle would all be classified
+    # flexibly-landing and quietly lose the exact-landing timing invariant they depend on. It would not
+    # raise; it would just change consensus. The sniff was never a test anyway: "mldsa44" + garbage passed.
+    from ops.address_ops import is_address
     r = transaction.get("recipient")
-    return (r in ("blob", "bridge", "bridge_withdraw", "dividend_withdraw")
-            or (isinstance(r, str) and r.startswith(ADDRESS_PREFIX)))
+    # WINDOWED DUTY (DUTY_WINDOW_ACTIVATION, 2026-08-19): a duty tx that CARRIES min_block lands
+    # flexibly in [min_block, max_block]. Every duty timing rule binds to max_block — attest epoch is
+    # tb // EPOCH_LENGTH, commit targets epoch_of(tb)+2, the reveal window asserts lo <= tb <= hi —
+    # never to the landing height, so any landing at or below max_block preserves the exact same
+    # semantics while removing the landing cliff that seeded every remaining organic fork (a producer
+    # including its own duty one gossip-hop before the rest of the fleet had it). LEGACY duties carry
+    # no min_block and keep EXACT landing below — historical replay is byte-identical.
+    if r == "duty" and "min_block" in transaction:
+        return True
+    # `faucet` BELONGS HERE and was simply missed when the reserved recipient was added. A donation is the
+    # same shape as a bridge deposit — validate_transaction checks only "amount > 0" and "fee >= MIN_TX_FEE"
+    # — so it carries no landing-block-dependent timing whatsoever. Left out, it took the EXACT-landing
+    # branch below and was includable only in the single block numbered exactly max_block, so a donation
+    # sat in the mempool and expired unmined. Observed on betanet-3: a faucet tx pending across 47 blocks,
+    # validating cleanly at every height (no exclusion logged) and never selected, which is precisely the
+    # signature of exact-landing on a tx nobody targets exactly. It is also part of why the faucet has
+    # never held a balance on any generation.
+    # `auth` (account authentication, doc/key-rotation.md) likewise carries no landing-height timing of its
+    # own: its rules (version, policy, freeze, pending effective = landing height + AUTH_DELAY) are checked
+    # by validate_transaction at whatever height it lands, identically on every node.
+    # The four TPM enrolment messages (doc/tpm-attestation-without-a-ca.md) land flexibly, and leaving them
+    # out reproduced the faucet bug above exactly: 12 tpm_enrol transactions sat in the mempool validating
+    # cleanly at every height and never being selected, because each was includable only in the one block
+    # numbered exactly its max_block. The client, seeing nothing land, resubmitted every ten seconds.
+    #
+    # They carry no landing-height timing that flexible landing would break. Every ordering rule the
+    # exchange depends on is a comparison against the height a message ACTUALLY landed at — a challenge
+    # after the enrolment, a commitment after every challenge, a reveal after the commitment — so it holds
+    # whatever block each lands in, and every node evaluates it against the same landing height. The
+    # challenger draw is likewise a function of the landing height, so it too is identical on every node.
+    # What would NOT be safe is an exact-landing message whose timing bound was computed from max_block
+    # and then applied at a different height; there is no such rule here.
+    if (r in ("blob", "bridge", "bridge_withdraw", "dividend_withdraw", "faucet", "auth",
+              "tpm_enrol", "tpm_challenge", "tpm_commit", "tpm_reveal", "tpm_ready") or is_address(r)):
+        return True
+    # A PAYMENT TO A MULTISIG ACCOUNT is a value transfer like any other, but is_address() deliberately refuses the
+    # MSIG_PREFIX, so it took the exact-landing branch and — like the faucet above — was includable only in the one
+    # block numbered exactly its max_block: a shared account could not be funded by an ordinary transfer (found by the
+    # scheme-wallet walk, 2026-11-04: accepted into every mempool, never mined). From MSIG_PAY_FLEXIBLE_HEIGHT it lands
+    # in [min_block, max_block]; below it the old classification stands so history replays. INVARIANT: both callers
+    # (match_transactions_target, check_target_match) pass the block number, so producer and verifier agree.
+    from protocol import MSIG_PREFIX, MSIG_PAY_FLEXIBLE_HEIGHT
+    from ops.address_ops import validate_address
+    return (block_number is not None and int(block_number) >= MSIG_PAY_FLEXIBLE_HEIGHT and isinstance(r, str)
+            and bool(MSIG_PREFIX) and r.startswith(MSIG_PREFIX) and validate_address(r, allow_reserved=False))
 
 
 def check_target_match(transaction_list, block_number, logger):
@@ -155,7 +205,7 @@ def check_target_match(transaction_list, block_number, logger):
     try:
         for transaction in transaction_list:
             tb = transaction["max_block"]
-            if _lands_flexibly(transaction):
+            if _lands_flexibly(transaction, block_number):
                 # eligible window [min_block, max_block] (see match_transactions_target): too-early is as
                 # invalid as expired, so no producer can front-run a tx before it has propagated.
                 if block_number < transaction.get("min_block", 0) or block_number > tb:
@@ -192,7 +242,7 @@ def match_transactions_target(transaction_list, block_number, logger):
                 # the bridge-deposit double-credit. verify_block enforces the same rule for remote blocks.
                 if txid in seen or kv_ops.tx_get(txid) is not None:
                     continue
-                if _lands_flexibly(transaction):
+                if _lands_flexibly(transaction, block_number):
                     # INCLUSION DELAY: a flexibly-landing tx becomes eligible only from its sender-set
                     # min_block (default 0). Set to submit_tip + a couple blocks by wallets, this guarantees
                     # the tx has gossiped to EVERY producer before any of them may include it — so all nodes
@@ -211,13 +261,38 @@ def match_transactions_target(transaction_list, block_number, logger):
 
         # AUDIT FIX: drop duplicate reserved txs (e.g. two withdraws of one unbond, two heartbeats of
         # one epoch) so an honest producer never assembles a block verify_block would reject.
-        from ops.transaction_ops import dedupe_reserved, cap_block_blobs
+        from ops.transaction_ops import dedupe_reserved, cap_block_blobs, cap_block_budget
         # DA cap: keep blob txs only up to the per-block byte budget so the assembled block passes
-        # assert_block_blob_cap (excess blobs wait for a later block).
-        return cap_block_blobs(dedupe_reserved(matched_txs), logger)
+        # assert_block_blob_cap (excess blobs wait for a later block). Then the block-wide budget
+        # (from block 1): the same bound assert_block_budget enforces on every block validated.
+        return cap_block_budget(cap_block_blobs(dedupe_reserved(matched_txs), logger), block_number, logger)
     except Exception as e:
         logger.error(f"Error when matching transactions to target block: {e}")
         return False
+
+
+def derive_header(parent: dict, block_number: int) -> dict:
+    """THE header fields every node derives for block `block_number` on top of `parent`, from committed parent state:
+    {"creator", "reward", "block_weight", "lane", "open_n", "bonded_n", "eligible_n"}. creator is None when no lane has an
+    eligible producer.
+
+    ONE function for production (get_block_candidate), rebuild (CoreClient.rebuild_block) and verification
+    (verify_block / validate_block_producer). Three hand-kept copies of this derivation halted the chain at 135625
+    (2026-10-09): the draw input was switched to the epoch's frozen registry and the same variable fed the fork weight at
+    production while verification weighed from the live registry.
+    INVARIANT: the producer DRAW reads the registry frozen at the epoch's anchor (bonded_registry_for_epoch, behind the
+    RANDAO gate); the fork WEIGHT reads the LIVE as-of-parent registry (withholding and the snapshot must not move
+    fork-choice); the reward is get_block_reward(). Nothing else derives these."""
+    epoch = epoch_of(block_number)
+    beacon = epoch_beacon(epoch)
+    open_registry = get_open_registry(epoch)
+    bonded_registry = bonded_registry_for_epoch(epoch)
+    eligible_bonded = randao_eligible_bonded(bonded_registry, epoch)
+    creator = select_producer_two_lane(open_registry, eligible_bonded, beacon, slot=block_number)
+    return {"creator": creator, "reward": get_block_reward(),
+            "block_weight": block_fork_weight(get_bonded_registry(), block_number),
+            "lane": lane_of(block_number, beacon), "open_n": len(open_registry),
+            "bonded_n": len(bonded_registry), "eligible_n": len(eligible_bonded)}
 
 
 def get_block_candidate(
@@ -238,19 +313,13 @@ def get_block_candidate(
     # of identity count (Sybil bound). Every node computes the SAME winner deterministically from
     # committed parent state and builds the identical block crediting the winner ADDRESS. block_ip
     # is set to the winner address so the hashed body is identical per node.
-    epoch = epoch_of(block_number)
-    beacon = epoch_beacon(epoch)
-    open_registry = get_open_registry(epoch)
-    bonded_registry = get_bonded_registry()
-    # RANDAO gate (pass-through while RANDAO_ENFORCED is off — reveals are optional). The full
-    # registry always backs block_fork_weight below (withholding must not move fork-choice).
-    eligible_bonded = randao_eligible_bonded(bonded_registry, epoch)
-    winner = select_producer_two_lane(open_registry, eligible_bonded, beacon, slot=block_number)
+    hdr = derive_header(latest_block, block_number)
+    winner = hdr["creator"]
     if winner is None:
         logger.error("No eligible producer (open+bonded empty / bonded slot skipped); skipping block")
         return None
-    logger.info(f"Block {block_number} producer [{lane_of(block_number, beacon)} lane]: {winner} "
-                f"(open:{len(open_registry)} bonded:{len(eligible_bonded)}/{len(bonded_registry)})")
+    logger.info(f"Block {block_number} producer [{hdr['lane']} lane]: {winner} "
+                f"(open:{hdr['open_n']} bonded:{hdr['eligible_n']}/{hdr['bonded_n']})")
 
     targeted_transactions = match_transactions_target(transaction_list=transaction_pool.copy(),
                                                       block_number=block_number,
@@ -266,11 +335,11 @@ def get_block_candidate(
         parent_hash=latest_block["block_hash"],
         creator=winner,
         transaction_pool=targeted_transactions,
-        block_reward=get_block_reward(),
+        block_reward=hdr["reward"],
         parent_cumulative_fees=latest_block.get("cumulative_fees", 0),
         parent_cumulative_weight=latest_block.get("cumulative_weight", 0),
         chain_id=CHAIN_ID,   # informational label on new blocks (not hashed); a rename shows up here
-        block_weight=block_fork_weight(bonded_registry, block_number),  # as-of-parent (registry read above)
+        block_weight=hdr["block_weight"],   # as derive_header: the LIVE as-of-parent registry, never the draw snapshot
     )
     return block
 
@@ -310,77 +379,6 @@ def _load_body(block_hash: str):
     return _stamp_child(_unpack_block(payload))
 
 
-def migrate_block_store(logger) -> int:
-    """One-time, idempotent startup migration into the append-only SEGMENT store: sweep any legacy
-    per-file bodies (flat blocks/*.block AND sharded blocks/<hhh>/*.block) into segments, indexing
-    each hash->locator, then delete the file. Batched (append N -> one fsync via the store's
-    per-record fsync -> one locator txn -> unlink N) and crash-safe: a file is deleted only AFTER
-    its locator committed, so a crash re-migrates at most the current batch (duplicate records are
-    inert garbage; the locator always points at the newest copy). Also repairs a torn segment tail
-    (segment_store.init) on every boot."""
-    segment_store.init()
-    root = f"{get_home()}/blocks"
-    moved = 0
-    batch = []                                   # [(path, hash, seg, off, ln)]
-
-    def _flush():
-        nonlocal moved
-        if not batch:
-            return
-        with kv_ops.write_txn():
-            for _p, h, seg, off, ln in batch:
-                kv_ops.block_loc_put(h, seg, off, ln)
-        for p, _h, _s, _o, _l in batch:
-            try:
-                os.remove(p)
-            except OSError as e:
-                logger.warning(f"migrate: could not remove {p}: {e}")
-        moved += len(batch)
-        batch.clear()
-
-    try:
-        entries = []
-        with os.scandir(root) as it:
-            for entry in it:
-                if entry.is_file() and entry.name.endswith(".block"):
-                    entries.append(entry.path)
-                elif entry.is_dir() and len(entry.name) == 3:          # shard dir from the interim layout
-                    with os.scandir(entry.path) as sub:
-                        entries.extend(e.path for e in sub if e.is_file() and e.name.endswith(".block"))
-    except FileNotFoundError:
-        return 0
-    for path in entries:
-        h = os.path.basename(path)[:-6]
-        if not is_hex_hash(h):
-            continue
-        try:
-            with open(path, "rb") as f:
-                payload = f.read()
-        except OSError as e:
-            logger.warning(f"migrate: could not read {path}: {e}")
-            continue
-        seg, off, ln = segment_store.append(h, payload)
-        batch.append((path, h, seg, off, ln))
-        if len(batch) >= 512:
-            _flush()
-    _flush()
-    # sweep now-empty shard dirs from the interim layout
-    try:
-        with os.scandir(root) as it:
-            for entry in it:
-                if entry.is_dir() and len(entry.name) == 3:
-                    try:
-                        os.rmdir(entry.path)
-                    except OSError:
-                        pass
-    except FileNotFoundError:
-        pass
-    if moved:
-        logger.warning(f"Block store migrated to append-only segments: {moved} body file(s) folded "
-                       f"into blocks/seg-*.dat (locators in LMDB block_loc)")
-    return moved
-
-
 def get_block(block):
     """return a block by its hash"""
     # SECURITY: `block` reaches here from the unauthenticated /get_block?hash= arg;
@@ -403,12 +401,51 @@ def get_block_number(number):
         return False
 
 
+_GENESIS_HASH_CACHE = [None]
+
+
+def genesis_hash_cached():
+    """Block 0's hash, computed once per process — immutable for a running node (a reroll purges and
+    restarts). None while genesis hasn't landed yet; callers treat a missing value as unknown, never as
+    foreign. The single memo for /status and the peer loop (they used to keep one each)."""
+    if _GENESIS_HASH_CACHE[0] is None:
+        try:
+            _GENESIS_HASH_CACHE[0] = get_block_hash_by_number(0)
+        except Exception:
+            return None
+    return _GENESIS_HASH_CACHE[0]
+
+
 def get_block_hash_by_number(number):
     """block hash for a block number from the block index, or None (no block-file read)."""
     try:
         return kv_ops.hash_by_number(number)
     except Exception:
         return None
+
+
+def prune_tx_history_window(finalized_height: int, retention: int, logger) -> int:
+    """ROLLING MODE, tx half: prune tx-history rows below `finalized_height - retention`.
+
+    This is the term that dominates a busy node's disk at scale — bodies plateau under rolling mode but
+    the tx history never did, so at 20 tx/block it is ~97% of a ten-year footprint (tools/sim_disk_growth.py).
+
+    THE FLOOR IS THE WHOLE SAFETY ARGUMENT. The at-most-once replay guard reads this index, and a tx
+    mined at H is unreplayable once the chain passes H + TX_LANDING_WINDOW (its max_block cannot reach
+    further). So the retained window must exceed TX_LANDING_WINDOW, plus FINALITY_DEPTH because a reorg
+    may re-apply blocks, plus margin. TX_HISTORY_MIN_RETENTION encodes that and is enforced here rather
+    than trusted to config: an operator setting a small number must get a safe one, not a replay hole."""
+    from protocol import TX_HISTORY_MIN_RETENTION
+    keep = max(int(retention or 0), TX_HISTORY_MIN_RETENTION)
+    cutoff = int(finalized_height) - keep
+    if cutoff <= 0:
+        return 0
+    from ops import kv_ops
+    n = kv_ops.prune_tx_history(cutoff)
+    if n:
+        logger.info(f"Rolling prune: dropped {n} tx-history row(s) below #{cutoff} "
+                    f"(keeping {keep} blocks; floor {TX_HISTORY_MIN_RETENTION})")
+    return n
 
 
 def prune_block_bodies(finalized_height: int, retention: int, logger) -> int:
@@ -547,6 +584,25 @@ def epoch_beacon(epoch):
     return compute_beacon(GENESIS_BEACON, [anchor] + secrets)
 
 
+def bonded_registry_for_epoch(epoch: int) -> dict:
+    """The bonded registry epoch `epoch`'s producer draw and duty committee read. From epoch 2 it is the registry
+    FROZEN by the epoch's anchor block (epoch - 1) * EPOCH_LENGTH (kv_ops.regsnap_put, written in incorporate_block) —
+    the same block the epoch's beacon is anchored on — so a bond landing after the anchor cannot move that epoch's
+    draw. Epochs 0-1 read the live registry (epoch 1's anchor is genesis, which writes no row).
+    FAIL-LOUD like epoch_beacon: a missing row from epoch 2 means this node has not applied the anchor block, and
+    substituting the live registry would draw a different set than synced nodes.
+    INVARIANT: block production, block verification and the duty committee all read the registry through this."""
+    e = int(epoch)
+    # REGISTRY_SNAPSHOT_HEIGHT (gen 28's gate, 1 from gen 29, inlined in G9): `(e - 1) * EPOCH_LENGTH < 1` cannot hold
+    # for e >= 2, so `e < 2` alone decides — and must keep matching incorporate_block's `_bn >= 1` anchor test.
+    if e < 2:
+        return get_bonded_registry()
+    snap = kv_ops.regsnap_get(e)
+    if snap is None:
+        raise RuntimeError(f"registry snapshot for epoch {e} missing (anchor block {(e - 1) * EPOCH_LENGTH} not applied)")
+    return snap
+
+
 # memo for randao_eligible_bonded: {(epoch, sorted-secrets-tuple): {opened commitments}} — reveals
 # for an epoch are FINALIZED before its first slot (reveal window ends EPOCH_LENGTH*E - FINALITY_DEPTH - 1),
 # so during epoch E the set is immutable; keying by the secret tuple makes the memo self-correcting
@@ -598,13 +654,56 @@ def duty_committee_for_epoch(epoch: int) -> dict:
     generation + epoch."""
     from ops.mining_ops import duty_committee
     if kv_ops.in_write_txn():
-        return duty_committee(get_bonded_registry(), epoch_beacon(epoch), epoch)
+        return duty_committee(bonded_registry_for_epoch(epoch), epoch_beacon(epoch), epoch)
     key = (kv_ops.env_path(), kv_ops.write_generation(), int(epoch))
     entry = _duty_committee_cache[0]
     if entry is None or entry[0] != key:
-        entry = (key, duty_committee(get_bonded_registry(), epoch_beacon(epoch), epoch))
+        entry = (key, duty_committee(bonded_registry_for_epoch(epoch), epoch_beacon(epoch), epoch))
         _duty_committee_cache[0] = entry
     return dict(entry[1])
+
+
+# /mining_status lane totals, memoized per (env, committed-write generation, epoch): the wallet polls this
+# ~4/s through the relay and every call summed open_shares over the whole open registry (1,125 entries)
+# on top of get_open_registry's own per-block rebuild — 17 % of relay GIL time (py-spy, 2026-09-06). The
+# address-specific part is two dict lookups, so only the lane totals are cached. Single slot + lock, the
+# _open_reg_cache pattern (e2396baf).
+_ms_lanes_cache = [None]
+_ms_lanes_lock = _threading.Lock()
+
+
+def _mining_status_lanes(epoch):
+    from .mining_ops import open_shares, selection_shares, bond_ramp_weight
+
+    # apply the producer-selection ramp to the DISPLAY weights too, so a freshly-bonded miner's "expected
+    # time to mine" honestly reflects that its bonded weight ramps up over BOND_RAMP_EPOCHS (consensus draw
+    # is the source of truth; this just keeps the estimate consistent with it).
+    def _bwt(info):
+        """display-side bonded weight: selection shares with the bond-age ramp applied (mirrors the consensus draw)"""
+        return bond_ramp_weight(selection_shares(info["bonded"], info.get("fidelity")),
+                                info.get("bond_since"), epoch)
+
+    key = (kv_ops.env_path(), kv_ops.write_generation(), epoch)
+    entry = _ms_lanes_cache[0]
+    if entry is None or entry[0] != key:
+        with _ms_lanes_lock:
+            entry = _ms_lanes_cache[0]
+            if entry is None or entry[0] != key:
+                beacon = epoch_beacon(epoch)
+                open_reg = get_open_registry(epoch)
+                # DISPLAY MIRRORS THE DRAW: the wallet's "expected time to mine" and lane totals go through the same
+                # registry functions the consensus draw calls (mining_ops.bonded_producer_registry /
+                # open_lane_draw_registry), never a re-derivation at this call site.
+                from .mining_ops import bonded_producer_registry
+                bonded_reg = bonded_producer_registry(bonded_registry_for_epoch(epoch), open_reg, epoch * EPOCH_LENGTH)
+                from .mining_ops import open_lane_draw_registry
+                open_draw = open_lane_draw_registry(open_reg, epoch * EPOCH_LENGTH)
+                total_open = sum(open_shares(i.get("fidelity"), epoch) for i in open_draw.values())
+                total_bonded = sum(_bwt(i) for i in bonded_reg.values())
+                entry = (key, beacon, open_reg, bonded_reg, total_open, total_bonded)
+                _ms_lanes_cache[0] = entry
+    _, beacon, open_reg, bonded_reg, total_open, total_bonded = entry
+    return beacon, open_reg, bonded_reg, total_open, total_bonded, _bwt, open_shares
 
 
 def mining_status(address, latest_block_number, block_time):
@@ -613,24 +712,13 @@ def mining_status(address, latest_block_number, block_time):
     (display only, never consensus). For the slot after the tip: reports the lane split, each lane's
     total weight + size, and `address`'s open/bonded weight, then derives expected blocks/seconds
     between wins from this identity's share of each lane."""
-    from .mining_ops import open_shares, selection_shares
     from protocol import K_OPEN
     next_block = latest_block_number + 1
     epoch = epoch_of(next_block)
-    beacon = epoch_beacon(epoch)
-    open_reg = get_open_registry(epoch)
-    bonded_reg = get_bonded_registry()
-    from .mining_ops import bond_ramp_weight
-    # apply the producer-selection ramp to the DISPLAY weights too, so a freshly-bonded miner's "expected
-    # time to mine" honestly reflects that its bonded weight ramps up over BOND_RAMP_EPOCHS (consensus draw
-    # is the source of truth; this just keeps the estimate consistent with it).
-    def _bwt(info):
-        """display-side bonded weight: selection shares with the bond-age ramp applied (mirrors the consensus draw)"""
-        return bond_ramp_weight(selection_shares(info["bonded"], info.get("fidelity")),
-                                info.get("bond_since"), epoch)
-    total_open = sum(open_shares(i.get("fidelity")) for i in open_reg.values())
-    total_bonded = sum(_bwt(i) for i in bonded_reg.values())
-    my_open = open_shares(open_reg[address]["fidelity"]) if address in open_reg else 0
+    beacon, open_reg, bonded_reg, total_open, total_bonded, _bwt, open_shares = _mining_status_lanes(epoch)
+    from .mining_ops import open_lane_draw_registry
+    _open_draw = open_lane_draw_registry(open_reg, next_block)
+    my_open = open_shares(open_reg[address]["fidelity"], epoch) if address in _open_draw else 0
     my_bonded = _bwt(bonded_reg[address]) if address in bonded_reg else 0
     open_frac = K_OPEN / EPOCH_LENGTH
     bonded_frac = (EPOCH_LENGTH - K_OPEN) / EPOCH_LENGTH
@@ -646,9 +734,21 @@ def mining_status(address, latest_block_number, block_time):
         "open_registry_size": len(open_reg), "total_open_weight": total_open,
         "bonded_registry_size": len(bonded_reg), "total_bonded_shares": total_bonded,
         "address": address, "registered_present": address in open_reg,
+        # read through open_lane_draw_registry, which excludes nobody since the gen-25 exclusion gates went: False
+        # for every address, kept because wallets read it
+        "open_excluded_bonded": bool(address in open_reg and address not in _open_draw),
         "my_open_weight": my_open, "my_bonded_shares": my_bonded,
+        # The savings lane is plain stake (protocol.py "THE SAVINGS LANE IS PLAIN STAKE"): no device is required and
+        # weight = stake. The two flags stay because wallets read them; the gen-25 cap / knee / pool fields went with
+        # the gates (bond_cap_active, pools_retired, bond_device_cap, bond_knee and the delegation view).
+        "bond_attest_required": False,
+        "bonded_producing": address in bonded_reg,
+        "my_bonded_raw": int((get_account(address, create_on_error=False) or {}).get("bonded", 0) or 0) if address else 0,
+        "my_bonded_effective": int(bonded_reg[address]["bonded"]) if address in bonded_reg else 0,
+        "bond_plain": True,
         "expected_blocks_between_wins": expected_blocks,
         "expected_seconds_between_wins": (expected_blocks * block_time) if expected_blocks else None,
+        "bonded_producer_cut": int(__import__("protocol").split_bonded_block_reward(int(get_block_reward()))[0]),
     }
 
 
@@ -697,6 +797,13 @@ def block_content_hash(block: dict) -> str:
         "state_root": block["state_root"],
         "exec_root": block["exec_root"],
         "exec_cursor": block["exec_cursor"],
+        # AUTHORIZATION COMMITMENT — MUST mirror construct_block exactly. This function is the RE-DERIVATION
+        # half of the hash, and save_block refuses (raises) any block whose content does not hash to its own
+        # block_hash. So a field added to construct_block's preimage and NOT added here does not cause a
+        # subtle mismatch somewhere: it makes EVERY block unpersistable and halts the chain outright. These
+        # two dicts are one definition written twice, and that is exactly why they drift.
+        "auth_root": block["auth_root"],
+        "auth_count": block["auth_count"],
         "chain_id": None,   # NON-HASHED (see construct_block): genesis-hash + parent linkage identify the
                             # chain, so a CHAIN_ID change never alters a block hash or breaks genesis sync.
     }
@@ -724,7 +831,8 @@ def save_block(block: dict, logger):
     # and get chained onto, forking every honest node that later re-derives the true hash (the "stuck /
     # rolls back and forth" wedge). Genesis (block 0) is hashed differently (over timestamp+[] only), skip it.
     _hashed = ("block_number", "parent_hash", "block_creator", "block_transactions", "block_reward",
-               "cumulative_fees", "cumulative_weight", "state_root", "exec_root", "exec_cursor")   # chain_id NON-hashed
+               "cumulative_fees", "cumulative_weight", "state_root", "exec_root", "exec_cursor",
+               "auth_root", "auth_count")   # chain_id NON-hashed
     if block.get("block_number", 0) != 0 and all(k in block for k in _hashed):
         expected = block_content_hash(block)
         if expected != block["block_hash"]:
@@ -933,6 +1041,20 @@ def construct_block(
 
     block_fees = sum(transaction["fee"] for transaction in transaction_pool)
 
+    # AUTHORIZATION COMMITMENT (signature aggregation, doc/zk-signature-aggregation.md). Commit, inside the
+    # hash preimage, a field-native root over the ordered authorization entries and the exact number of them.
+    # This is what gives an aggregate validity proof a statement it CANNOT choose: the entries are derived
+    # from the block's own transactions (verify_block recomputes both and rejects on mismatch), so a prover
+    # can only attest the checks the block actually demands.
+    #
+    # A PURE function of committed block data — no state read, no pubkey resolution (see
+    # mldsa_block_auth's docstring). That is deliberate: state_root is the one state-dependent header field
+    # and a mismatch there is fatal by design; a second one would add a divergence surface for no binding,
+    # since `sender` is the address derived from the key and proof_sender() ties them natively per tx.
+    from ops import mldsa_block_auth as _auth
+    _auth_root, _auth_count = _auth.auth_commitments(
+        {"block_number": block_number, "block_transactions": transaction_pool})
+
     block_message = {
         "block_number": block_number,
         "block_hash": None,
@@ -961,6 +1083,10 @@ def construct_block(
         "state_root": state_root,
         "exec_root": exec_root,
         "exec_cursor": exec_cursor,
+        # AUTHORIZATION COMMITMENT (see above): the ordered-entry root and the exact entry count. Hashed, so
+        # neither can change without changing block identity; recomputed and enforced in verify_block.
+        "auth_root": _auth_root,
+        "auth_count": _auth_count,
         "chain_id": None,          # EXCLUDED from the hash (see docstring); stamped as the real value below
     }
     block_hash = blake2b_hash_link(link_from=parent_hash, link_to=block_message)
@@ -977,22 +1103,57 @@ def construct_block(
 # Only the winner, holding its own key, can produce a valid one. Two valid signatures by the same
 # winner over two different blocks at the same height+parent are a portable EQUIVOCATION proof (slash).
 
+# The chain's identity as the block store itself defines it: block 0's hash is blake2b_hash_link(GENESIS_TIMESTAMP, [])
+# (genesis.make_genesis; nado.py's boot check purges on-disk data that disagrees). Fixed for the chain's whole life.
+_GENESIS_HASH = blake2b_hash_link(link_from=GENESIS_TIMESTAMP, link_to=[])
+
+
 def _block_sig_message_fields(block_number, parent_hash, block_hash) -> bytes:
-    """The exact bytes a winner signs to authenticate a block: blake2b(height, parent_hash, block_hash).
-    No chain_id: the block_hash is already unique to THIS chain (it descends from a unique genesis via
-    parent_hash), so it can't be replayed onto another chain — and leaving chain_id out keeps signature
-    verification, like block hashing, invariant to a CHAIN_ID constant change. Field-based so an
-    equivocation proof can reconstruct it without a full block dict."""
+    """The exact bytes a winner signs to authenticate a block. Field-based so an equivocation proof can reconstruct
+    it without a full block dict — which is also why it must name the chain by itself: a proof carries no block.
+
+    blake2b(DOMAIN_BLOCKSIG, CHAIN_GENERATION, genesis hash, height, parent_hash, block_hash). The chain-less form
+    blake2b(height, parent_hash, block_hash) (gen 27's) named no chain, and verify_equivocation_proof never checks the
+    proof's parent is ours, so a double-sign from ANY chain the key ever signed on (every earlier generation — keys
+    carry across rerolls, slash markers do not — or one that reused this genesis, as gens 7-9 and 26/27 did) slashed
+    the carried bond here (audit 2026-09-25 "cross-generation slash replay",
+    tests/test_slash_evidence_is_this_chain_only.py).
+
+    The chain-less form survives ONLY for a height that is not an int >= 1 — gen 27's BLOCK_SIG_CHAIN_BIND_HEIGHT,
+    1 from gen 28 (deleted). No winner signs block 0 and sign_block only ever signs tip + 1, so no signature this
+    chain makes uses it; it is kept so a height-0 or malformed height is judged exactly as it was under the gate
+    (verify_equivocation_proof refuses height-0 evidence judged at any block; see there).
+    INVARIANT: sign_block, verify_block_signature and verify_equivocation_proof all reach the signed bytes through
+    THIS function and nothing else; a second spelling of the message is a place where a foreign-chain signature
+    verifies again. Never bind the CHAIN_ID label here: a CHAIN_ID rename must not change a signature's bytes
+    (tests/test_genesis_sync_invariant, the relaunch-3 -> alphanet-1 sync wedge); the generation and the genesis hash
+    cannot change without the chain changing."""
+    # isinstance, not a bare comparison: a malformed height must fail verification exactly as it did before the gate,
+    # never raise from here (verify_block_signature runs before the rebuild that would refuse it).
+    if isinstance(block_number, int) and not isinstance(block_number, bool) and block_number >= 1:
+        return _unhex(blake2b_hash([DOMAIN_BLOCKSIG, CHAIN_GENERATION, _GENESIS_HASH,
+                                    block_number, parent_hash, block_hash]))
     return _unhex(blake2b_hash([block_number, parent_hash, block_hash]))
 
 
 def block_signature_message(block) -> bytes:
     """Bytes the winner signs over its block; binds the block's identity so a signature cannot be
-    replayed onto another block or chain. Hex/int only."""
+    replayed onto another block or onto another chain (see _block_sig_message_fields). Hex/int only."""
     return _block_sig_message_fields(block["block_number"], block["parent_hash"], block["block_hash"])
 
 
-def verify_equivocation_proof(proof) -> tuple:
+def hash_attest_message(height: int, block_hash: str, as_of_height: int) -> bytes:
+    """Bytes a node signs when ATTESTING its canonical hash at a height for the fork-verdict probes
+    (stake-signed verdicts; doc/finality.md §3a). Binds chain identity + the claim + freshness:
+      * chain_id — a signature from another generation must not count;
+      * height/block_hash — the claim itself;
+      * as_of_height — the signer's tip when it signed, so a STALE signature (captured before the signer
+        itself reorged) is refused by the prober's freshness window instead of counting forever.
+    Replay of a FRESH signature is harmless: it restates a live claim the signer would make again."""
+    return f"hashattest|{CHAIN_ID}|{int(height)}|{str(block_hash)}|{int(as_of_height)}".encode()
+
+
+def verify_equivocation_proof(proof, judge_height=None) -> tuple:
     """Verify a block-authorship EQUIVOCATION proof: the SAME identity validly signed TWO DIFFERENT
     blocks at the SAME height+parent (#15 step 5C). proof = {block_number, parent_hash, public_key,
     block_hash_a, signature_a, block_hash_b, signature_b}. Returns (offender_address, block_number)
@@ -1011,11 +1172,28 @@ def verify_equivocation_proof(proof) -> tuple:
             return None
         if ha == hb:
             return None  # not conflicting — same block
+        # THIS CHAIN ONLY (audit 2026-09-25 "cross-generation slash replay"): the signatures below are checked over
+        # _block_sig_message_fields, which names this generation and genesis for every height >= 1, so a pair signed
+        # for another chain does not verify. Height-0 evidence (which no winner signs) would be checked in the
+        # chain-less form, so it is refused outright when judged at a block. `>= 1` / `< 1` are gen 27's
+        # BLOCK_SIG_CHAIN_BIND_HEIGHT, 1 from gen 28 (deleted): judging height 0 (mempool admission on a genesis tip)
+        # or None (the in-block uniqueness key, the watchtower) was below the gate and keeps its verdict.
+        # INVARIANT: never verify evidence through any message other than _block_sig_message_fields.
+        if judge_height is not None and judge_height >= 1 and bn < 1:
+            return None
         for bh, sig in ((ha, proof.get("signature_a")), (hb, proof.get("signature_b"))):
             if not sig or not _verify_message(signed=sig, public_key=pk,
                                               message=_block_sig_message_fields(bn, parent, bh)):
                 return None
-        return make_address(pk), bn
+        # ACCOUNT AUTHENTICATION: the offender is the account the key authorized AT THAT HEIGHT — named in
+        # the proof when the key was a rotated-in authenticator (it no longer derives the address), else the
+        # address the key derives. Either way key_valid_at answers from auth_history, so a rotated-away
+        # key's past double-signs stay slashable and a key can never be pinned on an account it never held.
+        from ops.auth_ops import key_valid_at
+        offender = proof.get("offender") or make_address(pk)
+        if not isinstance(offender, str) or not key_valid_at(pk, offender, bn, judge_height):
+            return None
+        return offender, bn
     except Exception:
         return None
 
@@ -1042,31 +1220,105 @@ def verify_block_signature(block) -> bool:
     signature = sig.get("signature")
     if not pubkey or not signature:
         return False
-    if not proof_sender(public_key=pubkey, sender=block["block_creator"]):
-        return False  # signer is not the selected winner for this slot
+    from ops.auth_ops import key_authorized
+    if not key_authorized(pubkey, block["block_creator"], height=block.get("block_number")):
+        return False  # signer is not (a key that authorizes) the selected winner for this slot
     return _verify_message(signed=signature, public_key=pubkey, message=block_signature_message(block))
 
 
-async def knows_block(target_peer, port, hash, number, logger):
-    """ask a peer whether OUR block at height `number` is on ITS canonical chain
-    (GET /get_block_number + hash compare). Storing the hash is NOT knowing it: a fork leftover
-    lingering in the peer's store by hash must answer False here, because a donor that "knows" a
-    block it cannot extend baits the fast-forward sync leg into serves-nothing tip rejection —
-    observed live wedging a fresh node on a donor's abandoned-fork checkpoint. False on non-200
-    AND on any network error — an unreachable peer just counts as not knowing."""
+# --- authorization evidence: the node-side halves the pure commitment module cannot have -------------
+# mldsa_block_auth is deliberately state-free (it must be importable by a prover, a browser miner, and the
+# test suite without a database). Resolution and proof verification are the two things that genuinely need
+# the node, so they live here and are passed IN.
+
+def resolve_sender_pubkey(sender):
+    """The sender's on-chain public key under PUBKEY-ONCE — the verifier's OWN resolution, which is what
+    makes detached evidence unforgeable: an envelope that could name its own key would verify against
+    itself. None when the address has not yet published a key (its first tx must carry one, and that tx's
+    signature is checked natively from the tx body)."""
     try:
-        url_construct = f"http://{hostport(target_peer, port)}/get_block_number?number={int(number)}"
+        from ops.account_ops import get_account
+        acc = get_account(sender, create_on_error=False)
+        return (acc or {}).get("public_key") or None
+    except Exception:
+        return None
+
+
+def verify_auth_proof(circuit_id, proof, statement):
+    """Verify an AGGREGATE authorization proof against the verifier-derived statement.
+
+    `statement` is built by mldsa_block_auth from OUR recomputed (auth_root, auth_count, height, parent) —
+    never from the envelope. Returns False on anything unexpected: an envelope that cannot be verified is
+    not evidence, and a block that ships one is making a claim it cannot back."""
+    # THE AGGREGATE PATH IS GONE. An aggregate STARK envelope is never accepted; a block that ships one is
+    # making a claim nothing here can check, so this is False unconditionally.
+    #
+    # It was removed because the economics never worked, and the measurements are worth keeping: ONE
+    # ML-DSA-44 signature verifies natively in 120 us and occupies 2420 bytes. Proving even the BUTTERFLY
+    # half of one signature's w' cost 7.11 min, produced a 1.87 MB proof, and took 6.98 s to verify -- ~770x
+    # the size and ~58,000x the verify time of the thing it replaces. Aggregation can only win by
+    # amortising over a batch, and break-even needed ~116 signatures for size and ~12 for verify while the
+    # trace-row budget capped a batch near 7. ZK pays where CHECKING is much cheaper than DOING; verifying a
+    # signature is already cheap, so there was nothing to save.
+    #
+    # The state proof is the right shape and already exists: settlement_proofs proves a whole epoch as ONE
+    # zkVM trace and L1 verifies it in ~0.3 s INDEPENDENT of the call count, replacing re-execution, which
+    # genuinely is expensive. See SETTLE_PROOF_RECURSIVE.
+    return False
+
+
+def check_block_auth_evidence(block):
+    """(ok, reason) for a block's DETACHED authorization envelope, or (True, ...) when it ships none.
+
+    The one node-side entry point: it recomputes the commitment, resolves keys itself, and verifies either
+    raw signatures or an aggregate proof. Absent envelope -> the per-tx signatures validated natively ARE
+    the evidence, which is what every block ships today."""
+    from ops import mldsa_block_auth as _auth
+    ev = block.get("block_auth_evidence")
+    if ev is None:
+        return True, "no detached envelope (per-tx signatures are the evidence)"
+    return _auth.evidence_ok(
+        ev, block,
+        resolve_pubkey=resolve_sender_pubkey,
+        verify_sig=lambda sig, pk, txid, alg=None: bool(pk) and bool(
+            _verify_message(signed=sig, public_key=pk, message=_unhex(txid), alg=alg)),
+        verify_proof=verify_auth_proof)
+
+
+async def knows_block(target_peer, port, hash, number, logger):
+    """TRI-STATE: is OUR block at height `number` on the peer's canonical chain?
+
+        True   the peer serves OUR hash at that height — it knows the block.
+        False  the peer ANSWERED with a DIFFERENT hash at that height — positive evidence our block is
+               not on its chain. (Storing the hash is NOT knowing it: a fork leftover lingering in the
+               peer's store by hash must not count, because a donor that "knows" a block it cannot
+               extend baits the fast-forward leg into serves-nothing tip rejection.)
+        None   the peer COULD NOT ANSWER — unreachable, timeout, non-200 (it may simply not have the
+               height yet: a donor momentarily behind us 404s), malformed body.
+
+    THE DISTINCTION IS LOAD-BEARING. The old contract collapsed None into False ("an unreachable peer
+    just counts as not knowing"), and emergency sync ROLLS BACK A REAL BLOCK on False — so every donor
+    timeout converted directly into a reverted block, and a flaky donor could eat an entire 40-block
+    burst (measured 2026-08-17: 2,609 rollbacks, 20 exhausted bursts, in one day, while the chain was
+    healthy). Absence of information is never evidence of divergence — the same rule the exec layer's
+    finality-revert probe enforces, for the same reason (2026-08-03). Truthiness-only callers are
+    unaffected (None is falsy, the conservative read for donor qualification)."""
+    try:
+        url_construct = f"http://{hostport(target_peer, port)}/get_block?number={int(number)}"
 
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
-            async with session.get(url_construct) as response:
+            # allow_redirects=False: a peer's 302 to 127.0.0.1 would be a loopback-authorized GET here (ops/outbound_guard.py)
+            async with session.get(url_construct, allow_redirects=False) as response:
                 if response.status != 200:
-                    return False
+                    return None
                 data = await response.json(content_type=None)
-                return isinstance(data, dict) and data.get("block_hash") == hash
+                if not isinstance(data, dict) or not data.get("block_hash"):
+                    return None
+                return True if data.get("block_hash") == hash else False
 
     except Exception as e:
         logger.error(f"Failed to check block {hash} (height {number}) from {target_peer}: {e}")
-        return False
+        return None
 
 
 async def get_blocks_after(target_peer, from_hash, logger, count=50, compress="zstd"):
@@ -1080,7 +1332,8 @@ async def get_blocks_after(target_peer, from_hash, logger, count=50, compress="z
         url_construct = f"http://{hostport(target_peer, get_config()['port'])}/get_blocks_after?hash={from_hash}&count={count}&compress={compress}"
 
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60, connect=5)) as session:
-            async with session.get(url_construct) as response:
+            # allow_redirects=False: a peer's 302 to 127.0.0.1 would be a loopback-authorized GET here (ops/outbound_guard.py)
+            async with session.get(url_construct, allow_redirects=False) as response:
                 code = response.status
 
                 if code == 200 and compress == "zstd":
@@ -1092,51 +1345,3 @@ async def get_blocks_after(target_peer, from_hash, logger, count=50, compress="z
 
     except Exception as e:
         logger.error(f"Failed to get blocks after {from_hash} from {target_peer}: {e}")
-
-
-async def get_blocks_before(target_peer, from_hash, logger, count=50, compress="zstd"):
-    """mirror of get_blocks_after for backward sync: up to `count` blocks BEFORE from_hash (walking
-    toward genesis), same bomb-capped zstd wire decode, same tight-connect/long-total timeout split,
-    falsy on any failure."""
-    from ops.net_ops import read_capped   # local import: keep net_ops off block_ops' import-time graph
-    try:
-        url_construct = f"http://{hostport(target_peer, get_config()['port'])}/get_blocks_before?hash={from_hash}&count={count}&compress={compress}"
-
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60, connect=5)) as session:
-            async with session.get(url_construct) as response:
-                code = response.status
-
-                if code == 200 and compress == "zstd":
-                    return _unpack_wire(await read_capped(response, _SYNC_WIRE_CAP))
-                elif code == 200:
-                    return json.loads((await read_capped(response, _SYNC_WIRE_CAP)).decode())["blocks_before"]
-                else:
-                    return False
-
-    except Exception as e:
-        logger.error(f"Failed to get blocks before {from_hash} from {target_peer}: {e}")
-        return False
-
-
-async def get_from_single_target(key, target_peer, logger) -> list:
-    """obtain from a single target over the bomb-capped zstd(codec) wire, returns list ([] on failure).
-    The old JSON path also had NO body cap — a malicious peer could stream unbounded bytes."""
-    from ops.net_ops import read_capped, unpack_zstd_peer, MAX_PEER_BODY
-
-    try:
-        url_construct = f"http://{hostport(target_peer, get_config()['port'])}/{key}?compress=zstd"
-
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
-            async with session.get(url_construct) as response:
-                if response.status == 200:
-                    fetched = unpack_zstd_peer(await read_capped(response, MAX_PEER_BODY))
-                    return fetched if isinstance(fetched, list) else []
-                else:
-                    return []
-
-    except Exception as e:
-        logger.error(f"Failed to get {key} from {target_peer}: {e}")
-        return []
-
-
-

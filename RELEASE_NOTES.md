@@ -1,8 +1,643 @@
-# Alphanet reboot — 2026-07-14 (alphanet-5: zkVM-only, provable contracts, games returning)
+# betanet-8 (gen 27) — the carry-everything reroll (2026-09-25)
+
+**Everything carried, exactly.** Balances, bonded stake, uncollected dividends and pending exits: 128,252,772,528,624
+raw left betanet-7 at block 233042 and the same total started betanet-8 (Δ = 0). New this time: identities
+(registration, fidelity, device credential, account-auth keys), 103 device bindings, 6 aliases and account-auth history
+carry too, so nobody re-registers or re-binds a device. The exec layer was brought to the exact L1 tip before the carry,
+so dividend claims and deposits in the last unfinalized blocks were not lost.
+
+**The open lane starts with the 46 identities that were live at the tip.** An identity whose lease had lapsed on
+betanet-7 keeps its registration and device and rejoins with its next renewal. (A first genesis leased every registered
+identity — 79 collectors, 33 of them absent — and was replaced before block 1; no block was ever built on it.)
+
+**What changed for users**
+- Every rule betanet-7 switched on part-way is live from block 1: the full-domain proof checks, the key binding of
+  addresses that have sent, the stake-anchored settle window, one slash per offence per block, the privacy pause.
+- The savings lane is plain stake; staking pools, the savings cap and the bond curve are gone (they had been retired
+  on betanet-7). `pool` / `delegate` / `undelegate` are refused.
+- Intel TPMs whose endorsement certificate walks to Intel's V2 root can enrol, from block 1400.
+- The chain clock runs at the measured 6.4 s per block (was 6), so contract time tracks the wall clock again.
+- Game contracts were redeployed and every page rewired (the wallet's reserve panel included); the faucet prize bank
+  was refilled (99.4 NADO); the one game pot the carry could not attribute was refunded by hand (block 3090).
+
+**Fixed alongside**
+- The lend page never wired its buttons (since 2026-08-02); it works now.
+- A node catching up across a block with a records-bound settle proof crashed there; fixed before any new node hit it.
+- Two TPM challengers answering in one block could leave a node unable to re-take that block after a reorg; fixed.
+- A returning wallet no longer carries the previous chain's relay heights into its first transactions.
+- The translation file keeps its cache across updates, so pages stop showing raw placeholders after a deploy.
+
+**For operators:** every background job is declared in `deploy/units/manifest.json` and installed by the node's own
+update (doc/jobs.md); `/status` → `jobs.problems` lists anything missing or stopped. An existing operator machine needs
+the one-time pass in doc/jobs.md.
+
+# betanet-7 (gen 25) — the PoSEA reroll: Proof of Secure Element Attestation (2026-09-07)
+
+**2026-09-09 — stakers are back in the free lane (from block 29900; no exclusion at all at the next reroll).** One
+device is one open-lane slot, staked or not. The exclusion was per account, which free keys void (park the surplus in
+a second wallet), and it cut a saver's open-lane income tenfold at the tenth NADO. Open weight stays capital-free and
+one identity per device; the dividend never depended on stake.
+
+**2026-09-09 — the knee is gone (from block 19400; plain stake from genesis at the next reroll).** Savings-lane weight
+is stake, one for one. With free keys a per-wallet curve is undone by splitting at the knee; it shaped nobody's weight
+and only invited wallet sprawl. Nothing to do for anyone; one wallet is enough.
+
+**2026-09-08 night — staking pools retired (gated at block 16900; never enabled at the next reroll).** With the bonded
+lane device-free, a pool could pay a delegator at most what solo staking pays, minus a fee (nadochain.com's delegators
+were at 51 % of solo, ninja pool's at 79 %). From the gate every bonded identity produces alone, delegations are
+ignored, the in-block split is off and the three pool transactions are refused; nothing to do for former delegators.
+The code stays in git.
+
+**2026-09-08 evening — the bonded lane needs no device (gated at block 16150; from genesis at the next reroll).**
+Savings produce on their own on the knee/tail curve; nothing to attest, nothing to renew. Delegation stays optional
+(the wallet shows the solo yield next to every pool). The device rule stays where it discriminates: the free lane and
+the presence dividend, which an attested staker keeps earning on top. Why: on the live lane the attested-only rule
+idled 19 % of stake, cost device owners ~40 % against plain stake weight, and stopped only a one-phone whale — three
+phones beat it at any stake above 10,000 NADO. Details: `doc/device-attestation.md` §"Bonded lane without a device".
+
+Every open-lane identity is attested hardware. A `register` transaction (entry or renewal, every 36 h) carries a
+WebAuthn hardware attestation over a chain-chosen challenge, verified by every node with the native `native/attest`
+kernel against roots pinned in protocol: iPhone/iPad (Apple), Android (TEE/StrongBox, locked bootloader), Windows
+PCs on a physical TPM (Windows Hello; virtual TPMs refused), and FIDO2 security keys (each bound to its own vendor
+root from the FIDO metadata snapshot). A VM, an emulator, a desktop without hardware, a software authenticator or a
+rooted phone cannot register. No central service.
+
+Retired because a device proof makes them redundant: the sequential-work registration proof (PoSW) and its
+difficulty machinery, the per-IP entry budget and identity cap, probation (an attested identity earns from its
+first lease), the node's open-lane auto-register (nodes earn in the bonded lane), the gen-24 gate constants.
+
+**Clean dividend curve.** `dividend_weight = min(fidelity, 30)` over EVERY level: the first lease (fidelity 1) pays
+weight 1, then 2, 3 … 30. Gen 24 skipped fidelity 1 (probation) because identities were free to farm; an attested
+identity is a device and a tap, so the line is unbroken. Open-lane draw weight is the plain 2..10 floor+bonus curve
+from the first lease. The bond unlock delay, the fidelity ramp, the lease and the lane split are unchanged.
+
+**One device, one identity** (`DEVICE_BIND_HEIGHT` = 460 on betanet-7). From that block a register tx's device
+certificate — the Android remotely-provisioned attestation certificate, the Windows AIK certificate — is bound to
+its sender for one lease (36 h) in consensus state; the same certificate cannot register a second identity while
+the binding is live. Device classes without a per-device certificate (FIDO2 batch keys, Apple statements,
+batch-attested pre-Android-12 phones) are refused from that block: what cannot be bound is not accepted.
+
+**Strict binding** (`DEVICE_BIND_STRICT_HEIGHT` = 1700). A same-day review found two holes in the binding: duplicate
+CBOR keys let a statement verify as one chain and bind as another, and the parent-state check let several senders bind
+one device inside a single block. From block 1700 the consensus parser refuses duplicate keys and a register
+transaction occupies a per-device uniqueness key in its block. Also from the review: the node-attestation drop store
+is bounded (8 MiB, 16 KB per statement, four per sender, refused statements are never rebuilt), the identity log skips
+peer re-pushes, the mempool file is written synchronously at shutdown, and the Ledger path signs DER correctly.
+
+**Hardware wallets vouch.** A Ledger (WebHID) or a Trezor Safe (WebUSB) can attest the wallet's identity from
+Chrome, Edge or Brave on a computer: the wallet speaks the vendor's own genuineness protocol, the kernel verifies
+the per-device factory key (`ledger`) or per-device certificate chain to Trezor's pinned root key (`trezor`), and
+the device is bound like a phone or TPM. Their FIDO2 mode stays refused (batch certificates). Buttons under Start.
+
+**Open-lane blocks for device-only miners** (`OPEN_LANE_EXCLUDE_BONDED_HEIGHT` = 6600): the open-lane draw skips
+attested identities with a bonded share (`mining_ops.open_lane_draw_registry`, read as-of-parent like every draw
+input); the attested set itself, the bonded producer cap and the presence dividend are unchanged — the dividend stays
+per attested device. **Gentler dividend gradient**: `dividend_weight` caps at 15 instead of 30 from epoch 110
+(`DIVIDEND_WEIGHT_CAP_V2`), epoch-gated inside the function the live path and the replay share. `/mining_status`
+carries `open_excluded_bonded`; the wallet says why a staker has no free-lane weight, 16 languages.
+
+**Staking pools** (`POOL_HEIGHT` = 6000). `pool` (terms: fee_bps, open, min, max, label), `delegate {to}` and
+`undelegate` — fee-exempt, one per sender per block. A pool produces with own + delegated stake under the same
+1,000 NADO per-device cap; delegators have no producer weight of their own; fork weight and the FFG quorum keep each
+account's own stake. Every bonded block a pool wins is split at apply — delegators pro rata minus the fee, the pool the
+rest — and journaled per height for exact rollback. `pool {close: 1}` shuts a pool and releases its delegators in one block. `GET /pools`; the wallet's Savings card
+gains the pool panel in 16 languages. Sybil surface unchanged: one real attested device per 1,000 NADO of producing weight, now rentable.
+
+**Instant device moves, by eviction** (`DEVICE_REBIND_INSTANT_HEIGHT` = 5400). A device may move to another sender in
+any block: the move writes an epoch-stamped eviction row for the identity it leaves (`devbind` key `evict:<address>`,
+naming the recert epoch it voids), and both presence readers — the live open registry and the epoch-weight
+reconstruction — count only a recert newer than the voided one. The evicted identity is out of the draw and the
+dividend from that block and back with its next register. The 36-hour cooldown that stood in for this is gone from
+the gate on. Whoever holds the device wins immediately.
+
+**Binding modes: bound for life or leased** (`DEVICE_BIND_PERMANENT_HEIGHT` = 3900, doc/device-attestation.md
+§"Binding modes"). A binding is only as durable as the key behind it. Ledger and Trezor keys are factory-fixed, so
+from block 3900 a statement from one of them binds for LIFE: the `devbind` row is written in mode `perm`, the
+account carries `devkey`, and the identity renews its presence lease with a register tx that carries NO statement
+(valid while the row still points back at the sender). Android and TPM keys rotate, so those classes stay leased
+and re-attest every renewal. A permanent device can be REBOUND by a new sender — no old-key signature — once
+`POSW_LEASE_EPOCHS` have passed since the device's last statement (statement-free renewals never refresh that
+epoch, so the device holder always wins after one lease); the move supersedes the old binding in that block. One
+hardware wallet per identity. The wallet shows the mode on the lease panel, renews hardware-bound identities without
+a prompt, and asks before rebinding a device that vouches for another account (`POST /devbind_lookup`). A node
+attested with a hardware wallet renews itself statement-free (`/node_attest_status` carries `bind_mode`). The
+identity log records `bind: lease|perm|renew`.
+
+**The curve replaces the cliff** (`BOND_WEIGHT_CURVE_HEIGHT` = 11800): a device's producing weight is its stake up to a
+knee = max(1,000 NADO, 5 % of the other attested devices' stake), then K·(1.5 − 0.5·K/stake), saturating at 1.5·K —
+no coin counts for nothing, no device counts for more than 1.5 knees, a device cannot lift its own knee. Chosen by
+simulating the live lane and four stress cases with the chain's own draw (doc/device-attestation.md). Pool maximums
+are freed (`POOL_MAX_TOTAL`, 1,000 members); a pool's weight follows the curve of own + delegated stake.
+
+ (`BOND_DEVICE_CAP_HEIGHT` = 4200, `BOND_DEVICE_CAP` = 1,000 NADO,
+doc/device-attestation.md §"Savings-lane cap"). The bonded producer draw runs over `bonded_producer_registry`: only
+identities with a live open-lane lease (a device statement), each counting at most 1,000 NADO of stake; unattested
+stake weighs zero in the draw (a per-key cap was void, a per-device cap is not). Fork-choice weight, the FFG/settlement
+quorum and the duty committee are untouched. Liveness: with no attested bonded identity the draw falls back to the
+whole registry. `/mining_status` mirrors it; the wallet says whether the stake counts. At the gate every unattested
+bonded node — the relay fleet included — stops producing bonded blocks until its operator attests it.
+
+**Apple: built, verified, removed.** Kernel formats `apple-appattest` / `apple-assertion` were built, verified end to
+end against a real iPad statement (Swift Playgrounds build, no paid entitlement — Apple attests any registered-looking
+App ID), and enabled for one App ID at block 4400. Withdrawn the same evening, and since no block ever carried one, removed outright (formats, constants, root, app, build): Apple's
+attestation carries no per-device certificate, so one-key-per-device rests on app code, and a jailbroken older iPhone
+(checkm8 class) would farm identities the chain cannot see. The kernel code stays dormant; the app and its build were
+removed from the tree (git history keeps them). Apple users mine through a hardware wallet on a Mac or another device.
+
+**Attest from another device.** A wallet on Linux, Mac or iPhone (nothing bindable of its own) registers with a
+statement made on an accepted device: press *Attest from another device* on the wallet, then on the phone / TPM PC /
+hardware wallet open Mining → *Attest another wallet or node*, paste the address and confirm. The wallet picks the
+statement up from the relay and registers with it; the attesting device is the one bound.
+
+**Attest a node you run.** A node cannot attest itself, so its operator does: Mining page → *Attest a node you
+run* → paste the node's address → press the button. The statement travels through the relay (`/node_attest_drop`,
+forwarded one hop) and the node picks it up (`/node_attest_pickup`), signs its own register tx and merges it
+through the normal validation. Renews every 36 h, like any miner. `/node_attest_status` shows a node's lease.
+
+**Apple devices (correction).** iPhone, iPad and Mac passkeys return no attestation (`fmt: none`, iOS 16+ /
+macOS 13+), confirmed live on 2026-09-07: those devices cannot vouch through a web page. They mine with a FIDO2
+security key (NFC / USB-C); a native App Attest bridge is the only way to make the device itself count.
+
+**Identity log.** Enforcement retired, observation kept: every register tx a node receives at `/submit` leaves one
+node-local line in `<home>/identity_log.jsonl` (client IP, sender, entry/renewal, device class, AAGUID, leaf and root
+certificate hashes, mempool verdict — never consensus, never served, survives a generation purge).
+`tools/identity_audit.py` groups them by IP, by device certificate and by device class, so "are these identities
+really individual?" is answered from data.
+
+**Updater.** The fleet could not fast-forward past 070023a9: cargo had written an untracked
+`native/attest/Cargo.lock` on every node and the next commit tracked that path. Crate locks now live at
+`Cargo.lock.pinned` (copied in before every build, one dependency set fleet-wide) and the updater moves any
+untracked file the target commit tracks aside as `<path>.local-<ts>` before merging — never deletes.
+
+Balances, bonded stake, uncollected dividends and pending withdrawals carry forward at genesis (supply Δ = 0).
+Protocol handshake 12; chain id betanet-7. Design: doc/device-attestation.md.
+
+# v1.0.0-beta.7 — 2026-09-01 — betanet-6: the sybil-rules + account-auth reroll, every amount carried
+
+> **CHAIN_GENERATION 24, protocol 9.** Nodes purge and boot betanet-6 from genesis automatically on
+> restart (genesis 2026-09-01T13:35:32Z). All balances, bonded stakes, uncollected + pending dividends, user bridge
+> balances and pending exits carried forward — supply conserved exactly (`tools/alphanet6_carryforward.py`).
+> Shielded pools verified empty. Contract ids unchanged (`H(deployer, code, pinned nonce)`); every contract
+> redeployed open + upgradable at its existing address; the two users whose small game stakes the tool
+> attributes to the operator are refunded by hand.
+
+## What is different from block 0
+
+- **Linear dividend weight**: `min(fidelity, 30)` — days present — replaces the convex 1..25 curve (protocol 9 → 10,
+  ungated at chain age < 19 h: no epoch row differs until the first identity reaches fidelity 2).
+- **Probation** (`PROBATION_FIDELITY` = 2): an identity earns no presence dividend and has open-lane weight 1
+  until its first timely renewal (~19 h). It is *absent* from the epoch's weight set, not weighted 0.
+- **Burst-proof registration difficulty**: the flood baseline is capped by the 14-day trailing rate.
+- **Relays** count only *entry* registrations against the per-IP budget (default 8/h).
+- **Account authentication live** (`AUTH_ACTIVE`): key rotation / recovery / multi-authenticator policies.
+- **epochw rows leave the per-block root window**; a 32-byte accumulator keeps the weight history root-bound.
+- **Leaderless assembly touch-ups** (already live on betanet-5): pre-assembly next-block reconcile,
+  most-complete-pool tie-break, no sender-wide purge on an aggregate-spend refusal.
+- Every node's fidelity/recert history restarts at 0 (recerts are not carried): the whole open lane is on
+  probation for its first day; the dividend pool carries forward and pays from day two.
+
+# v1.0.0-beta.6 — 2026-08-25 — betanet-5: the dividend-rules reroll, every amount carried
+
+> **CHAIN_GENERATION 23, protocol 8.** Nodes purge and boot betanet-5 from genesis automatically on
+> restart. All balances, bonded stakes, uncollected + pending dividends, user bridge balances and pending
+> exits carried forward — supply conserved exactly (`tools/alphanet6_carryforward.py`). Shielded pools
+> verified empty, no assets, contracts held no value. Contract ids unchanged (pinned deploy nonce);
+> games redeployed upgradable at their existing addresses.
+
+## What is different from block 0
+
+- **No per-identity bond cap.** `BOND_CAP` / `MAX_SHARES` are gone; bonded weight is `bonded // B_MIN`,
+  linear. The cap was per key — a second key restored linear weight — so it bound only honest single-key
+  miners while their coins idled at 1,000 NADO. Auto-bond no longer stops.
+- **The presence dividend weighs presence, not headcount.** Its own convex curve, `dividend_weight`
+  (1..25, `1 + f²·24/900`), separate from producer selection (which keeps its 2..10 liveness floor). A
+  fresh identity is worth 4 % of a 30-day one instead of 20 %.
+- **A lapse halves fidelity instead of resetting it** (`fidelity_step`, never below 1) — one missed
+  renewal is survivable. The live apply and the fraud-proof replay now call the same function.
+- **Bonded blocks send 40 % to the dividend pool** (was 20 %): producer 50 / dividend 40 / treasury 10.
+  The one enforceable "tax the rich": levied on the block, not the key (`doc/progressive-levy.md`).
+- **Wallet:** presence-lease panel under Mining with a manual *Renew presence now* inside the
+  fidelity-earning window; dividend claims batched and served against the settled root.
+
+## Gate hygiene
+
+These rules rode the last hours of gen 22 behind a generation-keyed gate
+(`… if CHAIN_GENERATION == 22 else 0`) and shipped ungated here; the gate is deleted and
+`tests/test_dividend_rules.py` pins that none survives. That shape is now the documented pattern for any
+consensus change that must not re-split history (`doc/updates-and-rerolls.md`).
+
+# v1.0.0-beta.5 — 2026-08-20 — betanet-4: the convergence reroll, every amount carried
+
+> **CHAIN_GENERATION 22.** Nodes purge and boot betanet-4 from genesis automatically on restart.
+> All balances, bonded stakes, uncollected dividends, pending withdrawals and bridge amounts carried
+> forward — supply conserved exactly (Δ=0, 244 accounts). Contract ids unchanged; games redeployed
+> at their existing addresses.
+
+## Every 2026-08-20 consensus rule ships ungated, from block 0
+
+Canonical per-block dividend accrual, committed epoch weights, quantized boundary settle
+attestations. Every betanet-3 height gate is DELETED — including the h10047-16000 state-root repair
+window, whose raw heights would otherwise have suspended root enforcement on THIS chain at h10047.
+
+## Generation identity, three layers deep (what this cutover taught)
+
+A reroll's purge marker is a hint that hand-installed layouts miss; block-0 hash checks are mute on
+rolling nodes that hold no block 0 — and purged nodes were re-infected by the un-purged majority via
+quorum snapshots that carry no genesis-descent proof. The durable identity is arithmetic: **height is
+bound to wallclock** (production paces at BLOCK_TIME, so no chain of this genesis can be taller than
+~2x elapsed since GENESIS_TIMESTAMP). Boot purges on-disk data that exceeds the bound; status
+admission refuses peers advertising an impossible height; /status advertises genesis_hash and
+admission refuses a mismatch. A previous generation's chain can no longer veto finality, win a
+verdict, or serve a snapshot here.
+
+
+# v1.0.0-beta.4 — 2026-08-15 — the faucet actually pays, and a scary number that was never real
+
+> No consensus change. Wallet, operator tooling and the apps page. Safe to update at any time; nodes need
+> no coordination for this one.
+
+## The faucet was never going to pay anything
+
+`reward()` is operator-only and nothing in the node calls it — the distributor `scripts/operator/_faucet_rewards.py` is the
+only caller. It had been written, 14 games were enrolled against it, and **it was scheduled nowhere**: no
+crontab entry, no systemd timer, nothing in `/etc/cron.d`. Donations accumulated and every airdrop-play
+leaderboard went unpaid. Verified by hand: the exec layer showed a funded faucet balance and the
+distributor ran clean when invoked, so only the trigger was missing.
+
+The deeper problem was that the schedule lived nowhere in the repo. `bet-oracle` had the same shape —
+units committed, installed by hand — so a unit that exists on one machine silently stops existing.
+
+    scripts/nado-faucet-rewards.{service,timer}   the distributor, matching the bet-oracle convention
+    scripts/install-timers.sh                     installs + enables every OPERATOR timer (--list to preview)
+    doc/faucet.md §2b                             the scheduling step, and why re-running is safe
+
+Deliberately separate from `install.sh`: these act **as the operator** — they spend from operator-owned
+banks and sign with the operator key — so a normal node must not run them. Daily at 00:20 UTC, after the
+boundary the boards are keyed on (they rank *yesterday's* verified play), `Persistent=true` so a box that
+was down still pays that day, randomised so operators don't collide in a block. Re-running is safe by
+construction: the contract marks `(game, day, rank)` and reverts a repeat, underfunded payouts revert, and
+the per-game budget is capped in the script.
+
+**Autogame was paid prizes it never advertised.** The "🪂 airdrop play" badge is set by hand per tile while
+payouts come from a separate list — two hand-maintained lists that must agree, with nothing checking them:
+14 enrolled, 13 badged. Autogame had a working Daily Gauntlet, a replay oracle and rules shared with it, so
+the free play was real and would have been paid — but its tile advertised only the staked march, with no
+badge and no mention of free play at all. `tests/test_faucet_badges.py` now pins both directions: every
+paid game must advertise, and nothing may claim airdrop play without being enrolled (a badge promising
+prizes that never arrive is the worse failure). Verified it catches the real bug rather than merely passing.
+
+## "It says 25913 blocks to register"
+
+A user was, reasonably, alarmed. The registration banner computes the remaining distance as
+`targetBlock - state.latest`, guarded by `state.latest != null` — but `0 != null` is TRUE, so whenever the
+relay reported a low or zero tip (several nodes were resyncing that day) the subtraction returned the
+**absolute target height** and the wallet presented it as blocks remaining.
+
+The bound was there to be used: the tx is built as `tip + poswTargetMarginFor(...)`, so the distance can
+never legitimately exceed `POSW_TARGET_MARGIN`. Anything larger is not a long wait — it is our view of the
+tip being wrong. A number is now shown only when it is credible; otherwise the banner says it is syncing
+with the relay instead of inventing a figure.
+
+The same report noted that part was not translated, and it was not — both progress strings were inline
+English template literals. That turned out to be one instance of a class: `tools/check_i18n.py` flags keys
+referenced by `interface.js` but absent from the English base, which render their raw fallback in **every**
+language, and it was failing with 33 of them. This fixes the registration/mining path and everything added
+on 2026-08-14/15 — 10 keys × 16 languages. 23 remain (`quorum.autoYes*`, `shield.*`), all pre-existing;
+left rather than bulk-translated blind, since they deserve the same care.
+
+Also: three Czech strings used **`epochová`**, an adjective Czech does not form from *epocha* — and the
+real one, `epochální`, is a false friend meaning "momentous". Replaced with the genitive (`úkol epochy`,
+`atestace epochy`), and a doubled "epoch" dropped from the duty message.
+
+## Also
+
+- **Apps tab in the wallet**, linking to `nadochain.com/apps` (the canonical URL — `/apps.html` 301s to
+  it), styled like the existing Web tab, translated in all 16 languages.
+- **`config.py` wrote a stale auto-bond default.** It baked the literal `80` while
+  `protocol.AUTO_BOND_DEFAULT_PERCENT` had been raised to `99`, so a **fresh install** compounded at a
+  different rate than a config that merely lacked the key — two nodes installed a week apart behaving
+  differently with no way to tell from the outside which you had. It now writes the constant.
+
+## Validation
+
+Full suite: **264 passed, 30 failed, zero regressions** — the failure set is byte-identical to the
+v1.0.0-beta.3 run, and every one of those 30 was already reproduced at v1.0.0-beta.2 (settle/STARK
+proving, games, and browser e2e that need a display). All 14 constants the wallet mirrors from protocol.py
+verified equal, served asset stamps match their files, and the fleet is 8/8 in lockstep with
+`disagree=0`.
+
+## Not in this release
+
+A faucet change making the operator key rotatable on-chain was written and then **reverted** — the
+mechanism that matters (`state.transfer_contract`, which moves contract ownership with cid and storage
+preserved) already existed, and modifying a funded contract was not worth the risk for what it added.
+Nothing was ever deployed; the built code matches the on-chain contract exactly.
+
+---
+
+# v1.0.0-beta.3 — 2026-08-14 — a fleet fork of my own making, and the guards that close the class
+
+> **CONSENSUS.** Two changes bind: the number<->hash index is now bounded by protocol rule, and the
+> index-prune watermarks are excluded from the L1 state root. A bounded repair window
+> `[10047, 16000)` let the fleet cross the damage without a reroll; it has already expired and full
+> enforcement is back on. No reroll, no lost balances, no lost history.
+
+## The incident: a disk-retention counter reached consensus
+
+The index-retention work below wrote two watermarks into the `meta` sub-DB —
+`index_pruned_below_num` / `index_pruned_below_hash` — recording how far a node had pruned **its own
+disk**. `meta` feeds `l1_state_root()`, which is committed into every block header, and the new keys
+were never added to `ROOT_EXCLUDED_META_KEYS`. So a node's storage policy became consensus state.
+
+The split was clean and both sides were right. The index prune first fires when finality crosses
+`INDEX_RETENTION_HASH = 10 000`, so at block **10047** every ROLLING node wrote the watermark and its
+committed root moved, while every ARCHIVE node — which never prunes, so never wrote the row — computed
+the old root and correctly refused to extend. The fleet fragmented across three heights.
+
+**Diagnosed by replay, not by inspection.** Restoring the wedged node's OWN checkpoint at 10000 and
+replaying its OWN bodies forward reproduced `c55b376f31ee1296` — so its state was never corrupt; it was
+the honest result of applying the blocks. On that same state:
+
+    root with the watermark EXCLUDED : c55b376f31ee1296
+    root with the watermark INCLUDED : 00f00a01e387ccf3   <- the root committed in block 10047
+
+Bit-for-bit. That is what turned a guess into a diagnosis.
+
+**Recovery without a reroll.** The roots already committed over the affected span encode one node's disk
+state, so they are unverifiable *by construction* — an archive node never held the value at all.
+Enforcing them wedges every honest node permanently. So the equality comparison, and only the
+comparison, was suspended across `[10047, 16000)` and re-armed at a height every node agreed on;
+hash chain, producer signature, cumulative weight, tx validity and per-tx state transitions stayed
+enforced throughout. The fleet crossed 16000 with an archive node and five rolling nodes computing
+identical roots, zero divergence.
+
+## The tests that should have caught it, and why they did not
+
+Both failures were the same shape: a test that asserts a **literal** instead of a **property** cannot
+fail until someone has already performed the act it was meant to enforce.
+
+- `test_seed_divergence` asserted `ROOT_EXCLUDED_META_KEYS == frozenset((...))`. It could only go red
+  after the missing key had been added. Now containment plus a behavioural check — a node that has
+  pruned must compute the same root as one that has not, and the root must not move as pruning
+  progresses — plus the converse, that a block-derived row still DOES move it.
+- **New:** `tests/test_no_local_state_in_root.py` reads `kv_ops.py`, extracts the meta keys written
+  inside `prune_*`/`gc_*` functions, and requires each to be excluded. A future prune that stashes a
+  watermark fails the day it is written, not the day finality crosses its threshold in production.
+- **New:** `tests/test_rollback_symmetry.py` asserts rollback is the exact inverse of apply against the
+  REAL `incorporate_block`/`rollback_one_block`. The existing round-trip check hand-copied both
+  sequences ("mirrors ...") and so tested a replica that stayed symmetric while production drifted.
+
+## Storage: rolling by default, and the last unbounded store bounded
+
+- **Rolling mode is the default.** An archive node keeps every body forever — measured at 133 MB/day,
+  **~47.6 GB/year**. Fine for the one box hosting an explorer, unreasonable for volunteer VPSes; and a
+  node that fills its disk stops UPDATING, then forks. Rolling keeps state and the number<->hash
+  indexes, dropping only bodies older than the retention window, over a hard consensus floor config
+  cannot lower. Four independent decision sites now move together, pinned by test.
+- **`config_version`.** A changed default reached new installs and nothing else, because
+  `create_config` writes every default at install time and is create-only — the installer's value is
+  indistinguishable on disk from an operator's choice. Observed directly: flipping `archive` moved
+  exactly the ONE node whose config predated the key. One-time migration, narrow (only keys still
+  holding the old default), and a deliberate `"archive": true` set afterwards survives.
+- **The number<->hash index is bounded by protocol rule** (`doc/index-pruning.md`). At 144 B/block it
+  was ~7 GiB/decade and the dominant term once bodies and tx history are pruned. It could not be a node
+  setting — every carried row feeds `state_digest`, so differing depths split `snapshot_hash`. The
+  window is keyed on the checkpoint height C every node already agrees on: `[C-N, C]`, with
+  `N_num = 50 000` (~2.1x the deepest consumer) and `N_hash = 10 000` (~222x `FINALITY_DEPTH`, since its
+  only reader is a tip-local dedupe guard). Enforced on IMPORT as well as export, so a donor shipping
+  out-of-window rows has them dropped rather than trusted. Measured e2e on a 60 000-block chain:
+  **50% of the transferred payload dropped**, joiner still resolving the 24 000-deep lookback.
+
+## Archive nodes stop lying about what they hold
+
+- **A fresh archive node refuses snapshot bootstrap.** It backfills 265 bodies behind its anchor and
+  nothing older, ever — so `archive: true` used to yield a node that syncs fast, looks healthy, holds
+  nothing before its snapshot, and advertises "archive" to peers who read that as "can serve history".
+  Refused, naming every route to a real archive.
+- **Wedge recovery is NOT refused** — that node is on a fork it cannot leave by rollback, so declining
+  leaves it wedged forever serving nothing. It now logs the exact range lost and tells the operator to
+  re-seed.
+- **`earliest_block_height` in `/status`** — the body horizon. `node_type` answers "do I prune?";
+  callers were reading it as "can you serve history?".
+
+## Registration
+
+- **Renewals stopped re-broadcasting.** Reported as "renewal is especially difficult today", and it was:
+  552 registers from 37 senders, ~27 attempts each, every one rejected "sender already recerted this
+  epoch" — the first landed and the rest were noise. `maybeRenewLease` guarded on a flag cleared when
+  the SUBMIT returned, not when the tx LANDED, and its only other signal (`acc.reg_epoch`) is on-chain
+  state that cannot move until mined. Widening `POSW_TARGET_MARGIN` 30 -> 90 took that window from 3 to
+  9 minutes and the retries scaled with it.
+- **The target margin is sized to the work owed**, not the worst case: a base renewal now lands in
+  ~13 blocks (78 s) instead of 90 (540 s), while an expensive entry proof on a slow phone still gets the
+  full window.
+
+## Validation
+
+2000-transaction stress test after recovery: **2000/2000 accepted, 2000/2000 mined**, all 147 recipients
+credited, peak 44 txs in a block, 2.55 tx/s sustained, mempool building a backlog and draining it — and
+**zero state divergence across the whole run** with all nodes in lockstep. The submit rate limiter
+(30/min per IP per node), not the chain, was the ingestion ceiling.
+
+Test suite: **263 passed, 30 failed, ZERO regressions** — every failure reproduces at v1.0.0-beta.2 and
+predates this release (settle/STARK proving, games, and browser e2e that need a display). The one apparent
+regression, `pool_ui_e2e.mjs`, was a 180 s timeout on a box that was mining and had just absorbed the
+stress test; it passes in 480 s, and `pool.html` does not load any file this release touched.
+
+A second, unrelated fork appeared during validation: `202.91.32.228` — the node that had been stuck at
+height 63 with a frozen core loop all day — diverged alone at h17313 on a HEAVIER chain. Two safety
+mechanisms did their job with no operator action: the state-root gate **refused the heavier chain** rather
+than following weight into invalid state, and the dead-fork probe flipped to `stranded`, purged, resynced
+and rejoined. Cause not established — it predates none of the fixes here, sits 1300 blocks past the repair
+window, and the node destroyed its own evidence while healing. Recorded as unexplained rather than
+attributed to a guess.
+
+---
+
+# v1.0.0-beta.2 — 2026-08-13 — new miners could not join, and auto-bond compounded the wrong coins
+
+> **CONSENSUS FLAG DAY.** `POSW_ANCHOR_OFFSET` moves 30 -> 150 and a new `POSW_TARGET_MARGIN = 90` sizes the
+> proving budget. `validate_transaction` re-derives a registration's PoSW anchor from its own `max_block`, so
+> a node on the old offset computes a different challenge and rejects every honest registration. No compat
+> path, no height gate: update the whole fleet. No reroll — chain state is untouched.
+
+**New miners could not register, and the error said nothing useful.** A `register` lands at *exactly*
+`max_block`, and its anchor (`max_block − POSW_ANCHOR_OFFSET`) must already exist when proving starts — so a
+client targeting `tip+M` can only pick `M ≤ offset`, and `M` blocks was its entire proving budget. That
+budget (30 blocks, 180 s) was never a function of the *work* the difficulty demands, and the two had drifted
+far apart: an entry registration owes `POSW_ENTRY_MULT × rate` = up to 512 × `POSW_T` = 512M sequential
+hashes. Benchmarked against the hasher the miner actually ships:
+
+    WASM blake2b (what the browser uses)     3.17M hashes/sec
+    pure-JS fallback (WASM unavailable)      0.07M hashes/sec      <- 45x cliff
+
+    entry at the 96x that was live (96M)     desktop  30s | mid phone 121s | slow phone 303s   [window 180s]
+
+The phone finished a **perfectly valid proof for a block the chain had already passed**, the submit was
+refused, and the wallet reported *"the relay rejected the registration"*. Offset 150 / margin 90 gives a
+540 s budget and makes the anchor `tip−60` — 60 blocks deep at prove time, which is finally past
+`FINALITY_DEPTH` as the constant's own comment had always claimed. **The anti-Sybil cost does not change by
+a single hash.** The 512× worst case still does not fit on a slow phone; that case only occurs when the rate
+multiplier is pinned at its 16× cap by a sustained registration flood, which is when throttling entry is the
+point.
+
+**Auto-bond compounded coins it was never asked to touch.** It measured "newly-mined earnings" as the rise
+in spendable *balance*, which is not the same thing — it swept up transfers, faucet payouts, bridge
+deposits, and, worst, a **matured `withdraw`**: the coins the operator had just deliberately taken *out* of
+savings went straight back in behind another 24 h timelock, at 99% on a node. Leaving the bonded lane was
+silently self-reversing, once per unbond, forever. Both the node (`core_loop.maybe_auto_bond`) and the
+wallet (`autoBond`) now baseline on `produced` — the consensus counter of what the address actually mined,
+which moves only on a won slot. A clamped bond consumes only the slice of the gain it covered, so the
+remainder stays claimable instead of being written off.
+
+**Also:**
+
+- `/posw_difficulty` answered for a landing block nobody uses (`tip+6`, the CLI's margin) while every browser
+  miner targets `tip+margin` — two anchors that straddle an epoch boundary for 24 of every 60 heights.
+  `posw.verify` is EXACT-T, so whenever the rate multiplier differed across that boundary an honest
+  registration was rejected. Latent while the multiplier sat at 3×; live the moment it stepped to 2×, which
+  it did that afternoon (24/360 heights in the window then disagreed). Callers pass their own `max_block`,
+  and `required_t` now comes from `required_posw_t()` itself rather than a second copy of the formula.
+- `nado_cli register` called that endpoint **bare**, so it never saw the entry multiplier and under-worked
+  every first CLI registration by 32×. `mint_multiplier()` — which returned the rate multiplier alone and was
+  the obvious-looking thing to reach for — is deleted rather than left as a trap.
+- **`nado_cli withdraw`** exists. `unbond` only records a request; the only code that ever finished the exit
+  was the browser wallet's `refreshUnbond()`, so a headless operator who unbonded had no way to claim the
+  coins back at all.
+- The wallet now says when WASM is unavailable (that path cannot finish a registration in any window), and
+  `poswRate()`'s flat 700,000 guess — wrong by 4.5× one way and 10× the other — is seeded from the backend
+  that will actually run.
+- Explorer: an account read the `registered` flag alone and announced *"yes (OPEN-lane miner)"* at an address
+  that was also the largest bonded producer on the chain; lanes are not exclusive. Fidelity was shown out of
+  1000 when `FIDELITY_CAP` is 30, telling a fully-ramped miner it was at 3%.
+
+## A dead RANDAO reveal killed the whole epoch duty, forever
+
+Reported from a live session, once a minute: `Epoch duty rejected: … No matching commit for this reveal`.
+A bonded validator's FFG attest (epoch X), RANDAO commit (X+2) and reveal (X+1) ride in **one** `duty` tx,
+so a reveal the chain can never accept fails the whole transaction and takes the attest and the next
+commit — both perfectly valid — with it. The validator silently stops attesting for FFG and stops
+committing for future epochs, and retries forever, because the rejection never matched the "nothing left
+to post" pattern.
+
+The rejection is permanent, which is what `_randaoDead` was declared for ("a resubmit can never succeed")
+— and nothing ever added to it. A commit for epoch E must be posted in E−2 while its reveal lands in E−1's
+finalized window, so by the time a reveal is refused for a missing commit that window shut an epoch
+earlier. Now: mark it dead, drop the reveal section, resubmit at once so the attest and commit still land.
+
+## A node that cannot update itself now says so
+
+Four nodes stopped updating and stayed stuck for a day while answering `/status` with
+`update_capable: true, update_blocking: [], update_remote_reachable: true`. Nothing in the diagnosis
+looked at the host, and `update_available` is derived from the last *successful* fetch — which on a node
+whose every fetch fails can never learn that origin moved.
+
+`git fetch` was dying with `fatal: unpack-objects failed`. I reproduced that exactly (60 MiB loopback
+ext4, fetching as the unprivileged service account) — and then the new telemetry **disproved it as the
+cause here**: `89.143.197.28` reported 1424 GiB free and was still failing. git prints that line whenever
+the `unpack-objects` child dies for *any* reason, so the message cannot separate ENOSPC from inode
+exhaustion from an OOM-kill. All three are now measured, with the last fetch error, and surfaced in
+`/status` (`update_free_disk_mb`, `update_warnings`) — the warning band fires with ~1 GiB of headroom,
+days ahead, where `blocking` only fires once the node is already stranded.
+
+`check_and_update` also repacks and retries once on a space-shaped failure, and both fetch call sites pass
+`-c transfer.unpackLimit=1` so an incoming pack stays a pack (measured: 2030 loose objects = 35.1 MiB vs
+17112 packed = 22.6 MiB). **Measured limit, stated in the code:** `git gc` writes the new pack before
+dropping the old objects, so it needs free space of roughly the pack size — on a 13 MiB `.git` it failed
+at 6 MiB free, at 4, at 2 and at 0. The retry rescues loose-object bloat, not a full disk. Only the early
+warning catches that.
+
+## Also
+
+- **`nado_cli withdraw`** exists. `unbond` only records a request; the only code that ever finished the
+  exit was the browser wallet, so a headless operator who unbonded could not claim their coins back.
+- **`execJSON()`** — every shielded-pool call reached the exec node as a bare `(await fetch(…)).json()`.
+  `nado-exec` restarts independently of the relay, and on an HTML error page that surfaced to the user as
+  `Unexpected token '<', "<!DOCTYPE "… is not valid JSON`. `rpcJSON` had handled this for the relay all
+  along; the exec node had no equivalent.
+- **Three dead code paths the suite was already reporting.** `memserver.py` used `os.environ` without
+  importing `os`, inside a bare `except` — it raised on every boot and silently pinned
+  `tx_history_retention_blocks` to 0, so that setting has never worked on any node. `self_update.py`
+  called `_restart_services()`, which has never existed, so the stale-checkout self-heal reported an error
+  instead of restarting — and hid it, because `_stale_acted` is set on the line above the failing call.
+  `mint_multiplier()` returned the rate multiplier alone, so anything minting from it under-worked an
+  entry registration by 32×; deleted rather than left as a trap.
+- **Two tests were hiding bugs rather than catching them.** `test_stale_checkout_restart` patched
+  `SU._restart_services` — assigning a name the module lacks *created* it, so the test was green over a
+  production `NameError`. `test_auto_bond`'s fixture credited balance without touching `produced`, i.e. it
+  could not tell a mining reward from a receive — precisely the confusion behind the auto-bond bug.
+
+---
+
+# betanet-3 — 2026-08-13 (carry-forward reroll: dividends folded, fidelity farming closed)
+
+> **Chain reboot with balances carried.** `CHAIN_GENERATION 21`, `CHAIN_ID betanet-3`. Every holder's
+> **balance + bonded stake carries forward**, and so does everything that previously lived only in exec
+> state and would have been destroyed by the purge. Built with `tools/alphanet6_carryforward.py`, which
+> refuses to write unless supply conserves exactly:
+>
+>     L1 accounts total (balance+bonded)      11 157 250 452 256 raw
+>       folded user bridge                        11 898 223 615   -> users, -bridge escrow
+>       refunded contract pots                        30 000 000   -> players/operator
+>       folded dividends (uncollected)         1 651 471 200 086   -> users, -dividend pool
+>       folded dividend withdrawals (pending)    144 275 085 788   -> users, -dividend pool
+>       folded bridge withdrawals (pending)        2 373 497 180   -> users, -bridge escrow
+>     carried total after folds               11 157 250 452 256 raw   CONSERVATION OK (delta 0)
+>     139 accounts
+>
+> **181 NADO of dividends and bridged coins** that were unspendable-until-claimed are now plain balances at
+> genesis — better than before, since a folded dividend needs no `collect_dividend` + `dividend_withdraw`
+> against a settled root. **Contract ids are unchanged**: `H(deployer, code, nonce)` with a pinned nonce, so
+> every hardcoded cid in the wallet still resolves after `execnode.games.redeploy`.
+>
+> **Known residue: 0.70074001 NADO** stays in the keyless `dividend` account. It is accrual the L1 pool
+> received that no exec-side claim attributes to anyone (`div_carry`), and it does not shrink by chasing the
+> tip — measured 0.38 at a 94-block exec lag and 0.70 at 41. It is left rather than assigned to a guessed
+> owner. That is 0.06% of supply, and it is disclosed rather than quietly dropped.
+
+## Why now — two economic defects, both found by measuring rather than reading
+
+**The auto-register lease guard read a field that does not exist.** `core_loop.maybe_auto_register` gated
+renewal on `acc.get("reg_epoch", -1)`, but `reg_epoch` is an enrichment the HTTP handler adds — the stored
+document has no such key, so the value was always `-1`, the guard never fired, and every auto-registering
+node recerted **once per epoch instead of once per ~24 h lease**. Fidelity is +1 per recert, so the three
+node operators reached fidelity **366-379 on a 1.6-day chain** while browser miners sat at 1: open weight 10
+against 2, i.e. **5x the producer selection and 5x the dividend share**. That is the reward gap users
+reported, and it was ours, not an attacker's.
+
+**Fidelity itself was farmable.** The ramp is per recert and the only spacing rule was "one register per
+epoch" — six minutes — so `FIDELITY_CAP = 30` was reachable in **three hours**, not thirty days, on a
+fee-exempt transaction. `FIDELITY_MIN_GAP_EPOCHS = 192` now gates the ramp: a closer recert still renews the
+lease, it simply earns nothing. Both honest cadences (browser renews at 192, node at 230) are unaffected.
+
+## Also in this release
+
+- **Identity creation now costs more than renewal** (`POSW_ENTRY_MULT = 32`). The 64-per-IP registration cap
+  cannot be consensus — a transaction carries no IP and arrives by gossip, so nodes would disagree — so the
+  cost moved to something consensus can check: a register from an address with no valid lease pays 32x the
+  sequential PoSW; renewals are unchanged. Against the measured honest weight, taking half the open lane goes
+  from ~2 core-minutes/day to ~71 core-minutes one-time.
+- **Nodes auto-vote on whitelisted treasury proposals.** Quorum is counted in bonded shares, and 108 of 117
+  miners hold none — the wallet's auto-vote could never reach quorum by itself, which is why the treasury
+  accumulated 109 NADO with zero payouts. The default allow-list is the reserved keyless `faucet`; an empty
+  list approves nothing.
+- **The settle prover starts warm.** `storage_tree` persists its singleton-fold cache, so a restarted exec
+  node's first settle prove drops from 58.9 s to ~10 s (root() 50.30 s -> 0.64 s across a restart, root
+  bit-identical). No consensus change.
+- **Daily stats survive upgrades.** Chain-stamping was discarding *unstamped* history, so a routine update
+  wiped every node's accumulated trend data; an absent stamp is now adopted rather than dropped.
+- Docs: `doc/updates-and-rerolls.md` gains a pre-reroll checklist (what a "balances carry" promise must
+  actually cover), `SCHEDULED_CLEANUPS.md` tracks code that becomes deletable at a stated height, and
+  `doc/fri-parameters.md` records that the FRI blowup lever stays rejected — on proof size, not prove cost,
+  after both prior rejections turned out to have measured the Python prover.
+
+---
+
+# Betanet reboot — 2026-07-14 (betanet-5: zkVM-only, provable contracts, games returning)
 
 > **Chain reboot.** Deleting the legacy stack VM (v1.0.0-alpha.9) made the field-native **zkVM the only
-> contract runtime**, so alphanet-4 was rebooted to **alphanet-5** with a fresh genesis. Every holder's
-> **balance + bonded stake carried forward** (`tools/alphanet5_carryforward.py`): exec-side user balances +
+> contract runtime**, so betanet-4 was rebooted to **betanet-5** with a fresh genesis. Every holder's
+> **balance + bonded stake carried forward** (`tools/betanet5_carryforward.py`): exec-side user balances +
 > uncollected dividends folded into L1 balances, contract game-pots refunded to their players, and the folds
 > debited from the escrow reserved accounts so total supply is conserved EXACTLY (Δ=0). Nodes rebuild the
 > identical genesis from the shared `genesis_data/genesis_alloc.dat`. Bonded validators must update + rejoin

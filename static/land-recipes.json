@@ -1,0 +1,4866 @@
+{
+ "about": "Land's gathering and crafting web (doc/land.md 'Gathering, tools, crafting'). ONE file read by the page (static/land.js) and the world server (scripts/land_server.py), so both apply the same rules: 'you must gather resources to make tools to make tools to collect more resources' (operator, 2026-11-06). No eras: every recipe names exactly what it needs. Block ids are static/land-world.js BLOCKS.",
+ "version": 9,
+ "items": {
+  "fiber": {
+   "name": "Plant fiber"
+  },
+  "sticks": {
+   "name": "Sticks"
+  },
+  "stone": {
+   "name": "Stone"
+  },
+  "cordage": {
+   "name": "Cordage"
+  },
+  "dirt": {
+   "name": "Earth",
+   "places": 2
+  },
+  "sand": {
+   "name": "Sand",
+   "places": 4
+  },
+  "gravel": {
+   "name": "Gravel",
+   "places": 17
+  },
+  "snow": {
+   "name": "Snow",
+   "places": 6
+  },
+  "cobble": {
+   "name": "Cobblestone",
+   "places": 10
+  },
+  "wood": {
+   "name": "Wood",
+   "places": 7
+  },
+  "planks": {
+   "name": "Planks",
+   "places": 9
+  },
+  "darkwood": {
+   "name": "Charred planks",
+   "places": 15
+  },
+  "stonebrick": {
+   "name": "Stone brick",
+   "places": 16
+  },
+  "clay": {
+   "name": "Clay"
+  },
+  "brick": {
+   "name": "Fired brick",
+   "places": 11
+  },
+  "tiles": {
+   "name": "Roof tiles",
+   "places": 13
+  },
+  "glass": {
+   "name": "Glass",
+   "places": 12
+  },
+  "plaster": {
+   "name": "Plaster",
+   "places": 14
+  },
+  "charcoal": {
+   "name": "Charcoal"
+  },
+  "ironore": {
+   "name": "Iron ore"
+  },
+  "iron": {
+   "name": "Iron"
+  },
+  "nails": {
+   "name": "Nails"
+  },
+  "hinges": {
+   "name": "Hinges"
+  },
+  "lime": {
+   "name": "Lime"
+  },
+  "mortar": {
+   "name": "Mortar"
+  },
+  "beam": {
+   "name": "Timber beam",
+   "places": 38
+  },
+  "thatch": {
+   "name": "Thatch",
+   "places": 39
+  },
+  "door": {
+   "name": "Door",
+   "places": 37,
+   "unit": [
+    90,
+    5,
+    200
+   ]
+  },
+  "window": {
+   "name": "Window",
+   "places": 40,
+   "unit": [
+    100,
+    10,
+    120
+   ]
+  },
+  "coal": {
+   "name": "Coal"
+  },
+  "copperore": {
+   "name": "Copper ore"
+  },
+  "tinore": {
+   "name": "Tin ore"
+  },
+  "bronze": {
+   "name": "Bronze"
+  },
+  "table": {
+   "name": "Table",
+   "places": 45,
+   "unit": [
+    120,
+    80,
+    76
+   ]
+  },
+  "chair": {
+   "name": "Chair",
+   "places": 46,
+   "unit": [
+    50,
+    45,
+    95
+   ]
+  },
+  "bench": {
+   "name": "Bench",
+   "places": 47,
+   "unit": [
+    150,
+    35,
+    45
+   ]
+  },
+  "bed": {
+   "name": "Bed",
+   "places": 48,
+   "unit": [
+    200,
+    100,
+    90
+   ]
+  },
+  "fence": {
+   "name": "Fence",
+   "places": 49,
+   "unit": [
+    100,
+    8,
+    100
+   ]
+  },
+  "torch": {
+   "name": "Torch",
+   "places": 50,
+   "unit": [
+    10,
+    10,
+    120
+   ]
+  },
+  "flax": {
+   "name": "Flax"
+  },
+  "thread": {
+   "name": "Linen thread"
+  },
+  "linen": {
+   "name": "Linen cloth"
+  },
+  "sapling": {
+   "name": "Sapling",
+   "places": 52
+  },
+  "ladder": {
+   "name": "Ladder",
+   "places": 53,
+   "unit": [
+    50,
+    8,
+    300
+   ]
+  },
+  "chest": {
+   "name": "Chest",
+   "places": 54,
+   "unit": [
+    90,
+    50,
+    55
+   ]
+  },
+  "linen_shirt": {
+   "name": "Linen shirt",
+   "wear": "body"
+  },
+  "linen_trousers": {
+   "name": "Linen trousers",
+   "wear": "legs"
+  },
+  "linen_cap": {
+   "name": "Linen cap",
+   "wear": "head"
+  },
+  "linen_cloak": {
+   "name": "Linen cloak",
+   "wear": "back"
+  },
+  "silverore": {
+   "name": "Silver ore"
+  },
+  "goldore": {
+   "name": "Gold ore"
+  },
+  "silver": {
+   "name": "Silver"
+  },
+  "gold": {
+   "name": "Gold"
+  },
+  "poppy": {
+   "name": "Poppy",
+   "places": 58
+  },
+  "cornflower": {
+   "name": "Cornflower",
+   "places": 59
+  },
+  "daisy": {
+   "name": "Daisy",
+   "places": 60
+  },
+  "buttercup": {
+   "name": "Buttercup",
+   "places": 61
+  },
+  "water": {
+   "name": "Water (a bucketful)",
+   "places": 5
+  },
+  "lantern": {
+   "name": "Lantern",
+   "places": 62,
+   "unit": [
+    24,
+    24,
+    36
+   ]
+  },
+  "lamppost": {
+   "name": "Street lamp",
+   "places": 63,
+   "unit": [
+    24,
+    24,
+    320
+   ]
+  },
+  "steel": {
+   "name": "Steel"
+  },
+  "copper": {
+   "name": "Copper"
+  },
+  "wire": {
+   "name": "Copper wire"
+  },
+  "steel_plate": {
+   "name": "Steel plate",
+   "places": 64
+  },
+  "white_plate": {
+   "name": "White plate",
+   "places": 28
+  },
+  "red_plate": {
+   "name": "Red plate",
+   "places": 21
+  },
+  "yellow_plate": {
+   "name": "Yellow plate",
+   "places": 23
+  },
+  "black_plate": {
+   "name": "Black plate",
+   "places": 27
+  },
+  "orange_plate": {
+   "name": "Orange plate",
+   "places": 22
+  },
+  "green_plate": {
+   "name": "Green plate",
+   "places": 24
+  },
+  "blue_plate": {
+   "name": "Blue plate",
+   "places": 25
+  },
+  "purple_plate": {
+   "name": "Purple plate",
+   "places": 26
+  },
+  "gear": {
+   "name": "Gear"
+  },
+  "silicon": {
+   "name": "Silicon"
+  },
+  "circuit": {
+   "name": "Circuit board"
+  },
+  "power_cell": {
+   "name": "Power cell"
+  },
+  "motor": {
+   "name": "Electric motor"
+  },
+  "thruster": {
+   "name": "Thruster",
+   "places": 65,
+   "unit": [
+    100,
+    100,
+    140
+   ]
+  },
+  "pilot_seat": {
+   "name": "Pilot seat",
+   "places": 66,
+   "unit": [
+    80,
+    90,
+    110
+   ]
+  },
+  "smelter": {
+   "name": "Smelter",
+   "places": 67,
+   "unit": [
+    100,
+    100,
+    120
+   ]
+  },
+  "assembler": {
+   "name": "Assembler",
+   "places": 68,
+   "unit": [
+    100,
+    100,
+    120
+   ]
+  },
+  "generator": {
+   "name": "Generator",
+   "places": 69,
+   "unit": [
+    100,
+    100,
+    120
+   ]
+  },
+  "berries": {
+   "name": "Berries"
+  },
+  "grain": {
+   "name": "Grain"
+  },
+  "seed": {
+   "name": "Wheat seed",
+   "places": 72
+  },
+  "flour": {
+   "name": "Flour"
+  },
+  "bread": {
+   "name": "Bread"
+  },
+  "well": {
+   "name": "Well",
+   "places": 74,
+   "unit": [
+    120,
+    120,
+    90
+   ]
+  },
+  "meat": {
+   "name": "Raw meat"
+  },
+  "cooked_meat": {
+   "name": "Cooked meat"
+  },
+  "hide": {
+   "name": "Hide"
+  },
+  "bone": {
+   "name": "Bone"
+  },
+  "leather": {
+   "name": "Leather"
+  },
+  "arrow": {
+   "name": "Arrow"
+  },
+  "stand": {
+   "name": "Trading stand",
+   "places": 75,
+   "unit": [
+    200,
+    100,
+    110
+   ]
+  },
+  "copper_coin": {
+   "name": "Copper coin",
+   "coin": true
+  },
+  "silver_coin": {
+   "name": "Silver coin",
+   "coin": true
+  },
+  "gold_coin": {
+   "name": "Gold coin",
+   "coin": true
+  },
+  "parcel": {
+   "name": "Parcel",
+   "quest": true
+  },
+  "wheel": {
+   "name": "Wheel"
+  },
+  "magnetite": {
+   "name": "Magnetite"
+  },
+  "lodestone": {
+   "name": "Lodestone"
+  },
+  "compass_needle": {
+   "name": "Magnetised needle"
+  },
+  "compass": {
+   "name": "Compass"
+  },
+  "tanbark": {
+   "name": "Tanbark"
+  },
+  "ink": {
+   "name": "Ink"
+  },
+  "paper": {
+   "name": "Paper"
+  },
+  "map": {
+   "name": "Map"
+  },
+  "nav_unit": {
+   "name": "Nav unit",
+   "places": 78,
+   "unit": [
+    40,
+    30,
+    30
+   ]
+  },
+  "electrolyser": {
+   "name": "Electrolyser",
+   "places": 79,
+   "unit": [
+    100,
+    100,
+    120
+   ]
+  },
+  "liquefier": {
+   "name": "Liquefier",
+   "places": 80,
+   "unit": [
+    100,
+    100,
+    120
+   ]
+  },
+  "hydrogen": {
+   "name": "Hydrogen (a canister, 1.12 kg)"
+  },
+  "oxygen": {
+   "name": "Oxygen (a canister, 8.88 kg)"
+  },
+  "propellant": {
+   "name": "Liquid propellant (7.87 kg)"
+  },
+  "rocket_engine": {
+   "name": "Rocket engine",
+   "places": 81,
+   "unit": [
+    60,
+    60,
+    120
+   ]
+  },
+  "propellant_tank": {
+   "name": "Propellant tank",
+   "places": 82,
+   "unit": [
+    100,
+    100,
+    220
+   ]
+  },
+  "nav_satellite": {
+   "name": "Positioning satellite",
+   "places": 83,
+   "unit": [
+    150,
+    150,
+    150
+   ]
+  },
+  "launch_pad": {
+   "name": "Launch pad",
+   "places": 84,
+   "unit": [
+    300,
+    300,
+    20
+   ]
+  }
+ },
+ "tools": {
+  "axe": {
+   "name": "Stone axe",
+   "class": "axe",
+   "speed": 3
+  },
+  "pick": {
+   "name": "Stone pickaxe",
+   "class": "pick",
+   "speed": 3
+  },
+  "shovel": {
+   "name": "Stone shovel",
+   "class": "shovel",
+   "speed": 3
+  },
+  "hammer": {
+   "name": "Hammer",
+   "class": "hammer",
+   "speed": 1
+  },
+  "iron_axe": {
+   "name": "Iron axe",
+   "class": "axe",
+   "speed": 6
+  },
+  "iron_pick": {
+   "name": "Iron pickaxe",
+   "class": "pick",
+   "speed": 6
+  },
+  "iron_shovel": {
+   "name": "Iron shovel",
+   "class": "shovel",
+   "speed": 6
+  },
+  "bronze_axe": {
+   "name": "Bronze axe",
+   "class": "axe",
+   "speed": 4.5
+  },
+  "bronze_pick": {
+   "name": "Bronze pickaxe",
+   "class": "pick",
+   "speed": 4.5
+  },
+  "bronze_shovel": {
+   "name": "Bronze shovel",
+   "class": "shovel",
+   "speed": 4.5
+  },
+  "spindle": {
+   "name": "Drop spindle",
+   "class": "spindle",
+   "speed": 1
+  },
+  "bow_drill": {
+   "name": "Bow drill",
+   "class": "fire",
+   "speed": 1
+  },
+  "flint_steel": {
+   "name": "Flint and steel",
+   "class": "fire",
+   "speed": 3
+  },
+  "needle": {
+   "name": "Needle",
+   "class": "needle",
+   "speed": 1
+  },
+  "drill": {
+   "name": "Iron drill",
+   "class": "drill",
+   "speed": 2
+  },
+  "bucket": {
+   "name": "Wooden bucket",
+   "class": "bucket",
+   "speed": 1
+  },
+  "hoe": {
+   "name": "Stone hoe",
+   "class": "hoe",
+   "speed": 3
+  },
+  "spear": {
+   "name": "Stone spear",
+   "class": "spear",
+   "speed": 1
+  },
+  "bow": {
+   "name": "Bow",
+   "class": "bow",
+   "speed": 1
+  },
+  "knife": {
+   "name": "Stone knife",
+   "class": "knife",
+   "speed": 1
+  },
+  "saw": {
+   "name": "Saw",
+   "class": "saw",
+   "speed": 1
+  },
+  "chisel": {
+   "name": "Chisel",
+   "class": "chisel",
+   "speed": 1
+  },
+  "paper_mould": {
+   "name": "Paper mould",
+   "class": "paper_mould",
+   "speed": 1
+  }
+ },
+ "stations": {
+  "campfire": {
+   "name": "Campfire"
+  },
+  "workbench": {
+   "name": "Workbench"
+  },
+  "kiln": {
+   "name": "Kiln"
+  },
+  "bloomery": {
+   "name": "Bloomery"
+  },
+  "anvil": {
+   "name": "Anvil"
+  },
+  "loom": {
+   "name": "Loom"
+  },
+  "blast_furnace": {
+   "name": "Blast furnace"
+  },
+  "machine_shop": {
+   "name": "Machine shop"
+  },
+  "quern": {
+   "name": "Quern"
+  },
+  "tanning_rack": {
+   "name": "Tanning rack"
+  },
+  "mint": {
+   "name": "Mint"
+  }
+ },
+ "breaking": {
+  "about": "block id -> what it takes to break and what it yields. hard: seconds by hand (or with a tool of `class`, hard / speed). needs: a tool class without which it cannot be broken at all. yields: [item, count]; `bonus` is one more item every `every`-th cell (chosen by the cell's position, so the same cell always gives the same).",
+  "1": {
+   "hard": 0.6,
+   "class": "shovel",
+   "yields": [
+    [
+     "dirt",
+     1
+    ],
+    [
+     "fiber",
+     1
+    ]
+   ],
+   "bonus": [
+    "stone",
+    4
+   ]
+  },
+  "2": {
+   "hard": 0.6,
+   "class": "shovel",
+   "yields": [
+    [
+     "dirt",
+     1
+    ]
+   ],
+   "bonus": [
+    "stone",
+    3
+   ]
+  },
+  "4": {
+   "hard": 0.5,
+   "class": "shovel",
+   "yields": [
+    [
+     "sand",
+     1
+    ]
+   ]
+  },
+  "6": {
+   "hard": 0.4,
+   "class": "shovel",
+   "yields": [
+    [
+     "snow",
+     1
+    ]
+   ]
+  },
+  "7": {
+   "hard": 2.5,
+   "class": "axe",
+   "needs": "axe",
+   "yields": [
+    [
+     "wood",
+     1
+    ]
+   ]
+  },
+  "8": {
+   "hard": 0.25,
+   "yields": [
+    [
+     "sticks",
+     1
+    ],
+    [
+     "fiber",
+     1
+    ]
+   ],
+   "bonus": [
+    "sapling",
+    5
+   ]
+  },
+  "3": {
+   "hard": 3.0,
+   "class": "pick",
+   "needs": "pick",
+   "yields": [
+    [
+     "cobble",
+     1
+    ]
+   ],
+   "bonus": [
+    "stone",
+    2
+   ]
+  },
+  "10": {
+   "hard": 2.5,
+   "class": "pick",
+   "needs": "pick",
+   "yields": [
+    [
+     "cobble",
+     1
+    ]
+   ]
+  },
+  "16": {
+   "hard": 3.0,
+   "class": "pick",
+   "needs": "pick",
+   "yields": [
+    [
+     "stonebrick",
+     1
+    ]
+   ]
+  },
+  "17": {
+   "hard": 0.7,
+   "class": "shovel",
+   "yields": [
+    [
+     "gravel",
+     1
+    ]
+   ],
+   "bonus": [
+    "stone",
+    2
+   ]
+  },
+  "9": {
+   "hard": 1.0,
+   "class": "axe",
+   "yields": [
+    [
+     "planks",
+     1
+    ]
+   ]
+  },
+  "15": {
+   "hard": 1.0,
+   "class": "axe",
+   "yields": [
+    [
+     "darkwood",
+     1
+    ]
+   ]
+  },
+  "11": {
+   "hard": 2.0,
+   "class": "pick",
+   "needs": "pick",
+   "yields": [
+    [
+     "brick",
+     1
+    ]
+   ]
+  },
+  "13": {
+   "hard": 1.5,
+   "class": "pick",
+   "yields": [
+    [
+     "tiles",
+     1
+    ]
+   ]
+  },
+  "12": {
+   "hard": 0.5,
+   "yields": [
+    [
+     "glass",
+     1
+    ]
+   ]
+  },
+  "14": {
+   "hard": 1.5,
+   "class": "pick",
+   "yields": [
+    [
+     "plaster",
+     1
+    ]
+   ]
+  },
+  "31": {
+   "hard": 2.0,
+   "class": "axe",
+   "needs": "axe",
+   "yields": [
+    [
+     "wood",
+     1
+    ]
+   ]
+  },
+  "32": {
+   "hard": 0.25,
+   "yields": [
+    [
+     "sticks",
+     1
+    ],
+    [
+     "fiber",
+     1
+    ]
+   ],
+   "bonus": [
+    "sapling",
+    5
+   ]
+  },
+  "33": {
+   "hard": 0.25,
+   "yields": [
+    [
+     "fiber",
+     2
+    ]
+   ]
+  },
+  "85": {
+    "hard": 6.0,
+    "class": "pick",
+    "needs": "pick",
+    "yields": [["cobble", 3]],
+    "bonus": ["stone", 4]
+  },
+  "34": {
+   "hard": 0.2,
+   "yields": [
+    [
+     "stone",
+     1
+    ]
+   ]
+  },
+  "35": {
+   "hard": 0.2,
+   "yields": [
+    [
+     "sticks",
+     2
+    ]
+   ]
+  },
+  "36": {
+   "hard": 3.5,
+   "class": "pick",
+   "needs": "pick",
+   "yields": [
+    [
+     "ironore",
+     1
+    ]
+   ]
+  },
+  "37": {
+   "hard": 1.0,
+   "class": "axe",
+   "yields": [
+    [
+     "door",
+     1
+    ]
+   ]
+  },
+  "38": {
+   "hard": 1.5,
+   "class": "axe",
+   "yields": [
+    [
+     "beam",
+     1
+    ]
+   ]
+  },
+  "39": {
+   "hard": 0.5,
+   "yields": [
+    [
+     "thatch",
+     1
+    ]
+   ]
+  },
+  "40": {
+   "hard": 1.0,
+   "class": "axe",
+   "yields": [
+    [
+     "window",
+     1
+    ]
+   ]
+  },
+  "41": {
+   "hard": 2.5,
+   "class": "pick",
+   "needs": "pick",
+   "yields": [
+    [
+     "coal",
+     1
+    ]
+   ]
+  },
+  "42": {
+   "hard": 3.0,
+   "class": "pick",
+   "needs": "pick",
+   "yields": [
+    [
+     "copperore",
+     1
+    ]
+   ]
+  },
+  "43": {
+   "hard": 3.0,
+   "class": "pick",
+   "needs": "pick",
+   "yields": [
+    [
+     "tinore",
+     1
+    ]
+   ]
+  },
+  "44": {
+   "hard": 0.8,
+   "class": "shovel",
+   "yields": [
+    [
+     "clay",
+     1
+    ]
+   ]
+  },
+  "45": {
+   "hard": 1.0,
+   "class": "axe",
+   "yields": [
+    [
+     "table",
+     1
+    ]
+   ]
+  },
+  "46": {
+   "hard": 1.0,
+   "class": "axe",
+   "yields": [
+    [
+     "chair",
+     1
+    ]
+   ]
+  },
+  "47": {
+   "hard": 1.0,
+   "class": "axe",
+   "yields": [
+    [
+     "bench",
+     1
+    ]
+   ]
+  },
+  "48": {
+   "hard": 1.0,
+   "class": "axe",
+   "yields": [
+    [
+     "bed",
+     1
+    ]
+   ]
+  },
+  "49": {
+   "hard": 1.0,
+   "class": "axe",
+   "yields": [
+    [
+     "fence",
+     1
+    ]
+   ]
+  },
+  "50": {
+   "hard": 0.3,
+   "class": "axe",
+   "yields": [
+    [
+     "torch",
+     1
+    ]
+   ]
+  },
+  "51": {
+   "hard": 0.3,
+   "yields": [
+    [
+     "flax",
+     2
+    ]
+   ]
+  },
+  "52": {
+   "hard": 0.15,
+   "yields": [
+    [
+     "sapling",
+     1
+    ]
+   ]
+  },
+  "53": {
+   "hard": 0.6,
+   "class": "axe",
+   "yields": [
+    [
+     "ladder",
+     1
+    ]
+   ]
+  },
+  "54": {
+   "hard": 1.0,
+   "class": "axe",
+   "yields": [
+    [
+     "chest",
+     1
+    ]
+   ]
+  },
+  "55": {
+   "hard": 0.1,
+   "yields": []
+  },
+  "30": {
+   "hard": 8.0,
+   "class": "drill",
+   "needs": "drill",
+   "yields": []
+  },
+  "56": {
+   "hard": 4.0,
+   "class": "pick",
+   "needs": "pick",
+   "yields": [
+    [
+     "silverore",
+     1
+    ]
+   ]
+  },
+  "57": {
+   "hard": 4.0,
+   "class": "pick",
+   "needs": "pick",
+   "yields": [
+    [
+     "goldore",
+     1
+    ]
+   ]
+  },
+  "58": {
+   "hard": 0.2,
+   "yields": [
+    [
+     "poppy",
+     1
+    ]
+   ]
+  },
+  "59": {
+   "hard": 0.2,
+   "yields": [
+    [
+     "cornflower",
+     1
+    ]
+   ]
+  },
+  "60": {
+   "hard": 0.2,
+   "yields": [
+    [
+     "daisy",
+     1
+    ]
+   ]
+  },
+  "61": {
+   "hard": 0.2,
+   "yields": [
+    [
+     "buttercup",
+     1
+    ]
+   ]
+  },
+  "5": {
+   "hard": 0.3,
+   "class": "bucket",
+   "needs": "bucket",
+   "yields": [
+    [
+     "water",
+     1
+    ]
+   ]
+  },
+  "62": {
+   "hard": 0.5,
+   "yields": [
+    [
+     "lantern",
+     1
+    ]
+   ]
+  },
+  "63": {
+   "hard": 1.0,
+   "class": "pick",
+   "yields": [
+    [
+     "lamppost",
+     1
+    ]
+   ]
+  },
+  "64": {
+   "hard": 3.0,
+   "class": "pick",
+   "yields": [
+    [
+     "steel_plate",
+     1
+    ]
+   ],
+   "needs": "pick"
+  },
+  "28": {
+   "hard": 3.0,
+   "class": "pick",
+   "yields": [
+    [
+     "white_plate",
+     1
+    ]
+   ],
+   "needs": "pick"
+  },
+  "21": {
+   "hard": 3.0,
+   "class": "pick",
+   "yields": [
+    [
+     "red_plate",
+     1
+    ]
+   ],
+   "needs": "pick"
+  },
+  "23": {
+   "hard": 3.0,
+   "class": "pick",
+   "yields": [
+    [
+     "yellow_plate",
+     1
+    ]
+   ],
+   "needs": "pick"
+  },
+  "27": {
+   "hard": 3.0,
+   "class": "pick",
+   "yields": [
+    [
+     "black_plate",
+     1
+    ]
+   ],
+   "needs": "pick"
+  },
+  "65": {
+   "hard": 2.0,
+   "class": "pick",
+   "yields": [
+    [
+     "thruster",
+     1
+    ]
+   ]
+  },
+  "66": {
+   "hard": 2.0,
+   "class": "pick",
+   "yields": [
+    [
+     "pilot_seat",
+     1
+    ]
+   ]
+  },
+  "67": {
+   "hard": 2.0,
+   "class": "pick",
+   "yields": [
+    [
+     "smelter",
+     1
+    ]
+   ]
+  },
+  "68": {
+   "hard": 2.0,
+   "class": "pick",
+   "yields": [
+    [
+     "assembler",
+     1
+    ]
+   ]
+  },
+  "69": {
+   "hard": 2.0,
+   "class": "pick",
+   "yields": [
+    [
+     "generator",
+     1
+    ]
+   ]
+  },
+  "70": {
+   "hard": 0.25,
+   "yields": [
+    [
+     "berries",
+     3
+    ]
+   ],
+   "bonus": [
+    "sticks",
+    2
+   ]
+  },
+  "71": {
+   "hard": 0.25,
+   "yields": [
+    [
+     "grain",
+     1
+    ],
+    [
+     "seed",
+     1
+    ]
+   ]
+  },
+  "72": {
+   "hard": 0.15,
+   "yields": [
+    [
+     "seed",
+     1
+    ]
+   ]
+  },
+  "73": {
+   "hard": 0.6,
+   "class": "shovel",
+   "yields": [
+    [
+     "dirt",
+     1
+    ]
+   ]
+  },
+  "74": {
+   "hard": 2.0,
+   "class": "pick",
+   "yields": [
+    [
+     "well",
+     1
+    ]
+   ]
+  },
+  "75": {
+   "hard": 1.5,
+   "class": "axe",
+   "yields": [
+    [
+     "stand",
+     1
+    ]
+   ]
+  },
+  "76": {
+   "hard": 3.5,
+   "class": "pick",
+   "needs": "pick",
+   "yields": [
+    [
+     "magnetite",
+     1
+    ]
+   ]
+  },
+  "77": {
+   "hard": 3.5,
+   "class": "pick",
+   "needs": "pick",
+   "yields": [
+    [
+     "lodestone",
+     1
+    ]
+   ]
+  },
+  "78": {
+   "hard": 2.0,
+   "class": "pick",
+   "yields": [
+    [
+     "nav_unit",
+     1
+    ]
+   ]
+  },
+  "79": {
+   "hard": 2.0,
+   "class": "pick",
+   "yields": [
+    [
+     "electrolyser",
+     1
+    ]
+   ]
+  },
+  "80": {
+   "hard": 2.0,
+   "class": "pick",
+   "yields": [
+    [
+     "liquefier",
+     1
+    ]
+   ]
+  },
+  "81": {
+   "hard": 2.0,
+   "class": "pick",
+   "yields": [
+    [
+     "rocket_engine",
+     1
+    ]
+   ]
+  },
+  "82": {
+   "hard": 2.0,
+   "class": "pick",
+   "yields": [
+    [
+     "propellant_tank",
+     1
+    ]
+   ]
+  },
+  "83": {
+   "hard": 2.0,
+   "class": "pick",
+   "yields": [
+    [
+     "nav_satellite",
+     1
+    ]
+   ]
+  },
+  "84": {
+   "hard": 2.0,
+   "class": "pick",
+   "yields": [
+    [
+     "launch_pad",
+     1
+    ]
+   ]
+  }
+ },
+ "recipes": [
+  {
+   "id": "cordage",
+   "makes": [
+    [
+     "cordage",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "fiber",
+     3
+    ]
+   ]
+  },
+  {
+   "id": "axe",
+   "makes": [
+    [
+     "axe",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "sticks",
+     2
+    ],
+    [
+     "stone",
+     1
+    ],
+    [
+     "cordage",
+     1
+    ]
+   ]
+  },
+  {
+   "id": "pick",
+   "makes": [
+    [
+     "pick",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "sticks",
+     2
+    ],
+    [
+     "stone",
+     2
+    ],
+    [
+     "cordage",
+     1
+    ]
+   ]
+  },
+  {
+   "id": "shovel",
+   "makes": [
+    [
+     "shovel",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "sticks",
+     2
+    ],
+    [
+     "stone",
+     1
+    ],
+    [
+     "cordage",
+     1
+    ]
+   ]
+  },
+  {
+   "id": "campfire",
+   "makes": [
+    [
+     "campfire",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "sticks",
+     6
+    ],
+    [
+     "stone",
+     4
+    ]
+   ]
+  },
+  {
+   "id": "workbench",
+   "makes": [
+    [
+     "workbench",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "wood",
+     6
+    ],
+    [
+     "cordage",
+     2
+    ]
+   ],
+   "with": [
+    "axe"
+   ]
+  },
+  {
+   "id": "planks",
+   "makes": [
+    [
+     "planks",
+     4
+    ]
+   ],
+   "uses": [
+    [
+     "wood",
+     1
+    ]
+   ],
+   "with": [
+    "workbench"
+   ]
+  },
+  {
+   "id": "darkwood",
+   "makes": [
+    [
+     "darkwood",
+     2
+    ]
+   ],
+   "uses": [
+    [
+     "planks",
+     2
+    ],
+    [
+     "sticks",
+     1
+    ]
+   ],
+   "with": [
+    "campfire"
+   ]
+  },
+  {
+   "id": "stonebrick",
+   "makes": [
+    [
+     "stonebrick",
+     2
+    ]
+   ],
+   "uses": [
+    [
+     "cobble",
+     4
+    ],
+    [
+     "mortar",
+     1
+    ]
+   ],
+   "with": [
+    "workbench",
+    "pick"
+   ]
+  },
+  {
+   "id": "plaster",
+   "makes": [
+    [
+     "plaster",
+     2
+    ]
+   ],
+   "uses": [
+    [
+     "sand",
+     2
+    ],
+    [
+     "stone",
+     1
+    ]
+   ],
+   "with": [
+    "workbench"
+   ]
+  },
+  {
+   "id": "kiln",
+   "makes": [
+    [
+     "kiln",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "cobble",
+     8
+    ],
+    [
+     "clay",
+     4
+    ]
+   ],
+   "with": [
+    "campfire"
+   ]
+  },
+  {
+   "id": "brick",
+   "makes": [
+    [
+     "brick",
+     4
+    ]
+   ],
+   "uses": [
+    [
+     "clay",
+     2
+    ],
+    [
+     "wood",
+     1
+    ]
+   ],
+   "with": [
+    "kiln"
+   ]
+  },
+  {
+   "id": "tiles",
+   "makes": [
+    [
+     "tiles",
+     4
+    ]
+   ],
+   "uses": [
+    [
+     "clay",
+     2
+    ],
+    [
+     "wood",
+     1
+    ]
+   ],
+   "with": [
+    "kiln"
+   ]
+  },
+  {
+   "id": "glass",
+   "makes": [
+    [
+     "glass",
+     2
+    ]
+   ],
+   "uses": [
+    [
+     "sand",
+     4
+    ],
+    [
+     "wood",
+     1
+    ]
+   ],
+   "with": [
+    "kiln"
+   ]
+  },
+  {
+   "id": "charcoal",
+   "makes": [
+    [
+     "charcoal",
+     2
+    ]
+   ],
+   "uses": [
+    [
+     "wood",
+     1
+    ]
+   ],
+   "with": [
+    "campfire"
+   ]
+  },
+  {
+   "id": "bloomery",
+   "makes": [
+    [
+     "bloomery",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "cobble",
+     10
+    ],
+    [
+     "clay",
+     6
+    ]
+   ],
+   "with": [
+    "campfire"
+   ]
+  },
+  {
+   "id": "iron",
+   "makes": [
+    [
+     "iron",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "ironore",
+     2
+    ],
+    [
+     "charcoal",
+     2
+    ]
+   ],
+   "with": [
+    "bloomery"
+   ]
+  },
+  {
+   "id": "anvil",
+   "makes": [
+    [
+     "anvil",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "iron",
+     5
+    ]
+   ],
+   "with": [
+    "bloomery"
+   ]
+  },
+  {
+   "id": "hammer",
+   "makes": [
+    [
+     "hammer",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "iron",
+     1
+    ],
+    [
+     "sticks",
+     1
+    ]
+   ],
+   "with": [
+    "anvil"
+   ]
+  },
+  {
+   "id": "nails",
+   "makes": [
+    [
+     "nails",
+     12
+    ]
+   ],
+   "uses": [
+    [
+     "iron",
+     1
+    ]
+   ],
+   "with": [
+    "anvil",
+    "hammer"
+   ]
+  },
+  {
+   "id": "hinges",
+   "makes": [
+    [
+     "hinges",
+     2
+    ]
+   ],
+   "uses": [
+    [
+     "iron",
+     1
+    ]
+   ],
+   "with": [
+    "anvil",
+    "hammer"
+   ]
+  },
+  {
+   "id": "iron_axe",
+   "makes": [
+    [
+     "iron_axe",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "iron",
+     2
+    ],
+    [
+     "sticks",
+     2
+    ]
+   ],
+   "with": [
+    "anvil",
+    "hammer"
+   ]
+  },
+  {
+   "id": "iron_pick",
+   "makes": [
+    [
+     "iron_pick",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "iron",
+     3
+    ],
+    [
+     "sticks",
+     2
+    ]
+   ],
+   "with": [
+    "anvil",
+    "hammer"
+   ]
+  },
+  {
+   "id": "iron_shovel",
+   "makes": [
+    [
+     "iron_shovel",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "iron",
+     1
+    ],
+    [
+     "sticks",
+     2
+    ]
+   ],
+   "with": [
+    "anvil",
+    "hammer"
+   ]
+  },
+  {
+   "id": "lime",
+   "makes": [
+    [
+     "lime",
+     2
+    ]
+   ],
+   "uses": [
+    [
+     "stone",
+     2
+    ],
+    [
+     "charcoal",
+     1
+    ]
+   ],
+   "with": [
+    "kiln"
+   ]
+  },
+  {
+   "id": "mortar",
+   "makes": [
+    [
+     "mortar",
+     4
+    ]
+   ],
+   "uses": [
+    [
+     "lime",
+     1
+    ],
+    [
+     "sand",
+     2
+    ]
+   ],
+   "with": []
+  },
+  {
+   "id": "beam",
+   "makes": [
+    [
+     "beam",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "wood",
+     1
+    ]
+   ],
+   "with": [
+    "workbench",
+    "axe"
+   ]
+  },
+  {
+   "id": "thatch",
+   "makes": [
+    [
+     "thatch",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "fiber",
+     6
+    ]
+   ],
+   "with": []
+  },
+  {
+   "id": "door",
+   "makes": [
+    [
+     "door",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "planks",
+     6
+    ],
+    [
+     "hinges",
+     2
+    ],
+    [
+     "nails",
+     4
+    ]
+   ],
+   "with": [
+    "workbench",
+    "hammer"
+   ]
+  },
+  {
+   "id": "window",
+   "makes": [
+    [
+     "window",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "glass",
+     1
+    ],
+    [
+     "planks",
+     2
+    ],
+    [
+     "nails",
+     4
+    ]
+   ],
+   "with": [
+    "workbench",
+    "hammer"
+   ]
+  },
+  {
+   "id": "bronze",
+   "makes": [
+    [
+     "bronze",
+     2
+    ]
+   ],
+   "uses": [
+    [
+     "copperore",
+     3
+    ],
+    [
+     "tinore",
+     1
+    ],
+    [
+     "charcoal",
+     2
+    ]
+   ],
+   "with": [
+    "bloomery"
+   ]
+  },
+  {
+   "id": "bronze_coal",
+   "makes": [
+    [
+     "bronze",
+     2
+    ]
+   ],
+   "uses": [
+    [
+     "copperore",
+     3
+    ],
+    [
+     "tinore",
+     1
+    ],
+    [
+     "coal",
+     1
+    ]
+   ],
+   "with": [
+    "bloomery"
+   ]
+  },
+  {
+   "id": "bronze_axe",
+   "makes": [
+    [
+     "bronze_axe",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "bronze",
+     2
+    ],
+    [
+     "sticks",
+     2
+    ]
+   ],
+   "with": [
+    "bloomery"
+   ]
+  },
+  {
+   "id": "bronze_pick",
+   "makes": [
+    [
+     "bronze_pick",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "bronze",
+     3
+    ],
+    [
+     "sticks",
+     2
+    ]
+   ],
+   "with": [
+    "bloomery"
+   ]
+  },
+  {
+   "id": "bronze_shovel",
+   "makes": [
+    [
+     "bronze_shovel",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "bronze",
+     1
+    ],
+    [
+     "sticks",
+     2
+    ]
+   ],
+   "with": [
+    "bloomery"
+   ]
+  },
+  {
+   "id": "iron_coal",
+   "makes": [
+    [
+     "iron",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "ironore",
+     2
+    ],
+    [
+     "coal",
+     1
+    ]
+   ],
+   "with": [
+    "bloomery"
+   ]
+  },
+  {
+   "id": "iron_magnetite",
+   "makes": [
+    [
+     "iron",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "magnetite",
+     2
+    ],
+    [
+     "charcoal",
+     2
+    ]
+   ],
+   "with": [
+    "bloomery"
+   ]
+  },
+  {
+   "id": "iron_magnetite_coal",
+   "makes": [
+    [
+     "iron",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "magnetite",
+     2
+    ],
+    [
+     "coal",
+     1
+    ]
+   ],
+   "with": [
+    "bloomery"
+   ]
+  },
+  {
+   "id": "lime_coal",
+   "makes": [
+    [
+     "lime",
+     2
+    ]
+   ],
+   "uses": [
+    [
+     "stone",
+     2
+    ],
+    [
+     "coal",
+     1
+    ]
+   ],
+   "with": [
+    "kiln"
+   ]
+  },
+  {
+   "id": "bow_drill",
+   "makes": [
+    [
+     "bow_drill",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "sticks",
+     3
+    ],
+    [
+     "cordage",
+     1
+    ]
+   ]
+  },
+  {
+   "id": "flint_steel",
+   "makes": [
+    [
+     "flint_steel",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "iron",
+     1
+    ],
+    [
+     "stone",
+     1
+    ]
+   ],
+   "with": [
+    "anvil"
+   ]
+  },
+  {
+   "id": "spindle",
+   "makes": [
+    [
+     "spindle",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "sticks",
+     1
+    ],
+    [
+     "stone",
+     1
+    ]
+   ]
+  },
+  {
+   "id": "thread",
+   "makes": [
+    [
+     "thread",
+     2
+    ]
+   ],
+   "uses": [
+    [
+     "flax",
+     3
+    ]
+   ],
+   "with": [
+    "spindle"
+   ]
+  },
+  {
+   "id": "cordage_flax",
+   "makes": [
+    [
+     "cordage",
+     2
+    ]
+   ],
+   "uses": [
+    [
+     "flax",
+     2
+    ]
+   ],
+   "with": [
+    "spindle"
+   ]
+  },
+  {
+   "id": "loom",
+   "makes": [
+    [
+     "loom",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "wood",
+     2
+    ],
+    [
+     "sticks",
+     8
+    ],
+    [
+     "cordage",
+     4
+    ]
+   ],
+   "with": [
+    "workbench"
+   ]
+  },
+  {
+   "id": "linen",
+   "makes": [
+    [
+     "linen",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "thread",
+     6
+    ]
+   ],
+   "with": [
+    "loom"
+   ]
+  },
+  {
+   "id": "table",
+   "makes": [
+    [
+     "table",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "planks",
+     6
+    ],
+    [
+     "nails",
+     8
+    ]
+   ],
+   "with": [
+    "workbench",
+    "hammer"
+   ]
+  },
+  {
+   "id": "chair",
+   "makes": [
+    [
+     "chair",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "planks",
+     3
+    ],
+    [
+     "nails",
+     4
+    ]
+   ],
+   "with": [
+    "workbench",
+    "hammer"
+   ]
+  },
+  {
+   "id": "bench",
+   "makes": [
+    [
+     "bench",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "planks",
+     2
+    ],
+    [
+     "sticks",
+     4
+    ]
+   ],
+   "with": [
+    "workbench"
+   ]
+  },
+  {
+   "id": "bed",
+   "makes": [
+    [
+     "bed",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "planks",
+     8
+    ],
+    [
+     "nails",
+     6
+    ],
+    [
+     "cordage",
+     6
+    ],
+    [
+     "linen",
+     2
+    ],
+    [
+     "fiber",
+     6
+    ]
+   ],
+   "with": [
+    "workbench",
+    "hammer"
+   ]
+  },
+  {
+   "id": "fence",
+   "makes": [
+    [
+     "fence",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "wood",
+     1
+    ],
+    [
+     "sticks",
+     2
+    ],
+    [
+     "cordage",
+     1
+    ]
+   ],
+   "with": [
+    "axe"
+   ]
+  },
+  {
+   "id": "torch",
+   "makes": [
+    [
+     "torch",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "sticks",
+     1
+    ],
+    [
+     "fiber",
+     2
+    ]
+   ]
+  },
+  {
+   "id": "ladder",
+   "makes": [
+    [
+     "ladder",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "sticks",
+     6
+    ],
+    [
+     "cordage",
+     4
+    ]
+   ],
+   "with": [
+    "axe"
+   ]
+  },
+  {
+   "id": "chest",
+   "makes": [
+    [
+     "chest",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "planks",
+     6
+    ],
+    [
+     "nails",
+     6
+    ],
+    [
+     "hinges",
+     1
+    ]
+   ],
+   "with": [
+    "workbench",
+    "hammer"
+   ]
+  },
+  {
+   "id": "needle",
+   "makes": [
+    [
+     "needle",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "sticks",
+     1
+    ]
+   ],
+   "with": [
+    "axe"
+   ]
+  },
+  {
+   "id": "linen_shirt",
+   "makes": [
+    [
+     "linen_shirt",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "linen",
+     2
+    ],
+    [
+     "thread",
+     2
+    ]
+   ],
+   "with": [
+    "needle"
+   ]
+  },
+  {
+   "id": "linen_trousers",
+   "makes": [
+    [
+     "linen_trousers",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "linen",
+     2
+    ],
+    [
+     "thread",
+     2
+    ]
+   ],
+   "with": [
+    "needle"
+   ]
+  },
+  {
+   "id": "linen_cap",
+   "makes": [
+    [
+     "linen_cap",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "linen",
+     1
+    ],
+    [
+     "thread",
+     1
+    ]
+   ],
+   "with": [
+    "needle"
+   ]
+  },
+  {
+   "id": "linen_cloak",
+   "makes": [
+    [
+     "linen_cloak",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "linen",
+     4
+    ],
+    [
+     "thread",
+     3
+    ],
+    [
+     "cordage",
+     1
+    ]
+   ],
+   "with": [
+    "needle"
+   ]
+  },
+  {
+   "id": "drill",
+   "makes": [
+    [
+     "drill",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "iron",
+     6
+    ],
+    [
+     "sticks",
+     2
+    ],
+    [
+     "cordage",
+     2
+    ]
+   ],
+   "with": [
+    "anvil",
+    "hammer"
+   ]
+  },
+  {
+   "id": "silver",
+   "makes": [
+    [
+     "silver",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "silverore",
+     2
+    ],
+    [
+     "charcoal",
+     2
+    ]
+   ],
+   "with": [
+    "bloomery"
+   ]
+  },
+  {
+   "id": "gold",
+   "makes": [
+    [
+     "gold",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "goldore",
+     2
+    ],
+    [
+     "charcoal",
+     2
+    ]
+   ],
+   "with": [
+    "bloomery"
+   ]
+  },
+  {
+   "id": "bucket",
+   "makes": [
+    [
+     "bucket",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "planks",
+     3
+    ],
+    [
+     "cordage",
+     1
+    ]
+   ],
+   "with": [
+    "workbench"
+   ]
+  },
+  {
+   "id": "lantern",
+   "makes": [
+    [
+     "lantern",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "glass",
+     1
+    ],
+    [
+     "iron",
+     1
+    ],
+    [
+     "torch",
+     1
+    ]
+   ],
+   "with": [
+    "anvil",
+    "hammer"
+   ]
+  },
+  {
+   "id": "lamppost",
+   "makes": [
+    [
+     "lamppost",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "lantern",
+     1
+    ],
+    [
+     "iron",
+     3
+    ]
+   ],
+   "with": [
+    "anvil",
+    "hammer"
+   ]
+  },
+  {
+   "id": "blast_furnace",
+   "makes": [
+    [
+     "blast_furnace",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "stonebrick",
+     12
+    ],
+    [
+     "clay",
+     6
+    ],
+    [
+     "iron",
+     4
+    ]
+   ],
+   "with": [
+    "bloomery"
+   ]
+  },
+  {
+   "id": "steel",
+   "makes": [
+    [
+     "steel",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "iron",
+     2
+    ],
+    [
+     "coal",
+     1
+    ]
+   ],
+   "with": [
+    "blast_furnace"
+   ]
+  },
+  {
+   "id": "copper",
+   "makes": [
+    [
+     "copper",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "copperore",
+     2
+    ],
+    [
+     "charcoal",
+     1
+    ]
+   ],
+   "with": [
+    "bloomery"
+   ]
+  },
+  {
+   "id": "wire",
+   "makes": [
+    [
+     "wire",
+     4
+    ]
+   ],
+   "uses": [
+    [
+     "copper",
+     1
+    ]
+   ],
+   "with": [
+    "anvil",
+    "hammer"
+   ]
+  },
+  {
+   "id": "steel_plate",
+   "makes": [
+    [
+     "steel_plate",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "steel",
+     1
+    ]
+   ],
+   "with": [
+    "anvil",
+    "hammer"
+   ]
+  },
+  {
+   "id": "white_plate",
+   "makes": [
+    [
+     "white_plate",
+     4
+    ]
+   ],
+   "uses": [
+    [
+     "steel_plate",
+     4
+    ],
+    [
+     "lime",
+     1
+    ]
+   ],
+   "with": [
+    "workbench"
+   ]
+  },
+  {
+   "id": "red_plate",
+   "makes": [
+    [
+     "red_plate",
+     4
+    ]
+   ],
+   "uses": [
+    [
+     "steel_plate",
+     4
+    ],
+    [
+     "ironore",
+     1
+    ]
+   ],
+   "with": [
+    "workbench"
+   ]
+  },
+  {
+   "id": "yellow_plate",
+   "makes": [
+    [
+     "yellow_plate",
+     4
+    ]
+   ],
+   "uses": [
+    [
+     "steel_plate",
+     4
+    ],
+    [
+     "ironore",
+     1
+    ],
+    [
+     "clay",
+     1
+    ]
+   ],
+   "with": [
+    "workbench"
+   ]
+  },
+  {
+   "id": "black_plate",
+   "makes": [
+    [
+     "black_plate",
+     4
+    ]
+   ],
+   "uses": [
+    [
+     "steel_plate",
+     4
+    ],
+    [
+     "charcoal",
+     1
+    ]
+   ],
+   "with": [
+    "workbench"
+   ]
+  },
+  {
+   "id": "orange_plate",
+   "makes": [
+    [
+     "orange_plate",
+     4
+    ]
+   ],
+   "uses": [
+    [
+     "steel_plate",
+     4
+    ],
+    [
+     "ironore",
+     2
+    ],
+    [
+     "clay",
+     1
+    ]
+   ],
+   "with": [
+    "workbench"
+   ]
+  },
+  {
+   "id": "green_plate",
+   "makes": [
+    [
+     "green_plate",
+     4
+    ]
+   ],
+   "uses": [
+    [
+     "steel_plate",
+     4
+    ],
+    [
+     "copperore",
+     1
+    ]
+   ],
+   "with": [
+    "workbench"
+   ]
+  },
+  {
+   "id": "blue_plate",
+   "makes": [
+    [
+     "blue_plate",
+     4
+    ]
+   ],
+   "uses": [
+    [
+     "steel_plate",
+     4
+    ],
+    [
+     "copperore",
+     1
+    ],
+    [
+     "sand",
+     1
+    ],
+    [
+     "lime",
+     1
+    ]
+   ],
+   "with": [
+    "kiln"
+   ]
+  },
+  {
+   "id": "purple_plate",
+   "makes": [
+    [
+     "purple_plate",
+     4
+    ]
+   ],
+   "uses": [
+    [
+     "steel_plate",
+     4
+    ],
+    [
+     "ironore",
+     1
+    ],
+    [
+     "copperore",
+     1
+    ],
+    [
+     "sand",
+     1
+    ],
+    [
+     "lime",
+     1
+    ]
+   ],
+   "with": [
+    "kiln"
+   ]
+  },
+  {
+   "id": "machine_shop",
+   "makes": [
+    [
+     "machine_shop",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "steel",
+     6
+    ],
+    [
+     "iron",
+     4
+    ],
+    [
+     "planks",
+     4
+    ]
+   ],
+   "with": [
+    "anvil"
+   ]
+  },
+  {
+   "id": "gear",
+   "makes": [
+    [
+     "gear",
+     2
+    ]
+   ],
+   "uses": [
+    [
+     "steel",
+     1
+    ]
+   ],
+   "with": [
+    "machine_shop"
+   ]
+  },
+  {
+   "id": "silicon",
+   "makes": [
+    [
+     "silicon",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "sand",
+     4
+    ],
+    [
+     "coal",
+     2
+    ]
+   ],
+   "with": [
+    "blast_furnace"
+   ]
+  },
+  {
+   "id": "circuit",
+   "makes": [
+    [
+     "circuit",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "silicon",
+     1
+    ],
+    [
+     "wire",
+     2
+    ],
+    [
+     "tinore",
+     1
+    ]
+   ],
+   "with": [
+    "machine_shop"
+   ]
+  },
+  {
+   "id": "power_cell",
+   "makes": [
+    [
+     "power_cell",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "copper",
+     1
+    ],
+    [
+     "tinore",
+     1
+    ],
+    [
+     "lime",
+     1
+    ]
+   ],
+   "with": [
+    "machine_shop"
+   ]
+  },
+  {
+   "id": "motor",
+   "makes": [
+    [
+     "motor",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "wire",
+     6
+    ],
+    [
+     "iron",
+     2
+    ],
+    [
+     "gear",
+     1
+    ]
+   ],
+   "with": [
+    "machine_shop"
+   ]
+  },
+  {
+   "id": "thruster",
+   "makes": [
+    [
+     "thruster",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "steel_plate",
+     4
+    ],
+    [
+     "motor",
+     2
+    ],
+    [
+     "circuit",
+     2
+    ],
+    [
+     "power_cell",
+     4
+    ]
+   ],
+   "with": [
+    "machine_shop"
+   ]
+  },
+  {
+   "id": "pilot_seat",
+   "makes": [
+    [
+     "pilot_seat",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "steel",
+     2
+    ],
+    [
+     "glass",
+     4
+    ],
+    [
+     "circuit",
+     3
+    ],
+    [
+     "chair",
+     1
+    ]
+   ],
+   "with": [
+    "machine_shop"
+   ]
+  },
+  {
+   "id": "smelter",
+   "makes": [
+    [
+     "smelter",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "steel_plate",
+     4
+    ],
+    [
+     "stonebrick",
+     8
+    ],
+    [
+     "motor",
+     1
+    ],
+    [
+     "circuit",
+     1
+    ]
+   ],
+   "with": [
+    "machine_shop"
+   ]
+  },
+  {
+   "id": "assembler",
+   "makes": [
+    [
+     "assembler",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "steel_plate",
+     4
+    ],
+    [
+     "motor",
+     2
+    ],
+    [
+     "circuit",
+     2
+    ],
+    [
+     "gear",
+     4
+    ]
+   ],
+   "with": [
+    "machine_shop"
+   ]
+  },
+  {
+   "id": "generator",
+   "makes": [
+    [
+     "generator",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "steel_plate",
+     3
+    ],
+    [
+     "motor",
+     2
+    ],
+    [
+     "wire",
+     8
+    ],
+    [
+     "power_cell",
+     2
+    ]
+   ],
+   "with": [
+    "machine_shop"
+   ]
+  },
+  {
+   "id": "hoe",
+   "makes": [
+    [
+     "hoe",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "sticks",
+     2
+    ],
+    [
+     "stone",
+     2
+    ],
+    [
+     "cordage",
+     1
+    ]
+   ]
+  },
+  {
+   "id": "quern",
+   "makes": [
+    [
+     "quern",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "stone",
+     6
+    ],
+    [
+     "sticks",
+     2
+    ]
+   ],
+   "with": [
+    "workbench"
+   ]
+  },
+  {
+   "id": "flour",
+   "makes": [
+    [
+     "flour",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "grain",
+     3
+    ]
+   ],
+   "with": [
+    "quern"
+   ]
+  },
+  {
+   "id": "bread",
+   "makes": [
+    [
+     "bread",
+     2
+    ]
+   ],
+   "uses": [
+    [
+     "flour",
+     2
+    ],
+    [
+     "water",
+     1
+    ]
+   ],
+   "with": [
+    "campfire"
+   ]
+  },
+  {
+   "id": "well",
+   "makes": [
+    [
+     "well",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "cobble",
+     12
+    ],
+    [
+     "planks",
+     4
+    ],
+    [
+     "cordage",
+     2
+    ]
+   ],
+   "with": [
+    "workbench"
+   ]
+  },
+  {
+   "id": "spear",
+   "makes": [
+    [
+     "spear",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "sticks",
+     2
+    ],
+    [
+     "stone",
+     2
+    ],
+    [
+     "cordage",
+     1
+    ]
+   ]
+  },
+  {
+   "id": "bow",
+   "makes": [
+    [
+     "bow",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "wood",
+     1
+    ],
+    [
+     "cordage",
+     3
+    ]
+   ],
+   "with": [
+    "workbench"
+   ]
+  },
+  {
+   "id": "arrow",
+   "makes": [
+    [
+     "arrow",
+     4
+    ]
+   ],
+   "uses": [
+    [
+     "sticks",
+     2
+    ],
+    [
+     "stone",
+     1
+    ],
+    [
+     "fiber",
+     2
+    ]
+   ]
+  },
+  {
+   "id": "cooked_meat",
+   "makes": [
+    [
+     "cooked_meat",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "meat",
+     1
+    ]
+   ],
+   "with": [
+    "campfire"
+   ]
+  },
+  {
+   "id": "tanning_rack",
+   "makes": [
+    [
+     "tanning_rack",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "sticks",
+     6
+    ],
+    [
+     "cordage",
+     2
+    ]
+   ],
+   "with": [
+    "workbench"
+   ]
+  },
+  {
+   "id": "leather",
+   "makes": [
+    [
+     "leather",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "hide",
+     1
+    ],
+    [
+     "lime",
+     1
+    ]
+   ],
+   "with": [
+    "tanning_rack"
+   ]
+  },
+  {
+   "id": "stand",
+   "makes": [
+    [
+     "stand",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "planks",
+     6
+    ],
+    [
+     "beam",
+     2
+    ],
+    [
+     "cordage",
+     2
+    ]
+   ],
+   "with": [
+    "workbench"
+   ]
+  },
+  {
+   "id": "mint",
+   "makes": [
+    [
+     "mint",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "stonebrick",
+     6
+    ],
+    [
+     "iron",
+     4
+    ],
+    [
+     "planks",
+     4
+    ]
+   ],
+   "with": [
+    "anvil",
+    "hammer"
+   ]
+  },
+  {
+   "id": "copper_coin",
+   "makes": [
+    [
+     "copper_coin",
+     10
+    ]
+   ],
+   "uses": [
+    [
+     "copper",
+     1
+    ]
+   ],
+   "with": [
+    "mint"
+   ]
+  },
+  {
+   "id": "silver_coin",
+   "makes": [
+    [
+     "silver_coin",
+     10
+    ]
+   ],
+   "uses": [
+    [
+     "silver",
+     1
+    ]
+   ],
+   "with": [
+    "mint"
+   ]
+  },
+  {
+   "id": "gold_coin",
+   "makes": [
+    [
+     "gold_coin",
+     10
+    ]
+   ],
+   "uses": [
+    [
+     "gold",
+     1
+    ]
+   ],
+   "with": [
+    "mint"
+   ]
+  },
+  {
+   "id": "knife",
+   "makes": [
+    [
+     "knife",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "stone",
+     2
+    ],
+    [
+     "sticks",
+     1
+    ],
+    [
+     "cordage",
+     1
+    ]
+   ]
+  },
+  {
+   "id": "saw",
+   "makes": [
+    [
+     "saw",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "iron",
+     2
+    ],
+    [
+     "planks",
+     1
+    ]
+   ],
+   "with": [
+    "anvil",
+    "hammer"
+   ]
+  },
+  {
+   "id": "chisel",
+   "makes": [
+    [
+     "chisel",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "iron",
+     1
+    ],
+    [
+     "sticks",
+     1
+    ]
+   ],
+   "with": [
+    "anvil",
+    "hammer"
+   ]
+  },
+  {
+   "id": "planks_saw",
+   "makes": [
+    [
+     "planks",
+     6
+    ]
+   ],
+   "uses": [
+    [
+     "wood",
+     1
+    ]
+   ],
+   "with": [
+    "workbench",
+    "saw"
+   ]
+  },
+  {
+   "id": "beam_saw",
+   "makes": [
+    [
+     "beam",
+     2
+    ]
+   ],
+   "uses": [
+    [
+     "wood",
+     1
+    ]
+   ],
+   "with": [
+    "workbench",
+    "saw"
+   ]
+  },
+  {
+   "id": "wheel",
+   "makes": [
+    [
+     "wheel",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "planks",
+     4
+    ],
+    [
+     "iron",
+     1
+    ]
+   ],
+   "with": [
+    "workbench",
+    "chisel"
+   ]
+  },
+  {
+   "id": "compass_needle",
+   "makes": [
+    [
+     "compass_needle",
+     1
+    ],
+    [
+     "lodestone",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "iron",
+     1
+    ],
+    [
+     "lodestone",
+     1
+    ]
+   ],
+   "with": [
+    "anvil",
+    "hammer"
+   ]
+  },
+  {
+   "id": "compass",
+   "makes": [
+    [
+     "compass",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "compass_needle",
+     1
+    ],
+    [
+     "planks",
+     1
+    ],
+    [
+     "glass",
+     1
+    ]
+   ],
+   "with": [
+    "workbench"
+   ]
+  },
+  {
+   "id": "tanbark",
+   "makes": [
+    [
+     "tanbark",
+     2
+    ]
+   ],
+   "uses": [
+    [
+     "wood",
+     1
+    ]
+   ],
+   "with": [
+    "knife"
+   ]
+  },
+  {
+   "id": "ink",
+   "makes": [
+    [
+     "ink",
+     4
+    ]
+   ],
+   "uses": [
+    [
+     "iron",
+     1
+    ],
+    [
+     "tanbark",
+     2
+    ],
+    [
+     "water",
+     1
+    ]
+   ],
+   "with": [
+    "campfire"
+   ]
+  },
+  {
+   "id": "paper_mould",
+   "makes": [
+    [
+     "paper_mould",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "planks",
+     2
+    ],
+    [
+     "wire",
+     2
+    ]
+   ],
+   "with": [
+    "workbench"
+   ]
+  },
+  {
+   "id": "paper",
+   "makes": [
+    [
+     "paper",
+     2
+    ]
+   ],
+   "uses": [
+    [
+     "fiber",
+     4
+    ],
+    [
+     "water",
+     1
+    ]
+   ],
+   "with": [
+    "paper_mould"
+   ]
+  },
+  {
+   "id": "paper_linen",
+   "makes": [
+    [
+     "paper",
+     2
+    ]
+   ],
+   "uses": [
+    [
+     "linen",
+     1
+    ],
+    [
+     "water",
+     1
+    ]
+   ],
+   "with": [
+    "paper_mould"
+   ]
+  },
+  {
+   "id": "map",
+   "makes": [
+    [
+     "map",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "paper",
+     4
+    ],
+    [
+     "ink",
+     1
+    ]
+   ],
+   "with": [
+    "workbench"
+   ]
+  },
+  {
+   "id": "nav_unit",
+   "makes": [
+    [
+     "nav_unit",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "circuit",
+     4
+    ],
+    [
+     "compass",
+     1
+    ],
+    [
+     "gear",
+     2
+    ],
+    [
+     "glass",
+     1
+    ]
+   ],
+   "with": [
+    "machine_shop"
+   ]
+  },
+  {
+   "id": "electrolyser",
+   "makes": [
+    [
+     "electrolyser",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "steel_plate",
+     2
+    ],
+    [
+     "copper",
+     4
+    ],
+    [
+     "wire",
+     4
+    ],
+    [
+     "circuit",
+     1
+    ]
+   ],
+   "with": [
+    "machine_shop"
+   ]
+  },
+  {
+   "id": "liquefier",
+   "makes": [
+    [
+     "liquefier",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "steel_plate",
+     4
+    ],
+    [
+     "motor",
+     2
+    ],
+    [
+     "copper",
+     4
+    ],
+    [
+     "circuit",
+     2
+    ]
+   ],
+   "with": [
+    "machine_shop"
+   ]
+  },
+  {
+   "id": "electrolysis",
+   "makes": [
+    [
+     "hydrogen",
+     1
+    ],
+    [
+     "oxygen",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "water",
+     1
+    ]
+   ],
+   "with": [
+    "electrolyser"
+   ],
+   "mj": 160.7
+  },
+  {
+   "id": "liquefy_propellant",
+   "makes": [
+    [
+     "propellant",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "hydrogen",
+     1
+    ],
+    [
+     "oxygen",
+     1
+    ]
+   ],
+   "with": [
+    "liquefier"
+   ],
+   "mj": 75.9
+  },
+  {
+   "id": "rocket_engine",
+   "makes": [
+    [
+     "rocket_engine",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "steel_plate",
+     6
+    ],
+    [
+     "motor",
+     2
+    ],
+    [
+     "copper",
+     6
+    ],
+    [
+     "circuit",
+     2
+    ]
+   ],
+   "with": [
+    "machine_shop"
+   ]
+  },
+  {
+   "id": "propellant_tank",
+   "makes": [
+    [
+     "propellant_tank",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "steel_plate",
+     3
+    ],
+    [
+     "fiber",
+     8
+    ]
+   ],
+   "with": [
+    "machine_shop"
+   ]
+  },
+  {
+   "id": "nav_satellite",
+   "makes": [
+    [
+     "nav_satellite",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "steel_plate",
+     2
+    ],
+    [
+     "circuit",
+     6
+    ],
+    [
+     "silicon",
+     4
+    ],
+    [
+     "power_cell",
+     4
+    ],
+    [
+     "wire",
+     8
+    ]
+   ],
+   "with": [
+    "machine_shop"
+   ]
+  },
+  {
+   "id": "launch_pad",
+   "makes": [
+    [
+     "launch_pad",
+     1
+    ]
+   ],
+   "uses": [
+    [
+     "stonebrick",
+     12
+    ],
+    [
+     "steel_plate",
+     4
+    ]
+   ],
+   "with": [
+    "workbench"
+   ]
+  }
+ ],
+ "wilderness_regrow_s": 900,
+ "flight": {
+  "about": "#147 (doc/land-tech-to-flight.md): a craft is built pieces touching one another, with a pilot seat and at least one thruster. Its mass is each piece's volume x its material's density (t per m3; a unit part by its own mass); it rises only if its thrusters (kN each) beat its weight. Read by the page (it flies the craft) and the world server (it bounds what a pilot may claim). #175: a PART (static/land-shapes.js) weighs the material actually in it — its shape's share of its box, a tenth of that for a hollow skin (a hull, a nose, a wing, a canopy, a dome) — and an ENGINE part is as many thrusters as its volume comes to, each weighing and pushing as one. PAINTED PLATE (white 28, red 21, yellow 23, black 27) is steel plate (density 1.5) with a pigment worked in at the workbench: white from lime (whitewash is slaked-lime paint), black from charcoal (carbon black: charred wood), red from iron ore (red ochre is hematite, an iron oxide and an ore of iron), yellow from iron ore and clay (ochre is a clay earth pigment of ferric oxide and clay; real yellow ochre is the hydrated oxide, limonite — Land has one iron ore) — land research paint/. ORANGE 22, GREEN 24, BLUE 25, PURPLE 26 (#187): orange from more iron ore to the clay than yellow (ochre ranges \"from yellow to deep orange\" with its iron oxide and clay, paint/wikipedia-Ochre l.13), green from copper ore (malachite, a copper ore, \"used as a mineral pigment ... in green paints from antiquity until c. 1800\", paint/wikipedia-Malachite l.82), blue at the kiln from copper ore, sand and lime (Egyptian blue: silica, lime and a copper compound heated to 800-1000 C, paint/wikipedia-Egyptian_blue l.13 and l.40; its small share of alkali is left out), purple at the kiln from the red and the blue pigment together (a DESIGN CHOICE: purple ochre is red ochre of coarser grain, Ochre l.25, which no recipe could tell from red). One measure of pigment painting four plates is a DESIGN CHOICE. (#170) GAME RULES, chosen for play and not measurements: thrust_kn (30 kN a thruster), every density here (a block of plate or glass is chosen far lighter than the solid material, so a craft of plates lifts on a few thrusters), and the unit masses of the thruster (0.4 t), the pilot seat (0.15 t) and the nav unit (0.02 t). The rocket engine's, the tank's and the satellite's masses are the rocket section's, scaled from the RS-25 and cited there. vmax and aero are cited above.",
+  "g": 9.8,
+  "thrust_kn": 30,
+  "vmax": 292,
+  "vmax_about": "m/s: 1,050 km/h, the X-wing's stated maximum atmospheric speed (land research xwing/wikipedia-X-wing_fighter l.42); was 60 before #191 — the server bounds a pilot's reports by it",
+  "aero": {
+    "about": "#191: how a winged craft flies (land-flight.js aircraftStep). CITED: cd0 0.021 = the F-4 Phantom's subsonic zero-lift drag coefficient (planet/wikipedia-Drag_coefficient l.115, with the wing area as the reference area l.109); e 0.8 within the 0.7–0.85 of a conventional wing (flight/wikipedia-Oswald_efficiency_number l.25); stall_deg 15 within the sources' range (flight/wikipedia-Stall l.27: 17.5° in its example, 'varies from airfoil to airfoil'). DESIGN CHOICES: n_max 9 (a fighter's load limit — the limiter holds the angle of attack there, Angle of attack l.26), v_ctrl 40 m/s (the airspeed at which the control surfaces have their full effect), the full-authority rates roll 150 / pitch 40 / yaw 20 °/s, stab 1.5 /s (how fast the nose weathervanes toward the velocity), gear_brake 3 m/s² with the throttle shut, gear_roll 0.6 rad/s of ground steering.",
+    "cd0": 0.021, "e": 0.8, "stall_deg": 15, "n_max": 9, "v_ctrl": 40, "roll_dps": 150, "pitch_dps": 40, "yaw_dps": 20, "stab": 1.5, "gear_brake": 3.0, "gear_roll": 0.6
+  },
+  "turn": 1.2,
+  "density": {
+   "9": 0.5,
+   "15": 0.6,
+   "38": 0.6,
+   "39": 0.15,
+   "12": 1.0,
+   "64": 1.5,
+   "10": 1.6,
+   "16": 1.6,
+   "11": 1.4,
+   "13": 1.2,
+   "14": 1.0,
+   "28": 1.5,
+   "21": 1.5,
+   "23": 1.5,
+   "27": 1.5,
+   "22": 1.5,
+   "24": 1.5,
+   "25": 1.5,
+   "26": 1.5,
+   "default": 1.0
+  },
+  "unit_mass": {
+   "65": 0.4,
+   "66": 0.15,
+   "78": 0.02,
+   "81": 0.3177,
+   "82": 0.02833,
+   "83": 1.633
+  }
+ },
+ "machines": {
+  "about": "#148 automation: a smelter or an assembler placed on a plot runs one chosen recipe by itself on the world server's clock — what it takes from the chests touching it, what it makes into a chest touching it — while a generator within power_reach metres on the same plot burns coal or charcoal from a chest beside it (fuel: runs a unit gives). A machine stands in for the stations and tools listed in 'does'; it makes items only, never a station or a tool. tick_s: one run per machine per tick. ENERGY (#173): a fuel's runs are its electricity at run_mj each — coal 20 x 615 MJ = 12.3 GJ (1 m3 x 1.35 t x 24 MJ/kg x 38 %, land research rockets/ENERGY.md); a recipe with \"mj\" costs mj / run_mj of a run, every other one run.",
+  "67": {
+   "does": [
+    "campfire",
+    "bloomery",
+    "blast_furnace",
+    "kiln"
+   ]
+  },
+  "68": {
+   "does": [
+    "workbench",
+    "anvil",
+    "machine_shop",
+    "hammer",
+    "axe",
+    "pick",
+    "needle",
+    "spindle",
+    "loom"
+   ]
+  },
+  "generator": 69,
+  "fuel": {
+   "coal": 20,
+   "charcoal": 10
+  },
+  "power_reach": 12,
+  "tick_s": 4,
+  "79": {
+   "does": [
+    "electrolyser"
+   ]
+  },
+  "80": {
+   "does": [
+    "liquefier"
+   ]
+  },
+  "run_mj": 615
+ },
+ "farming": {
+  "about": "FARMING (#154, doc/land-civilisation.md; operator 2026-11-09: \"farmland, farming, soil types, etc\"). A hoe tills grass or earth with open air over it into farmland (not stony ground); a seed sown on farmland grows into ripe wheat in crop_s x its soil's time x moist when water lies within moist_reach columns at or below the field, and a harvest of it gives its soil's grain and seeds (wild grain gives 1 and 1). Read by the page (what the hoe says) and the world server (the rule). (#170) GAME RULES, chosen for play and not measurements: crop_s, every soil's time, grain and seed, moist and moist_reach — a field ripens in about twenty minutes of play, not a season, and a clay or peat field's slower growth and bigger yield are choices, not agronomy.",
+  "crop_s": 1200,
+  "moist_reach": 3,
+  "moist": 0.7,
+  "soil": {
+   "loam": {
+    "time": 1.0,
+    "grain": 3,
+    "seed": 2
+   },
+   "clay": {
+    "time": 1.3,
+    "grain": 4,
+    "seed": 2
+   },
+   "peat": {
+    "time": 1.2,
+    "grain": 4,
+    "seed": 2
+   },
+   "sandy": {
+    "time": 1.6,
+    "grain": 2,
+    "seed": 1
+   },
+   "stony": {
+    "till": false
+   }
+  }
+ },
+ "food": {
+  "about": "EATING (#155, doc/land-civilisation.md): food is a reward, never a meter that punishes a player who stops playing. Eating one item of food makes work quicker (breaking takes `work` of its time) for its seconds, added to what is left up to max_s. Read by the page (its break bar) and the world server (its work bucket). (#170) Every number in this section is a GAME RULE chosen for play, not a measurement of the world.",
+  "work": 0.8,
+  "max_s": 1800,
+  "items": {
+   "berries": 120,
+   "bread": 900,
+   "cooked_meat": 600
+  }
+ },
+ "hunting": {
+  "about": "HUNTING (#156, doc/land-civilisation.md): animals wander the wilderness near players — the world server keeps them (scripts/land_server.py herd): up to per_area within area metres of each player, spawned 18-40 m away on dry land by the biome's kinds, wandering, and fleeing at full speed from a player within flee metres; gone when no player is within keep metres. A weapon strikes one within its reach (a spear close, a bow far, spending an arrow); a strike costs strike_s of work; at 0 hp it drops its items into the hunter's bag. Animals only — weapons never touch a player. AGGRESSION (#162, operator: \"add aggressive deer and death/respawn mechanism\"): a share of each kind (angry) charge a player within charge metres and strike within strike_reach every strike_s for its damage; any animal struck by a hunter fights back the same way if its kind has damage. BALLISTICS AND THE KNIFE (#157, operator: \"ballistics? bow and arrow? knife? carpentry tools?\"): a bow shoots an arrow along the player's look at `draw` m/s; it falls under g, takes its time to arrive and hits an animal only where the animal is when the arrow gets there — a running one must be led, a far one aimed above; an arrow that misses lands, and some (`recover`) can be picked up where they fell for drop_s seconds. A kill gives its meat to anyone; its `butcher` items (hide, bone) only to a hunter with a knife. (#170) SOURCED: ballistics.draw 45 m/s is a hunting bow's arrow — a yew self bow's measured 47.23 m/s (land research hunting/wikipedia-English_longbow l.74); a size is the hit body as length, width and height, within the real animal: a deer 1.5 m long and 1.3 m up to the head (white-tailed deer stand 53-120 cm at the shoulder, White-tailed_deer l.171; red deer 180-201 cm head and body, Red_deer l.47), a boar 1.2 m and 0.9 m (wild boar 140-160 cm long and 70-95 cm at the shoulder, Wild_boar l.240 — ours a little short), a rabbit 0.4 m (36-38 cm, European_rabbit l.169). GAME RULES, chosen for play and not measurements: the speeds — far under the real (a white-tailed deer sprints at 40 mph, about 18 m/s, White-tailed_deer l.208; a wild boar runs at 40 km/h, Wild_boar l.235), so that a hunter on foot (WALK 4.6 m/s) can close on a fleeing animal; hp, damage, the angry share, charge, strike_reach, strike_every_s and strike_s; per_area, area, keep and flee; every weapon's reach and damage; and recover, drop_s and pickup.",
+  "per_area": 5,
+  "area": 48,
+  "keep": 96,
+  "flee": 9,
+  "strike_s": 0.8,
+  "species": {
+   "deer": {
+    "hp": 3,
+    "speed": 4.0,
+    "size": [
+     1.5,
+     0.5,
+     1.3
+    ],
+    "biomes": [
+     "forest",
+     "grass"
+    ],
+    "drops": [
+     [
+      "meat",
+      3
+     ],
+     [
+      "hide",
+      1
+     ],
+     [
+      "bone",
+      1
+     ]
+    ],
+    "angry": 0.35,
+    "damage": 3
+   },
+   "boar": {
+    "hp": 5,
+    "speed": 3.0,
+    "size": [
+     1.2,
+     0.55,
+     0.9
+    ],
+    "biomes": [
+     "forest"
+    ],
+    "drops": [
+     [
+      "meat",
+      4
+     ],
+     [
+      "hide",
+      1
+     ],
+     [
+      "bone",
+      2
+     ]
+    ],
+    "angry": 0.0,
+    "damage": 4
+   },
+   "rabbit": {
+    "hp": 1,
+    "speed": 4.5,
+    "size": [
+     0.4,
+     0.25,
+     0.35
+    ],
+    "biomes": [
+     "grass",
+     "forest",
+     "snow",
+     "desert"
+    ],
+    "drops": [
+     [
+      "meat",
+      1
+     ],
+     [
+      "hide",
+      1
+     ]
+    ],
+    "angry": 0.0,
+    "damage": 0
+   }
+  },
+  "weapons": {
+   "cannon": {
+    "reach": 400,
+    "damage": 5
+   },
+   "spear": {
+    "reach": 3.5,
+    "damage": 2
+   },
+   "bow": {
+    "reach": 30,
+    "damage": 2,
+    "ammo": "arrow"
+   }
+  },
+  "charge": 12,
+  "strike_reach": 1.8,
+  "strike_every_s": 1.5,
+  "butcher": [
+   "hide",
+   "bone"
+  ],
+  "ballistics": {
+   "draw": 45,
+   "g": 9.8,
+   "pad": 0.15,
+   "recover": 0.6,
+   "drop_s": 600,
+   "pickup": 2.5
+  }
+ },
+ "market": {
+  "about": "MARKETS (#161, doc/land-civilisation.md; operator 2026-11-09: \"local markets first, global only with the invention of the internet\", \"trading stands\"). An offer is made standing at a trading stand (within at metres of one) and lives there; it is seen and taken only by a player standing at a stand within reach metres of it — the stands of one market. A gift is handed over in person (within hand metres). On every offer taken the maker receives what it asked for less fee of each item (rounded down) — a sink that grows with trade itself. PRICES (#163: \"we need currencies of all types so we need a flexible value system based on supply and demand\"): every offer taken is a trade on the record; the going rate of X in Y at a market is the volume-weighted ratio of the market's trades of X for Y within window_s, each weighing half as much every half_life_s; X and Y that never traded directly are priced through the items that link them, the best-traded path first. No item has a fixed price — coins included: a coin is worth what the market gives for it.",
+  "at": 6,
+  "reach": 64,
+  "hand": 8,
+  "fee": 0.05,
+  "window_s": 604800,
+  "half_life_s": 172800,
+  "keep_trades": 20000
+ },
+ "health": {
+  "about": "HEALTH (#162): a player has max health; nothing that hurt them for calm_s, it comes back one point every regen_s; at 0 they die — the bag is kept — and wake at the bed they last used, or at the landing, with grace_s in which nothing hurts them. (#170) Every number in this section is a GAME RULE chosen for play, not a measurement of the world.",
+  "max": 20,
+  "regen_s": 6,
+  "calm_s": 10,
+  "grace_s": 5
+ },
+ "quests": {
+  "about": "NPCS AND QUESTS (#165, doc/land-civilisation.md; operator 2026-11-09: \"we may need npcs and quests and move this a little towards world of warcraft as well\"). NPCs stand where `at` says (face, u, v), kept by the world server; a player within talk metres talks to one. The quest giver offers each player up to `offered` quests made from the world as it is — bring items the land holds, hunt game that lives here, carry a parcel to another NPC — and a player holds up to `max_open`. A quest pays experience and — a bring or hunt quest, which costs the player something; a delivery is a walk, free to repeat, and pays experience only — from the TOWN TREASURY (the market's share of every trade, and what quests bring in), up to `reward_share` of the treasury's largest stock: nothing is made from nothing. Levels: level n needs level_xp × n × (n - 1) / 2 experience.",
+  "talk": 4,
+  "offered": 3,
+  "max_open": 3,
+  "reward_share": 0.02,
+  "level_xp": 100,
+  "npcs": [
+   {
+    "id": "elder",
+    "name": "Maren",
+    "role": "elder",
+    "at": [
+     0,
+     55046.0,
+     80001.0
+    ],
+    "look": {"skin": 2, "hair": 5, "body": 1, "face": 1, "worn": {"body": "linen_shirt", "legs": "linen_trousers"}},
+    "gives": true
+   },
+   {
+    "id": "trader",
+    "name": "Tobin",
+    "role": "trader",
+    "at": [
+     0,
+     55052.0,
+     80001.0
+    ],
+    "look": {"skin": 4, "hair": 1, "body": 0, "face": 0, "worn": {"body": "linen_shirt", "legs": "linen_trousers"}}
+   },
+   {
+    "id": "smith",
+    "name": "Ida",
+    "role": "smith",
+    "at": [
+     0,
+     55043.0,
+     80001.0
+    ],
+    "look": {"skin": 1, "hair": 0, "body": 1, "face": 3, "worn": {"body": "linen_shirt", "legs": "linen_trousers"}}
+   }
+  ],
+  "bring": [
+   [
+    "sticks",
+    10
+   ],
+   [
+    "stone",
+    6
+   ],
+   [
+    "fiber",
+    12
+   ],
+   [
+    "wood",
+    4
+   ],
+   [
+    "clay",
+    4
+   ],
+   [
+    "berries",
+    6
+   ],
+   [
+    "grain",
+    6
+   ],
+   [
+    "flax",
+    6
+   ],
+   [
+    "cobble",
+    8
+   ],
+   [
+    "planks",
+    4
+   ]
+  ],
+  "hand": [
+   "sticks",
+   "stone",
+   "fiber",
+   "berries",
+   "flax"
+  ],
+  "hunt": [
+   [
+    "rabbit",
+    2
+   ],
+   [
+    "deer",
+    1
+   ],
+   [
+    "boar",
+    1
+   ]
+  ],
+  "xp": {
+   "bring": 20,
+   "hunt": 35,
+   "deliver": 15
+  }
+ },
+ "rocket": {
+  "about": "#173 ROCKETS (doc/land-navigation.md 1.5, land research rockets/). engine: a tenth-scale RS-25 — its Isp and thrust-to-weight kept (RS-25 l.29-31, l.39, l.52: 1,859 kN sea level, 3,177 kg) — thrust and mass a design choice; tank: holds `holds` propellant canisters (7.87 kg each, 21.7 L: 1.119 kg LH2 at 70.85 kg/m3 + 6.748 kg LOX at 1,141 kg/m3), its dry mass dry_frac of what it holds (Space Shuttle external tank l.16, l.90: 26.5 t empty for 735.5 t of propellant); satellite: a GPS Block IIF's mass (GPS Block IIF l.34). The launch: dv = isp_sl * g0 * ln(m0/mf) (Tsiolkovsky l.10; sea-level Isp throughout — conservative), less a gravity loss g * burn time as if straight up (Gravity loss l.11 — conservative), against dv_orbit (vis-viva, doc 1.5); thrust must beat weight to leave the pad.",
+  "engine": {
+   "thrust_kn": 185.9,
+   "isp_sl": 366,
+   "isp_vac": 452.3,
+   "kg": 317.7
+  },
+  "tank": {
+   "holds": 100,
+   "dry_frac": 0.036
+  },
+  "satellite_kg": 1633,
+  "canister_kg": 7.87,
+  "dv_orbit": 1096,
+  "g0": 9.80665,
+  "orbit": {
+   "r": 135520,
+   "T": 1200,
+   "incl_deg": 55,
+   "planes": 6,
+   "per_plane": 4
+  }
+ }
+}

@@ -120,6 +120,10 @@ celerybeat.pid
 env/
 venv/
 nado_venv/
+# ALSO without the slash: `nado_venv/` matches only a DIRECTORY. A worktree's nado_venv SYMLINK (to the live
+# venv, for running tests) was tracked by `git add -A` on 2026-09-07 and the merge replaced the live venv
+# directory with a link to itself — the node died with 203/EXEC. Never track anything named like the venv.
+nado_venv
 ENV/
 env.bak/
 venv.bak/
@@ -149,9 +153,17 @@ dmypy.json
 .pyre/
 
 # Claude Code session/worktree dir (never commit)
-.claude/
+.claude/*
+# ...except the skills, which are repo procedures rather than local settings: how to ship a consensus
+# change, deploy and verify it, publish the client binary, and change the wallet. They encode what went
+# wrong here before, so they belong with the code and not in one machine's home directory.
+#
+# NOTE THE GLOB: `.claude/` excludes the DIRECTORY, and git never descends into an excluded directory, so
+# a later negation inside it can never match. Excluding the contents instead is what makes `!` work.
+!.claude/skills/
 
-# Rust build artifacts (the native Goldilocks lib is built by install.sh; wasm is embedded in JS)
+# Rust build artifacts (install.sh builds native/mldsa44, the node's updater the other native crates; the wasm/blake2b
+# module is embedded in static/vendor/blake2b-wasm.js)
 wasm/*/target/
 
 # off-chain message pool persistence (node-local, ephemeral-ish state)
@@ -181,3 +193,12 @@ chain_generation
 # node-local runtime telemetry (stats sampler) — never source
 daily_stats.json
 rollback_stats.json
+tests/.tmp_finality_probe/
+treasury_history.json
+fork_diffs.jsonl
+static/market/prices.json
+static/market/prices.json.tmp
+static/market/history.json
+static/market/history.json.tmp
+# gen 25 identity log (ops/identity_log): node-local observation, lives in <home> == this directory
+identity_log.jsonl

@@ -9,6 +9,7 @@ Run: python3 tests/test_auto_collect.py
 """
 import os, sys, tempfile, traceback, types, logging
 os.environ["HOME"] = tempfile.mkdtemp(prefix="nado_autocollect_")
+import atexit, shutil; atexit.register(shutil.rmtree, os.environ["HOME"], ignore_errors=True)   # leave no /tmp home behind (9,600 leaked by 2026-09-22)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 for d in ("index", "blocks", "logs", "peers"):
     os.makedirs(f"{os.environ['HOME']}/nado/{d}", exist_ok=True)
@@ -38,6 +39,7 @@ class FakeMem:
         self.address = kd["address"]
         self.auto_collect_dividend = True
         self.latest_block = {"block_number": EPOCH_LENGTH}     # epoch 1
+        self.emergency_mode = False        # the sweep is skipped while the node is in emergency sync
         self.submitted = []
     def merge_transaction(self, tx, user_origin=False):
         """Record the submitted tx instead of mempooling it; always report success."""
@@ -87,6 +89,18 @@ def t2():
     core.maybe_auto_collect()
     assert mem.submitted == [], "below the dust floor the accrual must keep growing fee-free"
 check("dust accrual -> no sweep", t2)
+
+# ---- 2b. a failing relay-fee claim never costs the dividend sweep ---------------------------------
+def t2b():
+    """The Stwo relay's fee claims (_claim_relay_unshields) run inside the same pass; an error there must not skip the
+    sweep (it shared the pass's try until 2026-10-12, so any relay-claim error cancelled the node's dividend sweep)."""
+    core, mem = make_core({"/exec/dividend?": {"accrued": AUTO_COLLECT_MIN_RAW, "pending": []}})
+    def boom():
+        raise RuntimeError("relay claims exploded")
+    core._claim_relay_unshields = boom
+    core.maybe_auto_collect()
+    assert len(mem.submitted) == 1, "the sweep still went out"
+check("a failing relay-fee claim never costs the dividend sweep", t2b)
 
 # ---- 3. accrued >= floor -> sweep, and the sweep dwarfs its fee -----------------------------------
 def t3():

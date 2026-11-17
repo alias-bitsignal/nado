@@ -31,7 +31,7 @@
 <script type="application/ld+json">{"@context": "https://schema.org", "@type": "VideoGame", "name": "NADO Stormhold", "url": "https://stormhold.nadochain.com/", "description": "Stormhold — an on-chain deck-building duel on the NADO blockchain: draft cards, out-build your rival and settle every match with provable fairness and post-quantum signatures.", "gamePlatform": "Web browser", "isAccessibleForFree": true, "publisher": {"@type": "Organization", "name": "NADO", "url": "https://nadochain.com/"}}</script>
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns=%22http%3A//www.w3.org/2000/svg%22%20viewBox=%220%200%2048%2048%22%20width=%2264%22%20height=%2264%22%20aria-hidden=%22true%22%3E%3Crect%20x=%228%22%20y=%2218%22%20width=%229%22%20height=%2222%22%20fill=%22%2300c9a7%22/%3E%3Crect%20x=%2231%22%20y=%2218%22%20width=%229%22%20height=%2222%22%20fill=%22%2300c9a7%22/%3E%3Crect%20x=%2215%22%20y=%2224%22%20width=%2218%22%20height=%2216%22%20fill=%22%2300ad93%22/%3E%3Crect%20x=%228%22%20y=%2215%22%20width=%223%22%20height=%223%22%20fill=%22%2300c9a7%22/%3E%3Crect%20x=%2214%22%20y=%2215%22%20width=%223%22%20height=%223%22%20fill=%22%2300c9a7%22/%3E%3Crect%20x=%2231%22%20y=%2215%22%20width=%223%22%20height=%223%22%20fill=%22%2300c9a7%22/%3E%3Crect%20x=%2237%22%20y=%2215%22%20width=%223%22%20height=%223%22%20fill=%22%2300c9a7%22/%3E%3Crect%20x=%2215%22%20y=%2221%22%20width=%223%22%20height=%223%22%20fill=%22%2300ad93%22/%3E%3Crect%20x=%2221%22%20y=%2221%22%20width=%223%22%20height=%223%22%20fill=%22%2300ad93%22/%3E%3Crect%20x=%2227%22%20y=%2221%22%20width=%223%22%20height=%223%22%20fill=%22%2300ad93%22/%3E%3Cpath%20d=%22M20%2040v-7a4%204%200%200%201%208%200v7z%22%20fill=%22%230b3d36%22/%3E%3Crect%20x=%2223.2%22%20y=%227%22%20width=%221.6%22%20height=%228%22%20fill=%22%23e3b341%22/%3E%3Cpath%20d=%22M24.8%207.5%2030%209.5%2024.8%2011.5z%22%20fill=%22%23e3b341%22/%3E%3C/svg%3E">
 <meta name="theme-color" content="#0b0f14">
-<script src="/static/i18n.js?v=201913cb"></script>
+<script src="/static/i18n.js"></script>
 <style>
   :root{--bg:#0b0f14;--elev:#131a23;--elev2:#1a232e;--border:#243140;--txt:#e6edf3;--dim:#93a1b0;--faint:#5d6b7a;
     --accent:#00ad93;--accent2:#00c9a7;--danger:#f85149;--gold:#e3b341;--green:#3fb950;--purple:#bc8cff;
@@ -126,7 +126,7 @@
 <body>
 <div class="wrap">
   <header><span class="logo"><svg viewBox="0 0 48 48" width="28" height="28" aria-hidden="true"><rect x="8" y="18" width="9" height="22" fill="#00c9a7"/><rect x="31" y="18" width="9" height="22" fill="#00c9a7"/><rect x="15" y="24" width="18" height="16" fill="#00ad93"/><rect x="8" y="15" width="3" height="3" fill="#00c9a7"/><rect x="14" y="15" width="3" height="3" fill="#00c9a7"/><rect x="31" y="15" width="3" height="3" fill="#00c9a7"/><rect x="37" y="15" width="3" height="3" fill="#00c9a7"/><rect x="15" y="21" width="3" height="3" fill="#00ad93"/><rect x="21" y="21" width="3" height="3" fill="#00ad93"/><rect x="27" y="21" width="3" height="3" fill="#00ad93"/><path d="M20 40v-7a4 4 0 0 1 8 0v7z" fill="#0b3d36"/><rect x="23.2" y="7" width="1.6" height="8" fill="#e3b341"/><path d="M24.8 7.5 30 9.5 24.8 11.5z" fill="#e3b341"/></svg></span>
-    <h1>NADO <span class="a">Stormhold</span></h1><a class="hub" href="https://nadochain.com/games" data-i18n="storm.allGames">🎮 All games</a></header>
+    <h1>NADO <span class="a">Stormhold</span></h1><a class="hub" href="https://nadochain.com/apps" data-i18n="storm.allApps">🎮 All apps</a></header>
   <p class="sub" data-i18n-html="storm.sub">A <b>deck-building strategy duel for stakes</b> on the NADO execution layer. Start with 10 humble cards, buy engines and victory piles from a shared supply, and out-build your opponent. Every move is logged on-chain, every shuffle draws its randomness from <b>future L1 block hashes</b> — provably fair, nobody (not even the shuffler) can rig a deck. The full rules run in your browser; the pot settles by concede / mutual agreement / refund-timeout. Post-quantum wallet, no install.</p>
 
   <div id="status"></div>
@@ -264,8 +264,8 @@
     </p>
   </div>
 
-  <footer data-i18n-html="storm.footer">Runs on <a href="https://get.nadochain.com/">NADO</a> · <a href="/games">more games</a> · an original deck-building game (no affiliation with any tabletop publisher) · moves ride L1 as ordered blobs.</footer>
+  <footer data-i18n-html="storm.footer">Runs on <a href="https://get.nadochain.com/">NADO</a> · <a href="/apps">more apps</a> · an original deck-building game (no affiliation with any tabletop publisher) · moves ride L1 as ordered blobs.</footer>
 </div>
-<script type="module" src="/static/stormhold.js?v=a3661f1d"></script>
+<script type="module" src="/static/stormhold.js"></script>
 </body>
 </html>

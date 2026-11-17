@@ -7,16 +7,14 @@ Run: python3 tests/test_zkpy.py
 """
 import os, sys, traceback
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from execnode import zkpy, zkvm, runtimes
+# BLAKE_EXEC_HEIGHT's gen-28 pin retired in G9: generation 28's rules (the v1 VM, field digests) are gone, so this
+# file runs on generation 29's exec layer like the chain does.
+from execnode import zkpy, zkvm2, runtimes
 from execnode.zkpy import hash as zhash, lo32, select
-from execnode.stark import alghash
 
-fails = 0
-def check(name, fn):
-    global fails
-    try: fn(); print(f"PASS  {name}")
-    except Exception as e:
-        fails += 1; print(f"FAIL  {name}: {e}"); traceback.print_exc()
+import _harness
+_report = _harness.Report()
+check = _report.run
 
 
 def _code():
@@ -42,7 +40,7 @@ def _code():
 
 def _run(code, meth, args, **kw):
     cf, fa = runtimes.zkvm_statement("z", args, {})
-    return zkvm.run(code, meth, cf, fa, kw.pop("slots", {}), **kw)
+    return zkvm2.run(code, meth, cf, fa, kw.pop("slots", {}), **kw)        # the gen-29 VM a bare build() targets
 
 
 def t_compiles():
@@ -62,7 +60,7 @@ def t_roll_differential():
     c, _ = _code(); code = c.build()
     for s in range(40):
         ok, ret, _, _ = _run(code, "roll", [s])
-        assert ok and ret == (alghash.hashn([s]) & 0xFFFFFFFF) % 6, f"roll {s}"
+        assert ok and ret == (zkvm2.hash_words([s]) & 0xFFFFFFFF) % 6, f"roll {s}"
 
 def t_select():
     c, _ = _code(); code = c.build()
@@ -104,7 +102,7 @@ def t_store_of_deep_expr_not_clobbered():
     code = c.build()
     for aa, bb, exp in ((1, 9, 777), (9, 1, 111), (5, 5, 111)):
         st = {1 << 32: aa, 2 << 32: bb, 3 << 32: 777, 4 << 32: 111}
-        ok, ret, storage, _ = zkvm.run(code, "f", 12345, [0], dict(st))
+        ok, ret, storage, _ = zkvm2.run(code, "f", 12345, [0], dict(st))
         assert ok and ret == exp, f"select({aa}<{bb}) returned {ret}, want {exp}"
         assert storage.get(5 << 32) == exp, f"stored {storage.get(5 << 32)}, want {exp}"
 
@@ -118,7 +116,7 @@ def t_store_of_deep_expr_not_clobbered():
     code2 = c2.build()
     vals = [7, 3, 5, 11, 4]
     st = {(10 + i) << 32: v for i, v in enumerate(vals)}
-    ok, ret, _, _ = zkvm.run(code2, "g", 12345, [0], dict(st))
+    ok, ret, _, _ = zkvm2.run(code2, "g", 12345, [0], dict(st))
     want = vals[0] + vals[1] * vals[2] + vals[3] - vals[4]
     assert ok and ret == want, f"deep store returned {ret}, want {want}"
 
@@ -211,5 +209,5 @@ if __name__ == "__main__":
     check("select normalizes a non-boolean cond", t_select_normalizes_cond)
     check("control flow: label/jmp reject live temporaries", t_control_flow_balance_guard)
     check("loop with named loop-carried state", t_loop_counts_down)
-    print("ALL PASS" if fails == 0 else f"{fails} FAILURES")
-    sys.exit(1 if fails else 0)
+    print("ALL PASS" if _report.fails == 0 else f"{_report.fails} FAILURES")
+    sys.exit(1 if _report.fails else 0)

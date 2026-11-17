@@ -17,6 +17,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from execnode.games import _lib   # the contract's hash and word, per generation
 from execnode.games.pets import (                    # noqa: F401 — re-exported for the harnesses
     DIE_PCT, CAP_BATTLE, TIER_CUM, TIER_BASE, TIER_COUNT, STAT_TIER_BONUS,
     roll32, ref_tier, ref_si, ref_stat, ref_power, ref_train_ok,
@@ -25,15 +26,14 @@ from execnode.games.pets import (
     ref_gene as _ref_gene,
     ref_train_roll as _ref_train_roll,
     ref_battle_turns as _ref_battle_turns,
+    ref_battle_seed,
 )
-from execnode.stark import alghash
-from execnode.stark import field as F
 
 
 def vm_hash(v):
     """The contract's hash: alghash over the zkVM field, NOT blake2b. Anything derived from a gene has to
     go through this or it lands in a different number space entirely."""
-    return alghash.hashn([v % F.P])
+    return _lib.vm_hash([v % _lib.vm_mod()])
 
 
 def ref_gene(bh, b, pid):
@@ -49,6 +49,11 @@ def ref_battle_turns(bh, wh, bid, eff_a, eff_b):
     return _ref_battle_turns(bh[wh], bh[wh + 1], bid, eff_a, eff_b)
 
 
+def ref_battle_turns_cr(s1, s2, bid, eff_a, eff_b):
+    """A commit-reveal battle (wm == 1): the duel over seed HASH(s1 + s2 + bid) in place of the block-hash pair."""
+    return _ref_battle_turns(ref_battle_seed(s1, s2, bid), 0, bid, eff_a, eff_b)
+
+
 def ref_species(gene):
     """legacy name: returns the TIER (sp) — callers use it as sp."""
     return ref_tier(gene)
@@ -57,7 +62,7 @@ def ref_species(gene):
 def ref_battle(bh, wh, bid, pwa, pwb):
     """The pre-2026-07-11 power-only battle. Kept because older vectors still reference it; the live
     contract settles with ref_battle_turns, where every stat fights."""
-    q = (bh[wh] % F.P + bh[wh + 1] % F.P + bid * 8) % F.P
-    sa = pwa * (75 + roll32((q + 1) % F.P) % 100)
-    sb = pwb * (75 + roll32((q + 2) % F.P) % 100)
-    return (sa > sb), (roll32((q + 3) % F.P) % 100 < DIE_PCT)
+    q = (bh[wh] % _lib.vm_mod() + bh[wh + 1] % _lib.vm_mod() + bid * 8) % _lib.vm_mod()
+    sa = pwa * (75 + roll32((q + 1) % _lib.vm_mod()) % 100)
+    sb = pwb * (75 + roll32((q + 2) % _lib.vm_mod()) % 100)
+    return (sa > sb), (roll32((q + 3) % _lib.vm_mod()) % 100 < DIE_PCT)

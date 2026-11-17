@@ -6,9 +6,12 @@
 #   1. producer  — match_transactions_target skips an already-mined txid
 #   2. consensus — a block's tx set may not contain a duplicate txid, nor an already-mined one
 #   3. mempool   — merge_transaction refuses an already-mined txid
+import os as _os, tempfile as _tempfile  # ISOLATION FIRST (CLAUDE.md rule 4): never the live node's HOME or exec files
+_os.environ["HOME"] = _tempfile.mkdtemp(prefix="nado-test-")
+_os.environ["NADO_EXEC_STATE"] = _os.path.join(_os.environ["HOME"], "exec_state.json")
+_os.environ["NADO_EXEC_DA"] = _os.path.join(_os.environ["HOME"], "exec_da")
 import sys, tempfile, os
-sys.path.insert(0, "/root/nado")
-os.environ.setdefault("NADO_HOME", "/root/nado")
+sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.dirname(__import__("os").path.abspath(__file__))))
 
 F = []
 def ck(n, c): print(("  ok  " if c else " FAIL ") + n); (F.append(n) if not c else None)
@@ -18,11 +21,14 @@ from unittest import mock
 import ops.block_ops as B
 from protocol import ADDRESS_PREFIX
 
-# The recipient is NOT decoration here: _lands_flexibly() routes on `recipient.startswith(ADDRESS_PREFIX)`,
-# so a plain-transfer recipient must carry the LIVE prefix or these txs silently take the exact-landing
-# path (max_block 100 != block 10), match nothing, and the dedup assertion below grades an empty list.
-# It used to read "ndoX" and stopped exercising the dedup the moment the prefix was rebranded — derive it.
-PAYEE = ADDRESS_PREFIX + "X"
+# The recipient is NOT decoration here: _lands_flexibly() routes on is_address() — a CHECKSUM-VALID
+# address — so a plain-transfer recipient must be a real derived address or these txs silently take the
+# exact-landing path (max_block 100 != block 10), match nothing, and the dedup assertion grades an empty
+# list. It read ADDRESS_PREFIX + "X", which stopped being address-shaped the moment the prefix went empty
+# at the debrand AND the sniff moved from startswith(prefix) to the checksum — the same pinned-literal rot
+# this comment already warned about once. Derive a real address instead; it can never rot again.
+from ops.address_ops import make_address
+PAYEE = make_address("ab" * 60)
 pool = [
     {"txid": "aaaa", "max_block": 100, "recipient": PAYEE, "amount": 1},    # never mined
     {"txid": "bbbb", "max_block": 100, "recipient": "bridge", "amount": 5}, # already mined -> must be skipped

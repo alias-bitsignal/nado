@@ -10,6 +10,7 @@ Run: python3 tests/test_treasury_burn.py
 """
 import os, sys, tempfile, logging, traceback
 os.environ["HOME"] = tempfile.mkdtemp(prefix="nado_tburn_")
+import atexit, shutil; atexit.register(shutil.rmtree, os.environ["HOME"], ignore_errors=True)   # leave no /tmp home behind (9,600 leaked by 2026-09-22)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 for d in ("index", "blocks", "logs", "peers"):
     os.makedirs(f"{os.environ['HOME']}/nado/{d}", exist_ok=True)
@@ -24,13 +25,9 @@ from ops.account_ops import create_account, get_account, fetch_totals
 from ops.reward_ops import apply_treasury_burn
 from ops.key_ops import generate_keys
 
-fails = 0
-def check(name, fn):
-    """Run fn; print PASS/FAIL and count failures."""
-    global fails
-    try: fn(); print(f"PASS  {name}")
-    except Exception as e:
-        fails += 1; print(f"FAIL  {name}: {e}"); traceback.print_exc()
+import _harness
+_report = _harness.Report()
+check = _report.run
 
 def bal():
     """Return the current treasury balance."""
@@ -77,5 +74,5 @@ def t3_revert_restores_balance_and_supply():
 for name, fn in sorted(globals().items()):
     if name.startswith("t") and callable(fn) and len(name) > 1 and name[1].isdigit():
         check(name, fn)
-print(f"\n{'ALL PASSED' if not fails else str(fails)+' FAILED'}")
-sys.exit(1 if fails else 0)
+print(f"\n{'ALL PASSED' if not _report.fails else str(_report.fails)+' FAILED'}")
+sys.exit(1 if _report.fails else 0)

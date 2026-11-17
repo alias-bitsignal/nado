@@ -1,0 +1,224 @@
+"""
+Block AUTHORIZATION commitments + DETACHED EVIDENCE — the block-format half of validity-proof signature
+aggregation (doc/zk-signature-aggregation.md).
+
+THE LOAD-BEARING IDEA. A block's CORE carries its transactions with signatures STRIPPED, plus two commitment
+fields:
+    auth_root   a BLAKE2s commitment to the ordered authorization entries
+    auth_count  the exact number K of signature checks the block requires
+The signatures (or the STARK proof that replaces them) travel in a SEPARATE evidence envelope, exactly one of:
+    {"type": "raw",   "witnesses": [...]}      every block can always ship this
+    {"type": "stark", "circuit_id": ..., "proof": ...}
+and the BLOCK HASH IS IDENTICAL either way, because the hash covers only the core. That decoupling is what
+makes the scheme safe to roll out: a relay can build the canonical block for an offline winner from the signed
+mempool without racing proof completion, and a missing or invalid proof can never change block identity when
+valid alternate evidence exists.
+
+NARROW SCOPE. The proof attests ONLY "every authorization entry carries a valid ML-DSA-44 signature over its
+txid under the sender's resolved public key". Everything else stays in the native verifier — spending,
+uniqueness, fee, target height, state root, PUBKEY-ONCE resolution — AND the native verifier INDEPENDENTLY
+recomputes auth_root and auth_count from the block. So a prover cannot choose the statement: it is derived
+from committed data.
+
+auth_leaf_i = BLAKE2s(canonical(AUTH_DOMAIN, AUTH_VERSION, block_height, tx_index, txid, sender,
+                                authorization_kind, signature_count))
+auth_root   = the BLAKE2s chain over the ordered leaves (_auth_root_b2; gen 28's alghash fold over field-limb
+              leaves went with BLAKE_EXEC_HEIGHT in G9)
+
+THE LEAF CARRIES NO PUBLIC KEY, DELIBERATELY. It used to hash H(pubkey), and that was wrong the moment
+auth_root entered the block hash preimage: under PUBKEY-ONCE a transaction MAY omit public_key, so resolving
+it means reading as-of-parent account state, and the block hash would then depend on state. NADO already
+enforces exactly one state-dependent header field (state_root) and treats a mismatch as fatal; adding a
+second one buys nothing, because `sender` IS the address derived from the key and proof_sender() binds the
+two natively on every single transaction. So the leaf is a pure function of IN-BLOCK data, the key stays the
+native verifier's business, and a proof's public statement takes the pubkey the VERIFIER resolved — never one
+the prover chose.
+
+WIRED (betanet-14): ops/block_ops.construct_block commits (auth_root, auth_count) inside the hash preimage
+and core_loop.verify_block independently recomputes both from the block's own transactions and rejects on
+mismatch. Evidence itself is DETACHED (see evidence_ok): raw signatures are what every block ships today, and
+a stark envelope is accepted wherever a prover can supply one — same block hash either way.
+"""
+
+AUTH_DOMAIN = "nado-auth-v1"          # domain separator; a reroll-time constant
+KIND_SINGLE_MLDSA44 = 1               # one ML-DSA-44 signature by the sender's own key
+KIND_MULTISIG_MLDSA44 = 2             # a descriptor account: M member signatures over the same txid
+# (from SIG_SCHEME_KEYS_HEIGHT a member's entry may name another scheme in its own `alg`: the leaf keeps kind 2 and the
+# entry count, and the scheme rides in the body the block hash commits — a new kind would move every leaf, for nothing)
+# ONE SIGNATURE BY THE SENDER'S OWN KEY IN ANOTHER SCHEME (protocol.py "USER-SELECTABLE SIGNATURE SCHEMES"): the leaf
+# declares which, so a validity proof can never be checked as the wrong scheme's. A tx without `alg` keeps kind 1, so no
+# existing leaf, root or block hash moves. INVARIANT: never reuse a kind number — the leaf is in the block-hash preimage.
+KIND_SINGLE_BY_ALG = {"mldsa65": 3, "mldsa87": 4, "slhdsa128s": 5, "fndsa512": 6}
+AUTH_VERSION = 1
+
+
+def auth_entries(block):
+    """The ordered authorization entries of a block: every transaction that requires a signature check.
+
+    Derived from the block body alone, in the block's own transaction order — which construct_block has
+    already canonicalised by txid, so two nodes holding the same tx set produce the same entries and hence
+    the same root."""
+    h = int(block.get("block_number", 0))
+    out = []
+    for idx, tx in enumerate(block.get("block_transactions", []) or []):
+        sender = tx.get("sender")
+        if not sender:
+            continue
+        if tx.get("multisig") is not None:
+            # A descriptor account authorises with M member signatures over the same txid, so the entry
+            # declares BOTH a different kind and the real check count. Counting it as one would let a block
+            # commit K checks and require more, which is the whole thing auth_count exists to pin.
+            sigs = tx.get("signature")
+            kind, n = KIND_MULTISIG_MLDSA44, (len(sigs) if isinstance(sigs, list) else 0)
+        elif tx.get("alg"):
+            kind, n = KIND_SINGLE_BY_ALG[tx["alg"]], 1          # admission refused any other alg (sig_scheme_check)
+        else:
+            kind, n = KIND_SINGLE_MLDSA44, 1
+        # tx_pubkey is the key the TRANSACTION carries, if any. It is NOT in the leaf — the leaf must stay a
+        # pure function of block data that every node hashes identically, and under PUBKEY-ONCE this field is
+        # present on a sender's first tx and absent afterwards. It rides alongside because evidence checking
+        # has to resolve keys exactly the way validate_origin does: the tx's own key when present, the
+        # on-chain key otherwise. Using only the on-chain key would fail every FIRST transaction from an
+        # address, which is precisely the case where there is nothing on chain yet.
+        e = {"height": h, "index": idx, "txid": tx.get("txid", ""), "sender": sender,
+             "kind": kind, "sig_count": n, "tx_pubkey": tx.get("public_key") or None}
+        if tx.get("alg"):
+            e["alg"] = tx["alg"]          # only when present: an untagged entry keeps its exact shape
+        out.append(e)
+    return out
+
+
+def entry_pubkey(entry, resolve_pubkey=None):
+    """The key an entry's signature must verify under — the tx's own if it carries one, else the sender's
+    on-chain key. Exactly ops.transaction_ops.validate_origin's rule, and it must STAY exactly that: a
+    divergence here would accept evidence for a key the native verifier would have rejected.
+
+    Both sources are trustworthy in the same way and for different reasons: the tx's key is inside the block
+    hash preimage AND proof_sender() ties it to the sender address natively; the on-chain key is committed
+    state. Neither comes from the evidence envelope, which is the property that matters."""
+    return entry.get("tx_pubkey") or (resolve_pubkey(entry["sender"]) if resolve_pubkey else None)
+
+
+def auth_root(entries, height=0):
+    """Fold the ordered entries into one commitment — generation 29's root at EVERY height, block 0's header included
+    (genesis calls this with height 0): the BLAKE2s chain of _auth_root_b2, domain-separated from the exec root and the
+    calls chain by its personalizations (Goldilocks retirement G2). `height` stays in the signature because callers
+    pass it."""
+    # BLAKE_EXEC_HEIGHT (gen 28's gate, 1 from gen 29, inlined in G9): the alghash chain over field leaves was gen 28's
+    # auth root and is gone; no height of this chain is committed under it
+    return _auth_root_b2(entries)
+
+
+AUTH_PERSON_LEAF = b"NADOauL1"           # BLAKE2s personalizations of the gen-29 auth chain: disjoint from the exec
+AUTH_PERSON_NODE = b"NADOauR1"           # root's (exec_root_b2) and the calls chain's, so no hash means two things
+
+
+def _auth_root_b2(entries):
+    """The gen-29 auth commitment: a BLAKE2s chain from 32 zero bytes over each entry's leaf, where the leaf is BLAKE2s
+    of the entry's canonical bytes (the fields gen 28's field leaf hashed, uncompressed: no 52-bit limbs, no mod P). One
+    compression per step. Returned as an int, so the header field keeps its type."""
+    import hashlib
+    from hashing import canonical_bytes
+    node = bytes(32)
+    for e in entries:
+        leaf = hashlib.blake2s(canonical_bytes([AUTH_DOMAIN, AUTH_VERSION, int(e["height"]), int(e["index"]),
+                                                str(e["txid"]), str(e["sender"]), int(e["kind"]), int(e["sig_count"])]),
+                               digest_size=32, person=AUTH_PERSON_LEAF).digest()
+        node = hashlib.blake2s(node + leaf, digest_size=32, person=AUTH_PERSON_NODE).digest()
+    return int.from_bytes(node, "big")
+
+
+def auth_commitments(block):
+    """(auth_root, auth_count) for a block — what the block CORE carries and the native verifier recomputes.
+
+    auth_count is the number of authorization ENTRIES; the number of SIGNATURE CHECKS is the sum of the entries'
+    sig_count, which differs once a multisig entry is present. The header pins the entry count because that is what indexes
+    the root; the check count rides inside each leaf and so is pinned too."""
+    entries = auth_entries(block)
+    return auth_root(entries, int(block.get("block_number", 0) or 0)), len(entries)
+
+
+# ---- detached evidence ------------------------------------------------------------------------------
+def strip_signatures(block):
+    """The signature-free block CORE: transactions keep everything the state machine needs (including a
+    first-use public key) but drop the signature. The block HASH is taken over this core, so it is identical
+    whether raw or proof evidence is shipped."""
+    core = dict(block)
+    txs = []
+    for tx in block.get("block_transactions", []) or []:
+        t = {k: v for k, v in tx.items() if k != "signature"}
+        txs.append(t)
+    core["block_transactions"] = txs
+    return core
+
+
+def raw_evidence(block):
+    """The always-available evidence: the ordered signatures the core dropped."""
+    return {"type": "raw",
+            "witnesses": [tx.get("signature") for tx in (block.get("block_transactions") or [])
+                          if tx.get("sender")]}
+
+
+def stark_evidence(circuit_id, proof):
+    return {"type": "stark", "circuit_id": circuit_id, "proof": proof}
+
+
+def evidence_ok(evidence, block, resolve_pubkey=None, verify_sig=None, verify_proof=None):
+    """Check ONE evidence envelope against a block core. Raw evidence is checked signature by signature
+    (`verify_sig(sig, pubkey, txid)`); stark evidence is checked by `verify_proof(circuit_id, proof, statement)`
+    where the statement is the verifier's OWN (auth_root, auth_count, height, ...) — never the prover's.
+    Returns (ok, reason)."""
+    if not isinstance(evidence, dict) or evidence.get("type") not in ("raw", "stark"):
+        return False, "evidence must be exactly one of raw | stark"
+    root, count = auth_commitments(block)
+    if int(block.get("auth_count", -1)) != count:
+        return False, f"auth_count {block.get('auth_count')} != recomputed {count}"
+    # BLAKE_EXEC_HEIGHT (gen 28's gate, 1 from gen 29, inlined in G9), at every height: the BLAKE2s commitment is
+    # compared exactly (it is no field element — never compare it mod P again), and there is no Goldilocks validity
+    # proof of it to accept: stark evidence is refused like the settle proof (option R), raw evidence still works
+    if int(block.get("auth_root", -1)) != root:
+        return False, "auth_root does not match the block's own transactions"
+    if evidence["type"] == "stark":
+        return False, "a BLAKE2s auth root has no Goldilocks validity proof (raw evidence only)"
+    if evidence["type"] == "raw":
+        entries = auth_entries(block)
+        wits = evidence.get("witnesses") or []
+        if len(wits) != len(entries):
+            return False, f"raw evidence has {len(wits)} witnesses for {len(entries)} entries"
+        if verify_sig is None:
+            return True, "raw evidence shape ok (no verifier supplied)"
+        for e, sig in zip(entries, wits):
+            # The KEY comes from the verifier's own PUBKEY-ONCE resolution, never from the leaf and never
+            # from the envelope — an envelope that could name its own key would verify against itself.
+            pk = entry_pubkey(e, resolve_pubkey)
+            # verified under the tx's OWN scheme, as validate_origin does; an untagged entry calls exactly as before
+            ok = verify_sig(sig, pk, e["txid"], e["alg"]) if e.get("alg") else verify_sig(sig, pk, e["txid"])
+            if not ok:
+                return False, f"signature {e['index']} invalid"
+        return True, f"raw evidence ok ({len(wits)} signatures)"
+    if verify_proof is None:
+        return True, "stark evidence shape ok (no verifier supplied)"
+    # The statement is built ENTIRELY from what the verifier derived: the recomputed root and count, the
+    # block's own height and parent, the entries read out of the block body, and the keys OUR PUBKEY-ONCE
+    # resolution produced. Nothing in it comes from the envelope. `witnesses` are the signatures the block
+    # itself carries — the current sub-AIRs take the signature as a PUBLIC input, so an aggregate proof
+    # offloads the verification ARITHMETIC rather than the signature BYTES; making the signature a witness
+    # is what the byte-saving phase needs and it is an AIR change, not a wiring one.
+    entries = auth_entries(block)
+    txs = block.get("block_transactions") or []
+    statement = {"auth_version": AUTH_VERSION, "auth_root": root, "auth_count": count,
+                 "height": int(block.get("block_number", 0)),
+                 "parent": block.get("parent_hash") or block.get("previous_hash"),
+                 "entries": entries,
+                 "pubkeys": [entry_pubkey(e, resolve_pubkey) for e in entries],
+                 "witnesses": [txs[e["index"]].get("signature") for e in entries]}
+    ok = verify_proof(evidence.get("circuit_id"), evidence.get("proof"), statement)
+    return (True, f"stark evidence ok ({count} authorizations)") if ok else (False, "validity proof rejected")
+
+
+def byte_saving(count, proof_bytes):
+    """The size trade the rollout thresholds are set from: an ML-DSA-44 signature is 2420 B, so proof evidence
+    pays off once 2420*K exceeds the proof. Returns (saved_bytes, crossover_K)."""
+    saved = 2420 * int(count) - int(proof_bytes)
+    crossover = -(-int(proof_bytes) // 2420)
+    return saved, crossover

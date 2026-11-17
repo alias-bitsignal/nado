@@ -1,5 +1,6 @@
 import os, sys, tempfile, traceback, types, logging
 os.environ["HOME"] = tempfile.mkdtemp(prefix="nado_autobond_")
+import atexit, shutil; atexit.register(shutil.rmtree, os.environ["HOME"], ignore_errors=True)   # leave no /tmp home behind (9,600 leaked by 2026-09-22)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 for d in ("index", "blocks", "logs", "peers"):
     os.makedirs(f"{os.environ['HOME']}/nado/{d}", exist_ok=True)
@@ -8,8 +9,9 @@ logger = logging.getLogger("autobond"); logger.addHandler(logging.NullHandler())
 from genesis import create_indexers
 create_indexers()
 
-from protocol import DENOMINATION, MIN_TX_FEE, AUTO_BOND_MIN_RAW, BOND_CAP, EPOCH_LENGTH
-from ops.account_ops import create_account, get_account, change_balance, change_bonded
+from protocol import DENOMINATION, MIN_TX_FEE, AUTO_BOND_MIN_RAW, EPOCH_LENGTH
+from ops.account_ops import (create_account, get_account, change_balance, change_bonded,
+                             increase_produced_count)
 from ops.key_ops import generate_keys
 from loops.core_loop import CoreClient as Core
 
@@ -45,7 +47,10 @@ def make_core(pct):
     mem = FakeMem(kd, pct)
     core = types.SimpleNamespace(
         memserver=mem, logger=logger,
-        last_auto_bond_epoch=-1, auto_bond_baseline=None,
+        # every field Core.__init__ gives these (loops/core_loop.py): auto_bond_dividend came later and, missing here,
+        # made maybe_auto_bond raise AttributeError inside its own try and "skip" — the test failed for weeks while
+        # the real Core (which initialises it to 0) bonded fine
+        last_auto_bond_epoch=-1, auto_bond_baseline=None, auto_bond_dividend=0,
         maybe_auto_bond=lambda: Core.maybe_auto_bond(core))
     return core, mem, kd
 
@@ -54,8 +59,14 @@ def set_epoch(mem, epoch):
     mem.latest_block = {"block_number": epoch * EPOCH_LENGTH}
 
 def add_reward(addr, nado):
-    """Credit addr with a mining reward of `nado` whole NADO."""
+    """Credit addr with a mining reward of `nado` whole NADO — balance AND the `produced` counter.
+
+    Auto-bond compounds MINED coins, and `produced` is what says a coin was mined (see
+    test_auto_bond_mined_only). This used to move balance alone, which is what a RECEIVE looks like:
+    the fixture could not tell the two apart, which is precisely the confusion that let the shipped
+    code sweep transfers and matured withdrawals into savings."""
     change_balance(addr, int(nado * DENOMINATION), logger=logger)
+    increase_produced_count(addr, int(nado * DENOMINATION), logger=logger)
 
 def apply_bond(addr, raw, fee):
     """Simulate a bond tx landing: move raw from spendable to bonded and destroy the fee."""
@@ -100,8 +111,9 @@ def t3():
     core, mem, kd = make_core(pct=1)
     core.maybe_auto_bond()                        # baseline = 0
     # 1% of this gain must be < AUTO_BOND_MIN_RAW (0.001 NADO). gain = 0.05 NADO -> 1% = 0.0005 NADO.
-    add_reward(kd["address"], 0)                  # noop
-    change_balance(kd["address"], AUTO_BOND_MIN_RAW * 50, logger=logger)  # gain = 5e8 raw
+    add_reward_raw = AUTO_BOND_MIN_RAW * 50       # gain = 5e8 raw, MINED (not received)
+    change_balance(kd["address"], add_reward_raw, logger=logger)
+    increase_produced_count(kd["address"], add_reward_raw, logger=logger)
     set_epoch(mem, 2)
     base_before = core.auto_bond_baseline
     core.maybe_auto_bond()
@@ -109,16 +121,17 @@ def t3():
     assert core.auto_bond_baseline == base_before, "dust path must NOT rebaseline (keeps accruing)"
 check("below dust floor accrues without a tx or rebaseline", t3)
 
-# ---- 4. stops at BOND_CAP (extra bond buys no weight) --------------------------------------------
+# ---- 4. NO upper stop (the per-identity cap was removed 2026-08-25; weight is linear in stake) ----
 def t4():
-    """Prove no auto-bond is emitted once bonded is already at BOND_CAP."""
-    core, mem, kd = make_core(pct=100)
-    change_bonded(kd["address"], BOND_CAP, logger=logger)   # already at cap
+    """Prove auto-bond keeps compounding above the OLD 1,000 NADO cap — extra bond IS weight now."""
+    core, mem, kd = make_core(pct=50)             # <100% so the gain also covers the tx fee
+    change_bonded(kd["address"], 1000 * 100_000_000_000, logger=logger)   # 1,000 NADO already bonded
     core.maybe_auto_bond()                        # baseline
     add_reward(kd["address"], 100); set_epoch(mem, 2)
     core.maybe_auto_bond()
-    assert mem.submitted == [], "must not bond once bonded >= BOND_CAP"
-check("stops auto-bonding at BOND_CAP", t4)
+    assert len(mem.submitted) == 1, "must keep bonding past 1,000 NADO (no cap)"
+    assert mem.submitted[0]["amount"] == 50 * DENOMINATION, mem.submitted[0]["amount"]
+check("keeps auto-bonding past the old 1,000 NADO cap", t4)
 
 # ---- 5. pct=0 is fully off --------------------------------------------------------------------
 def t5():

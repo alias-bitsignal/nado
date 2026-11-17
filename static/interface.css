@@ -9,6 +9,10 @@
   --txt-faint: #5d6b7a;
   --accent: #00ad93;          /* NADO brand teal (matches the logo + nadochain.com) */
   --accent-2: #00c9a7;        /* lighter teal for gradients/hover */
+  /* --accent-rgb repeats --accent in bare channels: rgba() cannot take a hex custom property, and the
+     page wash / button shadow / pill fills all need alpha over the accent. These were hardcoded to the
+     teal, so a theme recoloured the buttons and left the page glow teal. See the THEMES block below. */
+  --accent-rgb: 0, 173, 147;
   --bonded: #d29922;
   --open: #3fb950;
   --danger: #f85149;
@@ -23,7 +27,7 @@
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html, body { margin: 0; padding: 0; }
 body {
-  background: radial-gradient(1100px 560px at 50% -12%, rgba(0,173,147,.10), var(--bg) 62%);
+  background: radial-gradient(1100px 560px at 50% -12%, rgba(var(--accent-rgb),.10), var(--bg) 62%);
   background-attachment: fixed;
   color: var(--txt);
   font-family: var(--sans);
@@ -89,8 +93,12 @@ button, .btn {
 button:active { transform: translateY(1px); }
 button:disabled { opacity: .5; cursor: not-allowed; }
 /* brand-teal CTAs (match nadochain.com): dark text on a teal gradient, subtle lift on hover */
-button.primary, button.accent { background: linear-gradient(135deg, var(--accent), var(--accent-2)); border-color: transparent; color: #04110a; font-weight: 800; box-shadow: 0 6px 20px rgba(0,173,147,.30); }
-button.primary:hover:not(:disabled), button.accent:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 10px 28px rgba(0,173,147,.42); }
+/* `.btn` exists so a LINK can be a button, but the primary style was scoped to `button.primary`, so any
+   link marked primary rendered as a plain grey control — which is what happened to the one action on the
+   mining card that a stuck owner needs. */
+button.primary, button.accent, a.btn.primary, a.btn.accent { background: linear-gradient(135deg, var(--accent), var(--accent-2)); border-color: transparent; color: var(--bg); font-weight: 800; box-shadow: 0 6px 20px rgba(var(--accent-rgb),.30); }
+button.primary:hover:not(:disabled), button.accent:hover:not(:disabled),
+a.btn.primary:hover, a.btn.accent:hover { transform: translateY(-1px); box-shadow: 0 10px 28px rgba(var(--accent-rgb),.42); }
 button.ghost { background: transparent; }
 button.ghost:hover:not(:disabled) { border-color: var(--accent); }
 button.danger { color: var(--danger); border-color: #4a2326; background: #1c1416; }
@@ -139,7 +147,10 @@ input:focus, textarea:focus, select:focus { outline: none; border-color: var(--a
 .stat .value { font-size: 20px; font-weight: 700; margin-top: 4px; font-family: var(--mono); }
 .stat .value.sm { font-size: 15px; }
 .stat[title] { cursor: help; }
-.hint { color: var(--txt-faint); font-size: 10px; margin-left: 4px; cursor: help; font-weight: 700; }
+/* the help badge is DRAWN, not a glyph: ⓘ (U+24D8) is missing from many system fonts and renders as a box */
+.hint { display: inline-grid; place-items: center; width: 13px; height: 13px; margin-left: 4px; vertical-align: 1px;
+  border: 1px solid var(--txt-faint); border-radius: 50%; color: var(--txt-faint); font-size: 0; cursor: help; }
+.hint::before { content: "i"; font: 700 9px/1 var(--sans); }
 .stat[title]:hover { border-color: var(--accent-2); }
 
 .badge { display: inline-block; font-size: 11px; font-weight: 700; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--border); }
@@ -149,6 +160,7 @@ input:focus, textarea:focus, select:focus { outline: none; border-color: var(--a
 
 .addr-box { display: flex; align-items: center; gap: 8px; background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
 .addr-box .a { font-family: var(--mono); font-size: 12.5px; word-break: break-all; flex: 1; }
+#newMnemonic { word-break: normal; overflow-wrap: anywhere; }   /* words, not hex: never split "connect" into "connec t" */
 .copy { font-size: 12px; padding: 6px 10px; flex: 0 0 auto; }
 
 .warnbox { background: rgba(210,153,34,.1); border: 1px solid rgba(210,153,34,.4); color: #f0d488; border-radius: 10px; padding: 10px 12px; font-size: 12.5px; }
@@ -261,22 +273,27 @@ a { color: var(--accent-2); }
 /* payment-request banner (reuses the .hint ⓘ convention) on the Send tab */
 .hint-banner {
   display: flex; align-items: center; gap: 8px;
-  background: rgba(0,173,147,.08); border: 1px solid rgba(0,173,147,.28);
+  background: rgba(var(--accent-rgb),.08); border: 1px solid rgba(var(--accent-rgb),.28);
   color: var(--txt-dim); border-radius: 12px; padding: 13px 15px;
   font-size: 12.5px; line-height: 1.5; margin: 14px 0;
 }
 /* block-layout banners (the APY estimate + auto-bond controls) space their rows evenly */
 .hint-banner[style*="block"] > * + * { margin-top: 10px; }
 .hint-banner label { font-weight: 600; color: var(--txt); }
-.hint-banner .hint { color: inherit; cursor: default; font-size: 12px; margin: 0; font-weight: 400; }
+/* font-size stays 0: .hint draws its "i" with ::before and hides the literal ⓘ text behind font-size 0; the old 12px
+   here un-hid that text, so "Savings APY" showed TWO icons (user report 2026-09-07). Same drawn icon everywhere. */
+.hint-banner .hint { color: inherit; cursor: default; font-size: 0; margin: 0; font-weight: 400; }
 .hint-banner b { color: var(--txt); }
+/* The first-run note is a sentence followed by two links; as a flex row each link became its own squeezed column
+   ("I / already / have a / wallet" at 412 px). Block flow keeps it one paragraph. */
+#autoWalletNote { display: block; }
 /* staged status banner state variants (registration confirmed / failed) */
 .hint-banner.ok { background: rgba(63,185,80,.10); border-color: rgba(63,185,80,.4); color: #8be39a; }
 .hint-banner.warn { background: rgba(248,81,73,.10); border-color: rgba(248,81,73,.4); color: #ffb4ae; }
 
 /* inline button spinner — shown on the Start/Mine button while one-time registration is underway */
 .spin {
-  display: inline-block; width: 14px; height: 14px;
+  display: inline-block; width: 14px; height: 14px; flex: 0 0 auto;   /* never squashed into an ellipse by a flex row's text */
   margin-right: 9px; vertical-align: -2px;
   border: 2px solid rgba(255,255,255,.35);
   border-top-color: #fff;
@@ -312,7 +329,10 @@ a { color: var(--accent-2); }
 .modal-backdrop.hidden { display:none; }
 .modal { max-width:400px; width:100%; margin:0; animation:modalPop .16s cubic-bezier(.2,.9,.3,1.15); }
 .modal-title { margin:0 0 12px; font-size:16px; font-weight:700; color:var(--txt); }
-.modal-body { color:var(--txt-dim); font-size:14px; margin-bottom:14px; white-space:pre-line; }
+.modal-body { color:var(--txt-dim); font-size:14px; margin-bottom:14px; white-space:pre-line; overflow-wrap:anywhere; }
+/* overflow-wrap: a dialog that names an address (the replace-wallet confirm, 2026-10-08) ran 50 unbroken hex characters
+   off the right edge at 412 px; the checkbox label carries one too. */
+.modal-check span { overflow-wrap:anywhere; min-width:0; }
 .modal-rows { display:flex; flex-direction:column; gap:9px; margin-bottom:16px; }
 .modal-rows.hidden, .modal-body.hidden, .modal-warn.hidden, .modal-note.hidden, .modal-input.hidden { display:none; }
 .modal-row { display:flex; justify-content:space-between; gap:14px; font-size:14px; align-items:baseline; }
@@ -335,13 +355,13 @@ a { color: var(--accent-2); }
 .msgconv { display: flex; flex-direction: column; align-items: flex-start; gap: 1px; text-align: left; width: 100%;
   background: var(--bg-elev); border: 1px solid var(--border); border-radius: 10px; padding: 7px 10px; cursor: pointer; color: var(--txt); font: inherit; }
 .msgconv:hover, .msgconv.msgconv-active { border-color: var(--accent); }
-.msgconv.msgconv-active { background: rgba(0,173,147,.08); }
+.msgconv.msgconv-active { background: rgba(var(--accent-rgb),.08); }
 .msgconv > * { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .msgthread { flex: 1; display: flex; flex-direction: column; gap: 6px; overflow-y: auto; padding: 4px; }
 .msg-compose { margin-top: 8px; }
 .msgbubble { max-width: 84%; padding: 7px 11px; border-radius: 12px; }
 .msgbubble.in { align-self: flex-start; background: var(--bg-elev); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
-.msgbubble.out { align-self: flex-end; background: var(--accent); color: #04110a; border-bottom-right-radius: 4px; }
+.msgbubble.out { align-self: flex-end; background: var(--accent); color: var(--bg); border-bottom-right-radius: 4px; }
 .msgbubble .msgtext { white-space: pre-wrap; word-break: break-word; line-height: 1.35; }
 .msgbubble .msgmeta { margin-top: 2px; }
 .msgbubble.out .msgmeta { color: rgba(4,17,10,.72); }
@@ -367,15 +387,72 @@ a { color: var(--accent-2); }
 .rollup-hist:last-child { border-bottom: 0; }
 #rollupArgs .rollup-arg { margin-top: 2px; }
 
-/* ---- toggle switch (replaces the native checkbox on the key-save acknowledgement) ---- */
-.tgl input { position: absolute; opacity: 0; width: 0; height: 0; }
-.tgl .tgl-track { flex: 0 0 auto; width: 44px; height: 25px; border-radius: 999px; background: #26313d;
-  border: 1px solid var(--border); position: relative; transition: background .18s, border-color .18s; }
-.tgl .tgl-knob { position: absolute; top: 2px; left: 2px; width: 19px; height: 19px; border-radius: 50%;
-  background: #e6edf3; box-shadow: 0 1px 3px rgba(0,0,0,.4); transition: transform .18s; }
-.tgl input:checked + .tgl-track { background: linear-gradient(135deg, var(--accent), var(--accent-2)); border-color: transparent; }
-.tgl input:checked + .tgl-track .tgl-knob { transform: translateX(19px); background: #04110a; }
-.tgl input:focus-visible + .tgl-track { outline: 2px solid var(--accent-2); outline-offset: 2px; }
+
+/* >>> SHARED-COMPONENTS — copied VERBATIM into static/theme.css by tools/gen_theme_tokens.py.
+ * Everything between the sentinels must depend on nothing but the palette variables, because it is
+ * served to the ten game pages, which carry their own inline <style> and load no other stylesheet.
+ * Edit it HERE and regenerate; theme.css is not hand-editable. --------------------------------------
+ *
+ * ONE TOGGLE, EVERYWHERE. There used to be two, and neither worked properly:
+ *
+ * 1. `.switch` was a class with NO rules behind it — the Settings/Quorum/Assets toggles and every game
+ *    page's toggles were plain NATIVE checkboxes. On a dark card an unchecked native box paints as a
+ *    white square, and accent-color cannot help because it only tints the CHECKED fill. A box is also
+ *    the wrong affordance: each of these is an on/off preference, not a form field.
+ * 2. `.tgl` was a hand-built pill that DID look right, but it cost three elements of markup, lived in
+ *    interface.css where no game page could see it, and sat directly below the white native boxes in
+ *    the same Settings panel — which is precisely what made them read as broken.
+ *
+ * `.switch` is now that same pill drawn on the input itself with appearance:none: identical geometry,
+ * zero extra markup, and `.tgl` is deleted rather than kept in parallel. Because it is in this shared
+ * region it reaches the wallet and all ten game pages from one definition, so an SDK toggle can no
+ * longer stay OS-green while the wallet themes.
+ *
+ * The reset below is load-bearing: the generic `input, textarea, select` rule (correct for text fields)
+ * sets width:100%, padding, a border and a background, which stretched every box into a full-width
+ * padded block long before theming existed. Undo those four before styling anything, or the sizing
+ * here fights inherited padding. Boxes that are NOT .switch keep accent-color, and color-scheme:dark
+ * paints their unchecked state dark instead of white — every palette is dark. */
+/* The page glow. The wallet already derived it from the accent; all 24 game pages hardcoded the brand
+ * teal into their own body rule, so a themed page still sat in a teal halo. Restating it here from
+ * --accent-rgb gives both surfaces one definition — this sheet loads after their inline style, so the
+ * literal loses. Identical to the wallet's own rule, and `background` is a shorthand, so the
+ * attachment has to be restated with it or a themed page would scroll its glow. */
+html, body {
+  background: radial-gradient(1100px 560px at 50% -12%, rgba(var(--accent-rgb),.10), var(--bg) 62%);
+  background-attachment: fixed;
+}
+
+input[type="checkbox"], input[type="radio"] {
+  width: auto; padding: 0; border: 0; background: none; border-radius: 0;   /* undo the text-field rule */
+  accent-color: var(--accent);
+  color-scheme: dark;                   /* unchecked native box paints dark, not white */
+  cursor: pointer; flex: 0 0 auto;
+}
+input[type="range"], progress { accent-color: var(--accent); }
+input[type="checkbox"]:focus-visible, input[type="radio"]:focus-visible {
+  outline: 2px solid var(--accent-2); outline-offset: 2px;
+}
+
+input[type="checkbox"].switch {
+  -webkit-appearance: none; appearance: none;
+  position: relative; width: 44px; height: 25px; margin: 0; border-radius: 999px;
+  background: var(--bg-elev2); border: 1px solid var(--border);
+  transition: background .18s, border-color .18s;
+}
+input[type="checkbox"].switch::after {
+  content: ""; position: absolute; top: 2px; left: 2px; width: 19px; height: 19px; border-radius: 50%;
+  background: var(--txt); box-shadow: 0 1px 3px rgba(0,0,0,.4); transition: transform .18s, background .18s;
+}
+input[type="checkbox"].switch:checked {
+  background: linear-gradient(135deg, var(--accent), var(--accent-2)); border-color: transparent;
+}
+input[type="checkbox"].switch:checked::after { transform: translateX(19px); background: var(--bg); }
+input[type="checkbox"].switch:disabled { opacity: .5; cursor: not-allowed; }
+@media (prefers-reduced-motion: reduce) {
+  input[type="checkbox"].switch, input[type="checkbox"].switch::after { transition: none; }
+}
+/* <<< SHARED-COMPONENTS */
 
 /* the save-and-continue button PULSES once it's armed (ack toggled on) — the eye goes straight to it */
 .pulse-ready:not(:disabled) { animation: pulseready 1.3s ease-in-out infinite; }
@@ -426,3 +503,199 @@ a { color: var(--accent-2); }
 .mine-note.warn { color: #f0d488; }
 /* the share-of-network figure next to each stream's total — a quiet companion to the number, not a rival */
 .mine-legend .mshare { color: var(--txt-faint); font-weight: 600; font-size: 10.5px; }
+
+/* ---------------------------------------------------------------------------------------------------
+ * THEMES. Each is three variables — the accent, its lighter partner for gradients, and the same accent
+ * in bare RGB channels for the alpha washes. Everything else (surfaces, text, borders) is deliberately
+ * shared: recolouring only the accent keeps every contrast ratio the base theme was built with, so a
+ * theme cannot quietly make text unreadable. `teal` is the default and needs no block.
+ *
+ * The pairs run light -> dark within one hue so the 135deg button gradient reads as depth rather than as
+ * two different colours, and each is picked to stay legible against the dark #0b0f14 ground.
+ * ------------------------------------------------------------------------------------------------ */
+/* ---------------------------------------------------------------------------------------------------
+ * THEMES. A theme replaces the WHOLE palette — page ground, card surfaces, borders, the three text
+ * weights and the accent pair — so the interface is recoloured rather than just its buttons. Everything
+ * downstream already reads these variables (101 uses across the stylesheet), so no rule needs touching.
+ *
+ * CONTRAST IS MEASURED, NOT EYEBALLED. Tinting surfaces toward a hue is exactly how a theme quietly
+ * makes text unreadable, so every palette here was checked with the WCAG relative-luminance formula and
+ * tests/test_themes.mjs recomputes it on every run. The bar is the base theme's own behaviour: body text
+ * >= 4.5:1 on both the page and a card, dim text >= 4.5:1, faint text >= 3:1, accent >= 3:1. Measured
+ * results run 14.6-16.8:1 for body text and 4.5-7.6:1 for the accent — all above WCAG AA.
+ *
+ * --accent-rgb repeats the accent in bare channels because rgba() cannot take a hex custom property; the
+ * page wash, button shadow and pill fills need alpha over it. The test asserts it is arithmetically the
+ * same colour as --accent, since a mismatch is invisible in review and obvious on screen.
+ *
+ * `teal` is the default and deliberately has no block — the :root values stay authoritative, so a stale
+ * or tampered stored theme leaves a fully-styled page rather than a half-applied one.
+ * ------------------------------------------------------------------------------------------------ */
+html[data-theme="aqua"] {
+  --bg: #06120f; --bg-elev: #0d1f1b; --bg-elev2: #132a25; --border: #1e4239;
+  --txt: #e2f7f2; --txt-dim: #8fc3b9; --txt-faint: #5d8880;
+  --accent: #40e0d0; --accent-2: #7ceee3; --accent-rgb: 64, 224, 208;
+}
+html[data-theme="violet"] {
+  --bg: #0d0a16; --bg-elev: #171327; --bg-elev2: #1f1a33; --border: #312a4d;
+  --txt: #ece9f6; --txt-dim: #a49bc4; --txt-faint: #6b6390;
+  --accent: #7c5cff; --accent-2: #a78bfa; --accent-rgb: 124, 92, 255;
+}
+html[data-theme="ocean"] {
+  --bg: #080f18; --bg-elev: #101c2b; --bg-elev2: #172538; --border: #243a55;
+  --txt: #e4eefb; --txt-dim: #95aecd; --txt-faint: #5f7796;
+  --accent: #2f81f7; --accent-2: #58a6ff; --accent-rgb: 47, 129, 247;
+}
+html[data-theme="ember"] {
+  --bg: #150d08; --bg-elev: #231810; --bg-elev2: #2e2016; --border: #472f1e;
+  --txt: #f7ebe2; --txt-dim: #c5a68f; --txt-faint: #8d715c;
+  --accent: #f0883e; --accent-2: #ffab70; --accent-rgb: 240, 136, 62;
+}
+html[data-theme="rose"] {
+  --bg: #150a11; --bg-elev: #24141d; --bg-elev2: #301a27; --border: #4b2b3d;
+  --txt: #f8e9f1; --txt-dim: #c99cb4; --txt-faint: #8f6a7e;
+  --accent: #db61a2; --accent-2: #f778ba; --accent-rgb: 219, 97, 162;
+}
+html[data-theme="forest"] {
+  --bg: #08120b; --bg-elev: #0f2015; --bg-elev2: #152b1d; --border: #22432e;
+  --txt: #e6f4e9; --txt-dim: #98bda4; --txt-faint: #638071;
+  --accent: #3fb950; --accent-2: #56d364; --accent-rgb: 63, 185, 80;
+}
+html[data-theme="gold"] {
+  --bg: #121006; --bg-elev: #201c0e; --bg-elev2: #2b2513; --border: #443a1c;
+  --txt: #f6f0dd; --txt-dim: #c3b384; --txt-faint: #8b7d55;
+  --accent: #d29922; --accent-2: #e3b341; --accent-rgb: 210, 153, 34;
+}
+
+/* The theme picker: one swatch per theme, each showing its own gradient so the choice is the preview. */
+.themegrid { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 6px; }
+.themedot {
+  width: 38px; height: 38px; border-radius: 50%; cursor: pointer; padding: 0;
+  border: 2px solid var(--border); transition: transform .12s ease, border-color .12s ease;
+}
+.themedot:hover { transform: translateY(-2px); }
+.themedot[aria-pressed="true"] { border-color: var(--txt); transform: translateY(-2px); }
+.themedot:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+
+/* ---------------------------------------------------------------------------------------------------
+ * LOGO RAMP. The mark is five shades of one hue — a depth ramp, not five colours — so it re-hues cleanly
+ * per theme: each ramp keeps the artwork's original LIGHTNESS curve and only rotates the hue, with the
+ * lightest step being exactly that theme's --accent. Recomputing the curve rather than picking five new
+ * colours by hand is what keeps the facets reading as the same solid under every theme.
+ *
+ * logo.svg keeps the brand teal as each var's fallback, so the favicon and any <img src="logo.svg"> —
+ * neither of which can see page CSS — still render the original mark. Only the INLINED copy in the header
+ * follows the theme. -------------------------------------------------------------------------------- */
+:root {
+  --logo-1: #00443a; --logo-2: #006c5c; --logo-3: #00836f; --logo-4: #009982; --logo-5: #00ad93;
+}
+html[data-theme="aqua"] {
+  --logo-1: #106159; --logo-2: #199b8e; --logo-3: #1ebcac; --logo-4: #24dbc9; --logo-5: #40e0d0;
+}
+html[data-theme="violet"] {
+  --logo-1: #1b0088; --logo-2: #2b00d9; --logo-3: #3808ff; --logo-4: #5c34ff; --logo-5: #7c5cff;
+}
+html[data-theme="ocean"] {
+  --logo-1: #04306f; --logo-2: #074cb1; --logo-3: #085dd6; --logo-4: #0e6df6; --logo-5: #2f81f7;
+}
+html[data-theme="ember"] {
+  --logo-1: #6e3309; --logo-2: #af510e; --logo-3: #d46210; --logo-4: #ed741e; --logo-5: #f0883e;
+}
+html[data-theme="rose"] {
+  --logo-1: #651741; --logo-2: #a12567; --logo-3: #c32c7d; --logo-4: #d44390; --logo-5: #db61a2;
+}
+html[data-theme="forest"] {
+  --logo-1: #19491f; --logo-2: #277332; --logo-3: #308c3d; --logo-4: #38a447; --logo-5: #3fb950;
+}
+html[data-theme="gold"] {
+  --logo-1: #533c0d; --logo-2: #836015; --logo-3: #9f741a; --logo-4: #ba871e; --logo-5: #d29922;
+}
+
+/* HAZARD PALETTES — the signage/rave combos: a near-black ground with one fluorescent accent.
+ * The look depends on the accent screaming, so the surfaces stay almost neutral; the risk is that a
+ * saturated fluorescent on black reads as vibrating rather than legible, which is why these were
+ * measured like every other theme (toxic 14.8:1, hazard 15.8:1, alarm 5.3:1 accent-on-ground). */
+html[data-theme="toxic"] {
+  --bg: #060806; --bg-elev: #101410; --bg-elev2: #171d16; --border: #2a3a26;
+  --txt: #eaf7e6; --txt-dim: #a6c69c; --txt-faint: #6f8a67;
+  --accent: #39ff14; --accent-2: #7cff5a; --accent-rgb: 57, 255, 20;
+}
+html[data-theme="toxic"] {
+  --logo-1: #116c00; --logo-2: #1bac00; --logo-3: #21d000; --logo-4: #26f300; --logo-5: #39ff14;
+}
+html[data-theme="hazard"] {
+  --bg: #0a0800; --bg-elev: #151200; --bg-elev2: #1e1a04; --border: #3d3512;
+  --txt: #faf6e2; --txt-dim: #cbbf86; --txt-faint: #8d8352;
+  --accent: #ffe600; --accent-2: #fff45c; --accent-rgb: 255, 230, 0;
+}
+html[data-theme="hazard"] {
+  --logo-1: #645a00; --logo-2: #9f9000; --logo-3: #c1ae00; --logo-4: #e2cc00; --logo-5: #ffe600;
+}
+html[data-theme="alarm"] {
+  --bg: #0a0303; --bg-elev: #180909; --bg-elev2: #210d0d; --border: #421a1a;
+  --txt: #fdeaea; --txt-dim: #d09a9a; --txt-faint: #946a6a;
+  --accent: #ff1f1f; --accent-2: #ff6161; --accent-rgb: 255, 31, 31;
+}
+html[data-theme="alarm"] {
+  --logo-1: #700000; --logo-2: #b30000; --logo-3: #d90000; --logo-4: #fd0000; --logo-5: #ff1f1f;
+}
+
+/* settings: one card, clearly sectioned — a reader finds "Network" or "Backup" by scanning, not by reading */
+.settings-sect { margin: 24px 0 8px; padding-top: 14px; border-top: 1px solid var(--border); font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--txt-faint); }
+
+/* hardware-wallet + Register buttons (Mining page): wrap to full-width rows on a phone instead of squeezing three labels */
+#hwRow > button { flex: 1 1 160px; padding: 8px 12px; white-space: normal; }
+#regTapRow > button { flex: 1 1 100%; }
+@media (max-width: 480px) { #hwRow > button { flex-basis: 100%; } }
+
+/* ---- 2026-09-08 compact attestation UX (progressive disclosure, one primary action, captioned option list) ---- */
+details.disc > summary { list-style: none; cursor: pointer; font-size: 13px; color: var(--txt-dim); padding: 8px 0;
+  display: flex; align-items: center; justify-content: space-between; gap: 8px; user-select: none; }
+details.disc > summary::-webkit-details-marker { display: none; }
+details.disc > summary::after { content: "›"; font-size: 20px; line-height: 1; color: var(--txt-faint); transition: transform .15s; }
+details.disc[open] > summary::after { transform: rotate(90deg); }
+details.disc > summary:hover { color: var(--txt); }
+.optlist { display: flex; flex-direction: column; gap: 6px; }
+.opt { display: flex; flex-direction: column; align-items: flex-start; text-align: left; gap: 2px; width: 100%;
+  padding: 10px 12px; background: var(--bg-elev2); border: 1px solid var(--border); border-radius: 10px; }
+button.opt:hover:not(:disabled) { border-color: var(--accent); }
+.opt b { font-size: 14px; font-weight: 600; }
+.opt small { font-size: 12px; color: var(--txt-dim); font-weight: 400; line-height: 1.35; }
+#leaseWrap.compact { text-align: left; background: var(--bg-elev2); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
+#leaseWrap.compact .lrow { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 4px 8px; }
+#mineDevice { padding: 8px 12px; border-radius: 10px; background: var(--bg-elev2); border: 1px solid var(--border); }
+#mineDevice.ok { border-color: rgba(var(--accent-rgb), .45); }
+#mineDevice.warn { border-color: rgba(210, 153, 34, .5); }
+
+/* MINING IS A CONTINUOUS THING, SO SAY SO CONTINUOUSLY. The status cartouche read "Mining" as flat text
+   while a banner elsewhere announced the same fact and then had to be retracted — two places telling one
+   story. The pulse belongs on the state itself: it is true for as long as mining is true, needs no timer
+   to take it away, and does not compete with the one primary action. */
+#mineState.mining-now { color: var(--accent); }
+#mineState.mining-now::before {
+  content: ""; display: inline-block; width: .55em; height: .55em; margin-right: .45em;
+  border-radius: 50%; background: var(--accent); vertical-align: baseline;
+  animation: mine-pulse 1.6s ease-in-out infinite;
+}
+@keyframes mine-pulse {
+  0%, 100% { opacity: 1;   box-shadow: 0 0 0 0 rgba(var(--accent-rgb), .55); }
+  50%      { opacity: .55; box-shadow: 0 0 0 .42em rgba(var(--accent-rgb), 0); }
+}
+/* Someone who asked not to see motion should not be made to. */
+@media (prefers-reduced-motion: reduce) {
+  #mineState.mining-now::before { animation: none; }
+}
+
+/* THE WAY BACK TO THE PROJECT (2026-09-13): a small link under the title, on every screen. */
+header.app .site-link { display:block; margin-top:2px; text-decoration:none; }
+header.app .site-link:hover { text-decoration:underline; }
+
+/* FUNDED INVITES (interface.js "FUNDED INVITE LINKS"): the banner's one button wraps under its sentence on a phone,
+   and a list row keeps its action button at its natural width beside the text. */
+#inviteBanner { flex-wrap: wrap; }
+#inviteBanner > span { flex: 1 1 220px; }
+#inviteBanner > button { flex: 0 0 auto; }
+#inviteList .ex-row > div:first-child { min-width: 0; overflow-wrap: anywhere; }
+#inviteList .ex-row > div:last-child { flex: 0 1 auto; text-align: right; }
+#inviteList .inv-who { flex: 0 0 auto; white-space: nowrap; }   /* an address never breaks mid-word; its status wraps instead */

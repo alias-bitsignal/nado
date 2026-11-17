@@ -16,11 +16,22 @@ from hashing import canonical_bytes, merkle_root, merkle_proof, verify_merkle_pr
 P = (1 << 61) - 1          # Mersenne prime; a field element fits in 8 bytes (61 < 64 bits)
 
 
-def _leaf(index, shard: bytes) -> bytes:
-    """Canonical Merkle leaf for shard `index`. Binding the index makes a shard unswappable — a valid
-    proof for index i cannot be replayed at index j (the merkle set is order-independent, so the index
-    MUST live in the leaf content)."""
-    return canonical_bytes(["da", int(index), shard.hex()])
+def _leaf(index, shard: bytes, k, n, stripes, length) -> bytes:
+    """Canonical Merkle leaf for shard `index`, binding BOTH the index and the whole manifest.
+
+    The index makes a shard unswappable — a valid proof for index i cannot be replayed at index j (the
+    merkle set is order-independent, so the index MUST live in the leaf content).
+
+    THE MANIFEST IS BOUND FOR THE SAME REASON. It used to sit outside the commitment, so (k, n, stripes,
+    length) arrived from an untrusted peer while STEERING the decode: a smaller `length` truncates to
+    different bytes that still pass every per-shard check. The only defence available then was to decode
+    and RE-ENCODE the whole blob and compare commitments — ~50 s on a 118 MiB settle proof, inside block
+    validation, which is precisely why a peer could not resolve a DA-carried proof in time. Binding the
+    manifest into every leaf makes a lied manifest change every leaf hash, so the SAME Merkle proof that
+    already authenticates the shard now authenticates the manifest too, and the round-trip disappears.
+
+    This CHANGES THE COMMITMENT for identical bytes; commitments are not comparable across the change."""
+    return canonical_bytes(["da", int(index), shard.hex(), int(k), int(n), int(stripes), int(length)])
 SYMBOL_BYTES = 7           # 7 data bytes per field element (56 bits < 61) — the input packing granule
 _WORD = 8                  # on-wire bytes per field element (big-endian, fixed width)
 
@@ -45,11 +56,64 @@ def _lagrange_eval(points, x):
     return total
 
 
+_ENC_MATRIX_CACHE = {}
+
+
+def _enc_matrix(k, n):
+    """The k->n systematic Reed-Solomon generator matrix over GF(P), CACHED per (k, n).
+
+    The encode's interpolation points never vary: the data sits at x = 1..k and the shards are read off at
+    x = 1..n. So the Lagrange basis coefficients L_i(x) are CONSTANTS — they do not depend on the data at
+    all — and row x of this matrix is exactly [L_0(x), …, L_{k-1}(x)].
+
+    They were being recomputed for every stripe, and each recomputation ran _inv() = pow(a, P-2, P), a full
+    modular exponentiation, in the innermost loop: n·k = 32 modexps per stripe. A 118 MiB blob is ~17.7M
+    symbols = ~4.4M stripes = ~141 MILLION modexps, and encode measured 15 s/MiB — about 30 minutes for one
+    settlement proof. That is why a proof that passed its self-checks ("settle-with-proof BUILT", 13:35)
+    produced no DA publish for as long as anyone watched.
+
+    Same arithmetic, hoisted out of the loop: the encoded symbols are bit-identical (verified against the
+    previous implementation over random inputs in tests/test_da_encode_matrix.py), so commitments and
+    already-published blobs are unaffected."""
+    key = (int(k), int(n))
+    m = _ENC_MATRIX_CACHE.get(key)
+    if m is None:
+        m = []
+        for x in range(1, n + 1):
+            row = []
+            for i in range(k):
+                xi = i + 1
+                num = den = 1
+                for j in range(k):
+                    if i == j:
+                        continue
+                    xj = j + 1
+                    num = num * ((x - xj) % P) % P
+                    den = den * ((xi - xj) % P) % P
+                row.append(num * _inv(den) % P)
+            m.append(row)
+        _ENC_MATRIX_CACHE[key] = m
+    return m
+
+
 def _encode_stripe(data_syms, n):
     """k data symbols -> n shard symbols (systematic: the first k shards ARE the data). Any k of the n
     recover the degree-(k-1) polynomial, hence all symbols."""
-    pts = [(i + 1, data_syms[i] % P) for i in range(len(data_syms))]   # interpolate through x = 1..k
-    return [_lagrange_eval(pts, x) for x in range(1, n + 1)]           # evaluate at x = 1..n
+    k = len(data_syms)
+    M = _enc_matrix(k, n)
+    ys = [s % P for s in data_syms]
+    # THE FIRST k ROWS OF A SYSTEMATIC GENERATOR ARE THE IDENTITY — shard j < k IS data symbol j, which is
+    # the whole meaning of "systematic" and is what the decode side already exploits (_systematic_bytes).
+    # Multiplying by them computed a COPY the expensive way: for k=4, n=8 that was half of every stripe's
+    # arithmetic, i.e. half of a ~50 s encode on a 118 MiB proof. Only the n-k PARITY rows carry real work.
+    out = list(ys)
+    for x in range(k, n):
+        row = M[x]
+        acc = 0
+        for i in range(k):
+            acc += row[i] * ys[i]
+        out.append(acc % P)
+    return out
 
 
 def _pack(data):
@@ -102,9 +166,46 @@ def encode(data: bytes, k: int, n: int):
         for j in range(n):
             shard_syms[j].append(enc[j])
     shards = [_shard_bytes(ss) for ss in shard_syms]
-    leaves = [_leaf(j, shards[j]) for j in range(n)]   # hash-based (PQ) Merkle commitment, index-bound
+    # hash-based (PQ) Merkle commitment, index- AND manifest-bound (see _leaf)
+    leaves = [_leaf(j, shards[j], k, n, stripes, length) for j in range(n)]
     return {"commitment": merkle_root(leaves), "k": k, "n": n, "stripes": stripes,
             "length": length, "shards": shards}
+
+
+def _systematic_bytes(shards, k, stripes, length):
+    """Rebuild the blob straight from the k SYSTEMATIC shards, at C speed, without ever materialising a
+    field element.
+
+    The encoding is systematic and fixed-width: shard j < k holds data symbol j of every stripe as an
+    8-byte big-endian word, and a real data symbol is < 2**56, so each word is one ZERO high byte followed
+    by its 7 payload bytes (SYMBOL_BYTES). Recovering the blob is therefore pure byte movement — strip
+    every 8th byte, then interleave the 7-byte groups across the k shards — and both halves are expressible
+    as EXTENDED SLICES, which CPython executes in C:
+
+        del ba[0::8]                      # drop the high byte of every word
+        out[j*7 + t :: k*7] = pay[t::7]   # scatter shard j's groups into place, one byte-offset at a time
+
+    That is ~8*k slice operations for the whole blob, against ~17.8 MILLION int.to_bytes/int.from_bytes
+    round-trips for a 118 MiB proof. The symbol path stays for reconstruction from PARITY shards, where
+    real interpolation is required.
+
+    The zero-high-byte test is the same validity check _unpack makes: a word >= 2**56 cannot be a data
+    symbol, and silently dropping its high byte would return plausible-looking wrong bytes with no error.
+    """
+    need = stripes * _WORD
+    out = bytearray(stripes * k * SYMBOL_BYTES)
+    for j in range(k):
+        sh = shards[j]
+        if len(sh) < need:
+            raise ValueError("da: shard shorter than the manifest's stripe count")
+        ba = bytearray(sh[:need])
+        if any(ba[0::_WORD]):            # C-level scan for a non-zero high byte
+            raise ValueError("da: reconstructed symbol out of 7-byte data range (corrupt shard set)")
+        del ba[0::_WORD]                 # leaves the 7-byte payloads, concatenated
+        base, step = j * SYMBOL_BYTES, k * SYMBOL_BYTES
+        for t in range(SYMBOL_BYTES):
+            out[base + t::step] = ba[t::SYMBOL_BYTES]
+    return bytes(out[:length])
 
 
 def reconstruct(manifest_meta, known_shards: dict, verify: bool = True):
@@ -119,29 +220,107 @@ def reconstruct(manifest_meta, known_shards: dict, verify: bool = True):
     if len(known_shards) < k:
         raise ValueError(f"need >= {k} shards, have {len(known_shards)}")
     sym_by_idx = {idx: _shard_syms(b) for idx, b in known_shards.items()}
-    idx_list = list(sym_by_idx)
+    # SORTED, so the k SYSTEMATIC shards (indices 0..k-1) are preferred over parity whenever they are
+    # available, and so the choice no longer depends on dict insertion order (i.e. on the order shards
+    # happened to arrive from the network). Any k shards reconstruct the same bytes, so this changes no
+    # output — it only decides which arithmetic path below can be taken.
+    idx_list = sorted(sym_by_idx)
     use, extra = idx_list[:k], (idx_list[k:] if verify else [])
+    # SYSTEMATIC FAST PATH. _encode_stripe is systematic: shard j < k IS data symbol j. So when the chosen
+    # k are exactly 0..k-1 the decode matrix below is the IDENTITY and the whole per-stripe matrix-vector
+    # product is a no-op computed the expensive way — k*k modmuls per stripe, ~70 MILLION for a 118 MiB
+    # proof, ~55 s of pure Python. That cost is what makes a peer unable to resolve a settle proof inside
+    # block validation, which is why a proof-carrying settle cannot survive on a fleet where only one node
+    # holds the data. Reconstruction from parity still takes the general path unchanged.
+    systematic = (use == list(range(k)))
+    # PURE BYTE PATH when the systematic shards are present and no extra shard needs the interpolation
+    # consistency check: no field elements are formed at all. See _systematic_bytes.
+    if systematic and not extra:
+        return _systematic_bytes([known_shards[i] for i in range(k)], k, stripes, length)
+
+    # HOIST THE LAGRANGE BASIS OUT OF THE STRIPE LOOP — the same fix 08945e50 made on the encode side,
+    # and for the same reason: the basis depends ONLY on the x-coordinates, and here those are the CHOSEN
+    # SHARD INDICES, identical for every stripe. Only the y-values change. Rebuilding it per stripe meant
+    # _lagrange_eval -> _inv(den) = pow(a, P-2, P), a full modular exponentiation, k*k times per stripe:
+    # for a 118 MiB blob that is ~4.4M stripes x 16 = ~70 MILLION modexps.
+    #
+    # THIS WEDGED THE LIVE NODE, TWICE. h_da_get calls DaStore.get -> reconstruct SYNCHRONOUSLY on the
+    # event loop, so a single /da/get for a 118 MiB proof froze the exec node completely — HTTP dead, no
+    # log output, block application stopped, until it was restarted. py-spy caught it in the act:
+    #     _inv (ops/da.py:30) <- _lagrange_eval <- reconstruct <- get <- h_da_get <- aiohttp
+    # I had blamed the publish path for those wedges; it was the DECODE, triggered by fetching the blob.
+    #
+    # DECODE MATRIX: M[j][i] = L_i(x_j) for the k systematic outputs x_j = 1..k, over the k chosen points.
+    # Same arithmetic, hoisted, so the reconstructed bytes are bit-identical (checked against the previous
+    # implementation as an oracle in tests/test_da_reconstruct_matrix.py).
+    xs = [idx + 1 for idx in use]
+    dec = []
+    if not systematic:
+        for xj in range(1, k + 1):
+            row = []
+            for i, xi in enumerate(xs):
+                num = den = 1
+                for m, xm in enumerate(xs):
+                    if m == i:
+                        continue
+                    num = num * ((xj - xm) % P) % P
+                    den = den * ((xi - xm) % P) % P
+                row.append(num * _inv(den) % P)
+            dec.append(row)
+
+    # The redundancy check re-evaluates the SYSTEMATIC polynomial (x-coords 1..k, also constant) at each
+    # extra shard's position, so its basis is constant per extra index too.
+    ext = {}
+    for idx in extra:
+        xe, row = idx + 1, []
+        for i in range(k):
+            xi = i + 1
+            num = den = 1
+            for m in range(k):
+                if m == i:
+                    continue
+                xm = m + 1
+                num = num * ((xe - xm) % P) % P
+                den = den * ((xi - xm) % P) % P
+            row.append(num * _inv(den) % P)
+        ext[idx] = row
+
     out_syms = []
     for s in range(stripes):
-        pts = [(idx + 1, sym_by_idx[idx][s] % P) for idx in use]
-        data = [_lagrange_eval(pts, x) for x in range(1, k + 1)]
-        if extra:
-            dpts = [(i + 1, data[i]) for i in range(k)]
-            for idx in extra:
-                if _lagrange_eval(dpts, idx + 1) != sym_by_idx[idx][s] % P:
-                    raise ValueError(f"shard {idx} inconsistent with the k-of-n interpolation (corrupt shard)")
+        ys = [sym_by_idx[idx][s] % P for idx in use]
+        # identity decode when the systematic shards were chosen — the data symbols ARE the shard symbols
+        data = ys if systematic else [sum(dec[j][i] * ys[i] for i in range(k)) % P for j in range(k)]
+        for idx, row in ext.items():
+            if sum(row[i] * data[i] for i in range(k)) % P != sym_by_idx[idx][s] % P:
+                raise ValueError(f"shard {idx} inconsistent with the k-of-n interpolation (corrupt shard)")
         out_syms.extend(data)
     return _unpack(out_syms, length)
 
 
+def _meta_of(m):
+    """(k, n, stripes, length) from a manifest/meta dict — the tuple bound into every leaf."""
+    return int(m["k"]), int(m["n"]), int(m["stripes"]), int(m["length"])
+
+
 def sample_proof(manifest, index: int):
     """Merkle proof that shard `index` belongs to the commitment — what a sampler downloads with the shard."""
-    leaves = [_leaf(j, manifest["shards"][j]) for j in range(manifest["n"])]
+    k, n, stripes, length = _meta_of(manifest)
+    leaves = [_leaf(j, manifest["shards"][j], k, n, stripes, length) for j in range(n)]
     return {"index": index, "shard": manifest["shards"][index],
-            "proof": merkle_proof(leaves, _leaf(index, manifest["shards"][index]))}
+            "proof": merkle_proof(leaves, _leaf(index, manifest["shards"][index], k, n, stripes, length))}
 
 
-def verify_sample(commitment, index: int, shard: bytes, proof) -> bool:
-    """A light client / phone check: does this (index, shard) hash into the committed set? (Availability
-    sampling.) The index is bound into the leaf, so a shard proof cannot be replayed at another index."""
-    return verify_merkle_proof(_leaf(index, shard), proof, commitment)
+def verify_sample(commitment, index: int, shard: bytes, proof, meta) -> bool:
+    """A light client / phone check: does this (index, shard) hash into the committed set, UNDER THIS
+    MANIFEST? (Availability sampling.)
+
+    The index is bound into the leaf, so a shard proof cannot be replayed at another index. `meta` is bound
+    too, so this ALSO authenticates (k, n, stripes, length): a peer that lies about the manifest — e.g. a
+    shorter `length`, which would truncate the decode to different bytes that still pass every per-shard
+    check — produces leaves that do not hash to the commitment, and is rejected here rather than after an
+    expensive re-encode round-trip. `meta` is therefore an INPUT to be checked, never trusted."""
+    try:
+        k, n, stripes, length = _meta_of(meta)
+    except (KeyError, TypeError, ValueError):
+        return False
+    return verify_merkle_proof(_leaf(index, shard, k, n, stripes, length), proof, commitment)

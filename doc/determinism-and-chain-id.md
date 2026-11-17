@@ -32,7 +32,7 @@ structures must never contain floats** — amounts, fees, timestamps, block numb
 
 ## Chain-id binding (audit M3)
 
-A `chain_id` (`CHAIN_ID = "alphanet-8"`, and it changes at every reroll) is included in:
+A `chain_id` (`CHAIN_ID` in `protocol.py`, the network name — it changes at every reroll) is included in:
 - every **transaction** body (added in `draft_transaction`, asserted in
   `validate_transaction`), so it is committed by the txid and bound by the signature; and
 - every **block** body (added in `construct_block`, checked in `verify_block`).
@@ -56,11 +56,12 @@ replayed here.
 
 ## Address derivation
 
-`make_address(public_key)` = `"ndo" + public_key[:42] + make_checksum("ndo" + public_key[:42])`,
-where `make_checksum = blake2b_hash(body, size=2)` (canonical). `validate_address` recomputes
-the checksum; the keyless reserved recipients `bond`/`unbond` are also accepted. Because the
-checksum now uses canonical hashing, the genesis/treasury address is the legacy public-key body
-re-checksummed (`…b803280`, see [economics.md](economics.md)).
+`make_address(public_key)` = `body + make_checksum(body)` with **address format 2** (gen 28):
+`body` = `blake2b_hash(["nado-address-v2", public_key.lower()], size=21)` (42 hex; a blake2b *output
+length* of 21 bytes, not a slice of a longer digest) — a hash of the *whole* key, no prefix — and `make_checksum = blake2b_hash(body, size=4)` (canonical), 50 chars in all
+(`ops/address_ops.py`; multisig addresses keep their `msig` prefix). `validate_address` recomputes
+the checksum; the keyless reserved recipients `bond`/`unbond` are also accepted. The treasury
+is the keyless reserved account `treasury`, not a keyed address (see [economics.md](economics.md)).
 
 ## State-root determinism — what the root may commit (CHAIN_GENERATION 7)
 
@@ -86,12 +87,12 @@ rolled back. Four classes of data have been pulled OUT of the root — each was 
 
 1. **Reorg revert journals** (`bond_since_revert`, `hb_revert`, `msgkey_revert`, `gc_revert`,
    `block_loc`) → moved to `kv_ops._LOCAL_DBS` (excluded from `SNAPSHOT_DBS` entirely). These are
-   rollback bookkeeping whose contents depend on a node's reorg history. *(alphanet-7 h76000 split.)*
+   rollback bookkeeping whose contents depend on a node's reorg history. *(betanet-7 h76000 split.)*
 2. **Block storage** (`block_by_num`, `block_by_hash`) → `ROOT_EXCLUDED_DBS`. These are written on block
    *arrival* (`save_block`), so their contents depend on a node's height, history-retention/pruning, and
    orphan/fork bodies accumulated across reorgs. They were **52% of the root and grew 1:1 with height**,
    so a catching-up node computed a different as-of-parent root than the producer and tripped the (correct)
-   fatal gate at ~h62 — the **alphanet-8 fresh-sync wedge**. Blocks are already committed by the block-hash
+   fatal gate at ~h62 — the **betanet-8 fresh-sync wedge**. Blocks are already committed by the block-hash
    *chain* (parent linkage + tx content), so putting the block bytes in the state root was a **redundant,
    non-deterministic second commitment**. They are still *carried in the snapshot transfer* (a joiner's deep
    hash-lookbacks need them) — only the root **commitment** excludes them. Fixed in `CHAIN_GENERATION` 5.
@@ -113,7 +114,7 @@ rolled back. Four classes of data have been pulled OUT of the root — each was 
    `execsum:<h>` *and* prunes the one leaving the retention window (`exec_summary_del(h − EXEC_SUMMARY_RETENTION)`),
    but `rollback_one_block` only deletes the block's *own* height and never restores the pruned row — so a node
    that has rolled back holds a **different `execsum` set** than a forward-only node at the same tip. An
-   emergency-mode rollback storm dropped `execsum:3301..3305` on the catching-up alphanet-8 nodes; their
+   emergency-mode rollback storm dropped `execsum:3301..3305` on the catching-up betanet-8 nodes; their
    `l1_state_root` diverged from the canonical forward-only chain and the fatal gate refused them **forever**
    (a node wedged below its own finalized floor cannot self-heal). The summaries are still *carried in the
    snapshot* (settle-with-proof binding needs the retention window) — only the root **commitment** drops them.
@@ -139,9 +140,8 @@ absent must `meta_del` at `0`, or rollback will leave a phantom that forks the r
 
 ## In-block transaction ordering — RESOLVED (CO-8)
 
-`construct_block` currently hashes `block_transactions` in the order they came from the local
-pool, while the network only converges the transaction *set*. Equal-fee transactions can
-therefore let two honest nodes compute different block hashes for the same set. The fix
-(**now implemented**) is to canonicalize the order — `construct_block`/`rebuild_block` sort `block_transactions`
-by `txid` in `construct_block` and validate that ordering in `verify_block`. Track this for the
-S4.3 work.
+`construct_block` used to hash `block_transactions` in the order they came from the local
+pool, while the network only converges the transaction *set*, so equal-fee transactions could
+let two honest nodes compute different block hashes for the same set. The fix
+(**implemented**) is to canonicalize the order — `construct_block`/`rebuild_block` sort `block_transactions`
+by `txid` in `construct_block` and validate that ordering in `verify_block`.

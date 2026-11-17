@@ -4,8 +4,7 @@ WHY THIS EXISTS. A CHAIN_GENERATION reroll wipes the exec state: every deployed 
 every hardcoded CID in the frontend then points at nothing. The failure is SILENT — you click "Set out" in
 autogame, or anything in any other game, and nothing happens at all, because the call goes to an address
 that does not exist. Recovering by hand means deploying 23 contracts, hunting every CID reference across 21
-frontends plus the faucet-reward table plus the e2e harnesses, and remembering to restamp the cache-bust
-hashes. Missing any one of those leaves a game dead. This does all of it in one command, and verifies it.
+frontends plus the faucet-reward table plus the e2e harnesses. Missing any one of those leaves a game dead. This does all of it in one command, and verifies it.
 
 TWO THINGS THAT MAKE THE NAIVE VERSION FAIL, both learned the hard way:
 
@@ -13,17 +12,18 @@ TWO THINGS THAT MAKE THE NAIVE VERSION FAIL, both learned the hard way:
     blob tx expires 20 blocks after submission. The tail of the batch therefore expires unincluded and
     vanishes from the pool — silently, since submission itself returned "Success". We deploy in small
     batches and WAIT for each to land, resubmitting anything that expired.
-  * Browsers cache the game JS by its `?v=` stamp. Repointing a CID without restamping means the browser
-    keeps serving the old file with the dead CID, and the game stays broken even though the repo is right.
+  * Browsers cache the game JS by its `?v=` stamp. The stamp is now the file's CONTENT hash, computed by the
+    node when it serves the page (ops/static_versions.py), so a repointed CID changes the URL by itself; the
+    old step that rewrote md5 stamps into the sources (merge_games.py bust_*) is gone.
 
 A CID is H(deployer, code, nonce), so the target address of every game is computable BEFORE deploying —
 that is what lets this be idempotent: anything already live at its target CID is left alone, and a game
 whose code changed is redeployed because its target moved.
 
 Run:
-    python3 -m execnode.games.redeploy              # deploy what's missing, rewire, restamp, verify
+    python3 -m execnode.games.redeploy              # deploy what's missing, rewire, rebake i18n, verify
     python3 -m execnode.games.redeploy --check      # report only; touch nothing
-    python3 -m execnode.games.redeploy --wire-only  # skip deploying; just repoint + restamp + verify
+    python3 -m execnode.games.redeploy --wire-only  # skip deploying; just repoint + rebake i18n + verify
 """
 import argparse
 import glob
@@ -43,13 +43,18 @@ from execnode.state import ExecState
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 STATIC = os.path.join(ROOT, "static")
+# THE DISTRIBUTOR'S REAL PATH. wire()/verify() skip it when it does not exist (`if os.path.exists`), so a move that
+# forgets this line stops rewiring the prize table SILENTLY and pays every board out of a dead contract after the
+# next reroll. It moved from the repo root to scripts/operator/ on 2026-10-10;
+# tests/test_redeploy_rewires_every_cid.py fails if this path stops existing.
+FAUCET_REWARDS = os.path.join(ROOT, "scripts", "operator", "_faucet_rewards.py")
 
 # game -> the frontend that drives it. Everything else is static/<game>.js; these are the exceptions, and
 # the ones with no frontend at all (system contracts reached only from python or another contract).
 FRONTEND = {"holdem": "poker.js"}
 NO_FRONTEND = {"reserve", "faucet"}
 
-# _faucet_rewards.py carries its own CID table, keyed by a stable row index. Resolving the game from the
+# scripts/operator/_faucet_rewards.py carries its own CID table, keyed by a stable row index. Resolving the game from the
 # row's `kind` works for every "<game>-daily" row; the banked/duel rows need this map. Fail loudly rather
 # than guess: a wrong row here pays a board's rewards out of the wrong contract.
 FAUCET_ROW_GAME = {0: "dice", 1: "scrapline", 2: "stormhold", 3: "farkle", 4: "blackjack",
@@ -62,7 +67,7 @@ WAVE_RETRIES = 3
 
 def _get(url, timeout=10):
     try:
-        return json.load(urllib.request.urlopen(url, timeout=timeout))
+        return json.load(urllib.request.urlopen(url, timeout=timeout))  # nosec B310 # operator CLI: the operator's own node URL (literal http:// default or their flag), never peer input
     except Exception:
         return None
 
@@ -157,7 +162,22 @@ def wire(targets):
         open(path, "w", encoding="utf-8").write(src[:m.start(1)] + cid + src[m.end(1):])
         changed.append(f"{os.path.basename(path)}: {m.group(1)[:10]}… -> {cid[:10]}…")
 
-    fr = os.path.join(ROOT, "_faucet_rewards.py")
+    # SECOND CID IN ONE FRONTEND: dex.js also carries `const OTC_CID` (the cross-chain book + limit orders).
+    # It was never on this list, so the gen-24 redeploy left it on the pre-reroll id and the book showed
+    # "Loading orders…" forever (found 2026-09-02). Same rule as `const CID`: repoint, restamp, verify.
+    # interface.js carries RESERVE_CID (the wallet's reserve panel) — missed the same way until the betanet-8 reroll,
+    # where the redeploy reported every CID live while the panel pointed at the betanet-7 reserve.
+    for path, var, game in ((os.path.join(STATIC, "dex.js"), "OTC_CID", "otc"),
+                            (os.path.join(STATIC, "interface.js"), "RESERVE_CID", "reserve")):
+        if game not in targets or not os.path.exists(path):
+            continue
+        src = open(path, encoding="utf-8").read()
+        m = re.search(r'^const %s = "([0-9a-z]+)";' % var, src, re.M)
+        if m and m.group(1) != targets[game]:
+            open(path, "w", encoding="utf-8").write(src[:m.start(1)] + targets[game] + src[m.end(1):])
+            changed.append(f"{os.path.basename(path)} {var}: {m.group(1)[:10]}… -> {targets[game][:10]}…")
+
+    fr = FAUCET_REWARDS
     if os.path.exists(fr):
         lines = open(fr, encoding="utf-8").read().split("\n")
         for i, line in enumerate(lines):
@@ -176,23 +196,17 @@ def wire(targets):
                 changed.append(f"_faucet_rewards.py[{idx}] {game}: {old[:10]}… -> {targets[game][:10]}…")
         open(fr, "w", encoding="utf-8").write("\n".join(lines))
 
-    for harness, game in (("_autogame_e2e.py", "autogame"), ("_autogame_daily_e2e.py", "autogame")):
-        path = os.path.join(ROOT, harness)
-        if not os.path.exists(path):
-            continue
-        src = open(path, encoding="utf-8").read()
-        m = re.search(r'^CID = "([0-9a-z]+)"', src, re.M)
-        if m and m.group(1) != targets[game]:
-            open(path, "w", encoding="utf-8").write(src[:m.start(1)] + targets[game] + src[m.end(1):])
-            changed.append(f"{harness}: {m.group(1)[:10]}… -> {targets[game][:10]}…")
+    # The live e2e scripts (scripts/live/_*_e2e.py) are not rewired here: they derive their cid from target_cids() at run time,
+    # so a reroll cannot strand them (13 pointed at dead contracts after betanet-8 while only autogame's were rewired).
     return changed
 
 
 def restamp():
-    """Rebake i18n + bump every ?v= cache-bust stamp, so browsers actually fetch the repointed files."""
+    """Rebake static/i18n.js from its JSON sources. (Cache-busting needs no step: the node versions every served
+    reference by content, so the repointed files get new URLs on their own.)"""
     mg = os.path.join(STATIC, "i18n_games", "merge_games.py")
     if not os.path.exists(mg):
-        print("  ! merge_games.py not found — stamps NOT refreshed; browsers may serve the old CID")
+        print("  ! merge_games.py not found — i18n.js NOT rebuilt")
         return
     r = subprocess.run([sys.executable, mg], capture_output=True, text=True,
                        cwd=os.path.join(STATIC, "i18n_games"))
@@ -209,10 +223,12 @@ def verify(targets, ex):
         return False
     bad = []
     for path in sorted(glob.glob(os.path.join(STATIC, "*.js"))):
-        m = re.search(r'^const CID = "([0-9a-z]+)";', open(path, encoding="utf-8").read(), re.M)
-        if m and m.group(1) not in have:
-            bad.append(f"{os.path.basename(path)} -> {m.group(1)}")
-    fr = os.path.join(ROOT, "_faucet_rewards.py")
+        _src = open(path, encoding="utf-8").read()
+        # EVERY `const CID` / `const <NAME>_CID`, not a list of names: a list is how RESERVE_CID went unchecked
+        for var, cid in re.findall(r'^const ((?:[A-Z]+_)?CID) = "([0-9a-z]+)";', _src, re.M):
+            if cid not in have:
+                bad.append(f"{os.path.basename(path)} {var} -> {cid}")
+    fr = FAUCET_REWARDS
     if os.path.exists(fr):
         for cid in re.findall(r'\(\d+,\s*"([0-9a-z]+)"', open(fr, encoding="utf-8").read()):
             if cid not in have:
@@ -234,8 +250,18 @@ def main():
     ap.add_argument("--ex", default=os.environ.get("NADO_EX_URL", "http://127.0.0.1:9273").rstrip("/"))
     ap.add_argument("--fee", type=int, default=D.MIN_TX_FEE)
     ap.add_argument("--check", action="store_true", help="report only; change nothing")
-    ap.add_argument("--wire-only", action="store_true", help="skip deploying; repoint + restamp + verify")
+    ap.add_argument("--wire-only", action="store_true", help="skip deploying; repoint + rebake i18n + verify")
     a = ap.parse_args()
+
+    # CARRIED CONTRACTS (execnode/exec_genesis.py): when this generation started from a carried exec genesis every contract
+    # already lives at its old id. target_cids() derives ids from the CURRENT code, and a contract upgraded in place keeps
+    # the id of its first code — so a deploy here would create duplicates and rewire the frontends AWAY from the carried
+    # contracts (their state and pots). INVARIANT: with a carried genesis this tool only verifies references.
+    from execnode import exec_genesis as _EG
+    if _EG.load():
+        print("contracts were CARRIED (genesis_data/exec_genesis.json): verifying references only, deploying nothing")
+        ok = verify({}, a.ex)
+        sys.exit(0 if ok else 1)
 
     if a.check:
         targets, have = target_cids(), live_cids(a.ex)
@@ -256,7 +282,7 @@ def main():
         print(f"  {c}")
     if not changes:
         print("  every reference was already current")
-    print("\n== restamp ==")
+    print("\n== i18n ==")
     restamp()
     print("\n== verify ==")
     ok = verify(targets, a.ex)

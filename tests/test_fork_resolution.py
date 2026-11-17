@@ -11,17 +11,14 @@ first one wrong, which is what produced the 40-minute wedge:
 Run: python3 tests/test_fork_resolution.py
 """
 import os, sys, tempfile, traceback
-os.environ.setdefault("HOME", tempfile.mkdtemp(prefix="nado_fr_"))
+os.environ["HOME"] = tempfile.mkdtemp(prefix="nado_fr_")
+import atexit, shutil; atexit.register(shutil.rmtree, os.environ["HOME"], ignore_errors=True)   # leave no /tmp home behind (9,600 leaked by 2026-09-22)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ops import fork_resolution as FR
 
-fails = 0
-def check(name, fn):
-    """Run fn; print PASS/FAIL and count failures."""
-    global fails
-    try: fn(); print(f"PASS  {name}")
-    except Exception as e:
-        fails += 1; print(f"FAIL  {name}: {e}"); traceback.print_exc()
+import _harness
+_report = _harness.Report()
+check = _report.run
 
 
 def chain(prefix):
@@ -105,7 +102,9 @@ def t_search_is_logarithmic():
     peers, probe = peers_on("main")
     v = FR.resolve(ours, tip=100_000, finalized=0, peers=peers, probe=probe)
     assert v["ancestor"] == 50_000, v
-    assert v["probes"] <= 20, f"binary search must stay logarithmic, used {v['probes']} probes"
+    # + SHALLOW_SPLIT_DEPTH: the shallow-split fast path (2026-09-17) spends up to three rounds under the tip
+    # before the generic search runs; a deep fork pays them once and stays logarithmic after
+    assert v["probes"] <= 20 + FR.SHALLOW_SPLIT_DEPTH, f"binary search must stay logarithmic, used {v['probes']} probes"
 
 
 def t_classify_is_pure_arithmetic():
@@ -129,5 +128,5 @@ for name, fn in [
 ]:
     check(name, fn)
 
-print("ALL PASSED" if not fails else f"{fails} FAILED")
-sys.exit(1 if fails else 0)
+print("ALL PASSED" if not _report.fails else f"{_report.fails} FAILED")
+sys.exit(1 if _report.fails else 0)

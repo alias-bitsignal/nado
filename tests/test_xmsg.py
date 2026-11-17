@@ -9,6 +9,7 @@ Run: python3 tests/test_xmsg.py
 """
 import os, sys, tempfile, traceback, logging
 os.environ["HOME"] = tempfile.mkdtemp(prefix="nado_xmsg_")
+import atexit, shutil; atexit.register(shutil.rmtree, os.environ["HOME"], ignore_errors=True)   # leave no /tmp home behind (9,600 leaked by 2026-09-22)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 for d in ("index", "blocks", "logs", "peers"):
     os.makedirs(f"{os.environ['HOME']}/nado/{d}", exist_ok=True)
@@ -23,12 +24,9 @@ from ops.settlement_ops import latest_settled
 from ops.key_ops import generate_keys
 from execnode.state import ExecState
 
-fails = 0
-def check(name, fn):
-    global fails
-    try: fn(); print(f"PASS  {name}")
-    except Exception as e:
-        fails += 1; print(f"FAIL  {name}: {e}"); traceback.print_exc()
+import _harness
+_report = _harness.Report()
+check = _report.run
 def raises(fn):
     try: fn(); return False
     except Exception: return True
@@ -37,12 +35,20 @@ V = generate_keys(); create_account(V["address"], balance=B_MIN, bonded=4 * B_MI
 U = generate_keys(); create_account(U["address"], balance=1_000_000)                 # relayer
 
 
+def _outbox_proof(st, seq):
+    """(message, proof) for outbox `seq`, built exactly as the /exec/outbox_proof handler builds it."""
+    from execnode import exec_root_b2 as ER
+    m = st.outbox[str(seq)]
+    proof, _root = st.record_proof_at(None, ER.T_DIGEST, "outbox", ER.leaf_digest(ER.msg_outbox_leaf(m)), value=1)
+    return {"message": m, "proof": proof}
+
+
 def _emit_and_settle(ns_from, cursor, to_ns="rollupb", data={"hi": 1}):
     """Emit a message in A's exec state, settle A's root on L1 under `ns_from`@`cursor`; return (message, proof)."""
     st = ExecState(tempfile.mktemp(prefix="nado_a_", suffix=".json"))
     st.apply_blob({"op": "emit", "to_ns": to_ns, "data": data}, sender="ndoalice", txid="e1")
     root = st.state_root()
-    op = st.outbox_proof(0)
+    op = _outbox_proof(st, 0)
     reflect_transaction(construct_settle_tx(V, exec_cursor=cursor, state_root=root, max_block=1, ns=ns_from), logger, 1)
     assert latest_settled(ns_from)[1] == root, "A root settled on L1"
     return op["message"], op["proof"]
@@ -67,7 +73,7 @@ def t3_unsettled_namespace_rejected():
     """A message whose namespace has no settled root cannot be delivered."""
     st = ExecState(tempfile.mktemp(suffix=".json"))
     st.apply_blob({"op": "emit", "to_ns": "rollupb", "data": {"x": 1}}, sender="ndoalice", txid="e1")
-    op = st.outbox_proof(0)
+    op = _outbox_proof(st, 0)
     xt = construct_xmsg_tx(U, "neverset", "rollupb", op["message"], op["proof"], max_block=1)
     assert raises(lambda: validate_transaction(xt, logger, 1)), "no settled root -> reject"
 
@@ -90,5 +96,5 @@ def t5_receiver_inbox_commitment():
 for name, fn in sorted(globals().items()):
     if name.startswith("t") and callable(fn) and name[1].isdigit():
         check(name, fn)
-print(f"\n{'ALL PASSED' if not fails else str(fails)+' FAILED'}")
-sys.exit(1 if fails else 0)
+print(f"\n{'ALL PASSED' if not _report.fails else str(_report.fails)+' FAILED'}")
+sys.exit(1 if _report.fails else 0)

@@ -14,8 +14,8 @@
 // division on a non-negative value (`(a / b) | 0` is only safe below 2^31, so `Math.floor` is used) and
 // every subtraction goes through `csub`, which clamps at zero. A bare `a - b` that can go negative is the
 // bug that makes a browser preview disagree with the chain.
-import * as R from "./autogame-rules.js?v=a3d6848d";
-export * from "./autogame-rules.js?v=a3d6848d";
+import * as R from "./autogame-rules.js";
+export * from "./autogame-rules.js";
 
 // ── integer helpers, matching the VM exactly ────────────────────────────────────────────────────
 export const csub = (a, b) => (a > b ? a - b : 0);            // clamped: the field wraps, so this is law
@@ -471,9 +471,10 @@ export function step(run, tw, rw, agg, stance, focus, healpct, action) {
 
 // ── driving a leg ───────────────────────────────────────────────────────────────────────────────
 /**
- * The two 32-bit windows for step `i`, given an L1 block hash already reduced into the field.
+ * The two 32-bit windows for step `i`, given an L1 block hash already reduced into the hash's word.
  * `algHashn` is injected rather than imported so this module stays dependency-free and can be run by a
- * headless verifier: pass the browser's alghash port (nadodapp exports it).
+ * headless verifier: pass nadodapp's algHashn (the VM's BLAKE2s word hash) — the contract game and the Daily Gauntlet
+ * both do (the Gauntlet's gen-28 alghash road was retired 2026-10-28, see autogame-daily.js).
  */
 export function words(algHashn, blockHashField, runId, i) {
   return Number(algHashn([blockHashField, runId, i]) & 0xFFFFFFFFn);
